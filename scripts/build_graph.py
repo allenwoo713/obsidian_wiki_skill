@@ -47,6 +47,8 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
     pages = _load_pages(wiki_dir)
     G = nx.Graph()
     title_to_path: Dict[str, str] = {p["title"]: p["path"] for p in pages}
+    # slug → title 映射：[[文件名slug]] → frontmatter title
+    slug_to_title: Dict[str, str] = {Path(p["path"]).stem: p["title"] for p in pages}
     for p in pages:
         G.add_node(p["title"], **{
             "path": p["path"], "page_type": p["type"],
@@ -54,13 +56,21 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
         })
     # Signal 1: 直接链接
     for p in pages:
-        for link in p["links"]:
-            if link in title_to_path:
-                if G.has_edge(p["title"], link):
-                    G[p["title"]][link]["weight"] += 1.0
-                    G[p["title"]][link]["signals"].add("direct_link")
+        for link_raw in p["links"]:
+            # 处理 [[slug|display]] 格式，提取 slug 部分
+            link = link_raw.split("|")[0].strip() if "|" in link_raw else link_raw
+            resolved = link
+            if resolved not in title_to_path:
+                # slug → title 映射
+                if resolved in slug_to_title:
+                    resolved = slug_to_title[resolved]
                 else:
-                    G.add_edge(p["title"], link, weight=1.0, signals={"direct_link"})
+                    continue
+            if G.has_edge(p["title"], resolved):
+                G[p["title"]][resolved]["weight"] += 1.0
+                G[p["title"]][resolved]["signals"].add("direct_link")
+            else:
+                G.add_edge(p["title"], resolved, weight=1.0, signals={"direct_link"})
     # Signal 2: 源重叠
     src_sets = {p["title"]: set(p["sources"]) for p in pages}
     titles = list(src_sets.keys())
