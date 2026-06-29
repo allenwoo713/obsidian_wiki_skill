@@ -175,6 +175,23 @@ class WikiIndex:
         self.bm25 = data["bm25"]
         self._page_paths = data["paths"]
         self._get_lance()
+        # 从 manifest 重建 pages（供 search_bm25 获取 title/sources/snippet）
+        manifest_file = self.index_dir / "manifest.json"
+        if manifest_file.exists():
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            page_map = {p["path"]: p for p in manifest.get("pages", [])}
+            self.pages = []
+            for path in self._page_paths:
+                p = page_map.get(path, {})
+                self.pages.append(WikiPage(
+                    path=Path(path),
+                    title=p.get("title", Path(path).stem),
+                    page_type=p.get("page_type", "concept"),
+                    content="",  # snippet 从文件读取
+                    sources=p.get("sources", []),
+                    links=p.get("links", []),
+                    sha256=p.get("sha256", ""),
+                ))
 
     def search_bm25(self, query: str, k: int = 20) -> List[RetrievedPage]:
         if self.bm25 is None:
@@ -190,7 +207,16 @@ class WikiIndex:
             path = self._page_paths[idx]
             title = p.title if p else Path(path).stem
             sources = p.sources if p else []
-            snippet = (p.content[:200] if p else "")[:200]
+            snippet = (p.content[:200] if p and p.content else "")[:200]
+            if not snippet and p:
+                # 从文件读取 snippet
+                try:
+                    raw = p.path.read_text(encoding="utf-8", errors="replace")
+                    import re as _re
+                    m = _re.search(r"^---\n.*?\n---\n(.*)$", raw, _re.DOTALL)
+                    snippet = (m.group(1).strip()[:200] if m else raw[:200])
+                except Exception:
+                    snippet = ""
             results.append(RetrievedPage(
                 path=Path(path), title=title, score=float(score),
                 snippet=snippet, sources=sources, retrieval_method="bm25",
@@ -205,7 +231,7 @@ class WikiIndex:
         results = []
         for r in rows:
             results.append(RetrievedPage(
-                path=Path(r["path"]), title=r["title"], score=float(r.get("_distance", 1.0)),
+                path=Path(r["path"]), title=r["title"], score=1.0 / (1.0 + float(r.get("_distance", 1.0))),
                 snippet=r["content"][:200], sources=json.loads(r.get("sources", "[]")),
                 retrieval_method="vector",
             ))
