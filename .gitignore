@@ -1,0 +1,4 @@
+.pytest_tmp/
+pytest-cache-files-*/
+.pytest_tmp/
+pytest-cache-files-*/
