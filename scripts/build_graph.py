@@ -130,6 +130,9 @@ def render_html(G: nx.Graph, out_path: Path):
                "#46f0f0", "#f032e6", "#bcf60c", "#fabebe", "#008080"]
     net = Network(height="900px", width="100%", bgcolor="#1a1a2e",
                   font_color="white", directed=False, notebook=False)
+    # 物理引擎稳定化：防止疯狂旋转
+    net.toggle_physics(True)
+    net.set_options('{"physics": {"barnesHut": {"gravitationalConstant": -8000, "springLength": 150, "springConstant": 0.04, "damping": 0.4, "avoidOverlap": 0.2}, "stabilization": {"iterations": 300, "fit": true}}}')
     for n, d in G.nodes(data=True):
         ptype = d.get("page_type", "concept")
         deg = d.get("degree", 0)
@@ -141,8 +144,21 @@ def render_html(G: nx.Graph, out_path: Path):
         net.add_edge(u, v, value=d.get("weight", 1.0), title=sigs)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     net.write_html(str(out_path), notebook=False, open_browser=False)
-    html = out_path.read_text(encoding="utf-8")
-    header = '<div style="color:#fff;padding:10px;font-family:sans-serif;background:#16213e;"><h2><project_name> 知识图谱</h2><p>节点颜色 = Louvain 社区 | 边粗细 = 4信号加权 | 悬停看详情</p></div>'
+    html = out_path.read_text(encoding="utf-8", errors="replace")
+
+    # 后处理：CDN → 本地路径（file:// 下 CDN 被 CORS 拦截）
+    import re
+    # 移除不存在的本地引用
+    html = html.replace('<script src="lib/bindings/utils.js"></script>', '')
+    # vis-network CSS: CDN → 本地（用更宽松的匹配）
+    html = re.sub(r'<link[^>]*cdnjs\.cloudflare\.com[^>]*vis-network[^>]*>', '<link rel="stylesheet" href="lib/vis-network.min.css">', html)
+    # vis-network JS: CDN → 本地
+    html = re.sub(r'<script[^>]*cdnjs\.cloudflare\.com[^>]*vis-network[^>]*></script>', '<script src="lib/vis-network.min.js"></script>', html)
+    # 移除 bootstrap CDN（非必需，减少外部依赖）
+    html = re.sub(r'<link\s+href="https://cdn\.jsdelivr\.net/npm/bootstrap[^"]*"[^>]*/>', '', html)
+    html = re.sub(r'<script\s+src="https://cdn\.jsdelivr\.net/npm/bootstrap[^"]*"[^>]*></script>', '', html)
+
+    header = '<div style="color:#fff;padding:10px;font-family:sans-serif;background:#16213e;"><h2><project_name> 知识图谱</h2><p>节点颜色 = Louvain 社区 | 边粗细 = 4信号加权 | 悬停看详情 | 拖拽节点 | 滚轮缩放</p></div>'
     html = html.replace("<body>", f"<body>{header}", 1)
     out_path.write_text(html, encoding="utf-8")
 
