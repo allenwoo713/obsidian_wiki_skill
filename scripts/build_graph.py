@@ -1,0 +1,176 @@
+"""4 信号知识图谱 + Louvain 社区 + pyvis HTML 可视化。
+用法：python build_graph.py <project_root>
+"""
+from __future__ import annotations
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import networkx as nx
+
+_FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
+
+
+def _load_pages(wiki_dir: Path) -> List[dict]:
+    pages = []
+    for md in sorted(wiki_dir.rglob("*.md")):
+        if ".graph" in md.parts:
+            continue
+        raw = md.read_text(encoding="utf-8", errors="replace")
+        m = _FM_RE.match(raw)
+        if not m:
+            continue
+        import yaml
+        fm = yaml.safe_load(m.group(1)) or {}
+        links = [l.strip() for l in re.findall(r"\[\[([^\]]+)\]\]", m.group(2))]
+        pages.append({
+            "path": str(md),
+            "title": fm.get("title", md.stem),
+            "type": fm.get("type", "concept"),
+            "sources": fm.get("sources", []) or [],
+            "links": links,
+        })
+    return pages
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    inter = a & b
+    union = a | b
+    return len(inter) / len(union) if union else 0.0
+
+
+def build_graph(wiki_dir: Path) -> nx.Graph:
+    pages = _load_pages(wiki_dir)
+    G = nx.Graph()
+    title_to_path: Dict[str, str] = {p["title"]: p["path"] for p in pages}
+    for p in pages:
+        G.add_node(p["title"], **{
+            "path": p["path"], "page_type": p["type"],
+            "sources": p["sources"], "degree": 0,
+        })
+    # Signal 1: 直接链接
+    for p in pages:
+        for link in p["links"]:
+            if link in title_to_path:
+                if G.has_edge(p["title"], link):
+                    G[p["title"]][link]["weight"] += 1.0
+                    G[p["title"]][link]["signals"].add("direct_link")
+                else:
+                    G.add_edge(p["title"], link, weight=1.0, signals={"direct_link"})
+    # Signal 2: 源重叠
+    src_sets = {p["title"]: set(p["sources"]) for p in pages}
+    titles = list(src_sets.keys())
+    for i in range(len(titles)):
+        for j in range(i + 1, len(titles)):
+            ov = _jaccard(src_sets[titles[i]], src_sets[titles[j]])
+            if ov > 0:
+                if G.has_edge(titles[i], titles[j]):
+                    G[titles[i]][titles[j]]["weight"] += 0.6 * ov
+                    G[titles[i]][titles[j]]["signals"].add("source_overlap")
+                else:
+                    G.add_edge(titles[i], titles[j], weight=0.6 * ov, signals={"source_overlap"})
+    # Signal 3: Adamic-Adar
+    compute_adamic_adar(G)
+    # Signal 4: 类型亲和力
+    type_map = {p["title"]: p["type"] for p in pages}
+    for u, v in G.edges():
+        if type_map.get(u) == type_map.get(v) and "type_affinity" not in G[u][v]["signals"]:
+            G[u][v]["weight"] += 0.3
+            G[u][v]["signals"].add("type_affinity")
+    for n in G.nodes():
+        G.nodes[n]["degree"] = G.degree(n)
+    return G
+
+
+def compute_adamic_adar(G: nx.Graph):
+    if G.number_of_edges() == 0:
+        return
+    preds = nx.adamic_adar_index(G)
+    for u, v, score in preds:
+        if score > 0 and not G.has_edge(u, v):
+            G.add_edge(u, v, weight=0.4 * score, signals={"adamic_adar"})
+        elif score > 0 and G.has_edge(u, v):
+            G[u][v]["weight"] += 0.4 * score
+            G[u][v]["signals"].add("adamic_adar")
+
+
+def compute_4_signals(G: nx.Graph) -> Dict:
+    stats = {"direct_link": 0, "source_overlap": 0, "adamic_adar": 0, "type_affinity": 0}
+    for u, v, d in G.edges(data=True):
+        for s in d.get("signals", set()):
+            if s in stats:
+                stats[s] += 1
+    return stats
+
+
+def detect_communities(G: nx.Graph) -> List[List[str]]:
+    try:
+        import community as community_louvain
+        partition = community_louvain.best_partition(G)
+        comms: Dict[int, List[str]] = {}
+        for node, cid in partition.items():
+            comms.setdefault(cid, []).append(node)
+        return list(comms.values())
+    except ImportError:
+        return [list(G.nodes())]
+
+
+def render_html(G: nx.Graph, out_path: Path):
+    from pyvis.network import Network
+    comms = detect_communities(G)
+    node_comm: Dict[str, int] = {}
+    for i, comm in enumerate(comms):
+        for n in comm:
+            node_comm[n] = i
+    palette = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+               "#46f0f0", "#f032e6", "#bcf60c", "#fabebe", "#008080"]
+    net = Network(height="900px", width="100%", bgcolor="#1a1a2e",
+                  font_color="white", directed=False, notebook=False)
+    for n, d in G.nodes(data=True):
+        ptype = d.get("page_type", "concept")
+        deg = d.get("degree", 0)
+        size = 15 + min(deg * 3, 35)
+        color = palette[node_comm.get(n, 0) % len(palette)]
+        net.add_node(n, label=n, title=f"type: {ptype}\ndegree: {deg}", size=size, color=color)
+    for u, v, d in G.edges(data=True):
+        sigs = ", ".join(sorted(d.get("signals", set())))
+        net.add_edge(u, v, value=d.get("weight", 1.0), title=sigs)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    net.write_html(str(out_path), notebook=False, open_browser=False)
+    html = out_path.read_text(encoding="utf-8")
+    header = '<div style="color:#fff;padding:10px;font-family:sans-serif;background:#16213e;"><h2><project_name> 知识图谱</h2><p>节点颜色 = Louvain 社区 | 边粗细 = 4信号加权 | 悬停看详情</p></div>'
+    html = html.replace("<body>", f"<body>{header}", 1)
+    out_path.write_text(html, encoding="utf-8")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法: python build_graph.py <project_root>")
+        sys.exit(1)
+    proj = Path(sys.argv[1])
+    wiki = proj / "Wiki"
+    G = build_graph(wiki)
+    stats = compute_4_signals(G)
+    comms = detect_communities(G)
+    graph_json = {
+        "nodes": [{"title": n, **d} for n, d in G.nodes(data=True)],
+        "edges": [{"source": u, "target": v, **d} for u, v, d in G.edges(data=True)],
+        "signals": stats,
+        "communities": comms,
+    }
+    idx = proj / ".index"
+    idx.mkdir(exist_ok=True)
+    (idx / "graph.json").write_text(
+        json.dumps(graph_json, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
+    render_html(G, wiki / ".graph" / "index.html")
+    print(f"图谱构建完成: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边, {len(comms)} 社区")
+    print(f"信号分布: {stats}")
+    print(f"HTML → {wiki / '.graph' / 'index.html'}")
+
+
+if __name__ == "__main__":
+    main()
