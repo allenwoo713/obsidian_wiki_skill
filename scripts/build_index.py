@@ -181,23 +181,29 @@ class WikiIndex:
             table.add(data)
 
     def _write_manifest(self):
-        manifest = {
-            "built_at": datetime.now().isoformat(),
-            "page_count": len(self.pages),
-            "pages": [
-                {
-                    "path": str(p.path),
-                    "sha256": p.sha256,
-                    "page_type": p.page_type,
-                    "title": p.title,
-                    "sources": p.sources,
-                    "links": p.links,
-                }
-                for p in self.pages
-            ],
-        }
-        (self.index_dir / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        manifest_file = self.index_dir / "manifest.json"
+        # 读取现有 manifest（保留 images/entries 等非 pages 字段）
+        existing = {}
+        if manifest_file.exists():
+            try:
+                existing = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        existing["built_at"] = datetime.now().isoformat()
+        existing["page_count"] = len(self.pages)
+        existing["pages"] = [
+            {
+                "path": str(p.path),
+                "sha256": p.sha256,
+                "page_type": p.page_type,
+                "title": p.title,
+                "sources": p.sources,
+                "links": p.links,
+            }
+            for p in self.pages
+        ]
+        manifest_file.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
     def load(self):
