@@ -5,13 +5,33 @@ from __future__ import annotations
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from models import RetrievedPage
 
 
 _FM_RE = re.compile(r"^---\n.*?\n---\n(.*)$", re.DOTALL)
+
+
+@dataclass
+class SearchResults:
+    """检索结果，分离 text 与 image chunks。"""
+    text: List[RetrievedPage]
+    images: List[RetrievedPage]
+
+
+def split_text_image(results: List[RetrievedPage]) -> Tuple[List[RetrievedPage], List[RetrievedPage]]:
+    """按 path 推断：含 'assets/' 的归 image，其余归 text。"""
+    text, images = [], []
+    for r in results:
+        ps = str(r.path).replace("\\", "/")
+        if "assets/" in ps:
+            images.append(r)
+        else:
+            text.append(r)
+    return text, images
 
 
 def rrf_fuse(bm25_results: List[RetrievedPage], vector_results: List[RetrievedPage],
@@ -95,33 +115,48 @@ def read_full_content(path: Path, max_chars: int = 8000) -> str:
 
 
 def hybrid_search(wi, query: str, k: int = 5, max_tokens: int = 4096,
-                  wiki_dir: Path = None, read_full: bool = False) -> List[RetrievedPage]:
+                  wiki_dir: Path = None, read_full: bool = False) -> SearchResults:
     bm25_results = wi.search_bm25(query, k=20)
     vector_results = wi.search_vector(query, k=20)
     top_paths = [r.path for r in bm25_results[:5]]
     graph_results = graph_expand(wi, top_paths, wiki_dir, k=10) if wiki_dir else []
     fused = rrf_fuse(bm25_results, vector_results, graph_results)
-    results = budget_control(fused[:k * 3], max_tokens=max_tokens)[:k]
+    selected = budget_control(fused[:k * 3], max_tokens=max_tokens)[:k]
     if read_full:
-        for r in results:
-            full = read_full_content(r.path)
-            if full:
-                r.snippet = full
-    return results
+        for r in selected:
+            ps = str(r.path).replace("\\", "/")
+            if "assets/" not in ps:
+                full = read_full_content(r.path)
+                if full:
+                    r.snippet = full
+    text_chunks, image_chunks = split_text_image(selected)
+    return SearchResults(text=text_chunks, images=image_chunks)
 
 
-def format_for_agent(results: List[RetrievedPage], read_full: bool = False) -> str:
-    if not results:
-        return "[无检索结果]"
+def format_for_agent(results: SearchResults, read_full: bool = False) -> str:
     label = "全文" if read_full else "片段"
     lines = [f"## 检索结果（hybrid FTS+RAG，{label}模式）\n"]
-    for i, r in enumerate(results, 1):
-        lines.append(f"### [{i}] {r.title}")
-        lines.append(f"- 路径: {r.path}")
-        lines.append(f"- 相关度: {r.score:.4f} ({r.retrieval_method})")
-        lines.append(f"- 源文档: {', '.join(r.sources) if r.sources else 'N/A'}")
-        lines.append(f"- {label}:\n```\n{r.snippet}\n```")
-        lines.append("")
+    if results.text:
+        lines.append("### 文本片段\n")
+        for i, r in enumerate(results.text, 1):
+            lines.append(f"### [{i}] {r.title}")
+            lines.append(f"- 路径: {r.path}")
+            lines.append(f"- 相关度: {r.score:.4f} ({r.retrieval_method})")
+            lines.append(f"- 源文档: {', '.join(r.sources) if r.sources else 'N/A'}")
+            lines.append(f"- {label}:\n```\n{r.snippet}\n```")
+            lines.append("")
+    if results.images:
+        lines.append("### 相关图片（caption 命中）\n")
+        for i, r in enumerate(results.images, 1):
+            lines.append(f"### [图{i}] {r.title}")
+            lines.append(f"- 路径: {r.path}")
+            lines.append(f"- 相关度: {r.score:.4f} ({r.retrieval_method})")
+            lines.append(f"- 源文档: {', '.join(r.sources) if r.sources else 'N/A'}")
+            lines.append(f"- 图注/caption:\n```\n{r.snippet}\n```")
+            lines.append(f"- 嵌入建议: ![[{r.path.name}]]")
+            lines.append("")
+    if not results.text and not results.images:
+        return "[无检索结果]"
     return "\n".join(lines)
 
 
@@ -149,11 +184,16 @@ def main():
     wi.load()
     results = hybrid_search(wi, query, k=k, max_tokens=max_tokens, wiki_dir=proj / "Wiki", read_full=read_full)
     if as_json:
-        print(json.dumps([{
-            "path": str(r.path), "title": r.title, "score": r.score,
-            "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
+        print(json.dumps({
+            "text": [{"path": str(r.path), "title": r.title, "score": r.score,
+                      "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method}
+                     for r in results.text],
+            "images": [{"path": str(r.path), "title": r.title, "score": r.score,
+                        "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
+                        "embed": f"![[{r.path.name}]]"}
+                       for r in results.images],
             "read_full": read_full,
-        } for r in results], ensure_ascii=False, indent=2))
+        }, ensure_ascii=False, indent=2))
     else:
         print(format_for_agent(results, read_full=read_full))
 

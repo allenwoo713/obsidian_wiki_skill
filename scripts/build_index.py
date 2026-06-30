@@ -107,10 +107,41 @@ class WikiIndex:
 
     def build(self, wiki_dir: Path):
         self.pages = scan_wiki(wiki_dir, wiki_dir.parent)
+        # 追加图片 caption 作为虚拟页（page_type=image_caption）
+        idx_dir = wiki_dir.parent / ".index"
+        image_pages = self._load_image_caption_pages(idx_dir)
+        self.pages.extend(image_pages)
         self._page_paths = [str(p.path) for p in self.pages]
         self._build_bm25()
         self._build_vector()
         self._write_manifest()
+
+    def _load_image_caption_pages(self, idx_dir: Path) -> List[WikiPage]:
+        """从 manifest.json 读 images，caption_text 非空的转为 WikiPage。"""
+        manifest_file = idx_dir / "manifest.json"
+        if not manifest_file.exists():
+            return []
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        wiki_dir = idx_dir.parent / "Wiki"
+        pages = []
+        for img in manifest.get("images", []):
+            caption = img.get("caption_text", "")
+            if not caption.strip():
+                continue
+            img_path = wiki_dir / img["rel_path"]
+            pages.append(WikiPage(
+                path=img_path,
+                title=img.get("figure_caption") or img["filename"],
+                page_type="image_caption",
+                content=caption,
+                sources=[img.get("source_doc", "")],
+                links=[],
+                sha256=img.get("sha256", ""),
+            ))
+        return pages
 
     def _tokenize(self, text: str) -> List[str]:
         text = re.sub(r"[^\w\u4e00-\u9fff]", " ", text.lower())

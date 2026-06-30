@@ -36,7 +36,8 @@ read_when:
 <project_root>/
 ├── Raw/sources/          # 源文档（不可变）
 ├── Raw/assets/           # 二进制资产
-├── Wiki/                 # LLM 生成（双链 + frontmatter）
+├── Wiki/                 # LLM 生成（双链 + frontmatter）—— Obsidian vault root
+│   ├── .obsidian/         # ⚠️ PROTECTED：Obsidian 自动创建，脚本绝不触碰
 │   ├── index.md
 │   ├── overview.md
 │   ├── log.md
@@ -44,11 +45,27 @@ read_when:
 │   ├── concepts/
 │   ├── sources/
 │   ├── comparisons/
-│   └── .graph/index.html
+│   └── .graph/index.html  # pyvis 图谱（脚本生成）
 ├── .index/               # 索引层（BM25 + LanceDB + graph.json）
 ├── purpose.md
 └── schema.md
 ```
+
+### ⚠️ 脚本操作边界（强制）
+
+所有脚本的读写范围严格限于以下路径，**绝对禁止**操作 `.obsidian/`、`Raw/` 及其他目录：
+
+| 脚本 | 可写范围 | 禁止触碰 |
+|---|---|---|
+| `parse_sources.py` | `Wiki/*.md` | `.obsidian/` / `Raw/` / `.index/` |
+| `build_index.py` | `.index/` | `.obsidian/` / `Wiki/*.md` / `Raw/` |
+| `build_graph.py` | `Wiki/.graph/` + `.index/graph.json` | `.obsidian/` / `Wiki/*.md` / `Raw/` |
+| `update_wiki.py` | `Wiki/*.md` + `.index/manifest.json` | `.obsidian/` / `Raw/` |
+| `query.py` | 无（只读） | 全部 |
+
+**Obsidian vault 设置：** 必须指向 `Wiki/` 目录（不是 `project_root`），否则 Raw/sources/ 下的原始 `.md` 文件会被 Obsidian 索引，导致图谱中出现孤立幽灵节点。
+
+**`.obsidian/` 保护：** 该目录由 Obsidian 首次打开 vault 时自动创建，含 `app.json` / `graph.json` / `workspace.json` 等 vault 级配置。所有脚本强制绕过此目录。若新增脚本需要清理 `Wiki/`，必须显式排除 `.obsidian/` 和 `.graph/`。
 
 ---
 
@@ -59,7 +76,7 @@ read_when:
 3. Box 解析文档 → 生成 `Wiki/*.md`（按 schema 的页面类型与 frontmatter 规范）
 4. 构建索引：`PYTHONDONTWRITEBYTECODE=1 <venv_python> scripts/build_index.py <project_root>`
 5. 构建图谱：`PYTHONDONTWRITEBYTECODE=1 <venv_python> scripts/build_graph.py <project_root>`
-6. 用 Obsidian 打开 vault
+6. 用 Obsidian 打开 vault（必须指向 `Wiki/` 目录，**不是** project_root）
 
 ## 工作流 2：增量更新（append，不全量重扫）
 
@@ -277,3 +294,21 @@ Phase 4:   预算控制 (4K→1M tokens)
 - Windows + WorkBuddy 沙箱：.pyc / .pytest_cache / junction 路径需特殊处理
 - embedding 模型从 modelscope.cn 下载（HF 镜像对权重文件分发有问题）
 - LanceDB 在系统 Temp 目录被沙箱拦截，conftest.py 将 pytest basetemp 改到项目内
+- Obsidian vault 根目录 = `Wiki/`，不可设为 project_root（否则 Raw/sources/ 中 `.md` 文件混入图谱）
+- 脚本绝不触碰 `Wiki/.obsidian/`，该目录由 Obsidian 独占管理
+
+## 开发与维护规则（从实战教训沉淀）
+
+### 代码修改后必须重建产物
+修改 `build_graph.py` / `build_index.py` 等生成器脚本后，**立即运行该脚本**重建 HTML / 索引。不要假设"代码改了就行"——产物是用户看到的。
+
+### 内容生成后交叉验证关键实体
+生成 Wiki 内容后，对产品名、供应商、客户等关键事实做交叉验证：frontmatter `sources[]` 指向的原始文档 vs 生成内容中的声明。不一致时以原始文档为准。**云记忆中的项目信息不得作为事实来源。**
+
+### 中国网络环境依赖策略
+- 模型权重：优先 modelscope.cn（HF 镜像 xet 机制对权重文件不可靠）
+- 前端 CDN 资源：本地化到 `Wiki/.graph/lib/`（file:// 协议下 CORS 拦截 CDN）
+- pip 包：设 `-i https://pypi.tuna.tsinghua.edu.cn/simple`
+
+### 小 corpus BM25 选型
+corpus < 100 文档时，默认用 BM25Plus（非 BM25Okapi）。BM25Okapi 的 IDF 公式在小 corpus 上易产生 0 值。
