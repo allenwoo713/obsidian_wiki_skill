@@ -6,6 +6,17 @@ from typing import List, Dict, Optional
 
 
 @dataclass
+class ImageRef:
+    """提取的图片引用。"""
+    filename: str          # acme-visioncam-front-datasheet-v1-6_img03.png
+    rel_path: str          # assets/acme-visioncam-front-datasheet-v1-6_img03.png
+    caption: str           # 图注全文（"图3 方位角..."），可能为空
+    source_media_name: str # image3.png（docx）/ xref=17（pdf），溯源用
+    sha256: str            # 图片内容哈希，去重用
+    page_or_section: str   # "page 3" / "body"，定位用
+
+
+@dataclass
 class ParsedDoc:
     """解析后的源文档。"""
     path: Path
@@ -14,6 +25,7 @@ class ParsedDoc:
     tables: List[List[List[str]]]  # [table][row][cell]
     sha256: str
     doc_type: str  # 'docx' | 'pdf' | 'md' | 'txt'
+    images: List[ImageRef] = field(default_factory=list)
 
 
 @dataclass
