@@ -118,6 +118,9 @@ def main():
         for img in need_caption[:5]:
             print(f"  - {img['rel_path']} (源: {img['source_doc']})")
     manifest["images"] = image_manifest
+    (idx_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_images=None):
