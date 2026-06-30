@@ -297,6 +297,64 @@ Phase 4:   预算控制 (4K→1M tokens)
 - Obsidian vault 根目录 = `Wiki/`，不可设为 project_root（否则 Raw/sources/ 中 `.md` 文件混入图谱）
 - 脚本绝不触碰 `Wiki/.obsidian/`，该目录由 Obsidian 独占管理
 
+## 图片提取与 caption 检索（路线 B）
+
+### 写边界表
+
+| 脚本 | 可写范围 | 禁止触碰 |
+|---|---|---|
+| `extract_assets.py` | `Wiki/assets/` | `.obsidian/` / `Raw/` / `Wiki/*.md` / `.index/` |
+| `parsers/*.py` | 仅返回对象，不写盘 | 任何文件 |
+| `parse_sources.py` | `Wiki/assets/`（经 extract_assets） | `Wiki/*.md` / `Raw/` / `.index/` |
+| `update_wiki.py` | `Wiki/assets/` / `.index/manifest.json` | `Wiki/*.md` / `Raw/` |
+| `picture_caption.py` | `.index/manifest.json` | `Wiki/assets/` / `Raw/` / `Wiki/*.md` |
+| `build_index.py` | `.index/`（merge 模式） | `Wiki/assets/` / `Raw/` / `Wiki/*.md` |
+| `query.py` | 只读检索 | 任何文件 |
+
+### Box caption 生成工作流
+
+1. **列出待标注图片**：
+   ```bash
+   python picture_caption.py <project_root> list --limit N > captions.json
+   ```
+   输出 JSON，每项含 `filename`/`rel_path`/`figure_caption`/`source_doc`/空 `vlm_caption`。
+
+2. **Box 逐张 Read 图片**：`Read Wiki/assets/<filename>`，结合 `figure_caption` 生成结构化描述。
+
+3. **填充 captions.json 的 vlm_caption 与 caption_text**：
+   ```yaml
+   vlm_caption:
+     description: "1-3 句话描述图片内容（机械尺寸图/天线方向图/接线拓扑等）"
+     key_values: ["图中标注的关键数值或术语，如 ±45°, 120m, 12V, CAN"]
+     category: "图片类型分类，如 '天线规格/方位角覆盖图'"
+   caption_text: "{figure_caption}。{description} 关键数值: {key_values}。所属: {category}。"
+   ```
+   
+   Box generate caption prompt（内部用）：
+   > 你是雷达产品知识库的图片标注员。请阅读图片（源文档: {source_doc}，原图题: "{figure_caption}"）。
+   > 生成：1) description（1-3 句中文描述）2) key_values（图中原值，忠于图片不臆造）
+   > 3) category（图片类型）。中英文混合输出，key_values 必须忠于图中原值。
+
+4. **写回 manifest**：
+   ```bash
+   python picture_caption.py <project_root> apply captions.json
+   ```
+
+5. **重建索引**：
+   ```bash
+   python build_index.py <project_root>
+   ```
+
+### Box 检索答案合成工作流
+
+`query.py` 返回 text 和 images 两组。Box 合成答案时：
+1. **text** → 提取段落作 prose
+2. **images** → 嵌入 `![[xxx.png]]` + 引用 caption
+3. 必要时 Box 直接 `Read` 图片确认细节（多模态读图）
+4. **出处标注**：
+   - text: `[来源: Wiki/xxx.md]`
+   - image: `[来源: Wiki/assets/xxx.png, 源文档: Raw/.../xxx.docx]`
+
 ## 开发与维护规则（从实战教训沉淀）
 
 ### 代码修改后必须重建产物
