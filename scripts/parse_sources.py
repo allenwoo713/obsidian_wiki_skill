@@ -67,8 +67,15 @@ def parse_docx(path: Path, assets_dir: Path = None) -> ParsedDoc:
 def parse_pdf(path: Path, assets_dir: Path = None) -> ParsedDoc:
     """PDF 解析：优先 pdfplumber，回退 PyPDF2。传 assets_dir 委托 extract_assets.extract()。"""
     if assets_dir is not None:
-        from extract_assets import extract
-        return extract(path, assets_dir)
+        try:
+            from extract_assets import extract
+            return extract(path, assets_dir)
+        except ImportError as e:
+            # pymupdf 未安装，回退纯文本（无图片提取）
+            pass
+        except Exception:
+            # 其他提取器异常，也回退
+            pass
     text = ""
     try:
         import pdfplumber

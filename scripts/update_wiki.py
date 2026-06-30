@@ -125,22 +125,28 @@ def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_ima
     image_manifest = []
     existing_by_path = {e["path"]: e for e in (existing_images or [])}
     for d in new_or_modified:
-        parsed = parse_file(d, assets_dir=assets_dir)
+        p = d.path if hasattr(d, 'path') else d
+        try:
+            parsed = parse_file(p, assets_dir=assets_dir)
+        except Exception as e:
+            print(f"  [WARN] 图片提取跳过 {p}: {e}")
+            continue
         for ref in parsed.images:
             image_manifest.append({
                 "filename": ref.filename, "rel_path": ref.rel_path,
-                "sha256": ref.sha256, "source_doc": str(d),
+                "sha256": ref.sha256, "source_doc": str(p),
                 "source_media": ref.source_media_name,
                 "page_or_section": ref.page_or_section,
                 "figure_caption": ref.caption, "vlm_caption": None, "caption_text": "",
             })
     for d in unchanged:
-        existing = existing_by_path.get(str(d))
+        p = d.path if hasattr(d, 'path') else d
+        existing = existing_by_path.get(str(p))
         if existing:
             for img in existing.get("images", []):
                 image_manifest.append({
                     "filename": img["filename"], "rel_path": img.get("rel_path", f"assets/{img['filename']}"),
-                    "sha256": img["sha256"], "source_doc": str(d),
+                    "sha256": img["sha256"], "source_doc": str(p),
                     "source_media": img.get("source_media", ""),
                     "page_or_section": img.get("page_or_section", ""),
                     "figure_caption": img.get("figure_caption", ""),
