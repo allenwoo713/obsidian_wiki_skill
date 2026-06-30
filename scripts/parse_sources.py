@@ -39,7 +39,10 @@ def parse_txt(path: Path) -> ParsedDoc:
     )
 
 
-def parse_docx(path: Path) -> ParsedDoc:
+def parse_docx(path: Path, assets_dir: Path = None) -> ParsedDoc:
+    if assets_dir is not None:
+        from extract_assets import extract
+        return extract(path, assets_dir)
     from docx import Document
     doc = Document(str(path))
     paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
@@ -61,8 +64,11 @@ def parse_docx(path: Path) -> ParsedDoc:
     )
 
 
-def parse_pdf(path: Path) -> ParsedDoc:
-    """PDF 解析：优先 pdfplumber，回退 PyPDF2。"""
+def parse_pdf(path: Path, assets_dir: Path = None) -> ParsedDoc:
+    """PDF 解析：优先 pdfplumber，回退 PyPDF2。传 assets_dir 委托 extract_assets.extract()。"""
+    if assets_dir is not None:
+        from extract_assets import extract
+        return extract(path, assets_dir)
     text = ""
     try:
         import pdfplumber
