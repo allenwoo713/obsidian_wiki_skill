@@ -100,9 +100,11 @@ _PARSERS = {
 }
 
 
-def parse_file(path: Path) -> ParsedDoc:
+def parse_file(path: Path, assets_dir: Path = None) -> ParsedDoc:
     suffix = path.suffix.lower()
     parser = _PARSERS.get(suffix)
     if parser is None:
         raise ValueError(f"unsupported file type: {suffix} ({path})")
+    if assets_dir is not None and parser in (parse_docx, parse_pdf):
+        return parser(path, assets_dir)
     return parser(path)

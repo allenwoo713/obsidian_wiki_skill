@@ -108,6 +108,47 @@ def main():
     if not (diff["new"] or diff["modified"] or diff["deleted"]):
         print("\n无变更，零开销跳过。")
 
+    assets_dir = proj / "Wiki" / "assets"
+    existing_images = manifest.get("images", [])
+    new_or_mod = diff["new"] + diff["modified"]
+    image_manifest = extract_images_for_diff(new_or_mod, diff["unchanged"], assets_dir, existing_images)
+    need_caption = [img for img in image_manifest if not img.get("caption_text")]
+    if need_caption:
+        print(f"\n需 Box 生成 caption 的图片: {len(need_caption)} 张")
+        for img in need_caption[:5]:
+            print(f"  - {img['rel_path']} (源: {img['source_doc']})")
+    manifest["images"] = image_manifest
+
+
+def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_images=None):
+    from parse_sources import parse_file
+    image_manifest = []
+    existing_by_path = {e["path"]: e for e in (existing_images or [])}
+    for d in new_or_modified:
+        parsed = parse_file(d, assets_dir=assets_dir)
+        for ref in parsed.images:
+            image_manifest.append({
+                "filename": ref.filename, "rel_path": ref.rel_path,
+                "sha256": ref.sha256, "source_doc": str(d),
+                "source_media": ref.source_media_name,
+                "page_or_section": ref.page_or_section,
+                "figure_caption": ref.caption, "vlm_caption": None, "caption_text": "",
+            })
+    for d in unchanged:
+        existing = existing_by_path.get(str(d))
+        if existing:
+            for img in existing.get("images", []):
+                image_manifest.append({
+                    "filename": img["filename"], "rel_path": img.get("rel_path", f"assets/{img['filename']}"),
+                    "sha256": img["sha256"], "source_doc": str(d),
+                    "source_media": img.get("source_media", ""),
+                    "page_or_section": img.get("page_or_section", ""),
+                    "figure_caption": img.get("figure_caption", ""),
+                    "vlm_caption": img.get("vlm_caption"),
+                    "caption_text": img.get("caption_text", ""),
+                })
+    return image_manifest
+
 
 if __name__ == "__main__":
     main()
