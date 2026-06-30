@@ -47,7 +47,7 @@ def test_hybrid_search(tmp_path):
     wi = WikiIndex(idx_dir)
     wi.build(wiki)
     results = hybrid_search(wi, "Acme 60fps 频率", k=5, wiki_dir=wiki)
-    assert len(results) > 0
+    assert len(results.text) > 0
 
 
 def test_read_full_content(tmp_path):
@@ -75,6 +75,24 @@ def test_hybrid_search_read_full(tmp_path):
     wi = WikiIndex(idx_dir)
     wi.build(wiki)
     results = hybrid_search(wi, "Acme", k=1, wiki_dir=wiki, read_full=True)
-    assert len(results) > 0
+    assert len(results.text) > 0
     # read_full=True 时 snippet 应包含完整正文（远超 200 字符限制的 snippet）
-    assert "这是完整正文" in results[0].snippet
+    assert "这是完整正文" in results.text[0].snippet
+
+
+def test_split_text_image():
+    from models import RetrievedPage
+    from query import split_text_image
+    text = RetrievedPage(
+        path=Path("/wiki/p.md"), title="P", score=0.9, snippet="正文",
+        sources=[], retrieval_method="bm25",
+    )
+    img = RetrievedPage(
+        path=Path("/wiki/assets/x_img01.png"), title="图1",
+        score=0.8, snippet="图注", sources=[],
+        retrieval_method="bm25",
+    )
+    tc, ic = split_text_image([text, img])
+    assert len(tc) == 1
+    assert len(ic) == 1
+    assert ic[0].path.name == "x_img01.png"
