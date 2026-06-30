@@ -7,15 +7,27 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 
-def _make_pdf_with_image(tmp_path, caption="图1 测试示意图"):
+def _minimal_valid_png():
+    """生成最小合法 1x1 黑色 PNG。"""
+    import struct, zlib
+    def chunk(chunk_type, data):
+        c = chunk_type + data
+        crc = struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+        return struct.pack(">I", len(data)) + c + crc
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)  # 1x1, 8-bit RGB
+    idat = zlib.compress(b"\x00\x00\x00\x00")  # filter byte + RGB
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def _make_pdf_with_image(tmp_path, caption="Figure 1 Test Diagram"):
     """用 PyMuPDF 构造含图片的 PDF。"""
     import fitz
+    img_bytes = _minimal_valid_png()
+    img_path = tmp_path / "test.png"
+    img_path.write_bytes(img_bytes)
     doc = fitz.open()
     page = doc.new_page()
-    page.insert_text((72, 72), "文档开头正文。", fontsize=12)
-    img_path = tmp_path / "test.png"
-    img_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
-    img_path.write_bytes(img_bytes)
+    page.insert_text((72, 72), "Document body text.", fontsize=12)
     page.insert_image(fitz.Rect(72, 100, 200, 200), filename=str(img_path))
     if caption:
         page.insert_text((72, 220), caption, fontsize=10)
@@ -29,7 +41,7 @@ def test_pdf_parser_returns_parse_result(tmp_path):
     pdf_path = _make_pdf_with_image(tmp_path)
     from parsers.pdf_parser import PdfParser
     result = PdfParser().parse(pdf_path)
-    assert "文档开头正文" in result.text
+    assert "Document body text" in result.text
     assert len(result.images) >= 1
 
 
@@ -44,10 +56,10 @@ def test_pdf_parser_image_sha256(tmp_path):
 
 
 def test_pdf_parser_caption_extracted(tmp_path):
-    pdf_path = _make_pdf_with_image(tmp_path, caption="图1 方位角 FOV ±45° 示意图")
+    pdf_path = _make_pdf_with_image(tmp_path, caption="Figure 1 FOV Diagram")
     from parsers.pdf_parser import PdfParser
     result = PdfParser().parse(pdf_path)
-    assert any("图1" in img.caption for img in result.images)
+    assert any("Figure" in img.caption for img in result.images)
 
 
 def test_pdf_parser_placeholder_in_text(tmp_path):
