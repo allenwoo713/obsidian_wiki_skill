@@ -1,9 +1,10 @@
-"""parsers/utils.py 测试：slugify 与图片命名。"""
+"""parsers/utils.py 测试：slugify、图片命名与图注绑定。"""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from parsers.utils import slugify, image_filename
+from models import ImageRef
+from parsers.utils import attach_captions, image_filename, slugify
 
 
 def test_slugify_basic():
@@ -31,3 +32,78 @@ def test_image_filename_two_digit():
 
 def test_image_filename_preserves_ext():
     assert image_filename("d", 1, "jpg") == "d_img01.jpg"
+
+
+def _make_image(seq: int = 1) -> ImageRef:
+    return ImageRef(
+        filename=f"doc_img{seq:02d}.png",
+        rel_path=f"assets/doc_img{seq:02d}.png",
+        caption="",
+        source_media_name=f"xref={seq}",
+        sha256="a" * 64,
+        page_or_section=f"page {seq}",
+    )
+
+
+def test_attach_captions_chinese():
+    img = _make_image(1)
+    text = "some text\n{{IMG|assets/doc_img01.png|图注: 待补}}\n图1 系统架构图"
+    new_text, new_images = attach_captions(text, [img])
+    assert new_images[0].caption == "图1 系统架构图"
+    assert "图注: 图1 系统架构图" in new_text
+
+
+def test_attach_captions_figure():
+    img = _make_image(1)
+    text = "{{IMG|assets/doc_img01.png|图注: 待补}}\nFigure 1 System Architecture"
+    new_text, new_images = attach_captions(text, [img])
+    assert new_images[0].caption == "Figure 1 System Architecture"
+    assert "图注: Figure 1 System Architecture" in new_text
+
+
+def test_attach_captions_fig_dot():
+    img = _make_image(1)
+    text = "{{IMG|assets/doc_img01.png|图注: 待补}}\nFig. 1 System Architecture"
+    new_text, new_images = attach_captions(text, [img])
+    assert new_images[0].caption == "Fig. 1 System Architecture"
+    assert "图注: Fig. 1 System Architecture" in new_text
+
+
+def test_attach_captions_no_caption_within_window():
+    img = _make_image(1)
+    text = "{{IMG|assets/doc_img01.png|图注: 待补}}\nline1\nline2\nline3\nline4\nline5\n图1 too far"
+    new_text, new_images = attach_captions(text, [img])
+    assert new_images[0].caption == ""
+    assert "图注: [无图注]" in new_text
+
+
+def test_attach_captions_multiple_in_order():
+    img1 = _make_image(1)
+    img2 = _make_image(2)
+    text = (
+        "{{IMG|assets/doc_img01.png|图注: 待补}}\n图1 架构\n"
+        "{{IMG|assets/doc_img02.png|图注: 待补}}\n图2 流程"
+    )
+    _, new_images = attach_captions(text, [img1, img2])
+    assert new_images[0].caption == "图1 架构"
+    assert new_images[1].caption == "图2 流程"
+
+
+def test_attach_captions_more_placeholders_than_images():
+    img = _make_image(1)
+    text = (
+        "{{IMG|assets/doc_img01.png|图注: 待补}}\n图1 命中\n"
+        "{{IMG|assets/doc_img02.png|图注: 待补}}\n图2 未分配"
+    )
+    new_text, new_images = attach_captions(text, [img])
+    assert len(new_images) == 1
+    assert new_images[0].caption == "图1 命中"
+    assert "图注: 图1 命中" in new_text
+    assert "图注: 待补" in new_text
+
+
+def test_attach_captions_empty_images():
+    text = "{{IMG|assets/doc_img01.png|图注: 待补}}\n图1 说明"
+    new_text, new_images = attach_captions(text, [])
+    assert new_images == []
+    assert "图注: 待补" in new_text
