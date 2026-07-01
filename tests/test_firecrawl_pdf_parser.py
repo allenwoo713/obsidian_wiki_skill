@@ -56,3 +56,66 @@ def test_parse_markdown_caption_attached():
     md = f"![Diagram](data:image/png;base64,{b64})\n\nFigure 1 FOV Coverage\n\nbody"
     result = _markdown_to_parse_result(Path("test.pdf"), md)
     assert any("Figure" in img.caption for img in result.images)
+
+
+def test_parse_falls_back_on_network_error(tmp_path, monkeypatch):
+    """网络错误时回退本地 PdfParser。"""
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "fallback body", fontsize=12)
+    pdf_path = tmp_path / "fb.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    import parsers.firecrawl_pdf_parser as mod
+
+    def _fake_post(*a, **kw):
+        raise ConnectionError("simulated network error")
+
+    monkeypatch.setattr(mod, "_requests_post", _fake_post)
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
+
+    from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
+    result = FirecrawlPdfParser().parse(pdf_path)
+    assert "fallback body" in result.text
+
+
+def test_parse_falls_back_on_success_false(tmp_path, monkeypatch):
+    """API 返回 success=false 时回退本地。"""
+    import fitz
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "body", fontsize=12)
+    pdf_path = tmp_path / "fb2.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    import parsers.firecrawl_pdf_parser as mod
+
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return {"success": False, "data": {}}
+
+    monkeypatch.setattr(mod, "_requests_post", lambda *a, **kw: _FakeResp())
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
+
+    from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
+    result = FirecrawlPdfParser().parse(pdf_path)
+    assert "body" in result.text
+
+
+def test_parse_no_api_key_falls_back(tmp_path, monkeypatch):
+    """FIRECRAWL_API_KEY 未设置时回退本地。"""
+    import fitz
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "nokey body", fontsize=12)
+    pdf_path = tmp_path / "nk.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+
+    from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
+    result = FirecrawlPdfParser().parse(pdf_path)
+    assert "nokey body" in result.text

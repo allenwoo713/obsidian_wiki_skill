@@ -84,4 +84,51 @@ class FirecrawlPdfParser(DocumentParser):
     TIMEOUT_SEC = 60.0
 
     def parse(self, path: Path) -> ParseResult:
-        raise NotImplementedError("FirecrawlPdfParser.parse 在任务 5 实现")
+        import os
+        api_key = os.environ.get("FIRECRAWL_API_KEY", "")
+        if not api_key:
+            print("WARNING: FIRECRAWL_API_KEY 未设置，回退本地 PdfParser")
+            from parsers.pdf_parser import PdfParser
+            return PdfParser().parse(path)
+
+        try:
+            with open(path, "rb") as f:
+                file_bytes = f.read()
+        except OSError as e:
+            print(f"WARNING: 读取 PDF 失败 ({e})，回退本地 PdfParser")
+            from parsers.pdf_parser import PdfParser
+            return PdfParser().parse(path)
+
+        try:
+            resp = _requests_post(
+                self.API_URL,
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": (path.name, file_bytes, "application/pdf")},
+                data={
+                    "options": json.dumps({
+                        "formats": ["markdown"],
+                        "onlyMainContent": False,
+                        "removeBase64Images": False,
+                    })
+                },
+                timeout=self.TIMEOUT_SEC,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            print(f"WARNING: Firecrawl /parse 请求失败 ({type(e).__name__}: {e})，回退本地 PdfParser")
+            from parsers.pdf_parser import PdfParser
+            return PdfParser().parse(path)
+
+        if not payload.get("success"):
+            print("WARNING: Firecrawl 返回 success=false，回退本地 PdfParser")
+            from parsers.pdf_parser import PdfParser
+            return PdfParser().parse(path)
+
+        markdown = payload.get("data", {}).get("markdown", "")
+        if not markdown:
+            print("WARNING: Firecrawl 返回空 markdown，回退本地 PdfParser")
+            from parsers.pdf_parser import PdfParser
+            return PdfParser().parse(path)
+
+        return _markdown_to_parse_result(path, markdown)
