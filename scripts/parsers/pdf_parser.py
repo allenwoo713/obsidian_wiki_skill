@@ -86,14 +86,20 @@ class PdfParser(DocumentParser):
                 continue
         return None
 
-    def _extract_tables_pdfplumber(self, path) -> list:
-        """用 pdfplumber 二次遍历提取表格。返回 List[List[List[str]]]。"""
-        import pdfplumber
-        all_tables = []
-        with pdfplumber.open(str(path)) as pdf:
-            for page in pdf.pages:
-                for t in page.extract_tables() or []:
-                    cleaned = [[(c or "").strip() for c in row] for row in t]
-                    if any(any(cell for cell in row) for row in cleaned):
-                        all_tables.append(cleaned)
-        return all_tables
+    def _extract_tables_pdfplumber(self, path: Path) -> List[List[List[str]]]:
+        """用 pdfplumber 二次遍历提取表格。返回 List[List[List[str]]]。
+
+        表格是附加信息，失败时返回空列表，不影响文本/图片解析。
+        """
+        try:
+            import pdfplumber
+            all_tables = []
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages:
+                    for t in page.extract_tables() or []:
+                        cleaned = [[(c or "").strip() for c in row] for row in t]
+                        if any(any(cell for cell in row) for row in cleaned):
+                            all_tables.append(cleaned)
+            return all_tables
+        except Exception:
+            return []

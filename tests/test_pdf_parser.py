@@ -43,6 +43,9 @@ def test_pdf_parser_returns_parse_result(tmp_path):
     result = PdfParser().parse(pdf_path)
     assert "Document body text" in result.text
     assert len(result.images) >= 1
+    # 无表格 PDF：tables 应为空，且文本中不出现 [表格] 标记
+    assert result.tables == []
+    assert "[表格]" not in result.text
 
 
 def test_pdf_parser_image_sha256(tmp_path):
@@ -109,3 +112,49 @@ def test_pdf_parser_tables_in_text(tmp_path):
     result = PdfParser().parse(pdf_path)
     assert "[表格]" in result.text
     assert "表 1:" in result.text
+
+
+def _make_pdf_with_two_tables(tmp_path):
+    """用 reportlab 构造含 2 个表格的 PDF。"""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Table, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    from reportlab.platypus.tables import TableStyle
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(str(tmp_path / "two_tbl.pdf"), pagesize=letter)
+
+    def make_table(data):
+        table = Table(data, colWidths=[100, 80, 80])
+        table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+        ]))
+        return table
+
+    story = [
+        Paragraph("First Section", styles["Normal"]),
+        make_table([
+            ["Field", "Offset", "Length"],
+            ["Header", "0", "4"],
+            ["Payload", "4", "N"],
+        ]),
+        Spacer(1, 24),
+        Paragraph("Second Section", styles["Normal"]),
+        make_table([
+            ["Name", "Type", "Desc"],
+            ["id", "int", "primary key"],
+            ["ts", "float", "timestamp"],
+        ]),
+    ]
+    doc.build(story)
+    return tmp_path / "two_tbl.pdf"
+
+
+def test_pdf_parser_multiple_tables(tmp_path):
+    pdf_path = _make_pdf_with_two_tables(tmp_path)
+    from parsers.pdf_parser import PdfParser
+    result = PdfParser().parse(pdf_path)
+    assert len(result.tables) >= 2
+    assert "表 1:" in result.text
+    assert "表 2:" in result.text
