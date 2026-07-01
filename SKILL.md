@@ -297,6 +297,22 @@ Phase 4:   预算控制 (4K→1M tokens)
 - Obsidian vault 根目录 = `Wiki/`，不可设为 project_root（否则 Raw/sources/ 中 `.md` 文件混入图谱）
 - 脚本绝不触碰 `Wiki/.obsidian/`，该目录由 Obsidian 独占管理
 
+## PDF backend 配置（可选）
+
+默认所有 PDF 走本地 PyMuPDF + pdfplumber（L0，离线，隐私安全）。
+
+如需启用 Firecrawl 云解析（表格/布局更强，但文件上云）：
+
+1. 设置环境变量：
+   - `PDF_PARSER_BACKEND=firecrawl`
+   - `FIRECRAWL_API_KEY=<your_key>`
+
+2. 安装可选依赖：`pip install requests`
+
+3. 失败自动回退本地（含 WARNING 日志）
+
+⚠️ 雷达 datasheet 涉商业敏感信息，启用前需 Derek 明确授权。
+
 ## 图片提取与 caption 检索（路线 B）
 
 ### 写边界表

@@ -10,3 +10,4 @@ pytest>=8.0.0
 pdfplumber>=0.11.0
 pymupdf>=1.24.0
 python-pptx>=0.6.23
+requests>=2.31.0          # optional: firecrawl backend
