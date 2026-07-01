@@ -20,6 +20,7 @@ def _b64_png():
 
 
 def test_parse_markdown_extracts_base64_image():
+    """纯 Firecrawl 模式（无 local_images）：markdown 中 base64 图片被提取。"""
     from parsers.firecrawl_pdf_parser import _markdown_to_parse_result
     b64 = _b64_png()
     md = f"Body text.\n\n![Figure 1 Diagram](data:image/png;base64,{b64})\n\nMore text."
@@ -119,3 +120,91 @@ def test_parse_no_api_key_falls_back(tmp_path, monkeypatch):
     from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
     result = FirecrawlPdfParser().parse(pdf_path)
     assert "nokey body" in result.text
+
+
+def test_parse_mixed_mode_uses_local_images(tmp_path, monkeypatch):
+    """混合模式：text/tables 来自 Firecrawl，images 来自本地 PdfParser（含 caption）。"""
+    import fitz
+    from models import ImageRef
+    import parsers.firecrawl_pdf_parser as mod
+
+    # 构造含图片的 PDF（本地 PdfParser 能提取）
+    # 注意：PyMuPDF 默认字体不支持中文，用英文 caption 避免编码问题
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "firecrawl text", fontsize=12)
+    import io
+    from PIL import Image as PILImage
+    img_buf = io.BytesIO()
+    PILImage.new("RGB", (10, 10), (255, 0, 0)).save(img_buf, format="PNG")
+    img_bytes = img_buf.getvalue()
+    page.insert_image(fitz.Rect(100, 100, 110, 110), stream=img_bytes)
+    page.insert_text((72, 130), "Figure 1 Test Diagram", fontsize=10)
+    pdf_path = tmp_path / "mixed.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    # Mock Firecrawl 返回不含图片的 markdown
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"success": True, "data": {"markdown": "# Title\n\nfirecrawl text\n\n| Col1 | Col2 |\n|---|---|\n| a | b |"}}
+
+    monkeypatch.setattr(mod, "_requests_post", lambda *a, **kw: _FakeResp())
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
+
+    from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
+    result = FirecrawlPdfParser().parse(pdf_path)
+
+    # text 和 tables 来自 Firecrawl
+    assert "firecrawl text" in result.text
+    assert len(result.tables) == 1
+    assert result.tables[0][0] == ["Col1", "Col2"]
+    assert "[表格]" in result.text
+
+    # images 来自本地 PdfParser（含 caption）
+    assert len(result.images) >= 1
+    assert len(result._image_bytes) >= 1
+    # 图片占位符应在 text 中（追加在末尾）
+    assert "{{IMG|" in result.text
+    # 至少有一个图片含图注（本地 PdfParser 提取的 "Figure 1 Test Diagram"）
+    captions = [img.caption for img in result.images if img.caption]
+    assert any("Figure" in c or "Test" in c for c in captions), f"captions: {captions}"
+
+
+def test_parse_mixed_mode_local_fails_images_empty(tmp_path, monkeypatch):
+    """混合模式：本地图片提取失败时 images 为空，text/tables 仍来自 Firecrawl。"""
+    import fitz
+    import parsers.firecrawl_pdf_parser as mod
+
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "body", fontsize=12)
+    pdf_path = tmp_path / "nofail.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    class _FakeResp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"success": True, "data": {"markdown": "firecrawl body"}}
+
+    monkeypatch.setattr(mod, "_requests_post", lambda *a, **kw: _FakeResp())
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
+
+    # Mock PdfParser.parse 抛异常
+    from parsers.pdf_parser import PdfParser
+    original_parse = PdfParser.parse
+    def _failing_parse(self, path):
+        raise RuntimeError("simulated local parse failure")
+    monkeypatch.setattr(PdfParser, "parse", _failing_parse)
+
+    from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
+    result = FirecrawlPdfParser().parse(pdf_path)
+
+    # text 仍来自 Firecrawl
+    assert "firecrawl body" in result.text
+    # images 为空（本地提取失败）
+    assert len(result.images) == 0
+    assert len(result._image_bytes) == 0
