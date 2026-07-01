@@ -303,13 +303,15 @@ Phase 4:   预算控制 (4K→1M tokens)
 
 如需启用 Firecrawl 云解析（表格/布局更强，但文件上云）：
 
-1. 设置环境变量：
+1. 复制配置模板：`cp .env.example .env`，在 `.env` 中填入 `FIRECRAWL_API_KEY`（`.env` 已被 gitignore，不会泄露）
+
+2. 安装可选依赖：`pip install requests python-dotenv`
+
+3. 或通过系统环境变量配置（二选一）：
    - `PDF_PARSER_BACKEND=firecrawl`
    - `FIRECRAWL_API_KEY=<your_key>`
 
-2. 安装可选依赖：`pip install requests`
-
-3. 失败自动回退本地（含 WARNING 日志）
+4. 失败自动回退本地（含 WARNING 日志）
 
 ⚠️ 雷达 datasheet 涉商业敏感信息，启用前需 Derek 明确授权。
 

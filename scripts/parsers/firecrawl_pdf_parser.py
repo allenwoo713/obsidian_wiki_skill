@@ -77,6 +77,19 @@ def _requests_post(url, **kwargs):
     return requests.post(url, **kwargs)
 
 
+def _load_env_if_present():
+    """若 skill 根目录存在 .env 且 python-dotenv 可用，加载之。失败静默。
+
+    .env 为可选配置途径；未安装 python-dotenv 时回退到系统环境变量。
+    """
+    try:
+        from dotenv import load_dotenv
+        skill_root = Path(__file__).resolve().parents[2]  # scripts/parsers/ -> skill root
+        load_dotenv(skill_root / ".env", override=False)
+    except ImportError:
+        pass
+
+
 class FirecrawlPdfParser(DocumentParser):
     """调用 Firecrawl /parse API 解析 PDF，失败回退本地 PdfParser。"""
 
@@ -84,6 +97,7 @@ class FirecrawlPdfParser(DocumentParser):
     TIMEOUT_SEC = 60.0
 
     def parse(self, path: Path) -> ParseResult:
+        _load_env_if_present()
         import os
         api_key = os.environ.get("FIRECRAWL_API_KEY", "")
         if not api_key:

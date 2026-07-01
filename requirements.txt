@@ -11,3 +11,4 @@ pdfplumber>=0.11.0
 pymupdf>=1.24.0
 python-pptx>=0.6.23
 requests>=2.31.0          # optional: firecrawl backend
+python-dotenv>=1.0.0      # optional: firecrawl backend (.env loading)
