@@ -89,6 +89,49 @@ def test_attach_captions_multiple_in_order():
     assert new_images[1].caption == "图2 流程"
 
 
+def test_attach_captions_in_place_modification():
+    """契约：images 列表原地修改——返回对象身份相同，原列表元素被写入 caption。"""
+    img1 = _make_image(1)
+    img2 = _make_image(2)
+    imgs = [img1, img2]
+    text = (
+        "{{IMG|assets/doc_img01.png|图注: 待补}}\n图1 架构\n"
+        "{{IMG|assets/doc_img02.png|图注: 待补}}\n图2 流程"
+    )
+    _, returned = attach_captions(text, imgs)
+    assert returned is imgs  # 同一列表对象
+    assert imgs[0].caption == "图1 架构"  # 原列表元素被修改
+    assert imgs[1].caption == "图2 流程"
+    assert img1.caption == "图1 架构"  # 传入的 ImageRef 对象本身被修改
+    assert img2.caption == "图2 流程"
+
+
+def test_attach_captions_window_5th_line_hits():
+    """契约：占位符后第 5 行（含）命中的图注应被采纳。"""
+    img = _make_image(1)
+    text = (
+        "{{IMG|assets/doc_img01.png|图注: 待补}}\n"
+        "line1\nline2\nline3\nline4\n"
+        "图1 第五行命中"
+    )
+    new_text, new_images = attach_captions(text, [img])
+    assert new_images[0].caption == "图1 第五行命中"
+    assert "图注: 图1 第五行命中" in new_text
+
+
+def test_attach_captions_window_6th_line_misses():
+    """契约：占位符后第 6 行命中的图注不应被采纳。"""
+    img = _make_image(1)
+    text = (
+        "{{IMG|assets/doc_img01.png|图注: 待补}}\n"
+        "line1\nline2\nline3\nline4\nline5\n"
+        "图1 第六行未命中"
+    )
+    new_text, new_images = attach_captions(text, [img])
+    assert new_images[0].caption == ""
+    assert "图注: [无图注]" in new_text
+
+
 def test_attach_captions_more_placeholders_than_images():
     img = _make_image(1)
     text = (
@@ -106,4 +149,5 @@ def test_attach_captions_empty_images():
     text = "{{IMG|assets/doc_img01.png|图注: 待补}}\n图1 说明"
     new_text, new_images = attach_captions(text, [])
     assert new_images == []
+    assert new_text == text  # 无图片时 text 完全未变
     assert "图注: 待补" in new_text

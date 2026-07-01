@@ -21,7 +21,7 @@ _CAPTION_RE = re.compile(r"^\s*(图|Figure|Fig\.?)\s*\d+", re.IGNORECASE)
 
 
 def attach_captions(text: str, images: List[ImageRef]) -> Tuple[str, List[ImageRef]]:
-    """按行扫描 text，找到图片占位符后 5 行内匹配图注正则的段落作为图注。
+    """按行扫描 text，找到图片占位符后 5 行内（含第 5 行）匹配图注正则的段落作为图注。
 
     返回 (text, images)，其中 images 会被原地修改（按顺序写入 caption）。
     """
@@ -33,7 +33,7 @@ def attach_captions(text: str, images: List[ImageRef]) -> Tuple[str, List[ImageR
         if img_idx >= len(images):
             break
         caption = ""
-        for j in range(line_no + 1, min(line_no + 5, len(lines))):
+        for j in range(line_no + 1, min(line_no + 6, len(lines))):
             candidate = lines[j].strip()
             if candidate and _CAPTION_RE.match(candidate):
                 caption = candidate
