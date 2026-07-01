@@ -67,3 +67,45 @@ def test_pdf_parser_placeholder_in_text(tmp_path):
     from parsers.pdf_parser import PdfParser
     result = PdfParser().parse(pdf_path)
     assert "{{IMG|" in result.text
+
+
+def _make_pdf_with_table(tmp_path):
+    """用 reportlab 构造含表格的 PDF。"""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Table, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    from reportlab.platypus.tables import TableStyle
+    styles = getSampleStyleSheet()
+    doc = SimpleDocTemplate(str(tmp_path / "tbl.pdf"), pagesize=letter)
+    table = Table([
+        ["Field", "Offset", "Length"],
+        ["Header", "0", "4"],
+        ["Payload", "4", "N"],
+    ], colWidths=[100, 80, 80])
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.black),
+    ]))
+    doc.build([
+        Paragraph("UDP Frame Format", styles["Normal"]),
+        table,
+    ])
+    return tmp_path / "tbl.pdf"
+
+
+def test_pdf_parser_extracts_tables(tmp_path):
+    pdf_path = _make_pdf_with_table(tmp_path)
+    from parsers.pdf_parser import PdfParser
+    result = PdfParser().parse(pdf_path)
+    assert len(result.tables) >= 1
+    flat = [cell for row in result.tables[0] for cell in row]
+    assert any("Field" in c or "Header" in c or "Offset" in c for c in flat)
+
+
+def test_pdf_parser_tables_in_text(tmp_path):
+    pdf_path = _make_pdf_with_table(tmp_path)
+    from parsers.pdf_parser import PdfParser
+    result = PdfParser().parse(pdf_path)
+    assert "[表格]" in result.text
+    assert "表 1:" in result.text

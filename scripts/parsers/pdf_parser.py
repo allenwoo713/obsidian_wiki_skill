@@ -36,8 +36,22 @@ class PdfParser(DocumentParser):
                         text_parts.append(f"{{{{IMG|{ref.rel_path}|图注: 待补}}}}")
 
         doc.close()
+
+        # L0: pdfplumber 表格提取，追加到 text_parts（在 attach_captions 之前，
+        # 避免表格内容干扰图注匹配）
+        tables = self._extract_tables_pdfplumber(path)
+        if tables:
+            text_parts.append("\n[表格]\n")
+            for i, t in enumerate(tables):
+                text_parts.append(f"\n表 {i+1}:\n")
+                for row in t:
+                    text_parts.append(" | ".join(row))
+
         text, images = attach_captions("\n".join(text_parts), images)
-        return ParseResult(text=text, images=images, tables=[], _image_bytes=image_bytes_list)
+        return ParseResult(
+            text=text, images=images, tables=tables,
+            _image_bytes=image_bytes_list,
+        )
 
     def _extract_text(self, block: dict) -> str:
         lines = []
@@ -71,3 +85,15 @@ class PdfParser(DocumentParser):
             except Exception:
                 continue
         return None
+
+    def _extract_tables_pdfplumber(self, path) -> list:
+        """用 pdfplumber 二次遍历提取表格。返回 List[List[List[str]]]。"""
+        import pdfplumber
+        all_tables = []
+        with pdfplumber.open(str(path)) as pdf:
+            for page in pdf.pages:
+                for t in page.extract_tables() or []:
+                    cleaned = [[(c or "").strip() for c in row] for row in t]
+                    if any(any(cell for cell in row) for row in cleaned):
+                        all_tables.append(cleaned)
+        return all_tables
