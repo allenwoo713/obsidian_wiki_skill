@@ -21,14 +21,20 @@ def extract(path: Path, assets_dir: Path) -> ParsedDoc:
         from parsers.docx_parser import DocxParser
         parser = DocxParser()
     elif ext == ".pdf":
-        try:
+        import os
+        backend = os.environ.get("PDF_PARSER_BACKEND", "")
+        api_key = os.environ.get("FIRECRAWL_API_KEY", "")
+        if backend == "firecrawl" and api_key:
+            try:
+                from parsers.firecrawl_pdf_parser import FirecrawlPdfParser
+                parser = FirecrawlPdfParser()
+            except ImportError:
+                print("WARNING: PDF_PARSER_BACKEND=firecrawl 但 firecrawl_pdf_parser/requests 未安装，回退本地 PdfParser")
+                from parsers.pdf_parser import PdfParser
+                parser = PdfParser()
+        else:
             from parsers.pdf_parser import PdfParser
-        except ImportError:
-            raise UnsupportedFormat(
-                f"{ext} 解析器未安装（parsers.pdf_parser），"
-                f"请完成 PdfParser 实现后重试"
-            )
-        parser = PdfParser()
+            parser = PdfParser()
     elif ext == ".pptx":
         try:
             from parsers.pptx_parser import PptxParser

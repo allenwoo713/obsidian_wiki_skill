@@ -83,3 +83,43 @@ def test_extract_unsupported_format(tmp_path):
     f.write_text("?", encoding="utf-8")
     with pytest.raises(UnsupportedFormat):
         extract(f, tmp_path / "assets")
+
+
+def _make_minimal_pdf(tmp_path):
+    """构造最小 PDF 用于 extract 测试。"""
+    import fitz
+    doc = fitz.open()
+    doc.new_page().insert_text((72, 72), "extract test body", fontsize=12)
+    pdf_path = tmp_path / "e.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return pdf_path
+
+
+def test_extract_pdf_default_local_backend(tmp_path, monkeypatch):
+    """未设环境变量 → 走本地 PdfParser。"""
+    monkeypatch.delenv("PDF_PARSER_BACKEND", raising=False)
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    pdf_path = _make_minimal_pdf(tmp_path)
+    parsed = extract(pdf_path, tmp_path / "assets")
+    assert "extract test body" in parsed.text
+
+
+def test_extract_pdf_firecrawl_backend_no_key_falls_back(tmp_path, monkeypatch):
+    """设了 BACKEND=firecrawl 但无 API key → 回退本地。"""
+    monkeypatch.setenv("PDF_PARSER_BACKEND", "firecrawl")
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    pdf_path = _make_minimal_pdf(tmp_path)
+    parsed = extract(pdf_path, tmp_path / "assets")
+    assert "extract test body" in parsed.text
+
+
+def test_extract_pdf_firecrawl_import_error_falls_back(tmp_path, monkeypatch):
+    """设了 BACKEND + KEY，但 firecrawl_pdf_parser 导入失败 → 调度层回退。"""
+    monkeypatch.setenv("PDF_PARSER_BACKEND", "firecrawl")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fake")
+    import sys
+    monkeypatch.setitem(sys.modules, "parsers.firecrawl_pdf_parser", None)
+    pdf_path = _make_minimal_pdf(tmp_path)
+    parsed = extract(pdf_path, tmp_path / "assets")
+    assert "extract test body" in parsed.text
