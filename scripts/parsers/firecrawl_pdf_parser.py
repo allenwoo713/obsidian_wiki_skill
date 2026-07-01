@@ -1,0 +1,87 @@
+"""FirecrawlPdfParser：调用 Firecrawl /parse API + markdown 适配 ParseResult。"""
+from __future__ import annotations
+import base64
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import List
+
+from models import ImageRef
+from parsers.base import DocumentParser, ParseResult
+from parsers.utils import slugify, image_filename, attach_captions
+
+_IMG_RE = re.compile(r"!\[([^\]]*)\]\(data:image/(png|jpeg|jpg);base64,([^)]+)\)")
+_MD_TABLE_RE = re.compile(r"(?:^\|.+\|\n)(?:^\|[\s:|-]+\|\n)(?:^\|.+\|\n)+", re.MULTILINE)
+
+
+def _markdown_to_parse_result(path: Path, markdown: str) -> ParseResult:
+    """将 Firecrawl 返回的 markdown 解析为 ParseResult。"""
+    doc_slug = slugify(path.stem)
+    images: List[ImageRef] = []
+    image_bytes_list: List[bytes] = []
+    img_seq = 0
+
+    def _replace_img(m):
+        nonlocal img_seq
+        alt, ext, b64 = m.group(1), m.group(2), m.group(3)
+        img_bytes = base64.b64decode(b64)
+        sha = hashlib.sha256(img_bytes).hexdigest()
+        img_seq += 1
+        fname = image_filename(doc_slug, img_seq, ext)
+        ref = ImageRef(
+            filename=fname, rel_path=f"assets/{fname}", caption="",
+            source_media_name="firecrawl", sha256=sha, page_or_section="",
+        )
+        images.append(ref)
+        image_bytes_list.append(img_bytes)
+        return f"{{{{IMG|{ref.rel_path}|图注: 待补}}}}"
+
+    text = _IMG_RE.sub(_replace_img, markdown)
+
+    tables: List[List[List[str]]] = []
+
+    def _extract_table(m):
+        block = m.group(0)
+        lines = [ln for ln in block.strip().split("\n") if ln.strip()]
+        rows = []
+        for ln in lines:
+            if re.match(r"^\|[\s:|-]+\|$", ln):
+                continue
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            rows.append(cells)
+        if rows:
+            tables.append(rows)
+        return ""
+
+    text = _MD_TABLE_RE.sub(_extract_table, text)
+
+    if tables:
+        text = text.rstrip() + "\n\n[表格]\n"
+        for i, t in enumerate(tables):
+            text += f"\n表 {i+1}:\n"
+            for row in t:
+                text += " | ".join(row) + "\n"
+
+    text, images = attach_captions(text, images)
+
+    return ParseResult(
+        text=text, images=images, tables=tables,
+        _image_bytes=image_bytes_list,
+    )
+
+
+def _requests_post(url, **kwargs):
+    """requests.post 间接层，便于测试 mock。"""
+    import requests
+    return requests.post(url, **kwargs)
+
+
+class FirecrawlPdfParser(DocumentParser):
+    """调用 Firecrawl /parse API 解析 PDF，失败回退本地 PdfParser。"""
+
+    API_URL = "https://api.firecrawl.dev/v2/parse"
+    TIMEOUT_SEC = 60.0
+
+    def parse(self, path: Path) -> ParseResult:
+        raise NotImplementedError("FirecrawlPdfParser.parse 在任务 5 实现")
