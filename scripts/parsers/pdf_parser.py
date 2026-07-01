@@ -1,16 +1,12 @@
 """PdfParser：PyMuPDF 提取文本、图片、图注。"""
 from __future__ import annotations
 import hashlib
-import re
 from pathlib import Path
 from typing import List
 
 from models import ImageRef
 from parsers.base import DocumentParser, ParseResult
-from parsers.utils import slugify, image_filename
-
-_CAPTION_RE = re.compile(r"^\s*(图|Figure|Fig\.?)\s*\d+", re.IGNORECASE)
-
+from parsers.utils import slugify, image_filename, attach_captions
 
 class PdfParser(DocumentParser):
     def parse(self, path: Path) -> ParseResult:
@@ -40,7 +36,7 @@ class PdfParser(DocumentParser):
                         text_parts.append(f"{{{{IMG|{ref.rel_path}|图注: 待补}}}}")
 
         doc.close()
-        text, images = self._attach_captions("\n".join(text_parts), images)
+        text, images = attach_captions("\n".join(text_parts), images)
         return ParseResult(text=text, images=images, tables=[], _image_bytes=image_bytes_list)
 
     def _extract_text(self, block: dict) -> str:
@@ -75,23 +71,3 @@ class PdfParser(DocumentParser):
             except Exception:
                 continue
         return None
-
-    def _attach_captions(self, text: str, images: List[ImageRef]):
-        """占位符后第一个匹配 _CAPTION_RE 的段落作为图注。"""
-        lines = text.split("\n")
-        img_idx = 0
-        for line_no, line in enumerate(lines):
-            if "{{IMG|" not in line or "图注: 待补" not in line:
-                continue
-            if img_idx >= len(images):
-                break
-            caption = ""
-            for j in range(line_no + 1, min(line_no + 5, len(lines))):
-                candidate = lines[j].strip()
-                if candidate and _CAPTION_RE.match(candidate):
-                    caption = candidate
-                    break
-            images[img_idx].caption = caption
-            lines[line_no] = line.replace("图注: 待补", f"图注: {caption or '[无图注]'}")
-            img_idx += 1
-        return "\n".join(lines), images
