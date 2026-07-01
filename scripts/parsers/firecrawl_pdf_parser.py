@@ -120,9 +120,8 @@ class FirecrawlPdfParser(DocumentParser):
                 files={"file": (path.name, file_bytes, "application/pdf")},
                 data={
                     "options": json.dumps({
-                        "formats": ["markdown"],
+                        "formats": ["markdown", "images"],
                         "onlyMainContent": False,
-                        "removeBase64Images": False,
                     })
                 },
                 timeout=self.TIMEOUT_SEC,
@@ -139,10 +138,14 @@ class FirecrawlPdfParser(DocumentParser):
             from parsers.pdf_parser import PdfParser
             return PdfParser().parse(path)
 
-        markdown = payload.get("data", {}).get("markdown", "")
+        data = payload.get("data", {})
+        markdown = data.get("markdown", "")
         if not markdown:
             print("WARNING: Firecrawl 返回空 markdown，回退本地 PdfParser")
             from parsers.pdf_parser import PdfParser
             return PdfParser().parse(path)
 
+        # Firecrawl 对 PDF 当前不提取嵌入图片（images 格式被接受但返回空数组）。
+        # 若未来 Firecrawl 支持返回图片 URL，此处会下载并适配。
+        # 当前 images 仅为 markdown 中无图片引用时的空列表。
         return _markdown_to_parse_result(path, markdown)
