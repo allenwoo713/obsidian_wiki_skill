@@ -48,7 +48,9 @@ def mineru_markdown_to_parse_result(
 
     text = _MINERU_IMG_RE.sub(_replace_img, markdown)
     tables = _extract_html_tables(text)
-    text = _strip_html_tables(text)
+    # 保留 HTML 表格在 text 中（Obsidian 可渲染 HTML），
+    # 不再用 [table N] 占位符替换，避免下游输出丢失表格内容。
+    # tables 字段仍提取结构化数据供 FTS/RAG 索引器使用。
     text, images = attach_captions(text, images)
 
     return ParseResult(

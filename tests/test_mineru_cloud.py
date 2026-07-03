@@ -127,7 +127,7 @@ def test_parse_single_pdf_no_split(tmp_dir: Path):
     assert len(result.tables) == 1
     assert result.tables[0] == [["A"]]
     assert "{{IMG|" in result.text
-    assert "[table 1]" in result.text
+    assert "<table>" in result.text  # HTML 表格保留在 text 中
 
 
 def test_parse_pdf_split(tmp_dir: Path):

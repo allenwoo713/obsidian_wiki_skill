@@ -33,8 +33,8 @@ def test_extract_html_table():
     )
     assert len(result.tables) == 1
     assert result.tables[0] == [["A", "B"], ["1", "2"]]
-    assert "<table>" not in result.text
-    assert "[table 1]" in result.text
+    # HTML 表格保留在 text 中（Obsidian 可渲染），不再替换为 [table N] 占位符
+    assert "<table>" in result.text
 
 def test_merge_multiple_segments():
     seg1 = "# Part 1\n\n![](images/img1.jpg)\n"
