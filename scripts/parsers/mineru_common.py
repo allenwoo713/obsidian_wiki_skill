@@ -44,7 +44,7 @@ def mineru_markdown_to_parse_result(
         )
         images.append(ref)
         image_bytes_list.append(img_bytes)
-        return f"{{{{IMG|{ref.rel_path}|caption: TBD}}}}"
+        return f"{{{{IMG|{ref.rel_path}|图注: 待补}}}}"
 
     text = _MINERU_IMG_RE.sub(_replace_img, markdown)
     tables = _extract_html_tables(text)

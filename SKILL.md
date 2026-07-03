@@ -297,23 +297,36 @@ Phase 4:   预算控制 (4K→1M tokens)
 - Obsidian vault 根目录 = `Wiki/`，不可设为 project_root（否则 Raw/sources/ 中 `.md` 文件混入图谱）
 - 脚本绝不触碰 `Wiki/.obsidian/`，该目录由 Obsidian 独占管理
 
-## PDF backend 配置（可选）
+## 文档解析后端配置
 
-默认所有 PDF 走本地 PyMuPDF + pdfplumber（L0，离线，隐私安全）。
+默认路由（按扩展名）：
 
-如需启用 Firecrawl 云解析（表格/布局更强，但文件上云）：
+| 扩展名 | 默认后端 | 说明 |
+|--------|----------|------|
+| `.pdf` | MinerU Cloud API | 打印格式需 layout analysis；>200 页自动拆分 |
+| `.doc` / `.ppt` / `.xls` / `.xlsx` / `.html` | MinerU Cloud API | 旧二进制或本地不支持的格式 |
+| `.docx` | python-docx | 结构化 XML，本地解析足够准确 |
+| `.pptx` | python-pptx | 结构化 XML，本地解析足够准确 |
+| 其他 | 不支持 | 抛 `UnsupportedFormat` |
 
-1. 复制配置模板：`cp .env.example .env`，在 `.env` 中填入 `FIRECRAWL_API_KEY`（`.env` 已被 gitignore，不会泄露）
+敏感 PDF 处理：
+- 交互模式下，新增 PDF 会询问用户是否敏感；敏感则走 `MinerU Local`。
+- 非交互模式可设置环境变量 `MINERU_PDF_SENSITIVE=1` 强制所有 PDF 走本地。
+- 本地解析使用独立 MinerU venv：`<home>/.workbuddy/binaries/python/envs/mineru/Scripts/python.exe`。
 
-2. 安装可选依赖：`pip install requests python-dotenv`
+配置方式（二选一）：
 
-3. 或通过系统环境变量配置（二选一）：
-   - `PDF_PARSER_BACKEND=firecrawl`
-   - `FIRECRAWL_API_KEY=<your_key>`
+1. 复制 `.env.example` 为 `.env`：
+   ```bash
+   cp .env.example .env
+   ```
+2. 填入 `MINERU_API_TOKEN`（从 https://mineru.net/apiManage 获取）。
+3. 或直接使用系统环境变量：
+   - `MINERU_API_TOKEN=<your_token>`
+   - `MINERU_PYTHON_EXE=<path_to_mineru_venv_python>`
+   - `MINERU_PDF_SENSITIVE=0/1`
 
-4. 失败自动回退本地（含 WARNING 日志）
-
-⚠️ 雷达 datasheet 涉商业敏感信息，启用前需 Derek 明确授权。
+⚠️ 雷达 datasheet 涉商业敏感信息，启用 Cloud 前需 Derek 明确授权。
 
 ## 图片提取与 caption 检索（路线 B）
 

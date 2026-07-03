@@ -27,7 +27,20 @@ class SourceDiff:
     state: SourceState
 
 
-SUPPORTED_EXT = {".docx", ".pdf", ".md", ".markdown", ".txt"}
+SUPPORTED_EXT = {
+    ".docx",
+    ".pdf",
+    ".pptx",
+    ".doc",
+    ".ppt",
+    ".xls",
+    ".xlsx",
+    ".html",
+    ".htm",
+    ".md",
+    ".markdown",
+    ".txt",
+}
 
 
 def scan_sources(raw_sources_dir: Path) -> List[Path]:

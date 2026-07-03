@@ -1,11 +1,25 @@
-"""源文档解析：docx / pdf / md / txt → ParsedDoc。"""
+"""源文档解析：docx / pdf / pptx / 多格式 Office / md / txt → ParsedDoc。"""
 from __future__ import annotations
 import hashlib
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import re
 
 from models import ParsedDoc
+
+
+# 需要 extract_assets 进行解析的二进制/复杂格式（含图片提取）
+_BINARY_FORMATS = {
+    ".docx",
+    ".pdf",
+    ".pptx",
+    ".doc",
+    ".ppt",
+    ".xls",
+    ".xlsx",
+    ".html",
+    ".htm",
+}
 
 
 def compute_sha256(path: Path) -> str:
@@ -40,6 +54,7 @@ def parse_txt(path: Path) -> ParsedDoc:
 
 
 def parse_docx(path: Path, assets_dir: Path = None) -> ParsedDoc:
+    """DOCX 解析：优先走 extract_assets（提取图片），否则纯文本。"""
     if assets_dir is not None:
         from extract_assets import extract
         return extract(path, assets_dir)
@@ -64,33 +79,20 @@ def parse_docx(path: Path, assets_dir: Path = None) -> ParsedDoc:
     )
 
 
-def parse_pdf(path: Path, assets_dir: Path = None) -> ParsedDoc:
-    """PDF 解析：优先 pdfplumber，回退 PyPDF2。传 assets_dir 委托 extract_assets.extract()。"""
+def parse_pdf(path: Path, assets_dir: Path = None, is_sensitive: Optional[bool] = None) -> ParsedDoc:
+    """PDF 解析：委托 extract_assets，支持敏感文档本地解析。"""
     if assets_dir is not None:
-        try:
-            from extract_assets import extract
-            return extract(path, assets_dir)
-        except ImportError as e:
-            # pymupdf 未安装，回退纯文本（无图片提取）
-            pass
-        except Exception:
-            # 其他提取器异常，也回退
-            pass
+        from extract_assets import extract
+        return extract(path, assets_dir, is_sensitive=is_sensitive)
+    # 无 assets_dir 时的纯文本兜底
     text = ""
     try:
-        import pdfplumber
-        with pdfplumber.open(str(path)) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                text += t + "\n"
-    except ImportError:
-        try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(str(path))
-            for page in reader.pages:
-                text += (page.extract_text() or "") + "\n"
-        except ImportError:
-            text = ""
+        import fitz
+        with fitz.open(str(path)) as doc:
+            for page in doc:
+                text += (page.get_text() or "") + "\n"
+    except Exception:
+        text = ""
     title = _extract_title(text, path.stem)
     return ParsedDoc(
         path=path, title=title, text=text, tables=[],
@@ -107,11 +109,24 @@ _PARSERS = {
 }
 
 
-def parse_file(path: Path, assets_dir: Path = None) -> ParsedDoc:
+def parse_file(path: Path, assets_dir: Path = None, is_sensitive: Optional[bool] = None) -> ParsedDoc:
+    """统一入口解析单个源文档。
+
+    Args:
+        path: 源文件路径。
+        assets_dir: 图片输出目录。二进制/复杂格式必须提供。
+        is_sensitive: 仅对 PDF 有效。True 走 MinerU Local，False/None 走 Cloud。
+    """
     suffix = path.suffix.lower()
-    parser = _PARSERS.get(suffix)
-    if parser is None:
-        raise ValueError(f"unsupported file type: {suffix} ({path})")
-    if assets_dir is not None and parser in (parse_docx, parse_pdf):
-        return parser(path, assets_dir)
-    return parser(path)
+
+    if suffix in (".md", ".markdown", ".txt"):
+        parser = _PARSERS[suffix]
+        return parser(path)
+
+    if suffix in _BINARY_FORMATS:
+        if assets_dir is None:
+            raise ValueError(f"{suffix} 解析需要提供 assets_dir 以提取图片/表格")
+        from extract_assets import extract
+        return extract(path, assets_dir, is_sensitive=is_sensitive)
+
+    raise ValueError(f"unsupported file type: {suffix} ({path})")
