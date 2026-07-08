@@ -70,12 +70,14 @@ def test_docx_parser_extracts_image(tmp_path):
     assert hashlib.sha256(result._image_bytes[0]).hexdigest() == ref.sha256
 
 
-def test_docx_parser_image_placeholder_in_text(tmp_path):
+def test_docx_parser_image_renders_as_obsidian_embed(tmp_path):
+    """图片以 ![[filename]] Obsidian 嵌入格式出现，图注作为可读文本，非 {{IMG|}} 占位符。"""
     docx_path, _ = _make_docx_with_image(tmp_path, caption="图1 测试示意图")
     parser = DocxParser()
     result = parser.parse(docx_path)
-    assert "{{IMG|" in result.text
-    assert "图注:" in result.text
+    assert "{{IMG|" not in result.text
+    assert "![" in result.text
+    assert "图1 测试示意图" in result.text
 
 
 def test_docx_parser_caption_extracted(tmp_path):
@@ -117,3 +119,50 @@ def test_docx_parser_multiple_images(tmp_path):
     result = parser.parse(docx_path)
     assert len(result.images) == 2
     assert result.images[0].sha256 != result.images[1].sha256
+
+
+def test_docx_parser_table_surrounded_by_blank_lines(tmp_path):
+    """表格 markdown 前后应有空行，确保 Obsidian 正确渲染。"""
+    from docx import Document
+    doc = Document()
+    doc.add_paragraph("表格前文本")
+    table = doc.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "Header1"
+    table.cell(0, 1).text = "Header2"
+    table.cell(1, 0).text = "Value1"
+    table.cell(1, 1).text = "Value2"
+    doc.add_paragraph("表格后文本")
+    docx_path = tmp_path / "table.docx"
+    doc.save(str(docx_path))
+    parser = DocxParser()
+    result = parser.parse(docx_path)
+    assert "| Header1" in result.text
+    assert "| Value2" in result.text
+    # 表格前有空行
+    assert "\n\n| Header1" in result.text
+    # 表格后有空行
+    assert "Value2 |\n\n" in result.text
+
+
+def test_docx_parser_heading_converts_to_markdown(tmp_path):
+    """Word heading 样式应转为 markdown #/## 层级。"""
+    from docx import Document
+    doc = Document()
+    doc.add_heading("一级标题", level=1)
+    doc.add_paragraph("正文内容")
+    doc.add_heading("二级标题", level=2)
+    doc.add_paragraph("更多正文")
+    docx_path = tmp_path / "heading.docx"
+    doc.save(str(docx_path))
+    parser = DocxParser()
+    result = parser.parse(docx_path)
+    assert "# 一级标题" in result.text
+    assert "## 二级标题" in result.text
+
+
+def test_docx_parser_no_duplicate_caption(tmp_path):
+    """图注不应重复出现（占位符释放的 caption 与原文档 caption 段落去重）。"""
+    docx_path, _ = _make_docx_with_image(tmp_path, caption="图1 测试示意图")
+    parser = DocxParser()
+    result = parser.parse(docx_path)
+    assert result.text.count("图1 测试示意图") == 1

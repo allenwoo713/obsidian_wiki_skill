@@ -88,3 +88,70 @@ def test_extract_images_for_diff_new(tmp_path):
     assert len(im) == 1; assert im[0]["filename"].endswith("_img01.png")
     # assets 目录被创建且含图片
     assert assets.exists()
+
+
+def test_write_source_fulltext_no_images_section(tmp_path):
+    """write_source_fulltext 不生成 AUTO-GENERATED IMAGES 区（FULLTEXT 区已嵌入图片）。"""
+    from update_wiki import write_source_fulltext
+    from models import ParsedDoc, ImageRef
+
+    proj = tmp_path
+    source_path = proj / "Raw" / "sources" / "test.docx"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"fake")
+
+    img_ref = ImageRef(
+        filename="test_img01.png", rel_path="assets/test_img01.png",
+        caption="图1 测试", source_media_name="image1.png",
+        sha256="abc", page_or_section="body",
+    )
+    parsed = ParsedDoc(
+        path=source_path, title="Test Doc",
+        text="正文\n![[test_img01.png]]  \n图1 测试",
+        tables=[], sha256="def", doc_type="docx", images=[img_ref],
+    )
+    page = write_source_fulltext(proj, source_path, parsed)
+    content = page.read_text(encoding="utf-8")
+    # 不应有 AUTO-GENERATED IMAGES 标记
+    assert "BEGIN AUTO-GENERATED IMAGES" not in content
+    assert "END AUTO-GENERATED IMAGES" not in content
+    # 应有 AUTO-GENERATED FULLTEXT 标记
+    assert "BEGIN AUTO-GENERATED FULLTEXT" in content
+
+
+def test_write_source_fulltext_cleans_legacy_images(tmp_path):
+    """write_source_fulltext 清理旧的 AUTO IMAGES 标记区 + LLM 管理区'## 文档内嵌图片'段落。"""
+    from update_wiki import write_source_fulltext
+    from models import ParsedDoc
+
+    proj = tmp_path
+    source_path = proj / "Raw" / "sources" / "test.docx"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"fake")
+
+    page_path = proj / "Wiki" / "sources" / "test.md"
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    old_content = (
+        "---\ntype: source-summary\ntitle: \"Test\"\n"
+        'sources: ["Raw/sources/test.docx"]\nupdated: 2026-06-29\n---\n\n'
+        "# Test\n\n## 文档信息\n\n## 核心内容摘要\n\n旧摘要。\n\n"
+        "## 文档内嵌图片\n\n![[test_img01.png]] ![[test_img02.png]]\n\n"
+        "<!-- BEGIN AUTO-GENERATED FULLTEXT -->\n## 全文内容\n\n旧全文。\n<!-- END AUTO-GENERATED FULLTEXT -->\n\n"
+        "<!-- BEGIN AUTO-GENERATED IMAGES -->\n## 文档内嵌图片\n\n![[test_img01.png]]\n<!-- END AUTO-GENERATED IMAGES -->\n"
+    )
+    page_path.write_text(old_content, encoding="utf-8")
+
+    parsed = ParsedDoc(
+        path=source_path, title="Test", text="新全文",
+        tables=[], sha256="abc", doc_type="docx", images=[],
+    )
+    page = write_source_fulltext(proj, source_path, parsed)
+    content = page.read_text(encoding="utf-8")
+    # "## 文档内嵌图片" 完全消失（旧的 LLM 区 + 旧的 AUTO 区都清理）
+    assert "## 文档内嵌图片" not in content
+    # AUTO-GENERATED IMAGES 标记被移除
+    assert "BEGIN AUTO-GENERATED IMAGES" not in content
+    assert "END AUTO-GENERATED IMAGES" not in content
+    # FULLTEXT 区保留且更新
+    assert "BEGIN AUTO-GENERATED FULLTEXT" in content
+    assert "新全文" in content

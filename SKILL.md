@@ -82,7 +82,9 @@ read_when:
 
 1. 扫描变更：`<venv_python> scripts/update_wiki.py <project_root>`
    - 输出 new / modified / deleted / unchanged 列表
-2. 对 new / modified 文档：Box 解析 → 生成/更新 `Wiki/*.md`
+2. 对 new / modified 文档：
+   - **source-summary 全文区**（`## 全文内容` + `## 文档内嵌图片`）：`update_wiki.py` 步骤 1 已自动落盘 `ParsedDoc.text` 到 `<!-- BEGIN AUTO-GENERATED -->` 标记区，**不经 LLM**，保证数据完整性
+   - **source-summary 的 frontmatter/摘要/related** + **entities/concepts/comparisons 衍生页**：Box 生成/更新。衍生页数值必须从 source-summary 全文区提取，不得凭摘要臆测
 3. 对 deleted 文档：Box 清理关联 `Wiki/*.md`，更新 `index.md`
 4. 重建索引：`<venv_python> scripts/build_index.py <project_root>`
 5. 重建图谱：`<venv_python> scripts/build_graph.py <project_root>`
@@ -301,18 +303,37 @@ Phase 4:   预算控制 (4K→1M tokens)
 
 默认路由（按扩展名）：
 
-| 扩展名 | 默认后端 | 说明 |
-|--------|----------|------|
-| `.pdf` | MinerU Cloud API | 打印格式需 layout analysis；>200 页自动拆分 |
-| `.doc` / `.ppt` / `.xls` / `.xlsx` / `.html` | MinerU Cloud API | 旧二进制或本地不支持的格式 |
-| `.docx` | python-docx | 结构化 XML，本地解析足够准确 |
-| `.pptx` | python-pptx | 结构化 XML，本地解析足够准确 |
-| 其他 | 不支持 | 抛 `UnsupportedFormat` |
+| 扩展名 | 默认后端 | 敏感时 | 说明 |
+|--------|----------|--------|------|
+| `.pdf` | MinerU Cloud API | MinerU Local | >200 页自动拆分；Local 原生支持 |
+| `.pptx` | MinerU Cloud API | MinerU Local | Cloud/Local 均完整支持（需 mineru ≥3.1.0） |
+| `.doc` / `.ppt` / `.xls` / `.xlsx` / `.html` | MinerU Cloud API | — | 旧二进制或本地不支持的格式 |
+| `.docx` | python-docx | — | 结构化 XML，本地解析足够准确 |
+| 其他 | 不支持 | — | 抛 `UnsupportedFormat` |
 
-敏感 PDF 处理：
-- 交互模式下，新增 PDF 会询问用户是否敏感；敏感则走 `MinerU Local`。
-- 非交互模式可设置环境变量 `MINERU_PDF_SENSITIVE=1` 强制所有 PDF 走本地。
-- 本地解析使用独立 MinerU venv：`<home>/.workbuddy/binaries/python/envs/mineru/Scripts/python.exe`。
+敏感文档处理（PDF / PPTX）：
+- 交互模式下，新增 PDF/PPTX 会询问用户是否敏感；敏感则走 `MinerU Local`。
+- 非交互模式可设置环境变量 `MINERU_PDF_SENSITIVE=1` 强制 PDF/PPTX 走本地。
+- 本地解析使用独立 MinerU venv：`<home>/.workbuddy/binaries/python/envs/mineru/Scripts/python.exe`（当前 mineru 3.4.2）。
+
+### MinerU Local（可选组件）
+本地 MinerU 是**可选**的，仅在解析「敏感文档」时需要：
+- **非敏感文档默认走 MinerU Cloud API**（需 `MINERU_API_TOKEN`），不依赖本地 MinerU。
+- 若标记敏感但本地 venv 缺失，`MineruLocalPdfParser` 会直接抛 `FileNotFoundError`，**不会静默回退到 Cloud**——避免敏感内容外发，符合安全边界。
+- **格式支持**（取决于 mineru 版本）：
+  - ≥3.1.0：PDF / 图片 / DOCX / PPTX / XLSX 全格式
+  - 3.0.x：PDF / 图片 / DOCX（PPTX/XLSX 未实现，`_process_office_doc` 仅打 warning 跳过）
+  - 当前 venv = 3.4.2，全格式支持，PPTX 敏感走 Local 可正常解析
+- 用户可完全不安装本地 MinerU，代价是丧失敏感文档的本地解析能力；非敏感文档（Cloud API）与 docx 等本地解析均不受影响。
+
+重建本地 MinerU venv（从锁定文件）：
+```bash
+# 使用 managed Python 3.13 创建隔离 venv
+"<home>/.workbuddy/binaries/python/versions/3.13.12/python.exe" -m venv "<home>/.workbuddy/binaries/python/envs/mineru"
+"<home>/.workbuddy/binaries/python/envs/mineru/Scripts/pip.exe" install -r "<home>/.workbuddy/skills/obsidian_wiki_skill/requirements-mineru.txt"
+# 本地模型配置见 <home>/mineru.json（model-source: local）
+```
+依赖版本锁定见 `requirements-mineru.txt`（由 `envs/mineru` venv `pip freeze` 导出，共 132 包，含 torch / transformers / opencv 等重型依赖，刻意与 skill 的 default venv 隔离）。
 
 配置方式（二选一）：
 

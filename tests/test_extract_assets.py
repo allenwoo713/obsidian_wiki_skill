@@ -39,17 +39,6 @@ def _make_fake_docx_module():
     return module
 
 
-def _make_fake_pptx_module():
-    module = types.ModuleType("parsers.pptx_parser")
-
-    class PptxParser:
-        def parse(self, path: Path) -> ParseResult:
-            return ParseResult(text="pptx parser", images=[], tables=[])
-
-    module.PptxParser = PptxParser
-    return module
-
-
 def _make_fake_cloud_module():
     module = types.ModuleType("parsers.mineru_cloud")
 
@@ -82,7 +71,6 @@ def _make_fake_local_module():
 def _patch_parsers(monkeypatch):
     """Replace all parser modules with fakes so tests don't need real dependencies."""
     monkeypatch.setitem(sys.modules, "parsers.docx_parser", _make_fake_docx_module())
-    monkeypatch.setitem(sys.modules, "parsers.pptx_parser", _make_fake_pptx_module())
     monkeypatch.setitem(sys.modules, "parsers.mineru_cloud", _make_fake_cloud_module())
     monkeypatch.setitem(sys.modules, "parsers.mineru_local", _make_fake_local_module())
 
@@ -97,14 +85,24 @@ def test_docx_uses_local_parser(tmp_path: Path):
     assert result.text == "docx parser"
 
 
-def test_pptx_uses_local_parser(tmp_path: Path):
+def test_pptx_non_sensitive_uses_cloud(tmp_path: Path):
     pptx_path = tmp_path / "test.pptx"
     pptx_path.write_bytes(b"fake pptx")
     assets_dir = tmp_path / "assets"
 
-    result = extract(pptx_path, assets_dir)
+    result = extract(pptx_path, assets_dir, is_sensitive=False)
     assert result.doc_type == "pptx"
-    assert result.text == "pptx parser"
+    assert result.text == "mineru_cloud"
+
+
+def test_pptx_sensitive_uses_local(tmp_path: Path):
+    pptx_path = tmp_path / "test.pptx"
+    pptx_path.write_bytes(b"fake pptx")
+    assets_dir = tmp_path / "assets"
+
+    result = extract(pptx_path, assets_dir, is_sensitive=True)
+    assert result.doc_type == "pptx"
+    assert result.text == "mineru_local"
 
 
 def test_pdf_default_uses_cloud(tmp_path: Path):

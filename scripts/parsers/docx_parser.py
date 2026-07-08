@@ -58,9 +58,12 @@ class DocxParser(DocumentParser):
             elif tag == "tbl":
                 table_md = self._parse_table(elem)
                 if table_md:
+                    text_parts.append("")
                     text_parts.append(table_md)
+                    text_parts.append("")
 
         text, images = self._attach_captions("\n".join(text_parts), images)
+        text = self._replace_image_placeholders(text)
         return ParseResult(text=text, images=images, tables=[], _image_bytes=image_bytes_list)
 
     def _read_rels(self, z: zipfile.ZipFile) -> dict:
@@ -83,13 +86,34 @@ class DocxParser(DocumentParser):
     def _parse_paragraph(self, p_elem):
         text_parts = []
         pic_elem = None
+        heading_level = self._get_heading_level(p_elem)
         for child in p_elem.iter():
             tag = self._local_tag(child.tag)
             if tag == "t":
                 text_parts.append(child.text or "")
             elif tag == "pic":
                 pic_elem = child
-        return "".join(text_parts), pic_elem
+        text = "".join(text_parts)
+        if heading_level and text.strip():
+            text = "#" * heading_level + " " + text
+        return text, pic_elem
+
+    def _get_heading_level(self, p_elem) -> int:
+        """从 w:pStyle 提取 heading 层级，非 heading 返回 0。"""
+        pPr = p_elem.find("w:pPr", _NS)
+        if pPr is None:
+            return 0
+        pStyle = pPr.find("w:pStyle", _NS)
+        if pStyle is None:
+            return 0
+        _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        val = pStyle.attrib.get(f"{{{_W}}}val", "")
+        m = re.match(r"[Hh]eading\s*(\d+)", val)
+        if m:
+            return int(m.group(1))
+        if val.isdigit():
+            return int(val)
+        return 0
 
     def _make_image_ref(self, pic_elem, rels, media_bytes, doc_slug, img_seq):
         blip = None
@@ -159,3 +183,20 @@ class DocxParser(DocumentParser):
             lines[line_no] = line.replace("图注: 待补", f"图注: {caption or '[无图注]'}")
             img_idx += 1
         return "\n".join(lines), images
+
+    def _replace_image_placeholders(self, text: str) -> str:
+        """把 {{IMG|assets/xxx.png|图注: caption}} 替换为 ![[xxx.png]] + caption 可读文本。
+
+        对齐 MinerU 输出格式：图片用 Obsidian ![[filename]] 嵌入，图注作为下一行纯文本。
+        """
+        def _repl(m):
+            rel_path = m.group(1)
+            caption = m.group(2)
+            filename = Path(rel_path).name
+            if caption and caption != "[无图注]":
+                return f"![[{filename}]]  \n{caption}"
+            return f"![[{filename}]]"
+        text = re.sub(r"\{\{IMG\|([^|]+)\|图注: ([^}]*)\}\}", _repl, text)
+        # 去重：占位符释放的 caption 与紧跟的原文档 caption 段落重复时删除后者
+        text = re.sub(r"(!\[\[[^\]]+\]\]  \n)([^\n]+)\n\2\n", r"\1\2\n", text)
+        return text

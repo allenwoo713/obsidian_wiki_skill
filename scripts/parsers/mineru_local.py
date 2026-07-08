@@ -34,6 +34,11 @@ class MineruLocalPdfParser(DocumentParser):
         else:
             self.mineru_python_exe = self._DEFAULT_MINERU_PYTHON
 
+    @staticmethod
+    def _result_subdir(ext: str) -> str:
+        """MinerU do_parse 输出子目录：PDF→auto，Office（docx/pptx/xlsx）→office。"""
+        return "office" if ext.lower() in (".docx", ".pptx", ".xlsx") else "auto"
+
     def parse(self, path: Path) -> ParseResult:
         pdf_path = Path(path)
         mineru_python_exe = Path(self.mineru_python_exe)
@@ -64,9 +69,10 @@ class MineruLocalPdfParser(DocumentParser):
                 )
 
             stem = pdf_path.stem
-            auto_dir = output_dir / stem / "auto"
-            md_path = auto_dir / f"{stem}.md"
-            images_dir = auto_dir / "images"
+            subdir = self._result_subdir(pdf_path.suffix)
+            result_dir = output_dir / stem / subdir
+            md_path = result_dir / f"{stem}.md"
+            images_dir = result_dir / "images"
 
             markdown = md_path.read_text(encoding="utf-8")
 

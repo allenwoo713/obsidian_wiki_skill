@@ -39,11 +39,9 @@ def extract(
     if ext == ".docx":
         from parsers.docx_parser import DocxParser
         parser = DocxParser()
-    elif ext == ".pptx":
-        from parsers.pptx_parser import PptxParser
-        parser = PptxParser()
     elif ext in (
         ".pdf",
+        ".pptx",
         ".doc",
         ".ppt",
         ".xls",
@@ -51,7 +49,7 @@ def extract(
         ".html",
         ".htm",
     ):
-        if ext == ".pdf" and (
+        if ext in (".pdf", ".pptx") and (
             is_sensitive is True
             or (is_sensitive is None and _is_truthy_env(os.environ.get("MINERU_PDF_SENSITIVE")))
         ):
