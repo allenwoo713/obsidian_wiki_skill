@@ -126,7 +126,8 @@ def test_parse_single_pdf_no_split(tmp_dir: Path):
     assert result.images[0].source_media_name == "abc123.jpg"
     assert len(result.tables) == 1
     assert result.tables[0] == [["A"]]
-    assert "{{IMG|" in result.text
+    assert "{{IMG|" not in result.text  # 占位符应替换为 Obsidian 嵌入
+    assert "![[source_img01.jpg]]" in result.text
     assert "<table>" in result.text  # HTML 表格保留在 text 中
 
 

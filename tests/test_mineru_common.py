@@ -12,7 +12,8 @@ def test_extract_image_refs_from_markdown():
     )
     assert len(result.images) == 2
     assert result.images[0].filename == "test-doc_img01.jpg"
-    assert "{{IMG|" in result.text
+    assert "{{IMG|" not in result.text  # 占位符应替换为 Obsidian 嵌入
+    assert "![[test-doc_img01.jpg]]" in result.text
     assert "images/abc123.jpg" not in result.text
 
 def test_image_sha256_from_bytes():

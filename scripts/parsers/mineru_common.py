@@ -11,7 +11,7 @@ from typing import Dict, List
 
 from models import ImageRef
 from parsers.base import ParseResult
-from parsers.utils import slugify, image_filename, attach_captions
+from parsers.utils import slugify, image_filename, attach_captions, replace_image_placeholders
 
 _MINERU_IMG_RE = re.compile(r"!\[[^\]]*\]\(images/([^/)]+\.\w+)\)")
 
@@ -52,6 +52,7 @@ def mineru_markdown_to_parse_result(
     # 不再用 [table N] 占位符替换，避免下游输出丢失表格内容。
     # tables 字段仍提取结构化数据供 FTS/RAG 索引器使用。
     text, images = attach_captions(text, images)
+    text = replace_image_placeholders(text)
 
     return ParseResult(
         text=text, images=images, tables=tables,

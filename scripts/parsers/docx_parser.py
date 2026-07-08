@@ -189,14 +189,8 @@ class DocxParser(DocumentParser):
 
         对齐 MinerU 输出格式：图片用 Obsidian ![[filename]] 嵌入，图注作为下一行纯文本。
         """
-        def _repl(m):
-            rel_path = m.group(1)
-            caption = m.group(2)
-            filename = Path(rel_path).name
-            if caption and caption != "[无图注]":
-                return f"![[{filename}]]  \n{caption}"
-            return f"![[{filename}]]"
-        text = re.sub(r"\{\{IMG\|([^|]+)\|图注: ([^}]*)\}\}", _repl, text)
+        from parsers.utils import replace_image_placeholders
+        text = replace_image_placeholders(text)
         # 去重：占位符释放的 caption 与紧跟的原文档 caption 段落重复时删除后者
         text = re.sub(r"(!\[\[[^\]]+\]\]  \n)([^\n]+)\n\2\n", r"\1\2\n", text)
         return text

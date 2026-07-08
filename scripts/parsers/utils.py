@@ -1,5 +1,6 @@
 """parsers 共享工具：slug、图片命名与图注绑定。"""
 import re
+from pathlib import Path
 from typing import List, Tuple
 
 from models import ImageRef
@@ -42,3 +43,19 @@ def attach_captions(text: str, images: List[ImageRef]) -> Tuple[str, List[ImageR
         lines[line_no] = line.replace("图注: 待补", f"图注: {caption or '[无图注]'}")
         img_idx += 1
     return "\n".join(lines), images
+
+
+def replace_image_placeholders(text: str) -> str:
+    """把 {{IMG|assets/xxx.png|图注: caption}} 替换为 ![[xxx.png]] + caption 可读文本。
+
+    对齐 Obsidian 嵌入格式：图片用 ![[filename]]，有 caption 时紧跟下一行。
+    caption 为空或 [无图注] 时不输出 caption 行。
+    """
+    def _repl(m):
+        rel_path = m.group(1)
+        caption = m.group(2)
+        filename = Path(rel_path).name
+        if caption and caption != "[无图注]":
+            return f"![[{filename}]]  \n{caption}"
+        return f"![[{filename}]]"
+    return re.sub(r"\{\{IMG\|([^|]+)\|图注: ([^}]*)\}\}", _repl, text)
