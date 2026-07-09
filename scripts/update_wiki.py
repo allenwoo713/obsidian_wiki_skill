@@ -47,7 +47,12 @@ SUPPORTED_EXT = {
 def scan_sources(raw_sources_dir: Path) -> List[Path]:
     docs = []
     for f in sorted(raw_sources_dir.rglob("*")):
-        if f.is_file() and f.suffix.lower() in SUPPORTED_EXT:
+        if not f.is_file():
+            continue
+        # 跳过 Office 临时锁文件（Word/Excel 打开文档时生成的 ~$ 前缀文件）
+        if f.name.startswith("~$") or f.name.startswith(".~"):
+            continue
+        if f.suffix.lower() in SUPPORTED_EXT:
             docs.append(f)
     return docs
 

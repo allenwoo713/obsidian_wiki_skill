@@ -4,6 +4,9 @@ pytest-cache-files-*/
 tmp_*/
 tmp/
 
+# 误建的重复前端库副本（与根 lib/ 内容相同，不入库）
+scripts/lib/
+
 # 虚拟环境 / 构建产物
 .venv/
 venv/
