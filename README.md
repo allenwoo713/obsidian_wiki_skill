@@ -1,6 +1,6 @@
 # Obsidian Wiki Skill
 
-> 把一堆散乱的产品文档（datasheet / 安装规范 / 校准规范 / 工具手册 / 接口文档）变成可被 AI agent **混合检索**的知识库：Obsidian vault（双链 + frontmatter）作存储与人工浏览后端，BM25 + 向量 + 图谱三路融合作检索后端，答案强制标注出处。
+> 把一堆散乱的文档变成可被 AI agent **混合检索**的知识库：Obsidian vault（双链 + frontmatter）作存储与人工浏览后端，BM25 + 向量 + 图谱三路融合作检索后端，答案强制标注出处。
 
 专为 WorkBuddy agent（Box）设计——`query.py` 是 agent 检索知识库的唯一入口，返回带出处的结构化结果。
 
