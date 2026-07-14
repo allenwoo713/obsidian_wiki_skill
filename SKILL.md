@@ -24,11 +24,33 @@ read_when:
 ## 前置条件
 
 - Python venv: `<home>\.workbuddy\binaries\python\envs\default`
+- **venv Python 可执行文件（Windows 唯一正确路径）**：`<home>\.workbuddy\binaries\python\envs\default\Scripts\python.exe`
+  - ⚠️ **Windows 下 venv 用 `Scripts\python.exe`，不是 Linux 布局的 `bin/python`**。后者在此环境不存在，直跑会报 `No such file or directory`（exit 127）。所有 `scripts/*.py` 调用都必须用 `Scripts\python.exe`。
+  - 在 skill 正文与示例中统一用占位符 `<venv_python>` 表示上述完整路径；**展开时一律替换为 `.../envs/default/Scripts/python.exe`**，不要写成 `.../envs/default/bin/python`。
 - ⚠️ 所有 Python 运行必须设 `PYTHONDONTWRITEBYTECODE=1`
 - ⚠️ pytest 运行加 `-p no:cacheprovider`
 - ⚠️ git commit 在 junction 路径需 `dangerouslyDisableSandbox: true`
 - embedding 模型: `paraphrase-multilingual-MiniLM-L12-v2`（已从 modelscope 预下载到 venv/models/）
 - Skill 路径: `~/.workbuddy/skills/obsidian_wiki_skill/`
+
+## 标准调用模板（copy-paste，避免路径试错）
+
+所有 `scripts/*.py` 调用都用以下模板。关键三点已固化：**venv python 用 `Scripts/python.exe`、设 `PYTHONDONTWRITEBYTECODE=1`、query 大输出走 `--out` 落盘**。
+
+```bash
+# ① 自定义变量（一次性）
+VENV_PY="<home>/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
+SKILL_DIR="<home>/.workbuddy/skills/obsidian_wiki_skill"
+PROJ="<project_root>"
+
+# ② snippet 检索（小输出可直走管道）
+PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增强查询>" --k 6 --json
+
+# ③ 全文检索（>~20KB 必须 --out 落盘，禁直走 stdout 管道）
+PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增强查询>" --k 5 --read-full --json --out "$PROJ/tmp/rf_out.json"
+```
+
+> ⚠️ 常见踩坑（已发生并修正）：首次调用若写成 `.../envs/default/bin/python`（Linux 布局）会 `No such file or directory`(exit 127)。本环境 Windows venv 只有 `Scripts/python.exe`。见上方「前置条件」警告。
 
 ## 目录约定
 
