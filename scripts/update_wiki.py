@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -12,6 +13,16 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 
 from parse_sources import compute_sha256, parse_file
+
+
+def norm_key(p) -> str:
+    """归一化 manifest 键（Windows 路径大小写/分隔符不敏感）。
+
+    根因修复：不同运行传入的项目根盘符大小写不一（D:\\ vs d:\\），
+    导致 str(Path) 键逐字不匹配，误判全部源文档为 new、旧条目为 deleted，
+    触发整库重解析。统一经 normcase+normpath 归一，消解大小写/分隔符差异。
+    """
+    return os.path.normcase(os.path.normpath(str(p)))
 
 
 class SourceState(Enum):
@@ -59,10 +70,10 @@ def scan_sources(raw_sources_dir: Path) -> List[Path]:
 
 def diff_manifest(current_docs: List[Path], manifest: dict) -> Dict[str, List[SourceDiff]]:
     entries: Dict[str, dict] = manifest.get("entries", {})
-    current_paths = {str(d) for d in current_docs}
+    current_paths = {norm_key(d) for d in current_docs}
     new, modified, unchanged, deleted = [], [], [], []
     for d in current_docs:
-        key = str(d)
+        key = norm_key(d)
         sha = compute_sha256(d)
         entry = entries.get(key)
         if entry is None:
@@ -81,15 +92,15 @@ def update_manifest(diff: Dict[str, List[SourceDiff]], manifest: dict, wiki_page
     now = datetime.now().isoformat()
     entries = manifest.setdefault("entries", {})
     for d in diff["new"] + diff["modified"] + diff["unchanged"]:
-        entries[str(d.path)] = {
+        entries[norm_key(d.path)] = {
             "sha256": d.sha256,
             "status": "processed",
-            "wiki_pages": wiki_pages_map.get(str(d.path), []),
+            "wiki_pages": wiki_pages_map.get(norm_key(d.path), []),
             "last_processed": now,
         }
     for d in diff["deleted"]:
-        if str(d.path) in entries:
-            entries[str(d.path)]["status"] = "deleted"
+        if norm_key(d.path) in entries:
+            entries[norm_key(d.path)]["status"] = "deleted"
 
 
 def build_wiki_pages_map(proj: Path) -> Dict[str, List[str]]:
@@ -115,7 +126,7 @@ def build_wiki_pages_map(proj: Path) -> Dict[str, List[str]]:
         if isinstance(sources, str):
             sources = [sources]
         for s in sources:
-            key = str(Path(proj / s))
+            key = norm_key(Path(proj / s))
             mapping.setdefault(key, []).append(str(md))
     return mapping
 
@@ -141,6 +152,16 @@ def main():
     manifest = {"entries": {}}
     if manifest_file.exists():
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        # 加载时按 norm_key 合并历史遗留的大小写重复键（如 D:\ 与 d:\ 指向同一文件），
+        # 保留 processed 状态条目，避免 13 条 phantom deleted 残留
+        _raw = manifest.get("entries", {})
+        _collapsed: Dict[str, dict] = {}
+        for _k, _v in _raw.items():
+            _nk = norm_key(_k)
+            _cur = _collapsed.get(_nk)
+            if _cur is None or (_v.get("status") == "processed" and _cur.get("status") != "processed"):
+                _collapsed[_nk] = _v
+        manifest["entries"] = _collapsed
     docs = scan_sources(raw_sources)
     diff = diff_manifest(docs, manifest)
     print(f"扫描完成: {len(docs)} 源文档")
@@ -230,7 +251,7 @@ def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_ima
             prev = old_index.get(_norm(ref.filename))
             image_manifest.append({
                 "filename": ref.filename, "rel_path": ref.rel_path,
-                "sha256": ref.sha256, "source_doc": str(p),
+                "sha256": ref.sha256, "source_doc": norm_key(p),
                 "source_media": ref.source_media_name,
                 "page_or_section": ref.page_or_section,
                 "figure_caption": ref.caption or (prev.get("figure_caption", "") if prev else ""),
@@ -245,7 +266,7 @@ def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_ima
     deduped = []
     for e in image_manifest:
         fn = e.get("filename") or Path(e.get("rel_path", "")).name
-        key = (e.get("source_doc", ""), _norm(fn))
+        key = (norm_key(e.get("source_doc", "")), _norm(fn))
         if key in seen:
             idx = seen[key]
             # 优先保留有 caption 的；若都有 caption，优先新条目（与重生成页面文件一致）
@@ -280,7 +301,9 @@ def _replace_auto_block(content: str, begin: str, end: str, new_block: str) -> s
     """替换 begin...end 标记之间的内容为 new_block（含标记本身）。标记不存在则追加到末尾。"""
     pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
     if pattern.search(content):
-        return pattern.sub(new_block, content)
+        # new_block 含文档原文，可能含反斜杠（如 C:\ 路径），若作为替换模板会被
+        # re 解析转义而抛 `bad escape`。用 lambda 返回值作为字面量，跳过模板解析。
+        return pattern.sub(lambda m: new_block, content)
     return content.rstrip() + "\n\n" + new_block + "\n"
 
 

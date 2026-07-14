@@ -162,7 +162,7 @@ def format_for_agent(results: SearchResults, read_full: bool = False) -> str:
 
 def main():
     if len(sys.argv) < 3:
-        print("用法: python query.py <project_root> <query> [--k 5] [--max-tokens 4096] [--json] [--read-full]")
+        print("用法: python query.py <project_root> <query> [--k 5] [--max-tokens 4096] [--json] [--read-full] [--out <path>]")
         sys.exit(1)
     proj = Path(sys.argv[1])
     query = sys.argv[2]
@@ -170,6 +170,7 @@ def main():
     max_tokens = 4096
     as_json = False
     read_full = False
+    out_path = None
     for i, arg in enumerate(sys.argv[3:], 3):
         if arg == "--k":
             k = int(sys.argv[i + 1])
@@ -179,23 +180,30 @@ def main():
             as_json = True
         elif arg == "--read-full":
             read_full = True
+        elif arg == "--out":
+            out_path = sys.argv[i + 1]
     from build_index import WikiIndex
     wi = WikiIndex(proj / ".index")
     wi.load()
     results = hybrid_search(wi, query, k=k, max_tokens=max_tokens, wiki_dir=proj / "Wiki", read_full=read_full)
-    if as_json:
-        print(json.dumps({
-            "text": [{"path": str(r.path), "title": r.title, "score": r.score,
-                      "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method}
-                     for r in results.text],
-            "images": [{"path": str(r.path), "title": r.title, "score": r.score,
-                        "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
-                        "embed": f"![[{r.path.name}]]"}
-                       for r in results.images],
-            "read_full": read_full,
-        }, ensure_ascii=False, indent=2))
+    payload = json.dumps({
+        "text": [{"path": str(r.path), "title": r.title, "score": r.score,
+                  "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method}
+                 for r in results.text],
+        "images": [{"path": str(r.path), "title": r.title, "score": r.score,
+                    "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
+                    "embed": f"![[{r.path.name}]]"}
+                   for r in results.images],
+        "read_full": read_full,
+    }, ensure_ascii=False, indent=2) if as_json else format_for_agent(results, read_full=read_full)
+    if out_path:
+        op = Path(out_path)
+        op.parent.mkdir(parents=True, exist_ok=True)
+        op.write_text(payload, encoding="utf-8")
+        # 仅向 stdout 输出一行小确认（管道安全）；大 payload 落盘，绕开沙箱 stdout 拦截段错误
+        print(f"wrote {op} ({len(payload)} bytes)")
     else:
-        print(format_for_agent(results, read_full=read_full))
+        print(payload)
 
 
 if __name__ == "__main__":

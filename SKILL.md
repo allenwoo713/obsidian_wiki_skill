@@ -127,6 +127,12 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> scripts/query.py <project_root> "<增强
 
 默认返回 snippet 模式（每结果 200 字片段）。
 
+> ⚠️ **`--read-full` 必须用 `--out` 落盘，禁止直走 stdout 管道**：沙箱对 managed-python 的 stdout 拦截层在大输出（≈20KB+）时存在非确定性 access-violation（exit -1073741819）。正确写法：
+> ```bash
+> PYTHONDONTWRITEBYTECODE=1 <venv_python> scripts/query.py <project_root> "<增强查询>" --k 5 --read-full --json --out <project_root>/tmp/rf_out.json
+> ```
+> stdout 仅返回一行 `wrote <path> (N bytes)`（管道安全）；Box 用 Read 工具读 `tmp/rf_out.json` 取大 payload。无 `--out` 时行为不变（小输出可直走管道）。详见"已知环境约束"。
+
 **何时加 `--read-full`（Box 判断规则）：**
 
 | 场景 | 用 --read-full | 理由 |
@@ -234,8 +240,9 @@ for e in g['edges']:
 
 3. **执行检索：**
    ```bash
-   PYTHONDONTWRITEBYTECODE=1 <venv_python> scripts/query.py <project_root> "Acme 前雷达 Front Radar 探测距离 range FOV" --k 3 --read-full --json
+   PYTHONDONTWRITEBYTECODE=1 <venv_python> scripts/query.py <project_root> "Acme 前雷达 Front Radar 探测距离 range FOV" --k 3 --read-full --json --out <project_root>/tmp/rf_out.json
    ```
+   （stdout 仅 `wrote ... (N bytes)`；Box 随后 Read `tmp/rf_out.json`）
 
 4. **解读结果：** top1 = Acme Front Radar（score=0.03x, fused），读全文找到规格表
 
@@ -294,6 +301,7 @@ Phase 4:   预算控制 (4K→1M tokens)
 ## 已知环境约束
 
 - Windows + WorkBuddy 沙箱：.pyc / .pytest_cache / junction 路径需特殊处理
+- **stdout 大输出段错误（2026-07-14 定位）**：沙箱对 managed-python 的 stdout 拦截层在进程经捕获管道写出较大数据（query.py `--read-full` JSON ≈29KB+、trivial 写 50KB 均复现）时，非确定性触发 access-violation（exit -1073741819 / 0xC0000005）。**非尺寸阈值**（64KB 成功而 50KB 崩溃），是拦截层时序竞态；纯 Python 脚本（仅 json/pathlib）也复现 → 非 torch/LanceDB 原生库问题。**规避**：`--read-full` 及任何 >~20KB stdout 一律 `> tmp/out.json 2> tmp/err.log` 重定向到文件再 Read；小输出可直走管道；禁用 `| head` 等管道。
 - embedding 模型从 modelscope.cn 下载（HF 镜像对权重文件分发有问题）
 - LanceDB 在系统 Temp 目录被沙箱拦截，conftest.py 将 pytest basetemp 改到项目内
 - Obsidian vault 根目录 = `Wiki/`，不可设为 project_root（否则 Raw/sources/ 中 `.md` 文件混入图谱）
