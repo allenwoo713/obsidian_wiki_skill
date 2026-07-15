@@ -399,7 +399,8 @@ Phase 4:   预算控制 (4K→1M tokens)
    ```bash
    python picture_caption.py <project_root> list --limit N > captions.json
    ```
-   输出 JSON，每项含 `filename`/`rel_path`/`figure_caption`/`source_doc`/空 `vlm_caption`。
+   stdout 输出 pending JSON（每项含 `filename`/`rel_path`/`figure_caption`/`source_doc`/空 `vlm_caption`）；
+   **stderr 输出 total/done/pending 统计 + 按 source_doc 分组**。务必先读统计，勿把 pending 切片当成全集汇报。
 
 2. **Box 逐张 Read 图片**：`Read Wiki/assets/<filename>`，结合 `figure_caption` 生成结构化描述。
 
@@ -411,6 +412,8 @@ Phase 4:   预算控制 (4K→1M tokens)
      category: "图片类型分类，如 '天线规格/方位角覆盖图'"
    caption_text: "{figure_caption}。{description} 关键数值: {key_values}。所属: {category}。"
    ```
+   
+   > **关键约束**：`caption_text` 是 `build_index._load_image_caption_pages` **唯一读取的检索字段**；`vlm_caption` 仅作 metadata 存储、检索不读。caption_text 为空的图**不会进 BM25/LanceDB**。apply 已加自愈（caption_text 空时回退 vlm_caption.description），build_index 也有兜底，但仍应按上方模板显式填好 caption_text。
    
    Box generate caption prompt（内部用）：
    > 你是雷达产品知识库的图片标注员。请阅读图片（源文档: {source_doc}，原图题: "{figure_caption}"）。

@@ -30,10 +30,16 @@ def save_manifest(project_root: Path, manifest: Dict):
 
 
 def list_pending(project_root: Path, limit: int = None) -> List[Dict]:
-    """列出所有 caption_text 为空的图片，输出简略 JSON 供 Box 填充。"""
+    """列出所有 caption_text 为空的图片，输出简略 JSON 供 Box 填充。
+
+    stdout 输出 pending JSON 数组（供 apply 消费）；stderr 输出 total/done/pending
+    统计 + 按 source_doc 分组，防止调用方把 pending 切片误当成全集。
+    """
     manifest = load_manifest(project_root)
+    all_imgs = manifest.get("images", [])
     pending = []
-    for img in manifest.get("images", []):
+    per_doc: Dict[str, int] = {}
+    for img in all_imgs:
         if not img.get("caption_text", "").strip():
             pending.append({
                 "filename": img["filename"],
@@ -48,6 +54,19 @@ def list_pending(project_root: Path, limit: int = None) -> List[Dict]:
                 },
                 "caption_text": "",
             })
+            doc = img.get("source_doc", "(unknown)")
+            # 取文件名部分，避免绝对路径刷屏
+            short = doc.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] or doc
+            per_doc[short] = per_doc.get(short, 0) + 1
+
+    total = len(all_imgs)
+    done = total - len(pending)
+    # 统计走 stderr，不污染 stdout 的 JSON
+    print(f"[caption 统计] 总图: {total}, 已标注: {done}, 待标注: {len(pending)}", file=sys.stderr)
+    if per_doc:
+        print("[caption 待标注按文档]:", file=sys.stderr)
+        for doc, n in sorted(per_doc.items(), key=lambda x: -x[1]):
+            print(f"    {n:>3}  {doc}", file=sys.stderr)
 
     if limit:
         pending = pending[:limit]
@@ -65,11 +84,25 @@ def apply_captions(project_root: Path, captions_file: Path):
     by_filename = {c["filename"]: c for c in captions}
 
     updated = 0
+    healed = 0
     for img in manifest.get("images", []):
         cap = by_filename.get(img["filename"])
         if cap:
             img["vlm_caption"] = cap.get("vlm_caption", {})
-            img["caption_text"] = cap.get("caption_text", "")
+            # caption_text 是 build_index 唯一读取的检索字段；为空时自动从
+            # vlm_caption.description 回填，避免"填了 VLM 却没进检索"静默发生。
+            ct = (cap.get("caption_text") or "").strip()
+            if not ct:
+                vlm = cap.get("vlm_caption") or {}
+                desc = (vlm.get("description") or "").strip()
+                if desc:
+                    parts = [desc]
+                    kvs = vlm.get("key_values") or []
+                    if kvs:
+                        parts.append("关键词: " + ", ".join(str(k) for k in kvs))
+                    ct = "\n".join(parts)
+                    healed += 1
+            img["caption_text"] = ct
             updated += 1
 
     save_manifest(project_root, manifest)
@@ -77,7 +110,7 @@ def apply_captions(project_root: Path, captions_file: Path):
     # 统计
     total = len(manifest.get("images", []))
     done = sum(1 for i in manifest["images"] if i.get("caption_text", "").strip())
-    print(f"更新 {updated} 条。总计: {total}, 已标注: {done}, 待标注: {total - done}")
+    print(f"更新 {updated} 条（其中 caption_text 自愈回填 {healed} 条）。总计: {total}, 已标注: {done}, 待标注: {total - done}")
 
 
 def main():

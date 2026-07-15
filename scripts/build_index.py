@@ -128,8 +128,13 @@ class WikiIndex:
         wiki_dir = idx_dir.parent / "Wiki"
         pages = []
         for img in manifest.get("images", []):
-            caption = img.get("caption_text", "")
-            if not caption.strip():
+            # caption_text 是主检索字段；为空时兜底读 vlm_caption.description，
+            # 确保已生成 VLM 描述的图不会因 caption_text 漏填而缺席检索（defense-in-depth）。
+            caption = (img.get("caption_text") or "").strip()
+            if not caption:
+                vlm = img.get("vlm_caption") or {}
+                caption = (vlm.get("description") or "").strip()
+            if not caption:
                 continue
             img_path = wiki_dir / img["rel_path"]
             pages.append(WikiPage(
