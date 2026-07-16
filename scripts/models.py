@@ -42,13 +42,21 @@ class WikiPage:
 
 @dataclass
 class RetrievedPage:
-    """检索结果。"""
+    """检索结果。
+
+    ISSUE-15：score 与 distance 分离。
+    - score: 0~1 展示相似度（转换后），便于人类理解与跨 metric 比较。
+    - distance: LanceDB 返回的原始距离（仅 vector 检索有值），便于调试。
+    - vector_metric: 本次向量检索使用的 metric（仅 vector/fused 有值）。
+    """
     path: Path
     title: str
     score: float
     snippet: str
     sources: List[str]
     retrieval_method: str  # 'bm25' | 'vector' | 'graph' | 'fused'
+    distance: Optional[float] = None       # 原始距离（仅 vector 检索）
+    vector_metric: Optional[str] = None     # 向量 metric 名称（仅 vector/fused）
 
 
 @dataclass

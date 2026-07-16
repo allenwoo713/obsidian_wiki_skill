@@ -252,9 +252,11 @@ def main():
                              wiki_dir=proj / "Wiki", read_full=args.read_full)
     payload = json.dumps({
         "text": [{"path": str(r.path), "title": r.title, "score": r.score,
+                  "distance": r.distance, "vector_metric": r.vector_metric,
                   "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method}
                  for r in results.text],
         "images": [{"path": str(r.path), "title": r.title, "score": r.score,
+                    "distance": r.distance, "vector_metric": r.vector_metric,
                     "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
                     "embed": f"![[{r.path.name}]]"}
                    for r in results.images],

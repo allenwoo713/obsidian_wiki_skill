@@ -18,6 +18,13 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 from models import WikiPage, RetrievedPage, ManifestEntry
 
 
+# ISSUE-15：向量检索 metric contract —— 固定配置，索引侧与查询侧一致
+# 默认 cosine：不受向量模长影响，语义稳定，0~1 score 含义明确
+VECTOR_METRIC = "cosine"
+# embedding 不做 L2 归一化（保持 MiniLM 原始输出，cosine metric 已处理模长）
+NORMALIZE_EMBEDDINGS = False
+
+
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
@@ -115,7 +122,11 @@ class WikiIndex:
 
     def _embedding_dim(self) -> int:
         """ISSUE-10：从当前 embedder 动态获取向量维度，避免硬编码。"""
-        return self._get_embedder().get_sentence_embedding_dimension()
+        emb = self._get_embedder()
+        # sentence-transformers 新版重命名为 get_embedding_dimension，旧版用 get_sentence_embedding_dimension
+        if hasattr(emb, "get_embedding_dimension"):
+            return emb.get_embedding_dimension()
+        return emb.get_sentence_embedding_dimension()
 
     def build(self, wiki_dir: Path):
         self.pages = scan_wiki(wiki_dir, wiki_dir.parent)
@@ -197,7 +208,11 @@ class WikiIndex:
     def _build_vector(self):
         embedder = self._get_embedder()
         texts = [p.title + "\n" + p.content for p in self.pages]
-        vectors = embedder.encode(texts, show_progress_bar=False).tolist()
+        # ISSUE-15：索引侧与查询侧必须用相同 normalize_embeddings 配置
+        vectors = embedder.encode(
+            texts, show_progress_bar=False,
+            normalize_embeddings=NORMALIZE_EMBEDDINGS,
+        ).tolist()
         # ISSUE-10：建表时传入动态维度（而非硬编码 384），换模型时 schema 正确
         table = self._get_lance(dim=self._embedding_dim())
         try:
@@ -235,6 +250,13 @@ class WikiIndex:
                 )
         existing["built_at"] = datetime.now().isoformat()
         existing["page_count"] = len(self.pages)
+        # ISSUE-15：持久化向量 metric 配置，load 时校验
+        existing["vector_config"] = {
+            "metric": VECTOR_METRIC,
+            "normalize_embeddings": NORMALIZE_EMBEDDINGS,
+            "score_mapping": "cosine_linear_v1",
+            "schema_version": 1,
+        }
         existing["pages"] = [
             {
                 "path": str(p.path),
@@ -260,6 +282,22 @@ class WikiIndex:
         manifest_file = self.index_dir / "manifest.json"
         if manifest_file.exists():
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            # ISSUE-15：检测 legacy 索引（无 vector_config），避免 metric 语义不确定
+            vc = manifest.get("vector_config")
+            if vc is None:
+                raise RuntimeError(
+                    "Legacy vector index detected (no vector_config in manifest). "
+                    "Old index was built with LanceDB default L2 metric, which has "
+                    "ambiguous score semantics. Rebuild the index: "
+                    "python build_index.py <project_root>"
+                )
+            manifest_metric = vc.get("metric")
+            if manifest_metric != VECTOR_METRIC:
+                raise RuntimeError(
+                    f"Vector metric mismatch: manifest has '{manifest_metric}', "
+                    f"current code expects '{VECTOR_METRIC}'. "
+                    "Rebuild the vector index before querying."
+                )
             page_map = {p["path"]: p for p in manifest.get("pages", [])}
             self.pages = []
             for path in self._page_paths:
@@ -309,14 +347,31 @@ class WikiIndex:
         return results
 
     def search_vector(self, query: str, k: int = 20) -> List[RetrievedPage]:
+        """ISSUE-15：显式指定 cosine metric，用 normalize_vector_score 替换旧 1/(1+d)。"""
         embedder = self._get_embedder()
-        qv = embedder.encode([query], show_progress_bar=False)[0].tolist()
+        qv = embedder.encode(
+            [query], show_progress_bar=False,
+            normalize_embeddings=NORMALIZE_EMBEDDINGS,
+        )[0].tolist()
         table = self._get_lance()
-        rows = table.search(qv).limit(k).to_list()
+        from vector_scoring import apply_vector_metric, normalize_vector_score
+        query_builder = apply_vector_metric(table.search(qv), VECTOR_METRIC)
+        rows = query_builder.limit(k).to_list()
         results = []
         for r in rows:
+            # _distance 必须存在，缺失则报错（不伪造默认值）
+            if "_distance" not in r:
+                raise RuntimeError(
+                    f"LanceDB result missing '_distance' field: {r}"
+                )
+            distance = float(r["_distance"])
+            score = normalize_vector_score(
+                distance, VECTOR_METRIC,
+                vectors_are_unit_normalized=NORMALIZE_EMBEDDINGS,
+            )
             results.append(RetrievedPage(
-                path=Path(r["path"]), title=r["title"], score=1.0 / (1.0 + float(r.get("_distance", 1.0))),
+                path=Path(r["path"]), title=r["title"], score=score,
+                distance=distance, vector_metric=VECTOR_METRIC,
                 snippet=r["content"][:200], sources=json.loads(r.get("sources", "[]")),
                 retrieval_method="vector",
             ))
