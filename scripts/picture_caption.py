@@ -116,26 +116,28 @@ def apply_captions(project_root: Path, captions_file: Path):
 
 
 def main():
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
+    # ISSUE-06：argparse 子命令替代手写 argv
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="picture_caption.py",
+        description="图片 caption 管理：列出待标注 / 写入 caption 到 manifest",
+    )
+    p.add_argument("project_root", help="知识库项目根目录")
+    sub = p.add_subparsers(dest="cmd", required=True)
 
-    proj = Path(sys.argv[1])
-    cmd = sys.argv[2]
+    p_list = sub.add_parser("list", help="输出待标注图片 JSON 清单")
+    p_list.add_argument("--limit", type=int, default=None, help="最多列出 N 张")
 
-    if cmd == "list":
-        limit = None
-        for i, arg in enumerate(sys.argv):
-            if arg == "--limit" and i + 1 < len(sys.argv):
-                limit = int(sys.argv[i + 1])
-        list_pending(proj, limit=limit)
+    p_apply = sub.add_parser("apply", help="将 captions JSON 写回 manifest")
+    p_apply.add_argument("captions_json", help="captions JSON 文件路径")
 
-    elif cmd == "apply":
-        if len(sys.argv) < 4:
-            print("用法: python picture_caption.py <project_root> apply <captions.json>")
-            sys.exit(1)
-        captions_path = Path(sys.argv[3])
-        apply_captions(proj, captions_path)
+    args = p.parse_args()
+    proj = Path(args.project_root)
+
+    if args.cmd == "list":
+        list_pending(proj, limit=args.limit)
+    elif args.cmd == "apply":
+        apply_captions(proj, Path(args.captions_json))
 
 
 if __name__ == "__main__":

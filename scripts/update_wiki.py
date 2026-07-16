@@ -135,11 +135,17 @@ def build_wiki_pages_map(proj: Path) -> Dict[str, List[str]]:
 
 def main():
     # .env 已由顶部 `import _config` 统一加载（ISSUE-01）
-    if len(sys.argv) < 2:
-        print("用法: python update_wiki.py <project_root> [--apply]")
-        sys.exit(1)
-    proj = Path(sys.argv[1])
-    apply = "--apply" in sys.argv
+    # ISSUE-06：argparse 替代手写 argv
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="update_wiki.py",
+        description="增量更新调度：扫描 Raw/sources → diff manifest → 输出 new/modified/deleted 列表",
+    )
+    p.add_argument("project_root", help="知识库项目根目录（含 Raw/sources/ 与 .index/）")
+    p.add_argument("--apply", action="store_true", help="执行全文落盘与 manifest 更新（默认仅 dry-run）")
+    args = p.parse_args()
+    proj = Path(args.project_root)
+    apply = args.apply
     raw_sources = proj / "Raw" / "sources"
     idx_dir = proj / ".index"
     idx_dir.mkdir(exist_ok=True)

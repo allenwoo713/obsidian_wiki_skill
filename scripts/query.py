@@ -2,7 +2,9 @@
 用法：python query.py <project_root> "<query>" [--k 5] [--max-tokens 4096] [--json] [--read-full]
 """
 from __future__ import annotations
+import argparse
 import json
+import logging
 import re
 import sys
 from dataclasses import dataclass
@@ -12,6 +14,9 @@ from typing import List, Tuple
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在 build_index 的向量检索触发前执行
 
 from models import RetrievedPage
+
+# ISSUE-07：异常不再静默吞没，至少 warning 到 stderr（不污染 stdout 管道）
+logger = logging.getLogger(__name__)
 
 
 _FM_RE = re.compile(r"^---\n.*?\n---\n(.*)$", re.DOTALL)
@@ -104,16 +109,22 @@ def graph_expand(wi, top_paths: List[Path], wiki_dir: Path, k: int = 10) -> List
 
 
 def read_full_content(path: Path, max_chars: int = 8000) -> str:
-    """读取 wiki 页面完整内容（去 frontmatter），截断到 max_chars。"""
+    """读取 wiki 页面完整内容（去 frontmatter），截断到 max_chars。
+
+    ISSUE-07：异常不再静默吞没。读文件失败时 warning 到 stderr 并返回空串，
+    让上层（hybrid_search）按"无内容可读"处理，而非把异常当作"文件无内容"。
+    两者语义不同：前者是 I/O 故障，后者是合法空页。
+    """
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
-        m = _FM_RE.match(raw)
-        content = m.group(1).strip() if m else raw
-        if len(content) > max_chars:
-            content = content[:max_chars] + "\n...[截断，完整内容见原文件]"
-        return content
-    except Exception:
+    except OSError as e:
+        logger.warning("read_full_content: 读取失败 %s: %s", path, e)
         return ""
+    m = _FM_RE.match(raw)
+    content = m.group(1).strip() if m else raw
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n...[截断，完整内容见原文件]"
+    return content
 
 
 def hybrid_search(wi, query: str, k: int = 5, max_tokens: int = 4096,
@@ -162,32 +173,34 @@ def format_for_agent(results: SearchResults, read_full: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """ISSUE-06：用 argparse 替代手写 sys.argv 循环，自动生成 --help、参数校验、
+    避免 --k/--max-tokens/--out 后无值时 IndexError。"""
+    p = argparse.ArgumentParser(
+        prog="query.py",
+        description="Hybrid FTS+RAG 检索：BM25 + 向量 + 图谱 → RRF 融合 → 预算控制",
+    )
+    p.add_argument("project_root", help="知识库项目根目录（含 Wiki/ 与 .index/）")
+    p.add_argument("query", help="检索查询串（建议先做关键词提取与中英互译扩展）")
+    p.add_argument("--k", type=int, default=5, help="返回 top-K 结果（默认 5）")
+    p.add_argument("--max-tokens", type=int, default=4096, help="预算控制上限（默认 4096 tokens）")
+    p.add_argument("--json", dest="as_json", action="store_true", help="输出 JSON 格式（默认输出 markdown）")
+    p.add_argument("--read-full", action="store_true", help="读取命中页面全文（适合问具体数值/流程/对比）")
+    p.add_argument("--out", dest="out_path", default=None, help="输出落盘路径（大输出必须用，绕开沙箱 stdout 拦截段错误）")
+    return p
+
+
 def main():
-    if len(sys.argv) < 3:
-        print("用法: python query.py <project_root> <query> [--k 5] [--max-tokens 4096] [--json] [--read-full] [--out <path>]")
-        sys.exit(1)
-    proj = Path(sys.argv[1])
-    query = sys.argv[2]
-    k = 5
-    max_tokens = 4096
-    as_json = False
-    read_full = False
-    out_path = None
-    for i, arg in enumerate(sys.argv[3:], 3):
-        if arg == "--k":
-            k = int(sys.argv[i + 1])
-        elif arg == "--max-tokens":
-            max_tokens = int(sys.argv[i + 1])
-        elif arg == "--json":
-            as_json = True
-        elif arg == "--read-full":
-            read_full = True
-        elif arg == "--out":
-            out_path = sys.argv[i + 1]
+    # ISSUE-07：stderr 日志（不污染 stdout 管道），WARNING 级别即打印
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="[%(levelname)s] %(name)s: %(message)s")
+
+    args = _build_arg_parser().parse_args()
+    proj = Path(args.project_root)
     from build_index import WikiIndex
     wi = WikiIndex(proj / ".index")
     wi.load()
-    results = hybrid_search(wi, query, k=k, max_tokens=max_tokens, wiki_dir=proj / "Wiki", read_full=read_full)
+    results = hybrid_search(wi, args.query, k=args.k, max_tokens=args.max_tokens,
+                             wiki_dir=proj / "Wiki", read_full=args.read_full)
     payload = json.dumps({
         "text": [{"path": str(r.path), "title": r.title, "score": r.score,
                   "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method}
@@ -196,10 +209,10 @@ def main():
                     "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
                     "embed": f"![[{r.path.name}]]"}
                    for r in results.images],
-        "read_full": read_full,
-    }, ensure_ascii=False, indent=2) if as_json else format_for_agent(results, read_full=read_full)
-    if out_path:
-        op = Path(out_path)
+        "read_full": args.read_full,
+    }, ensure_ascii=False, indent=2) if args.as_json else format_for_agent(results, read_full=args.read_full)
+    if args.out_path:
+        op = Path(args.out_path)
         op.parent.mkdir(parents=True, exist_ok=True)
         op.write_text(payload, encoding="utf-8")
         # 仅向 stdout 输出一行小确认（管道安全）；大 payload 落盘，绕开沙箱 stdout 拦截段错误

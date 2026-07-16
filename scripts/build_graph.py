@@ -189,10 +189,15 @@ def render_html(G: nx.Graph, out_path: Path, title: str = "Wiki"):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python build_graph.py <project_root>")
-        sys.exit(1)
-    proj = Path(sys.argv[1])
+    # ISSUE-06：argparse 替代手写 argv
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="build_graph.py",
+        description="构建 4 信号知识图谱 + Louvain 社区 + pyvis HTML 可视化",
+    )
+    p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
+    args = p.parse_args()
+    proj = Path(args.project_root)
     wiki = proj / "Wiki"
     G = build_graph(wiki)
     stats = compute_4_signals(G)

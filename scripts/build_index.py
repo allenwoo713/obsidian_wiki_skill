@@ -92,19 +92,30 @@ class WikiIndex:
             self._embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
         return self._embedder
 
-    def _get_lance(self):
+    def _get_lance(self, dim: int = None):
+        """获取 LanceDB 表。首次建表时需提供 dim（向量维度）。
+
+        ISSUE-10：维度从硬编码 384 改为运行时从 embedder.get_sentence_embedding_dimension()
+        动态获取，换模型（如 bge-m3 是 1024 维）不再崩。
+        """
         if self._lance_table is None:
             import lancedb
             db = lancedb.connect(str(self.index_dir / "lance_db"))
             try:
                 self._lance_table = db.open_table("wiki_pages")
             except Exception:
+                # 首次建表：用占位空行初始化 schema，dim 必须由调用方传入
+                vec_dim = dim or 384  # 兜底 MiniLM-L12-v2 维度，避免无 dim 调用建错 schema
                 self._lance_table = db.create_table("wiki_pages", data=[
                     {"path": "", "title": "", "page_type": "", "content": "",
-                     "sources": "", "vector": [0.0] * 384}
+                     "sources": "", "vector": [0.0] * vec_dim}
                 ])
                 self._lance_table.delete('path = ""')
         return self._lance_table
+
+    def _embedding_dim(self) -> int:
+        """ISSUE-10：从当前 embedder 动态获取向量维度，避免硬编码。"""
+        return self._get_embedder().get_sentence_embedding_dimension()
 
     def build(self, wiki_dir: Path):
         self.pages = scan_wiki(wiki_dir, wiki_dir.parent)
@@ -118,16 +129,26 @@ class WikiIndex:
         self._write_manifest()
 
     def _load_image_caption_pages(self, idx_dir: Path) -> List[WikiPage]:
-        """从 manifest.json 读 images，caption_text 非空的转为 WikiPage。"""
+        """从 manifest.json 读 images，caption_text 非空的转为 WikiPage。
+
+        ISSUE-07：manifest 解析失败不再静默吞没。schema 漂移会 warning 到 stderr，
+        让维护者知道 manifest 格式出问题，而不是误判"知识库无 caption"。
+        ISSUE-12：字段访问统一 .get() + 跳过不完整条目并 warning。
+        """
         manifest_file = idx_dir / "manifest.json"
         if not manifest_file.exists():
             return []
         try:
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        except Exception:
+        except (json.JSONDecodeError, OSError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "_load_image_caption_pages: manifest 解析失败 %s: %s", manifest_file, e
+            )
             return []
         wiki_dir = idx_dir.parent / "Wiki"
         pages = []
+        skipped = 0
         for img in manifest.get("images", []):
             # caption_text 是主检索字段；为空时兜底读 vlm_caption.description，
             # 确保已生成 VLM 描述的图不会因 caption_text 漏填而缺席检索（defense-in-depth）。
@@ -137,16 +158,26 @@ class WikiIndex:
                 caption = (vlm.get("description") or "").strip()
             if not caption:
                 continue
-            img_path = wiki_dir / img["rel_path"]
+            # ISSUE-12：rel_path 缺失则跳过（否则 KeyError 崩溃整个 build）
+            rel_path = img.get("rel_path")
+            if not rel_path:
+                skipped += 1
+                continue
+            img_path = wiki_dir / rel_path
             pages.append(WikiPage(
                 path=img_path,
-                title=img.get("figure_caption") or img["filename"],
+                title=img.get("figure_caption") or img.get("filename") or rel_path,
                 page_type="image_caption",
                 content=caption,
                 sources=[img.get("source_doc", "")],
                 links=[],
                 sha256=img.get("sha256", ""),
             ))
+        if skipped:
+            import logging
+            logging.getLogger(__name__).warning(
+                "_load_image_caption_pages: 跳过 %d 条 rel_path 缺失的图片条目", skipped
+            )
         return pages
 
     def _tokenize(self, text: str) -> List[str]:
@@ -167,11 +198,14 @@ class WikiIndex:
         embedder = self._get_embedder()
         texts = [p.title + "\n" + p.content for p in self.pages]
         vectors = embedder.encode(texts, show_progress_bar=False).tolist()
-        table = self._get_lance()
+        # ISSUE-10：建表时传入动态维度（而非硬编码 384），换模型时 schema 正确
+        table = self._get_lance(dim=self._embedding_dim())
         try:
             table.delete("path != ''")
-        except Exception:
-            pass
+        except Exception as e:
+            # 首次建表时 delete 可能因空表 / SQL 方言差异失败，属预期情况，debug 级记录即可
+            import logging
+            logging.getLogger(__name__).debug("_build_vector: 跳过 delete（可能首次建表）: %s", e)
         data = [
             {
                 "path": str(p.path),
@@ -193,8 +227,12 @@ class WikiIndex:
         if manifest_file.exists():
             try:
                 existing = json.loads(manifest_file.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                # manifest 损坏时 warning，从空重建（不崩整个 build）
+                import logging
+                logging.getLogger(__name__).warning(
+                    "_write_manifest: 现有 manifest 解析失败，将覆盖重建: %s", e
+                )
         existing["built_at"] = datetime.now().isoformat()
         existing["page_count"] = len(self.pages)
         existing["pages"] = [
@@ -252,13 +290,17 @@ class WikiIndex:
             sources = p.sources if p else []
             snippet = (p.content[:200] if p and p.content else "")[:200]
             if not snippet and p:
-                # 从文件读取 snippet
+                # 从文件读取 snippet（I/O 异常时 warning，不当作"页面无内容"）
                 try:
                     raw = p.path.read_text(encoding="utf-8", errors="replace")
                     import re as _re
                     m = _re.search(r"^---\n.*?\n---\n(.*)$", raw, _re.DOTALL)
                     snippet = (m.group(1).strip()[:200] if m else raw[:200])
-                except Exception:
+                except OSError as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "search_bm25: 读取 snippet 失败 %s: %s", p.path, e
+                    )
                     snippet = ""
             results.append(RetrievedPage(
                 path=Path(path), title=title, score=float(score),
@@ -282,10 +324,15 @@ class WikiIndex:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python build_index.py <project_root>")
-        sys.exit(1)
-    proj = Path(sys.argv[1])
+    # ISSUE-06：argparse 替代手写 argv
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="build_index.py",
+        description="构建 BM25 + LanceDB 向量索引",
+    )
+    p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
+    args = p.parse_args()
+    proj = Path(args.project_root)
     wiki = proj / "Wiki"
     idx_dir = proj / ".index"
     wi = WikiIndex(idx_dir)
