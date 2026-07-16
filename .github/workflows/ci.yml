@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install core deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-dotenv
+          # 轻量依赖：只装 import 健康检查需要的
+          # 重型依赖（lancedb / sentence-transformers / torch）不在 CI 验证范围
+          # 它们的 import 在实际使用时由 _get_embedder/_get_lance 惰性加载
+
+      - name: Syntax check (compile all .py)
+        run: |
+          find scripts -name "*.py" -exec python -m py_compile {} +
+          echo "All scripts compile OK"
+
+      - name: Import health check (_config + models)
+        run: |
+          cd scripts
+          python -c "import _config; print(f'SKILL_DIR={_config.SKILL_DIR}')"
+          python -c "from models import WikiPage, RetrievedPage, ManifestEntry; print('models import OK')"
+          python -c "from parsers.utils import slugify, image_filename, attach_captions; print('parsers.utils import OK')"
+
+      - name: Verify .env not tracked
+        run: |
+          if git ls-files | grep -q '^\.env$'; then
+            echo "ERROR: .env is tracked in git!"
+            exit 1
+          fi
+          echo ".env is not tracked (OK)"
+
+      - name: Verify no hardcoded sensitive paths
+        run: |
+          # 检查脚本中不应出现本机用户名或绝对路径（应使用占位符或 env）
+          if grep -rE "C:\\\\Users\\\\[^<]" scripts/ --include="*.py"; then
+            echo "WARNING: found hardcoded Windows user paths in scripts/"
+            exit 1
+          fi
+          echo "No hardcoded sensitive paths (OK)"
+
+      - name: Verify .env.example has all required keys
+        run: |
+          for key in MINERU_API_TOKEN MINERU_PYTHON_EXE MINERU_PDF_SENSITIVE WIKI_VENV_PYTHON WIKI_EMBEDDER_LOCAL_PATH HF_ENDPOINT; do
+            if ! grep -q "^$key=" .env.example; then
+              echo "ERROR: $key missing from .env.example"
+              exit 1
+            fi
+          done
+          echo "All required keys present in .env.example (OK)"

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# obsidian_wiki_skill wrapper —— 免手拼 venv_python / skill_dir 路径
+#
+# 用法：
+#   ./scripts/wiki <project_root> "<query>" --k 5 --json
+#   ./scripts/wiki <project_root> "<query>" --read-full --json --out <path>
+#   ./scripts/wiki build-index <project_root>
+#   ./scripts/wiki build-graph <project_root>
+#   ./scripts/wiki update <project_root> [--apply]
+#
+# Python 解释器选择优先级：
+#   1. 环境变量 WIKI_VENV_PYTHON（或 .env 中配置）
+#   2. PATH 中的 python
+#
+# skill_dir 自推导：脚本知道自己在哪里，无需配置。
+set -euo pipefail
+
+# 定位 skill_dir（本脚本在 scripts/ 下，上一级即 skill_dir）
+# 用 pwd -W 获取 Windows 风格路径（MSYS/Git Bash），Linux/macOS fallback 到 pwd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && (pwd -W 2>/dev/null || pwd))"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && (pwd -W 2>/dev/null || pwd))"
+
+# 加载 .env 中的 WIKI_VENV_PYTHON（若存在）
+if [[ -f "$SKILL_DIR/.env" ]]; then
+    # shellcheck disable=SC1090
+    set -a
+    source <(grep -E '^[A-Z_]+=' "$SKILL_DIR/.env" || true)
+    set +a
+fi
+
+# 选择 python 解释器
+VENV_PY="${WIKI_VENV_PYTHON:-python}"
+
+# 固化环境变量
+export PYTHONDONTWRITEBYTECODE=1
+
+# 子命令路由
+case "${1:-}" in
+    build-index)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/build_index.py" "$@"
+        ;;
+    build-graph)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/build_graph.py" "$@"
+        ;;
+    update)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/update_wiki.py" "$@"
+        ;;
+    caption-list)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/picture_caption.py" "$@" list
+        ;;
+    caption-apply)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/picture_caption.py" "$1" apply "${@:2}"
+        ;;
+    ""|-h|--help|help)
+        cat <<EOF
+obsidian_wiki_skill wrapper
+
+用法:
+  wiki <project_root> "<query>" [query 选项]    检索知识库
+  wiki build-index <project_root>               构建索引
+  wiki build-graph <project_root>               构建图谱
+  wiki update <project_root> [--apply]          增量更新
+  wiki caption-list <project_root> [--limit N]  列出待标注图片
+  wiki caption-apply <project_root> <json>      写入 caption
+
+Python 解释器:
+  优先用环境变量 WIKI_VENV_PYTHON（或 <skill_dir>/.env 中配置），
+  否则 fallback 到 PATH 中的 python。
+
+配置:
+  一次性配置写入 <skill_dir>/.env（复制 .env.example 为 .env 填值）。
+  scripts/_config.py 会自动加载到所有 Python 脚本。
+EOF
+        ;;
+    *)
+        # 默认：当作 query 调用（project_root + query + query 选项）
+        exec "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$@"
+        ;;
+esac

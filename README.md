@@ -52,6 +52,8 @@ obsidian_wiki_skill/
 ├── SKILL.md                  # agent 工作流规范（何时触发/检索礼仪/出处标注）
 ├── CHANGELOG.md              # 变更记录
 ├── scripts/
+│   ├── _config.py           # 集中配置加载（import 即 load .env，自推导 SKILL_DIR）
+│   ├── wiki / wiki.cmd      # wrapper 脚本（bash / Windows），免手拼路径
 │   ├── parse_sources.py      # Raw/sources/ → Wiki/*.md（路由到各 parser）
 │   ├── update_wiki.py        # 增量更新（manifest SHA256 追踪，append 不全量重扫）
 │   ├── build_index.py        # 建 BM25 + LanceDB 索引
@@ -67,7 +69,11 @@ obsidian_wiki_skill/
 │       ├── mineru_common.py  # MinerU markdown → ParseResult 适配器
 │       ├── docx_parser.py    # python-docx 本地解析
 │       └── pdf_split.py      # PyMuPDF 仅拆页（>200 页分批），不解析内容
+├── references/               # 首次 setup 模板
+│   ├── purpose.template.md  # 知识库目标模板
+│   └── schema.template.md   # 页面类型与 frontmatter 规范模板
 ├── lib/                      # 前端库（vis-network / tom-select，图谱可视化用）
+├── .github/workflows/ci.yml # GitHub Actions CI（语法检查 + import 健康 + .env 未入库）
 ├── requirements.txt          # 核心依赖
 ├── requirements-mineru.txt   # 本地 MinerU venv 依赖锁定（含 torch/transformers）
 ├── conftest.py               # pytest 配置（LanceDB basetemp 改到项目内）
@@ -167,16 +173,33 @@ cp .env.example .env
 
 ## 使用
 
-### 首次构建
+### wrapper 脚本（推荐，免手拼路径）
+
+配好 `.env`（至少 `WIKI_VENV_PYTHON`）后，用 wrapper 免去每次手拼 venv_python / skill_dir：
 
 ```bash
-# 1. 起草 purpose.md / schema.md，重组源文档到 Raw/sources/
-# 2. 解析文档 → Wiki/*.md（由 agent/LLM 按 schema 生成）
-# 3. 建索引
+# bash（Linux/macOS/Git Bash on Windows）
+./scripts/wiki <project_root> "<query>" --k 5 --json
+./scripts/wiki build-index <project_root>
+./scripts/wiki build-graph <project_root>
+./scripts/wiki update <project_root> [--apply]
+
+# Windows cmd.exe
+scripts\wiki.cmd <project_root> "<query>" --k 5 --json
+scripts\wiki.cmd build-index <project_root>
+```
+
+wrapper 自动定位 skill_dir，从 `.env` 读 `WIKI_VENV_PYTHON` 决定用哪个 python。`<venv_python>` 和 `<skill_dir>` 都不用再手填。
+
+### 直接调用脚本（显式路径）
+
+不用 wrapper 时，按以下模板手填路径：
+
+```bash
+# 首次构建
 PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root>
-# 4. 建图谱
 PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_graph.py <project_root>
-# 5. 用 Obsidian 打开 Wiki/ 目录（必须指向 Wiki/，不是 project_root）
+# 用 Obsidian 打开 Wiki/ 目录（必须指向 Wiki/，不是 project_root）
 ```
 
 ### 增量更新
