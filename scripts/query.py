@@ -9,7 +9,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在 build_index 的向量检索触发前执行
 
@@ -42,14 +42,31 @@ def split_text_image(results: List[RetrievedPage]) -> Tuple[List[RetrievedPage],
 
 
 def rrf_fuse(bm25_results: List[RetrievedPage], vector_results: List[RetrievedPage],
-             graph_results: List[RetrievedPage], k_rrf: int = 60) -> List[RetrievedPage]:
+             graph_results: List[RetrievedPage], k_rrf: int = 60,
+             graph_rank_offset: int = 10) -> List[RetrievedPage]:
+    """RRF 融合三路结果。
+
+    ISSUE-16：原实现三路等权 RRF，图谱召回置信度本应低于直接命中（BM25/向量），
+    等权会让图谱噪声挤占 top 结果。改进：给图谱路一个 rank 偏移（rank 从
+    graph_rank_offset+1 开始计），相当于在 RRF 公式中降低图谱路的贡献。
+
+    Args:
+        graph_rank_offset: 图谱路 rank 偏移量。设为 0 则退化为等权（向后兼容）。
+            默认 10：图谱第 1 名的 rank 相当于 BM25/向量第 11 名。
+    """
     scores: dict = {}
     meta: dict = {}
-    for results in [bm25_results, vector_results, graph_results]:
+    # BM25 与向量：rank 从 1 开始
+    for results in [bm25_results, vector_results]:
         for rank, r in enumerate(results, 1):
             key = str(r.path)
             scores[key] = scores.get(key, 0) + 1.0 / (k_rrf + rank)
             meta[key] = r
+    # 图谱：rank 从 graph_rank_offset+1 开始，降低贡献
+    for rank, r in enumerate(graph_results, 1):
+        key = str(r.path)
+        scores[key] = scores.get(key, 0) + 1.0 / (k_rrf + graph_rank_offset + rank)
+        meta[key] = r
     fused = []
     for key, score in sorted(scores.items(), key=lambda x: -x[1]):
         r = meta[key]
@@ -75,22 +92,54 @@ def budget_control(pages: List[RetrievedPage], max_tokens: int = 4096,
 
 
 def graph_expand(wi, top_paths: List[Path], wiki_dir: Path, k: int = 10) -> List[RetrievedPage]:
+    """图谱 2 跳扩展：从 BM25/向量 top 命中的页面出发，找图谱邻居。
+
+    ISSUE-09：节点匹配改为规范化绝对路径精确匹配优先，stem 仅作 fallback。
+    此前同名 stem（不同目录下同名 .md，如 entities/foo.md 与 concepts/foo.md）
+    会误匹配到错误节点，导致图谱扩展召回噪声。
+    """
     idx_file = wiki_dir.parent / ".index" / "graph.json"
     if not idx_file.exists():
         return []
     data = json.loads(idx_file.read_text(encoding="utf-8"))
     edges = data.get("edges", [])
     nodes = {n["title"]: n for n in data.get("nodes", [])}
+    # 路径索引：规范化绝对路径 → title，用于精确匹配
+    path_to_title: Dict[str, str] = {}
+    stem_to_titles: Dict[str, List[str]] = {}  # stem fallback（同名 stem 可能多个）
+    for t, n in nodes.items():
+        np = (n.get("path") or "").replace("\\", "/").lower()
+        if np:
+            path_to_title[np] = t
+        stem_to_titles.setdefault(Path(t).stem.lower(), []).append(t)
+
     neighbors: dict = {}
     for e in edges:
         neighbors.setdefault(e["source"], []).append((e["target"], e.get("weight", 1)))
         neighbors.setdefault(e["target"], []).append((e["source"], e.get("weight", 1)))
+
+    # 精确路径匹配优先，stem 仅 fallback
     top_titles = set()
     for p in top_paths:
-        stem = p.stem
-        for t, n in nodes.items():
-            if t == stem or n.get("path", "").replace("\\", "/").endswith(p.name.replace("\\", "/")):
-                top_titles.add(t)
+        p_norm = str(p).replace("\\", "/").lower()
+        # 1. 精确路径匹配
+        if p_norm in path_to_title:
+            top_titles.add(path_to_title[p_norm])
+            continue
+        # 2. endswith 匹配（兼容 graph.json 里存的绝对路径与传入的相对路径）
+        matched = False
+        for npath, ntitle in path_to_title.items():
+            if npath.endswith(p_norm) or p_norm.endswith(npath):
+                top_titles.add(ntitle)
+                matched = True
+                break
+        if matched:
+            continue
+        # 3. stem fallback（同名 stem 可能多个，全部加入，让图谱扩展自然处理）
+        stem = p.stem.lower()
+        for t in stem_to_titles.get(stem, []):
+            top_titles.add(t)
+
     seen = set(top_titles)
     expanded = []
     for title in top_titles:

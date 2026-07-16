@@ -111,16 +111,37 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
     return G
 
 
-def compute_adamic_adar(G: nx.Graph):
-    if G.number_of_edges() == 0:
+def compute_adamic_adar(G: nx.Graph, top_n_per_node: int = 5, min_score: float = 0.0):
+    """计算 Adamic-Adar 相似度并加边。
+
+    ISSUE-08：原实现对所有非邻居对计算且 score>0 就加边，页面数 >200 时
+    会产生大量弱边使图谱变"毛球"，2 跳扩展召回噪声。
+
+    改进：对每个节点只保留 top-N 个最高 AA 分数的候选邻居（按节点对称去重），
+    且 score 需 > min_score。这样既保留高置信度推荐边，又避免全图稠密化。
+
+    Args:
+        G: 已含 direct_link + source_overlap 边的图。
+        top_n_per_node: 每个节点最多新增的 AA 邻居数。
+        min_score: AA 分数阈值，低于此值不加边。
+    """
+    if G.number_of_edges() == 0 or G.number_of_nodes() < 2:
         return
-    preds = nx.adamic_adar_index(G)
+    # 收集所有 (u, v, score) 并按 score 降序
+    preds = [(u, v, s) for u, v, s in nx.adamic_adar_index(G) if s > min_score]
+    preds.sort(key=lambda x: -x[2])
+    # 每个节点最多新增 top_n 条边（双向计数）
+    added_count: Dict[str, int] = {}
     for u, v, score in preds:
-        if score > 0 and not G.has_edge(u, v):
-            G.add_edge(u, v, weight=0.4 * score, signals={"adamic_adar"})
-        elif score > 0 and G.has_edge(u, v):
+        if added_count.get(u, 0) >= top_n_per_node and added_count.get(v, 0) >= top_n_per_node:
+            continue
+        if G.has_edge(u, v):
             G[u][v]["weight"] += 0.4 * score
             G[u][v]["signals"].add("adamic_adar")
+        else:
+            G.add_edge(u, v, weight=0.4 * score, signals={"adamic_adar"})
+        added_count[u] = added_count.get(u, 0) + 1
+        added_count[v] = added_count.get(v, 0) + 1
 
 
 def compute_4_signals(G: nx.Graph) -> Dict:
@@ -133,15 +154,32 @@ def compute_4_signals(G: nx.Graph) -> Dict:
 
 
 def detect_communities(G: nx.Graph) -> List[List[str]]:
+    """Louvain 社区检测。
+
+    ISSUE-17：孤立节点（degree=0）在 Louvain 下各成一社区，可视化时颜色爆炸。
+    改进：孤立节点统一归入最后一个社区（"未分类"），用单一颜色着色。
+    """
     try:
         import community as community_louvain
         partition = community_louvain.best_partition(G)
         comms: Dict[int, List[str]] = {}
         for node, cid in partition.items():
             comms.setdefault(cid, []).append(node)
-        return list(comms.values())
+        comm_list = list(comms.values())
     except ImportError:
-        return [list(G.nodes())]
+        comm_list = [list(G.nodes())]
+
+    # ISSUE-17：把孤立节点从各自社区抽出，统一归入"未分类"社区
+    isolated = [n for n in G.nodes() if G.degree(n) == 0]
+    if isolated:
+        # 从现有社区中移除孤立节点
+        comm_list = [
+            [n for n in comm if G.degree(n) > 0]
+            for comm in comm_list
+        ]
+        comm_list = [c for c in comm_list if c]  # 去空社区
+        comm_list.append(isolated)  # 孤立节点归入末尾社区
+    return comm_list
 
 
 def render_html(G: nx.Graph, out_path: Path, title: str = "Wiki"):
@@ -153,6 +191,8 @@ def render_html(G: nx.Graph, out_path: Path, title: str = "Wiki"):
             node_comm[n] = i
     palette = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
                "#46f0f0", "#f032e6", "#bcf60c", "#fabebe", "#008080"]
+    # ISSUE-17：孤立节点社区（最后一个）用统一灰色，区别于彩色社区
+    isolated_comm_id = len(comms) - 1 if comms and any(G.degree(n) == 0 for n in comms[-1]) else -1
     net = Network(height="900px", width="100%", bgcolor="#1a1a2e",
                   font_color="white", directed=False, notebook=False)
     # 物理引擎稳定化：防止疯狂旋转
@@ -162,7 +202,9 @@ def render_html(G: nx.Graph, out_path: Path, title: str = "Wiki"):
         ptype = d.get("page_type", "concept")
         deg = d.get("degree", 0)
         size = 15 + min(deg * 3, 35)
-        color = palette[node_comm.get(n, 0) % len(palette)]
+        cid = node_comm.get(n, 0)
+        # 孤立节点统一灰色，其余用调色板
+        color = "#808080" if cid == isolated_comm_id else palette[cid % len(palette)]
         net.add_node(n, label=n, title=f"type: {ptype}\ndegree: {deg}", size=size, color=color)
     for u, v, d in G.edges(data=True):
         sigs = ", ".join(sorted(d.get("signals", set())))
