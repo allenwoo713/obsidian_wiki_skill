@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
+import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在下方 setdefault 之前执行
+
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 from models import WikiPage, RetrievedPage, ManifestEntry

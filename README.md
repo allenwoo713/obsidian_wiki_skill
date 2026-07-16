@@ -138,7 +138,11 @@ python -m venv <mineru_venv>
 # Linux/macOS: <mineru_venv>/bin/pip install -r requirements-mineru.txt
 ```
 
-> 未安装本地 MinerU 不影响非敏感文档（走 Cloud）和 `.docx`（走 python-docx）的解析。敏感文档若标记本地但 venv 缺失（`MINERU_PYTHON_EXE` 未设置），会直接抛 `FileNotFoundError`——**不静默回退 Cloud**，避免敏感内容外发。
+`MINERU_PYTHON_EXE` 是**可选**配置：留空时按约定位置自动探测（`~/.workbuddy/binaries/python/envs/mineru/Scripts|bin/python`），命中就用；探测不到且未显式设置时，才会抛 `FileNotFoundError`（**不静默回退 Cloud**，避免敏感内容外发）。venv 装在其他位置时显式设置该变量覆盖自动探测。
+
+模型下载路径由 MinerU 自身的 `mineru.json`（默认 `~/mineru.json`）管理，与本 skill 解耦——每个人的硬盘/挂载盘不同，模型存放位置不应硬编码在 skill 里。若 `mineru.json` 不在默认位置，用 `MINERU_TOOLS_CONFIG_JSON` 指定；该变量会被自动透传给 MinerU 子进程。
+
+> 未安装本地 MinerU 不影响非敏感文档（走 Cloud）和 `.docx`（走 python-docx）的解析。
 
 ### 4. 配置
 

@@ -23,16 +23,20 @@ read_when:
 
 ## 路径变量（首次使用前必读）
 
-本 skill 所有调用模板使用以下占位符，**调用方需按本机实际路径替换**：
+本 skill 所有调用模板使用以下占位符。**它们不是同一类配置**——按变化频率 × 作用域分三层，归属不同：
 
-| 占位符 | 含义 | 示例（Windows / macOS / Linux） |
-|---|---|---|
-| `<venv_python>` | skill 核心 venv 的 python 可执行文件 | `C:/path/to/venv/Scripts/python.exe` / `/path/to/venv/bin/python` |
-| `<skill_dir>` | 本 skill 根目录（含 `SKILL.md`） | `C:/Users/<you>/.workbuddy/skills/obsidian_wiki_skill` / `~/.workbuddy/skills/obsidian_wiki_skill` |
-| `<project_root>` | 目标知识库项目根目录 | `D:/path/to/MyKnowledgeBase` / `/home/<you>/projects/my-wiki` |
-| `<mineru_python>` | MinerU Local venv 的 python（**可选**，仅敏感文档需要） | `C:/path/to/mineru_venv/Scripts/python.exe` / `/path/to/mineru_venv/bin/python` |
+| 占位符 | 含义 | 归属 | 说明 |
+|---|---|---|---|
+| `<skill_dir>` | 本 skill 根目录（含 `SKILL.md`） | **脚本自推导，无需配置** | `scripts/_config.py` 用 `Path(__file__).parent.parent` 自动定位；调用模板里仍保留占位符是为了拼接命令行，但你无需手动"配置"它，只需在拼命令时填自己机器上的实际路径一次 |
+| `<venv_python>` | skill 核心 venv 的 python 可执行文件 | **`.env` 一次性配置**（可选） | 每台机器装一次就不变；可写入 `<skill_dir>/.env` 的 `WIKI_VENV_PYTHON`，或直接在调用命令里手填 |
+| `<mineru_python>` | MinerU Local venv 的 python（**可选组件**，仅敏感文档需要） | **`.env` 一次性配置** | 写入 `<skill_dir>/.env` 的 `MINERU_PYTHON_EXE`；留空则按约定位置自动探测，探测不到才报错（见下方「MinerU Local」章节） |
+| `<project_root>` | 目标知识库项目根目录 | **命令行参数，绝不进 `.env`** | 每次调用都可能不同——skill 设计目标是跨知识库复用（同一份 skill 服务多个项目），锁死单一 `project_root` 会破坏这个能力 |
+
+示例路径（Windows / macOS / Linux）：`<venv_python>` → `C:/path/to/venv/Scripts/python.exe` / `/path/to/venv/bin/python`；`<project_root>` → `D:/path/to/MyKnowledgeBase` / `/home/<you>/projects/my-wiki`。
 
 > ⚠️ **首次使用前请按本机环境把上述占位符替换为真实路径**，不要直接 copy-paste 模板。
+>
+> **配置加载机制**：所有入口脚本（`build_index.py` / `query.py` / `build_graph.py` / `update_wiki.py` / `picture_caption.py`）顶部 `import _config`，会自动加载 `<skill_dir>/.env`。一次性配置写入 `.env` 后，对所有脚本统一生效，无需每次调用手填环境变量。完整配置项见 `<skill_dir>/.env.example`。
 
 ## 前置条件
 
@@ -358,13 +362,16 @@ Phase 4:   预算控制 (4K→1M tokens)
 敏感文档处理（PDF / PPTX）：
 - 交互模式下，新增 PDF/PPTX 会询问用户是否敏感；敏感则走 `MinerU Local`。
 - 非交互模式可设置环境变量 `MINERU_PDF_SENSITIVE=1` 强制 PDF/PPTX 走本地。
-- 本地解析使用独立 MinerU venv，路径由 `MINERU_PYTHON_EXE` 环境变量指定（必须指向已安装 MinerU 的 venv python 可执行文件，对应占位符 `<mineru_python>`）。
+- 本地解析使用独立 MinerU venv，路径由 `MINERU_PYTHON_EXE` 环境变量指定（对应占位符 `<mineru_python>`）。**该变量是可选的**：留空时脚本会按约定位置自动探测（见下），探测不到才报错。
 
 ### MinerU Local（可选组件）
 
 本地 MinerU 是**可选**的，仅在解析「敏感文档」时需要：
 - **非敏感文档默认走 MinerU Cloud API**（需 `MINERU_API_TOKEN`），不依赖本地 MinerU。
-- 若标记敏感但本地 venv 缺失（即 `MINERU_PYTHON_EXE` 未设置或路径不存在），`MineruLocalPdfParser` 会直接抛 `FileNotFoundError`，**不会静默回退到 Cloud**——避免敏感内容外发，符合安全边界。
+- 若标记敏感但本地 venv 缺失，`MineruLocalPdfParser` 会直接抛 `FileNotFoundError`（不会静默回退到 Cloud，避免敏感内容外发），**除非**能按约定位置自动探测到 venv：
+  - `~/.workbuddy/binaries/python/envs/mineru/Scripts/python.exe`（Windows）
+  - `~/.workbuddy/binaries/python/envs/mineru/bin/python`（Linux/macOS）
+  - 若 venv 装在其他位置，显式设置 `MINERU_PYTHON_EXE` 覆盖自动探测。
 - **格式支持**（取决于 mineru 版本）：
   - ≥3.1.0：PDF / 图片 / DOCX / PPTX / XLSX 全格式
   - 3.0.x：PDF / 图片 / DOCX（PPTX/XLSX 未实现，`_process_office_doc` 仅打 warning 跳过）
@@ -377,27 +384,33 @@ python -m venv <mineru_venv>
 # Windows: <mineru_venv>/Scripts/pip install -r <skill_dir>/requirements-mineru.txt
 # Linux/macOS: <mineru_venv>/bin/pip install -r <skill_dir>/requirements-mineru.txt
 
-# 2. 配置模型源（local 模式，避免联网下载）
-# 创建 mineru.json 配置文件指向本地模型，内容形如：{"model-source": "local"}
+# 2. 配置模型源与模型存放路径（local 模式，避免联网下载）
+# MinerU 自身在 ~/mineru.json（默认路径）管理模型位置，与本 skill 解耦——
+# 每个人的模型存放路径不同（硬盘大小/挂载盘不同），不应由 skill 管理：
+#   { "models-dir": { "pipeline": "<你的模型路径>", "vlm": "<你的模型路径>" }, "model-source": "local" }
+# 若 mineru.json 不在默认位置，用 MINERU_TOOLS_CONFIG_JSON 指定实际路径
+# （该变量已被 mineru_local.py 透传给 MinerU 子进程，无需额外配置）
 # 详见 MinerU 官方文档
 
-# 3. 设置环境变量
+# 3. 设置 MINERU_PYTHON_EXE（可选，见上方自动探测说明）
 # Windows (PowerShell): $env:MINERU_PYTHON_EXE = "<mineru_venv>/Scripts/python.exe"
 # Linux/macOS: export MINERU_PYTHON_EXE="<mineru_venv>/bin/python"
+# 若按约定位置安装（.workbuddy/binaries/python/envs/mineru/），可跳过此步。
 ```
 依赖版本锁定见 `<skill_dir>/requirements-mineru.txt`（含 torch / transformers / opencv 等重型依赖，刻意与 skill 的核心 venv 隔离）。
 
-配置方式（二选一）：
+配置方式（推荐）：
 
-1. 复制 `.env.example` 为 `.env`，填入实际路径与 token：
+1. 复制 `.env.example` 为 `.env`，填入实际路径与 token（一次性配置，`_config.py` 会自动加载到所有脚本）：
    ```bash
    cp <skill_dir>/.env.example <skill_dir>/.env
    ```
-2. 填入 `MINERU_API_TOKEN`（从 https://mineru.net/apiManage 获取）和 `MINERU_PYTHON_EXE`（指向本机 MinerU venv 的 python）。
-3. 或直接使用系统环境变量：
-   - `MINERU_API_TOKEN=<your_token>`
-   - `MINERU_PYTHON_EXE=<path_to_mineru_venv_python>`
-   - `MINERU_PDF_SENSITIVE=0/1`
+2. 按需填入：
+   - `MINERU_API_TOKEN`（从 https://mineru.net/apiManage 获取，Cloud 解析必填）
+   - `MINERU_PYTHON_EXE`（可选，MinerU Local venv 路径，未按约定位置安装时才需要）
+   - `MINERU_TOOLS_CONFIG_JSON`（可选，MinerU 自身 mineru.json 不在默认位置时指定）
+   - `MINERU_PDF_SENSITIVE`（可选，非交互模式的敏感开关）
+3. 或跳过 `.env`，直接使用系统环境变量（同名变量，优先级高于 `.env`）。
 
 ⚠️ 涉及商业敏感信息的文档（如厂商私有 datasheet），启用 Cloud 前需用户明确授权。
 

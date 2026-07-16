@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），保持与其他入口脚本一致
+
 import networkx as nx
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)

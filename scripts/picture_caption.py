@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import List, Dict
 
+import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），统一入口脚本行为
+
 
 def load_manifest(project_root: Path) -> Dict:
     manifest_file = project_root / ".index" / "manifest.json"

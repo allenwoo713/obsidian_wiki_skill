@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
+import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在 build_index 的向量检索触发前执行
+
 from models import RetrievedPage
 
 

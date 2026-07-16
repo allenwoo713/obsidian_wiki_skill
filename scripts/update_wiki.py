@@ -12,6 +12,8 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Tuple
 
+import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01，统一收口，替代下方原手写 load_dotenv）
+
 from parse_sources import compute_sha256, parse_file
 
 
@@ -132,14 +134,7 @@ def build_wiki_pages_map(proj: Path) -> Dict[str, List[str]]:
 
 
 def main():
-    # 加载 skill 目录 .env（含 MINERU_API_TOKEN），使脚本可独立运行
-    try:
-        from dotenv import load_dotenv
-        _env = Path(__file__).resolve().parent.parent / ".env"
-        if _env.exists():
-            load_dotenv(_env)
-    except Exception:
-        pass
+    # .env 已由顶部 `import _config` 统一加载（ISSUE-01）
     if len(sys.argv) < 2:
         print("用法: python update_wiki.py <project_root> [--apply]")
         sys.exit(1)
