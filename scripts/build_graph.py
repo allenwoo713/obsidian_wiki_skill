@@ -13,6 +13,19 @@ import networkx as nx
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 
 
+def _read_title(proj: Path) -> str:
+    """从 purpose.md 读知识库名称；读不到返回 'Wiki'。"""
+    purpose = proj / "purpose.md"
+    if purpose.exists():
+        for line in purpose.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("# "):
+                return line[2:].strip()
+            if line.startswith("title:"):
+                return line.split(":", 1)[1].strip().strip('"\'')
+    return "Wiki"
+
+
 def _load_pages(wiki_dir: Path) -> List[dict]:
     pages = []
     for md in sorted(wiki_dir.rglob("*.md")):
@@ -129,7 +142,7 @@ def detect_communities(G: nx.Graph) -> List[List[str]]:
         return [list(G.nodes())]
 
 
-def render_html(G: nx.Graph, out_path: Path):
+def render_html(G: nx.Graph, out_path: Path, title: str = "Wiki"):
     from pyvis.network import Network
     comms = detect_communities(G)
     node_comm: Dict[str, int] = {}
@@ -168,7 +181,7 @@ def render_html(G: nx.Graph, out_path: Path):
     html = re.sub(r'<link\s+href="https://cdn\.jsdelivr\.net/npm/bootstrap[^"]*"[^>]*/>', '', html)
     html = re.sub(r'<script\s+src="https://cdn\.jsdelivr\.net/npm/bootstrap[^"]*"[^>]*></script>', '', html)
 
-    header = '<div style="color:#fff;padding:10px;font-family:sans-serif;background:#16213e;"><h2><project_name> 知识图谱</h2><p>节点颜色 = Louvain 社区 | 边粗细 = 4信号加权 | 悬停看详情 | 拖拽节点 | 滚轮缩放</p></div>'
+    header = f'<div style="color:#fff;padding:10px;font-family:sans-serif;background:#16213e;"><h2>{title} 知识图谱</h2><p>节点颜色 = Louvain 社区 | 边粗细 = 4信号加权 | 悬停看详情 | 拖拽节点 | 滚轮缩放</p></div>'
     html = html.replace("<body>", f"<body>{header}", 1)
     out_path.write_text(html, encoding="utf-8")
 
@@ -192,7 +205,7 @@ def main():
     idx.mkdir(exist_ok=True)
     (idx / "graph.json").write_text(
         json.dumps(graph_json, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
-    render_html(G, wiki / ".graph" / "index.html")
+    render_html(G, wiki / ".graph" / "index.html", title=_read_title(proj))
     print(f"图谱构建完成: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边, {len(comms)} 社区")
     print(f"信号分布: {stats}")
     print(f"HTML → {wiki / '.graph' / 'index.html'}")

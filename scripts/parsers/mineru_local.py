@@ -17,7 +17,7 @@ class MineruLocalPdfParser(DocumentParser):
     This bypasses the MinerU CLI server which may swallow logs and exceptions.
     """
 
-    _DEFAULT_MINERU_PYTHON = "<home>/.workbuddy/binaries/python/envs/mineru/Scripts/python.exe"
+    _DEFAULT_MINERU_PYTHON = None  # 必须由 env 或构造参数显式提供，避免硬编码本机路径
 
     def __init__(
         self,
@@ -32,7 +32,13 @@ class MineruLocalPdfParser(DocumentParser):
         elif os.environ.get("MINERU_PYTHON_EXE"):
             self.mineru_python_exe = os.environ["MINERU_PYTHON_EXE"]
         else:
-            self.mineru_python_exe = self._DEFAULT_MINERU_PYTHON
+            raise FileNotFoundError(
+                "MinerU Python executable not configured. "
+                "Please set the MINERU_PYTHON_EXE environment variable "
+                "(or pass mineru_python_exe to the constructor), "
+                "pointing to the python executable of a venv with MinerU installed. "
+                "See README.md > 文档解析后端 > MinerU Local for setup instructions."
+            )
 
     @staticmethod
     def _result_subdir(ext: str) -> str:

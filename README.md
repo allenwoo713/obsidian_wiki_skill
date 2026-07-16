@@ -2,7 +2,7 @@
 
 > 把一堆散乱的文档变成可被 AI agent **混合检索**的知识库：Obsidian vault（双链 + frontmatter）作存储与人工浏览后端，BM25 + 向量 + 图谱三路融合作检索后端，答案强制标注出处。
 
-专为 WorkBuddy agent（Box）设计——`query.py` 是 agent 检索知识库的唯一入口，返回带出处的结构化结果。
+专为 AI agent 设计（兼容 WorkBuddy / Claude Code / 其他 agent 框架）——`query.py` 是 agent 检索知识库的唯一入口，返回带出处的结构化结果。
 
 ---
 
@@ -12,8 +12,8 @@
 
 | 痛点 | 本方案 |
 |---|---|
-| 产品型号 / 具体数值（60fps、±45°、120m）向量检索不到 | BM25 关键词精确命中 |
-| 同义不同形（"前雷达" vs "Front Radar"）词袋错过 | 多语言向量 + 查询预处理中英互译 |
+| 产品型号 / 具体数值（60fps、±45°、0.1mm）向量检索不到 | BM25 关键词精确命中 |
+| 同义不同形（"前向相机" vs "Front Camera"）词袋错过 | 多语言向量 + 查询预处理中英互译 |
 | 孤立页面无上下文 | 4 信号图谱 2 跳扩展 |
 | 三路结果难取舍 | RRF（Reciprocal Rank Fusion, k=60）融合 |
 
@@ -21,7 +21,7 @@
 
 ```
 Raw/sources/ ──parse──▶ Wiki/*.md ──index──▶ .index/ ──query──▶ 带出处的答案
- (不可变)      (Box LLM)   (双链+frontmatter)   (BM25+LanceDB+graph)   (RRF 融合)
+ (不可变)      (LLM)     (双链+frontmatter)   (BM25+LanceDB+graph)   (RRF 融合)
 ```
 
 ### 检索管道
@@ -39,7 +39,7 @@ Phase 4    预算控制 (4K→1M tokens)
 | 信号 | 计算 | 权重 |
 |---|---|---|
 | 直接链接 | `[[wikilink]]` 解析 | 1.0 |
-| 源重叠 | `sources[]` Jaccard | 0.6 |
+| 源重叠 | sources[] Jaccard | 0.6 |
 | Adamic-Adar | 共同邻居 | 0.4 |
 | 类型亲和力 | 同 `type` | 0.3 |
 
@@ -50,6 +50,7 @@ Louvain 社区检测用于可视化聚类。
 ```
 obsidian_wiki_skill/
 ├── SKILL.md                  # agent 工作流规范（何时触发/检索礼仪/出处标注）
+├── CHANGELOG.md              # 变更记录
 ├── scripts/
 │   ├── parse_sources.py      # Raw/sources/ → Wiki/*.md（路由到各 parser）
 │   ├── update_wiki.py        # 增量更新（manifest SHA256 追踪，append 不全量重扫）
@@ -67,12 +68,13 @@ obsidian_wiki_skill/
 │       ├── docx_parser.py    # python-docx 本地解析
 │       └── pdf_split.py      # PyMuPDF 仅拆页（>200 页分批），不解析内容
 ├── lib/                      # 前端库（vis-network / tom-select，图谱可视化用）
-├── tests/                    # pytest 测试套件
 ├── requirements.txt          # 核心依赖
-├── requirements-mineru.txt   # 本地 MinerU venv 依赖锁定（132 包，含 torch/transformers）
+├── requirements-mineru.txt   # 本地 MinerU venv 依赖锁定（含 torch/transformers）
 ├── conftest.py               # pytest 配置（LanceDB basetemp 改到项目内）
 └── .env.example              # 配置模板
 ```
+
+> **tests/** 目录为本地开发用，**不在公开发布的 skill 仓库中包含**（已在 `.gitignore` 中排除）。如需测试用例，请联系作者。
 
 ### 项目侧目录（skill 运行时操作的工作区）
 
@@ -94,9 +96,10 @@ obsidian_wiki_skill/
 ### 1. 核心依赖（轻量，CPU 即可）
 
 ```bash
-python -m venv .venv
+python -m venv <venv>
 # 国内推荐清华源
-pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+<venv>/Scripts/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+# Linux/macOS: <venv>/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 ```
 
 核心依赖：`rank-bm25`、`lancedb`、`sentence-transformers`、`networkx`、`python-docx`、`PyMuPDF`、`pyvis`。
@@ -111,6 +114,8 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 from modelscope import snapshot_download
 snapshot_download('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 ```
+
+下载后放到 `<venv>/models/paraphrase-multilingual-MiniLM-L12-v2/` 下，`build_index.py` 会优先从该位置加载。
 
 ### 3. 文档解析后端（可选但推荐）
 
@@ -129,20 +134,32 @@ snapshot_download('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 
 ```bash
 python -m venv <mineru_venv>
-<mineru_venv>/Scripts/pip install -r requirements-mineru.txt
+# Windows: <mineru_venv>/Scripts/pip install -r requirements-mineru.txt
+# Linux/macOS: <mineru_venv>/bin/pip install -r requirements-mineru.txt
 ```
 
-> 未安装本地 MinerU 不影响非敏感文档（走 Cloud）和 `.docx`（走 python-docx）的解析。敏感文档若标记本地但 venv 缺失，会直接抛 `FileNotFoundError`——**不静默回退 Cloud**，避免敏感内容外发。
+> 未安装本地 MinerU 不影响非敏感文档（走 Cloud）和 `.docx`（走 python-docx）的解析。敏感文档若标记本地但 venv 缺失（`MINERU_PYTHON_EXE` 未设置），会直接抛 `FileNotFoundError`——**不静默回退 Cloud**，避免敏感内容外发。
 
 ### 4. 配置
 
-复制 `.env.example` 为 `.env` 并填入 token：
+复制 `.env.example` 为 `.env` 并填入实际值：
 
 ```bash
 cp .env.example .env
 ```
 
 或直接用系统环境变量：`MINERU_API_TOKEN` / `MINERU_PYTHON_EXE` / `MINERU_PDF_SENSITIVE`。
+
+## 路径变量
+
+本 skill 的所有命令模板使用以下占位符，**调用方需按本机实际路径替换**：
+
+| 占位符 | 含义 |
+|---|---|
+| `<venv_python>` | skill 核心 venv 的 python 可执行文件 |
+| `<skill_dir>` | 本 skill 根目录（含 `SKILL.md`） |
+| `<project_root>` | 目标知识库项目根目录 |
+| `<mineru_python>` | MinerU Local venv 的 python（可选，仅敏感文档需要） |
 
 ## 使用
 
@@ -152,9 +169,9 @@ cp .env.example .env
 # 1. 起草 purpose.md / schema.md，重组源文档到 Raw/sources/
 # 2. 解析文档 → Wiki/*.md（由 agent/LLM 按 schema 生成）
 # 3. 建索引
-PYTHONDONTWRITEBYTECODE=1 python scripts/build_index.py <project_root>
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root>
 # 4. 建图谱
-PYTHONDONTWRITEBYTECODE=1 python scripts/build_graph.py <project_root>
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_graph.py <project_root>
 # 5. 用 Obsidian 打开 Wiki/ 目录（必须指向 Wiki/，不是 project_root）
 ```
 
@@ -162,7 +179,7 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/build_graph.py <project_root>
 
 ```bash
 # 扫描变更（manifest SHA256 追踪，未变更零开销跳过）
-PYTHONDONTWRITEBYTECODE=1 python scripts/update_wiki.py <project_root>
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/update_wiki.py <project_root>
 # 输出 new / modified / deleted / unchanged 列表
 # 对 new/modified 由 agent 生成 frontmatter/摘要/衍生页
 # 重建索引与图谱（秒级）
@@ -172,20 +189,20 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/update_wiki.py <project_root>
 
 ```bash
 # snippet 模式（默认，每结果 200 字片段）
-PYTHONDONTWRITEBYTECODE=1 python scripts/query.py <project_root> "<query>" --k 5 --json
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<query>" --k 5 --json
 
-# 全文模式（问具体数值/流程/对比时用）
-PYTHONDONTWRITEBYTECODE=1 python scripts/query.py <project_root> "<query>" --k 5 --read-full --json
+# 全文模式（问具体数值/流程/对比时用，必须 --out 落盘）
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<query>" --k 5 --read-full --json --out <project_root>/tmp/rf_out.json
 ```
 
-**查询预处理**（agent 调用前必做）：提取产品名/术语 → 中英互译扩展 → 拼接增强查询。例：`"Acme 前雷达的频率"` → `"Acme 前雷达 Front Radar 频率 frequency 60fps"`。
+**查询预处理**（agent 调用前必做）：提取产品名/术语 → 中英互译扩展 → 拼接增强查询。例（虚构的工业相机知识库）：`"Acme 前向相机的帧率"` → `"Acme 前向相机 VisionCam Front 帧率 frame rate fps"`。
 
 **score 解读**：RRF 融合后典型范围 0.015–0.035，看相对 gap 不看绝对值——top1 是 top2 的 2 倍以上为高置信。`method` 字段：`fused`（三路融合）/ `bm25`（仅关键词）/ `vector`（仅语义）/ `graph`（图谱邻居，置信度低）。
 
 ### 图谱邻域查询
 
 ```bash
-python scripts/query.py <project_root> "<X>" --k 5 --json   # 检索自带图谱扩展
+<venv_python> <skill_dir>/scripts/query.py <project_root> "<X>" --k 5 --json   # 检索自带图谱扩展
 # 或直接读 .index/graph.json 手动遍历 edges
 ```
 
@@ -206,6 +223,7 @@ python scripts/query.py <project_root> "<X>" --k 5 --json   # 检索自带图谱
 ## 已知约束
 
 - **Windows + WorkBuddy 沙箱**：`.pyc` / `.pytest_cache` / junction 路径需特殊处理；pytest 加 `-p no:cacheprovider`，Python 运行设 `PYTHONDONTWRITEBYTECODE=1`
+- **stdout 大输出段错误**：沙箱对 managed-python 的 stdout 拦截层在 >~20KB 时非确定性触发 access-violation。`--read-full` 必须用 `--out` 落盘，禁用 `| head` 等管道
 - **LanceDB basetemp**：沙箱拦截系统 Temp 目录，`conftest.py` 将 pytest basetemp 改到项目内
 - **Obsidian vault 根**：必须指向 `Wiki/`，不可设为 `project_root`（否则 `Raw/sources/` 下 `.md` 文件混入图谱成孤立幽灵节点）
 - **小 corpus BM25**：默认 BM25Plus（BM25Okapi 的 IDF 在 < 100 文档时易产生 0 值）
@@ -222,16 +240,18 @@ agent 用本 skill 回答问题时**强制标注出处**：
 
 ---
 **引用来源：**
-- [1] Wiki/entities/acme-visioncam-front.md — 产品实体页
-  - 原始文档: Raw/sources/Datasheet/.../xxx.docx
+- [1] Wiki/entities/<entity-page>.md — <实体页简述>
+  - 原始文档: Raw/sources/.../xxx.<ext>
 ```
 
 无结果时诚实说"知识库中未找到"，**绝不编造**。
 
 ## 测试
 
+测试代码本地保留（`tests/` 目录），但**不在公开发布的 skill 仓库中包含**（`.gitignore` 已排除）。本地运行：
+
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+PYTHONDONTWRITEBYTECODE=1 <venv_python> -m pytest -p no:cacheprovider
 ```
 
 覆盖：索引构建、图谱构建、BM25/向量/融合检索、各 parser、manifest 增量、图片 caption。

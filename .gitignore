@@ -4,6 +4,9 @@ pytest-cache-files-*/
 tmp_*/
 tmp/
 
+# 测试代码（本地开发保留，不公开发布）
+tests/
+
 # 误建的重复前端库副本（与根 lib/ 内容相同，不入库）
 scripts/lib/
 

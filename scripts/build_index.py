@@ -77,11 +77,10 @@ class WikiIndex:
                     os.path.dirname(os.path.abspath(__file__))))),
                     "binaries", "python", "envs", "default", "models",
                     "paraphrase-multilingual-MiniLM-L12-v2")
-            # 也检查 venv 标准位置（跨平台）
+            # 也检查 venv 标准位置（跨平台，基于 home 目录展开）
             candidate_paths = [
                 local_path,
                 os.path.expanduser("~/.workbuddy/binaries/python/envs/default/models/paraphrase-multilingual-MiniLM-L12-v2"),
-                "<home>/.workbuddy/binaries/python/envs/default/models/paraphrase-multilingual-MiniLM-L12-v2",
             ]
             for p in candidate_paths:
                 if os.path.isdir(p) and os.path.exists(os.path.join(p, "model.safetensors")):
