@@ -18,13 +18,20 @@ from parse_sources import compute_sha256, parse_file
 
 
 def norm_key(p) -> str:
-    """归一化 manifest 键（Windows 路径大小写/分隔符不敏感）。
+    """规范化 manifest 键：保留真实大小写 + 统一为绝对路径。
 
-    根因修复：不同运行传入的项目根盘符大小写不一（D:\\ vs d:\\），
-    导致 str(Path) 键逐字不匹配，误判全部源文档为 new、旧条目为 deleted，
-    触发整库重解析。统一经 normcase+normpath 归一，消解大小写/分隔符差异。
+    根因修复（2026-07-18）：
+    - 旧实现用 os.path.normcase，Windows 下会强制小写，导致所有键与内部
+      source_doc 被存成小写，与磁盘真实大小写（如 FMEA / AIAG_VDA_...）不一致；
+    - normcase 也不统一绝对/相对路径形态，使同一物理文件产生"绝对键"与
+      "相对键"两条记录，相对键在扫描时匹配不到磁盘而被误标 deleted（幽灵删除）。
+    新实现用 Path.resolve() 取真实大小写与绝对路径，仅归一盘符大小写与分隔符，
+    既消解大小写/绝对-相对差异，又保留磁盘真实拼写，避免误报与整库重解析。
     """
-    return os.path.normcase(os.path.normpath(str(p)))
+    s = str(Path(p).resolve())
+    if len(s) >= 2 and s[1] == ":":
+        s = s[0].upper() + s[1:]
+    return s.replace("/", "\\")
 
 
 class SourceState(Enum):
