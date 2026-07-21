@@ -99,6 +99,7 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增
 | `build_index.py` | `.index/` | `.obsidian/` / `Wiki/*.md` / `Raw/` |
 | `build_graph.py` | `Wiki/.graph/` + `.index/graph.json` | `.obsidian/` / `Wiki/*.md` / `Raw/` |
 | `update_wiki.py` | `Wiki/*.md` + `.index/manifest.json` | `.obsidian/` / `Raw/` |
+| `check_tags.py` | `Wiki/*.md`（`tags:` 行） | `.obsidian/` / `Raw/` / `.index/` |
 | `query.py` | 无（只读） | 全部 |
 
 **Obsidian vault 设置：** 必须指向 `Wiki/` 目录（不是 `project_root`），否则 Raw/sources/ 下的原始 `.md` 文件会被 Obsidian 索引，导致图谱中出现孤立幽灵节点。
@@ -123,10 +124,16 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增
 2. 对 new / modified 文档：
    - **source-summary 全文区**（`## 全文内容` + `## 文档内嵌图片`）：`update_wiki.py` 步骤 1 已自动落盘 `ParsedDoc.text` 到 `<!-- BEGIN AUTO-GENERATED -->` 标记区，**不经 LLM**，保证数据完整性
    - **source-summary 的 frontmatter/摘要/related** + **entities/concepts/comparisons 衍生页**：agent 生成/更新。衍生页数值必须从 source-summary 全文区提取，不得凭摘要臆测
-3. 对 deleted 文档：agent 清理关联 `Wiki/*.md`，更新 `index.md`
+3. 对 deleted 文档：agent 清理关联 `Wiki/*.md`（`index.md` 由脚本自动重建，见步骤 7，无需手改）
 4. 重建索引：`<venv_python> <skill_dir>/scripts/build_index.py <project_root>`
 5. 重建图谱：`<venv_python> <skill_dir>/scripts/build_graph.py <project_root>`
 6. 更新 `Wiki/log.md`（append 操作记录）
+7. 重建 Wiki 索引 MOC（`index.md`）：由 `build_index_md.py` 扫描 `Wiki/**/*.md`、按页面 `type` 分组自动生成 `[[slug|title]]` 列表。
+   - `update_wiki.py` 末尾已**自动调用**，增量流程无需手动触发；重建时同时自动修复非法 `tags:`（含空格标签转连字符，见上方 frontmatter 规范）；
+
+   - 仅当**绕过 update_wiki.py 手动新增/删除 Wiki 页面**时，须单独运行：
+     `<venv_python> <skill_dir>/scripts/build_index_md.py <project_root>`
+   - 该文件为自动生成，**禁止手改**（下次重建会被覆盖）。
 
 **增量原理：** `manifest.json` 记录每个源文件 SHA256。未变更文件零开销跳过。仅索引/图谱全量重建（秒级）。
 
@@ -318,6 +325,11 @@ related: ["[[其他页标题]]"]
 updated: 2026-06-29
 ---
 ```
+
+> ⚠️ **tag 命名规范（强制）**：Obsidian 标签值**不能含空格**（也不能含 `#`）。含空格的标签（如 `"Euro NCAP"` / `"AD 001"` / `"Assisted Driving"`）会被 Obsidian 判为非法（提示"不被允许的标签名"），不建立 tag 索引——视觉上只剩合法的家族标签（如 `"NCAP"`）生效。
+> - 规则：tag 值用连字符替空格，如 `Euro-NCAP` / `C-NCAP` / `AD-001` / `Assisted-Driving`。
+> - 自动修复：`scripts/check_tags.py` 扫描全部 `Wiki/**/*.md` 的 `tags:` 行，检测任何含空白的标签值→自动转连字符（**幂等**，可重复运行）。`build_index_md.py` 在重建 `index.md` 时**已自动调用**它，任何批次新增/编辑页面后跑一遍即修干净，无需手改。
+> - 已知别名归一（在 `check_tags.py` 的 `_ALIASES` 中）：`c-ncap`→`C-NCAP`、`euro-ncap`→`Euro-NCAP`。
 
 ## 4 信号图谱边定义
 

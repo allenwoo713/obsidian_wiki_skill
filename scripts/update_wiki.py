@@ -221,6 +221,13 @@ def main():
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+    # ISSUE: index-md-auto —— 增量更新末尾自动重建 Wiki/index.md MOC，避免人工维护遗漏/漂移
+    try:
+        from build_index_md import build_wiki_index_md
+        build_wiki_index_md(proj)
+    except Exception as e:
+        print(f"[WARN] index.md 自动重建失败（不影响主流程）: {e}")
+
 
 def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_images=None):
     """重建图片清单，但保留全部旧条目的 caption（使历史标注不丢失）。
