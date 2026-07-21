@@ -55,9 +55,11 @@ obsidian_wiki_skill/
 │   ├── _config.py           # 集中配置加载（import 即 load .env，自推导 SKILL_DIR）
 │   ├── wiki / wiki.cmd      # wrapper 脚本（bash / Windows），免手拼路径
 │   ├── parse_sources.py      # Raw/sources/ → Wiki/*.md（路由到各 parser）
-│   ├── update_wiki.py        # 增量更新（manifest SHA256 追踪，append 不全量重扫）
+│   ├── update_wiki.py        # 增量更新（manifest SHA256 追踪，append 不全量重扫；末尾自动重建 index.md）
 │   ├── build_index.py        # 建 BM25 + LanceDB 索引
 │   ├── build_graph.py        # 建 4 信号图谱 + pyvis 可视化 HTML
+│   ├── build_index_md.py     # 自动重建 Wiki/index.md（MOC，按 type 分组）
+│   ├── check_tags.py         # 检测并修复 Obsidian 非法标签（含空格→连字符）
 │   ├── query.py              # 检索入口（agent 调用）
 │   ├── extract_assets.py     # 提取文档内嵌图片到 Wiki/assets/
 │   ├── picture_caption.py    # 图片 caption 管理（list/apply）
@@ -209,7 +211,7 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_graph.py <proj
 PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/update_wiki.py <project_root>
 # 输出 new / modified / deleted / unchanged 列表
 # 对 new/modified 由 agent 生成 frontmatter/摘要/衍生页
-# 重建索引与图谱（秒级）
+# 重建索引与图谱（秒级）；update_wiki.py 末尾已自动重建 Wiki/index.md（MOC）
 ```
 
 ### 检索（agent 核心）
@@ -233,6 +235,23 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 # 或直接读 .index/graph.json 手动遍历 edges
 ```
 
+### 维护命令（MOC 与标签自检）
+
+`Wiki/index.md` 是**自动生成**的 MOC（按 `type` 分组的页面地图），禁止手改；Obsidian 标签值也**禁止含空格**（否则报"不被允许的标签名"）。
+
+```bash
+# 手动增删 Wiki 页面后，重建 index.md（会顺带自动修复非法标签）
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index_md.py <project_root>
+
+# 仅检查非法标签（只报告不修改）
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <project_root> --check
+
+# 自动修复非法标签（含空格/# 的标签值→连字符；c-ncap→C-NCAP 等别名归一）
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <project_root>
+```
+
+> 这两个脚本已**自动接入**：`update_wiki.py` 末尾调用 `build_index_md.py`，`build_index_md.py` 重建前调用 `check_tags.fix_invalid_tags()`。增量流程通常无需手动触发；仅当直接手改 `Wiki/*.md` 时才需补跑一次。
+
 ## 脚本写边界（强制安全约束）
 
 所有脚本的读写范围严格隔离，防止破坏源数据或 Obsidian 配置：
@@ -244,6 +263,8 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 | `build_graph.py` | `Wiki/.graph/` + `.index/graph.json` | `.obsidian/` / `Wiki/*.md` / `Raw/` |
 | `update_wiki.py` | `Wiki/*.md` + `.index/manifest.json` | `.obsidian/` / `Raw/` |
 | `query.py` | 无（只读） | 全部 |
+| `build_index_md.py` | `Wiki/index.md` | `.obsidian/` / `Raw/` / `Wiki/*.md`（除 index.md 外不重写） |
+| `check_tags.py` | `Wiki/*.md`（仅 `tags:` 行） | `.obsidian/` / `Raw/` / 正文与标题 |
 
 `.obsidian/` 目录由 Obsidian 独占管理，含 vault 级配置，任何脚本强制绕过。
 

@@ -34,6 +34,8 @@
 ### Added
 
 - **CHANGELOG.md**：本次创建，记录通用化改造。
+- **`scripts/build_index_md.py`**：按 frontmatter `type` 自动重建 `Wiki/index.md`（MOC，页面地图），替代纯手改、避免遗漏与质量不稳；`update_wiki.py` 末尾自动调用。
+- **`scripts/check_tags.py`**：通用、幂等检测并修复 Obsidian 非法标签（含空格/`#` 的标签值→连字符，`c-ncap`→`C-NCAP` 等别名归一），仅改 `tags:` 行；`build_index_md.py` 重建前自动调用。
 
 ### Notes
 
