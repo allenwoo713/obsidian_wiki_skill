@@ -6,6 +6,8 @@
 #   ./scripts/wiki <project_root> "<query>" --read-full --json --out <path>
 #   ./scripts/wiki build-index <project_root>
 #   ./scripts/wiki build-graph <project_root>
+#   ./scripts/wiki build-index-md <project_root>
+#   ./scripts/wiki check-tags <project_root> [--check]
 #   ./scripts/wiki update <project_root> [--apply]
 #
 # Python 解释器选择优先级：
@@ -44,6 +46,14 @@ case "${1:-}" in
         shift
         exec "$VENV_PY" "$SKILL_DIR/scripts/build_graph.py" "$@"
         ;;
+    build-index-md)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/build_index_md.py" "$@"
+        ;;
+    check-tags)
+        shift
+        exec "$VENV_PY" "$SKILL_DIR/scripts/check_tags.py" "$@"
+        ;;
     update)
         shift
         exec "$VENV_PY" "$SKILL_DIR/scripts/update_wiki.py" "$@"
@@ -64,6 +74,8 @@ obsidian_wiki_skill wrapper
   wiki <project_root> "<query>" [query 选项]    检索知识库
   wiki build-index <project_root>               构建索引
   wiki build-graph <project_root>               构建图谱
+  wiki build-index-md <project_root>           重建 Wiki/index.md（MOC）
+  wiki check-tags <project_root> [--check]     检查/修复非法标签
   wiki update <project_root> [--apply]          增量更新
   wiki caption-list <project_root> [--limit N]  列出待标注图片
   wiki caption-apply <project_root> <json>      写入 caption

@@ -184,11 +184,16 @@ cp .env.example .env
 ./scripts/wiki <project_root> "<query>" --k 5 --json
 ./scripts/wiki build-index <project_root>
 ./scripts/wiki build-graph <project_root>
+./scripts/wiki build-index-md <project_root>       # 重建 Wiki/index.md（MOC）
+./scripts/wiki check-tags <project_root> [--check] # 检查/修复非法标签
 ./scripts/wiki update <project_root> [--apply]
 
 # Windows cmd.exe
 scripts\wiki.cmd <project_root> "<query>" --k 5 --json
 scripts\wiki.cmd build-index <project_root>
+scripts\wiki.cmd build-graph <project_root>
+scripts\wiki.cmd build-index-md <project_root>       # 重建 Wiki/index.md（MOC）
+scripts\wiki.cmd check-tags <project_root> [--check] # 检查/修复非法标签
 ```
 
 wrapper 自动定位 skill_dir，从 `.env` 读 `WIKI_VENV_PYTHON` 决定用哪个 python。`<venv_python>` 和 `<skill_dir>` 都不用再手填。
@@ -250,7 +255,7 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <proje
 PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <project_root>
 ```
 
-> 这两个脚本已**自动接入**：`update_wiki.py` 末尾调用 `build_index_md.py`，`build_index_md.py` 重建前调用 `check_tags.fix_invalid_tags()`。增量流程通常无需手动触发；仅当直接手改 `Wiki/*.md` 时才需补跑一次。
+> 这两个脚本已**自动接入**：`update_wiki.py` 末尾调用 `build_index_md.py`，`build_index_md.py` 重建前调用 `check_tags.fix_invalid_tags()`。增量流程通常无需手动触发；仅当直接手改 `Wiki/*.md` 时才需补跑一次。也可用 wrapper 调用：`./scripts/wiki build-index-md <project_root>` / `./scripts/wiki check-tags <project_root> [--check]`。
 
 ## 脚本写边界（强制安全约束）
 

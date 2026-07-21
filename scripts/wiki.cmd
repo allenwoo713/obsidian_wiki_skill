@@ -5,6 +5,8 @@ REM 用法：
 REM   scripts\wiki.cmd <project_root> "<query>" --k 5 --json
 REM   scripts\wiki.cmd build-index <project_root>
 REM   scripts\wiki.cmd build-graph <project_root>
+REM   scripts\wiki.cmd build-index-md <project_root>
+REM   scripts\wiki.cmd check-tags <project_root> [--check]
 REM   scripts\wiki.cmd update <project_root> [--apply]
 REM
 REM Python 解释器选择优先级：
@@ -46,6 +48,16 @@ if /i "%SUBCMD%"=="build-graph" (
     "%VENV_PY%" "%SKILL_DIR%\scripts\build_graph.py" %2 %3 %4 %5
     goto :eof
 )
+if /i "%SUBCMD%"=="build-index-md" (
+    shift
+    "%VENV_PY%" "%SKILL_DIR%\scripts\build_index_md.py" %2 %3 %4 %5
+    goto :eof
+)
+if /i "%SUBCMD%"=="check-tags" (
+    shift
+    "%VENV_PY%" "%SKILL_DIR%\scripts\check_tags.py" %2 %3 %4 %5
+    goto :eof
+)
 if /i "%SUBCMD%"=="update" (
     shift
     "%VENV_PY%" "%SKILL_DIR%\scripts\update_wiki.py" %2 %3 %4 %5
@@ -74,6 +86,8 @@ echo 用法:
 echo   wiki.cmd ^<project_root^> "^<query^>" [query 选项]    检索知识库
 echo   wiki.cmd build-index ^<project_root^>               构建索引
 echo   wiki.cmd build-graph ^<project_root^>               构建图谱
+echo   wiki.cmd build-index-md ^<project_root^>           重建 Wiki/index.md（MOC）
+echo   wiki.cmd check-tags ^<project_root^> [--check]     检查/修复非法标签
 echo   wiki.cmd update ^<project_root^> [--apply]          增量更新
 echo   wiki.cmd caption-list ^<project_root^> [--limit N]  列出待标注图片
 echo   wiki.cmd caption-apply ^<project_root^> ^<json^>      写入 caption
