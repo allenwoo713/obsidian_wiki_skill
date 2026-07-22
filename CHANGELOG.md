@@ -31,6 +31,11 @@
 - 使用 `git filter-repo --replace-text` 清除了所有历史 commit 中的本机路径、用户名、真实产品名/客户名/规格数值。
 - 验证：重写后历史中上述敏感字符串出现次数为 0（CHANGELOG.md 与 commit message 中的描述性提及除外）。
 
+#### 强制先检索（防止 agent 跳过 query 直接回答）
+
+- **SKILL.md**：`description` 触发词扩展（新增「根据知识库回答 / 根据wiki回答」等同义表述），提升自动加载命中面；新增「⚠️ 强制检索规则」段，规定 skill 加载后 MUST 先执行 `query.py` 再回答、每个事实陈述标注 `[来源: Wiki/xxx.md]`、检索为空时明确告知「基于模型自身训练数据或网页搜索」。
+- **README.md**：新增「进阶：用项目级 hook 强制先检索（可选）」章节，提供脱敏版 `settings.json` + hook 脚本模板，说明如何在宿主框架层（UserPromptSubmit）再兜一道底；并明确「SKILL.md 无需重复写 hook 配置」——hook 由框架在对话外触发、不由模型执行，写在 SKILL.md 属无效误导。
+
 ### Added
 
 - **CHANGELOG.md**：本次创建，记录通用化改造。

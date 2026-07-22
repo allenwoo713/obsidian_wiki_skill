@@ -299,6 +299,62 @@ agent 用本 skill 回答问题时**强制标注出处**：
 
 无结果时诚实说"知识库中未找到"，**绝不编造**。
 
+## 进阶：用项目级 hook 强制先检索（可选）
+
+`query.py` 是 agent 检索知识库的唯一入口，但 agent 有时会"自作主张"跳过检索、直接用模型自身知识回答。有两道防线可以强制"先 query 再答"：
+
+| 防线 | 位置 | 作用域 | 依赖 skill 激活 |
+|---|---|---|---|
+| **强制检索规则**（本 skill 内置） | `SKILL.md` body 指令块 | 该 skill 被加载的任何会话 | 是（inject 型 skill 全文注入） |
+| **项目级 hook**（可选，使用者自建） | `<project_root>/.codebuddy/settings.json` | 仅该项目 | 否（框架级，每条消息都触发） |
+
+第一道是本 skill 自带的（`SKILL.md` 里的「强制检索规则」段）。第二道是**框架级 hook**——不依赖 skill 是否被激活，只要在这个项目里提问就生效，是更硬的兜底。
+
+> 该机制基于 CodeBuddy / WorkBuddy 的 `UserPromptSubmit` hook（在用户提交消息后、模型处理前运行，可向 prompt 注入额外指令）。其他 agent 框架若有等价的 prompt 预处理钩子，同理适用。
+
+### 配置步骤
+
+在**知识库项目根**（不是 skill 目录）建两个文件：
+
+**1. `<project_root>/.codebuddy/settings.json`**
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash .codebuddy/hooks/force_kb_query.sh", "timeout": 10 } ] }
+    ]
+  }
+}
+```
+
+**2. `<project_root>/.codebuddy/hooks/force_kb_query.sh`**
+
+```bash
+#!/usr/bin/env bash
+# UserPromptSubmit hook：命中知识库相关问题时，强制 agent 先 query 再回答。
+# 对本项目每条消息都触发；仅当关键词命中才注入指令，否则输出 {}（no-op）。
+INPUT="$(cat)"
+# 关键词按你的知识库领域自行增删（示例为虚构工业相机知识库）
+if printf '%s' "$INPUT" | grep -qiE '知识库|wiki|检索|查知识库|资料库|根据文档|根据知识库|根据wiki|datasheet|规格|参数|校准|安装|接口|诊断|Acme|VisionCam'; then
+  cat <<'JSON'
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"【强制检索指令】本问题与知识库相关：你必须先调用本 skill 的 query.py 检索，再基于结果回答；禁止未检索直接凭模型自身知识回答。每个事实须标注 [来源: Wiki/xxx.md]。若检索为空，明确告知用户此答基于模型自身知识或网页搜索。"}}
+JSON
+else
+  printf '{}'
+fi
+```
+
+### 注意事项
+
+- **无 matcher**：`UserPromptSubmit` 不支持按工具过滤，对本项目**每条消息**都触发；是否注入由脚本里的关键词判断，按你的领域改脚本第 6 行的词表。
+- **JSON 必须配平**：heredoc 里的注入 JSON 是 `{...{...}}` 两层，漏一个闭合 `}` 会让宿主解析失败（静默不注入）。改完用 `echo '{"prompt":"知识库测试"}' | bash force_kb_query.sh | python -m json.tool` 自测。
+- **cwd 假设**：命令用相对路径 `bash .codebuddy/hooks/...`，前提是宿主调用 hook 时工作目录为项目根；不确定就改用绝对路径。
+- **首次启用**：部分宿主需在设置界面「信任 / 批准」该 hook 后才生效。
+- **可移植性**：此 hook 属于**使用者的项目**，不随本 skill 分发；不同项目按需各自配置。
+
+> **要不要在 `SKILL.md` 里也写 hook？——不需要。** `SKILL.md` 是给模型读的行为指令，而 hook 由宿主框架在对话外触发、不由模型执行；在 `SKILL.md` 写 hook 配置模型既不会也无法执行。"加载后必须先 query" 的行为约束已由 `SKILL.md` 的「强制检索规则」段覆盖，hook 只是框架层再加固一道，两者互补、无需重复。
+
 ## 测试
 
 测试代码本地保留（`tests/` 目录），但**不在公开发布的 skill 仓库中包含**（`.gitignore` 已排除）。本地运行：
