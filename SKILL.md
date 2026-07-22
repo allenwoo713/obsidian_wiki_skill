@@ -1,6 +1,6 @@
 ---
 name: obsidian_wiki_skill
-description: "管理 Obsidian 知识库：setup（首次构建）、增量更新、hybrid FTS+RAG 检索、4 信号图谱。AI agent 通过 query.py 检索知识库回答用户问题，答案必须标注出处。触发词：知识库 / wiki / 检索 / 查知识库 / my wiki / 我的知识库。"
+description: "管理 Obsidian 知识库：setup（首次构建）、增量更新、hybrid FTS+RAG 检索、4 信号图谱。AI agent 通过 query.py 检索知识库回答用户问题，答案必须标注出处。触发词：知识库 / wiki / 检索 / 查知识库 / my wiki / 我的知识库 / 根据知识库回答 / 根据wiki回答。"
 read_when:
   - 用户要把一批文档整理成知识库
   - 用户要增量更新已有知识库
@@ -136,6 +136,22 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增
    - 该文件为自动生成，**禁止手改**（下次重建会被覆盖）。
 
 **增量原理：** `manifest.json` 记录每个源文件 SHA256。未变更文件零开销跳过。仅索引/图谱全量重建（秒级）。
+
+---
+
+## ⚠️ 强制检索规则（MANDATORY — 不可跳过）
+
+当用户的请求涉及知识库的内容时：
+
+1. **MUST 先执行 query.py，再回答。** 禁止在未检索的情况下凭自身知识回答。
+2. 判断规则：不确定是否需要查询 → **查询**。宁可多查，不可漏查。
+3. 如果 query 返回空结果 → 明确告知"知识库中未找到，此回答是基于模型自身训练数据或者网页搜索"。
+4. 回答中每个事实陈述 MUST 标注出处 `[来源: Wiki/xxx.md]`。
+
+**禁止行为：**
+- ❌ 跳过 query.py 直接回答产品相关问题
+- ❌ 用模型自身训练数据替代知识库内容
+- ❌ 把 query 当"可选步骤"
 
 ---
 
