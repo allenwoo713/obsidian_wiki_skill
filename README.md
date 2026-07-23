@@ -333,13 +333,21 @@ agent 用本 skill 回答问题时**强制标注出处**：
 ```bash
 #!/usr/bin/env bash
 # UserPromptSubmit hook：命中知识库相关问题时，强制 agent 先 query 再回答。
-# 对本项目每条消息都触发；仅当关键词命中才注入指令，否则输出 {}（no-op）。
+# 对本项目每条消息都触发；仅当命中知识库词且非「写/入库」意图时才注入指令，否则输出 {}（no-op）。
 INPUT="$(cat)"
-# 关键词按你的知识库领域自行增删（示例为虚构工业相机知识库）
-if printf '%s' "$INPUT" | grep -qiE '知识库|wiki|检索|查知识库|资料库|根据文档|根据知识库|根据wiki|datasheet|规格|参数|校准|安装|接口|诊断|Acme|VisionCam'; then
-  cat <<'JSON'
+# 触发词表按你的知识库领域自行增删（示例为虚构工业相机知识库）
+KB_RE='知识库|wiki|检索|查知识库|资料库|根据文档|根据知识库|根据wiki|datasheet|规格|参数|校准|安装|接口|诊断|Acme|VisionCam'
+# 负向守卫：命中知识库词但属「写/入库」意图（导入、转换、构建知识库等）时，
+# 属入库任务而非查询，不强制先检索。
+WRITE_RE='导入|转换|入库|构建|重建|建库|建索引|更新知识库|写入知识库|加入知识库|加进知识库|添加.*知识库|重新建立|重新构建|新增.*知识库'
+if printf '%s' "$INPUT" | grep -qiE "$KB_RE"; then
+  if printf '%s' "$INPUT" | grep -qiE "$WRITE_RE"; then
+    printf '{}'   # 入库任务，不强制查询
+  else
+    cat <<'JSON'
 {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"【强制检索指令】本问题与知识库相关：你必须先调用本 skill 的 query.py 检索，再基于结果回答；禁止未检索直接凭模型自身知识回答。每个事实须标注 [来源: Wiki/xxx.md]。若检索为空，明确告知用户此答基于模型自身知识或网页搜索。"}}
 JSON
+  fi
 else
   printf '{}'
 fi
@@ -347,7 +355,8 @@ fi
 
 ### 注意事项
 
-- **无 matcher**：`UserPromptSubmit` 不支持按工具过滤，对本项目**每条消息**都触发；是否注入由脚本里的关键词判断，按你的领域改脚本第 6 行的词表。
+- **无 matcher**：`UserPromptSubmit` 不支持按工具过滤，对本项目**每条消息**都触发；是否注入由脚本里的关键词判断。`KB_RE` 为触发词表、`WRITE_RE` 为写意图负向守卫，按你的领域自行增删。
+- **写/入库任务不触发**：用户意图若是「导入 / 转换 / 构建知识库」等写操作，hook 不注入检索指令（此时库中可能尚无该内容），由 `WRITE_RE` 守卫控制。
 - **JSON 必须配平**：heredoc 里的注入 JSON 是 `{...{...}}` 两层，漏一个闭合 `}` 会让宿主解析失败（静默不注入）。改完用 `echo '{"prompt":"知识库测试"}' | bash force_kb_query.sh | python -m json.tool` 自测。
 - **cwd 假设**：命令用相对路径 `bash .codebuddy/hooks/...`，前提是宿主调用 hook 时工作目录为项目根；不确定就改用绝对路径。
 - **首次启用**：部分宿主需在设置界面「信任 / 批准」该 hook 后才生效。
