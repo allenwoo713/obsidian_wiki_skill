@@ -59,11 +59,11 @@ VENV_PY="<venv_python>"
 SKILL_DIR="<skill_dir>"
 PROJ="<project_root>"
 
-# ② snippet 检索（小输出可直走管道）
-PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增强查询>" --k 6 --json
+# ② snippet 检索（小输出可直走管道）—— 注意：传用户【原始问题】，禁止调用前改写
+PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<用户原始问题>" --k 6 --json
 
 # ③ 全文检索（>~20KB 必须 --out 落盘，禁直走 stdout 管道）
-PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增强查询>" --k 5 --read-full --json --out "$PROJ/tmp/rf_out.json"
+PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<用户原始问题>" --k 5 --mode full --json --out "$PROJ/tmp/rf_out.json"
 ```
 
 > ⚠️ 常见踩坑：Windows 下首次调用若写成 `<venv_python>` 实际指向 `.../venv/bin/python`（Linux 布局）会 `No such file or directory`(exit 127)。Windows venv 只有 `Scripts/python.exe`。见上方「前置条件」警告。
@@ -159,44 +159,38 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<增
 
 ### 标准检索流程（4 步）
 
-#### 步骤 1：查询预处理（关键词提取与扩展）
+#### 步骤 1：把【用户原始问题】原样传给 query.py（⚠️ 禁止调用前改写）
 
-**BM25 是词袋模型，query 与 doc 的 token 重叠决定得分。关键词提取质量直接影响检索结果。** agent 在调用 query.py 前必须做查询预处理：
+**检索查询的预处理（关键词提取、中英文互译、同义词扩展、型号/错误码保护、意图识别、低召回重试）现在全部由 `query.py` 内部的独立 Query Planner 模块（`scripts/query_planner.py`）自动完成。** agent **不得**在调用前手工构造"增强查询"、提取关键词或拼接中英文扩展。
 
-1. **识别查询语言**（中文 / 英文 / 混合）
-2. **提取产品名/型号**——对照知识库 `purpose.md` 中的产品实体清单（例如某知识库的产品是 `Acme VisionCam` / `Vega Opticam`，就把这些名词加入查询）
-3. **提取技术术语**——按知识库领域提取（示例：相机领域常见术语 `FOV` / `帧率` / `分辨率` / `GigE` / `PoE` / `Global Shutter` / `HDR` / `校准` / `安装` / `诊断` / `接口`）
-4. **中英文互译扩展**：
-   - "<中文产品名>" → 加对应英文（如"前向相机" → 加 "Front Camera"）
-   - "校准" → 加 "calibration"
-   - "安装" → 加 "installation"
-   - "诊断" → 加 "diagnostics"
-   - "接口" → 加 "interface"
-   - "规格" → 加 "specs"
-5. **构造增强查询**：原文 + 扩展词，用空格连接
+- ✅ 正确：`query.py <project_root> "ARS540 在大雨时为什么会丢目标？"`
+- ❌ 错误：`query.py <project_root> "ARS540 雷达 大雨 目标丢失 丢目标 原因 cause"`（agent 手工拼词）
 
-**示例（以虚构的 Acme 工业相机知识库为例）：**
-- 用户问"Acme 前向相机的帧率是多少" → 增强查询：`Acme 前向相机 Front Camera 帧率 frame rate fps`
-- 用户问"Vega 的 GigE 接口怎么配置" → 增强查询：`Vega Opticam GigE Vision 接口 interface configuration`
-- 用户问"校准流程" → 增强查询：`校准 calibration 流程 角度 对齐`
+Query Planner 的行为（详见 GitHub issue #6）：
+- **原始问题永远是最终回答目标**，永不被替换；它作为第一条 `semantic_queries` 保留。
+- 自动生成**通道专用查询**：FTS 用 `lexical_terms + exact_terms`（型号/错误码/路径/数字单位原样保留），向量用 `semantic_queries`，图谱用 `entities/relation_intent`。
+- 仅在必要时（指代/口语过短/多对象多跳/意图不确定/首轮低召回）触发可选 LLM rewrite；LLM 失败/超时/违反约束自动回退确定性规划；最多 1 次低召回重试。
+- 无 LLM / 无网络时仍可完成确定性规划与检索。
+
+> 指代不清（"它""这个"）时，用 `--conversation-context "<最小必要上下文>"` 或 `--conversation-context-file <file>` 只消解指代，**不替代原始问题**。
 
 #### 步骤 2：执行 hybrid 检索
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<增强查询>" --k 5 --json
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<用户原始问题>" --k 5 --json
 ```
 
-默认返回 snippet 模式（每结果 200 字片段）。
+默认按 Query Planner 识别的 `context_mode` 返回对应粒度的上下文（lookup→section，procedure→parent section，comparison→multiple sections，relation→evidence）。
 
-> ⚠️ **`--read-full` 必须用 `--out` 落盘，禁止直走 stdout 管道**：沙箱对 managed-python 的 stdout 拦截层在大输出（≈20KB+）时存在非确定性 access-violation（exit -1073741819）。正确写法：
+> ⚠️ **大输出（`--mode full` 或 JSON ≈20KB+）必须用 `--out` 落盘，禁止直走 stdout 管道**：沙箱对 managed-python 的 stdout 拦截层在大输出时存在非确定性 access-violation（exit -1073741819）。正确写法：
 > ```bash
-> PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<增强查询>" --k 5 --read-full --json --out <project_root>/tmp/rf_out.json
+> PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<用户原始问题>" --mode full --json --out <project_root>/tmp/rf_out.json
 > ```
-> stdout 仅返回一行 `wrote <path> (N bytes)`（管道安全）；agent 用 Read 工具读 `tmp/rf_out.json` 取大 payload。无 `--out` 时行为不变（小输出可直走管道）。详见"已知环境约束"。
+> stdout 仅返回一行 `wrote <path> (N bytes)`（管道安全）；agent 用 Read 工具读 `tmp/rf_out.json` 取大 payload。无 `--out` 时小输出可直走管道。详见"已知环境约束"。
 
-**何时加 `--read-full`（agent 判断规则）：**
+**何时加 `--mode full`（agent 判断规则）：**
 
-| 场景 | 用 --read-full | 理由 |
+| 场景 | 用 --mode full | 理由 |
 |---|---|---|
 | 用户问具体规格数值（帧率/分辨率/FOV/精度） | ✅ 是 | 数值在表格中，snippet 可能截断 |
 | 用户问流程/步骤（校准/安装/诊断流程） | ✅ 是 | 流程是多步骤，snippet 不够 |
@@ -206,14 +200,28 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 | 检索结果 score 很接近（gap < 2x） | ✅ 是 | 需要更多上下文区分 |
 | 只需要快速定位页面路径 | ❌ 否 | snippet 够 |
 
-**决策原则：** snippet 能否支撑你给出完整、准确的答案？如果不确定，先用 snippet，发现不够再补 `--read-full`。
+**决策原则：** snippet 能否支撑你给出完整、准确的答案？如果不确定，先用默认 snippet，发现不够再补 `--mode full`。
+
+> 返回的 JSON 含完整 `query_plan`（original_query / intent / semantic_queries / lexical_terms / exact_terms / entities / context_mode / rewrite 来源 / 约束保留 / retry 原因）。用它判断实际检索路径，并用 `context_text` 合成答案。
+
+**Query Planner 配置（环境变量，均有默认值）：**
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `QUERY_PLANNER_REWRITE` | `auto` | LLM rewrite 策略：`auto`（仅必要时）/ `off`（纯确定性）/ `force`（总是尝试） |
+| `QUERY_PLANNER_MAX_SEMANTIC_QUERIES` | `3` | 各通道语义查询条数上限（含原始问题） |
+| `QUERY_PLANNER_MAX_RETRIES` | `1` | 低召回重试上限（总检索 ≤2 轮） |
+| `QUERY_PLANNER_REWRITE_TIMEOUT_SECONDS` | `8` | rewrite provider 超时（超时自动回退） |
+| `QUERY_PLANNER_MIN_QUERY_CHARS` | `6` | 短于该长度视为口语/过短，触发 rewrite |
+
+项目级资源（可选）：`<project_root>/lexicon.txt`（专业词典，一行一词）与 `<project_root>/query_synonyms.yaml`（同义词表，`term: [alt1, alt2]` 或 `term: alt1, alt2`）。两者被索引端与查询端**共享同一份**，保证 tokenizer/词典 schema 一致。
 
 #### 步骤 3：解读检索结果
 
 **score 读取规则：**
 - RRF 融合后 score 典型范围 0.015–0.035
 - **看相对 gap，不看绝对值**：top1 score 是 top2 的 2 倍以上 → 高置信；gap 小 → 多读几条
-- `method` 字段：`fused` = 三路融合，`bm25` = 仅关键词命中，`vector` = 仅语义命中，`graph` = 图谱扩展
+- `method` 字段（inclusion_reason）：`rrf` = FTS+向量 page-level RRF 融合命中，`graph_expansion` = 图谱 1-hop 扩展，`image` = 图片命中
 - 如果 top 结果全是 `graph` 方法 → 说明关键词和向量都没直接命中，是图谱邻居推荐，置信度低
 
 **无结果处理：**
@@ -293,21 +301,18 @@ for e in g['edges']:
 
 **agent 内部执行：**
 
-1. **查询预处理：**
-   - 语言：中文
-   - 产品名：Acme 前向相机 → Acme VisionCam Front
-   - 术语：帧率 → frame rate / fps，FOV
-   - 增强查询：`Acme 前向相机 VisionCam Front 帧率 frame rate FOV`
+1. **把原始问题原样传给 query.py**（查询预处理由 Query Planner 自动完成，agent 不手工拼词）：
+   - 原始问题："Acme 前向相机的帧率和 FOV 是多少？"（直接传入，不改写）
 
-2. **判断 --read-full：** 用户问具体数值 → ✅ 需要 --read-full（数值在表格中）
+2. **判断 `--mode full`：** 用户问具体数值（帧率/FOV）→ ✅ 需要 `--mode full`（数值在表格中）
 
 3. **执行检索：**
    ```bash
-   PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "Acme 前向相机 VisionCam Front 帧率 frame rate FOV" --k 3 --read-full --json --out <project_root>/tmp/rf_out.json
+   PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "Acme 前向相机的帧率和 FOV 是多少？" --mode full --k 3 --json --out <project_root>/tmp/rf_out.json
    ```
-   （stdout 仅 `wrote ... (N bytes)`；agent 随后 Read `tmp/rf_out.json`）
+   （stdout 仅 `wrote ... (N bytes)`；agent 随后 Read `tmp/rf_out.json`，其中包含 `query_plan` 与 `context_text`）
 
-4. **解读结果：** top1 = Acme VisionCam Front（score=0.03x, fused），读全文找到规格表
+4. **解读结果：** top1 = Acme VisionCam Front（inclusion_reason=`rrf`），读全文找到规格表
 
 **agent 回答用户：**
 
@@ -369,7 +374,7 @@ Phase 4:   预算控制 (4K→1M tokens)
 ## 已知环境约束
 
 - Windows + WorkBuddy 沙箱：.pyc / .pytest_cache / junction 路径需特殊处理
-- **stdout 大输出段错误（2026-07-14 定位）**：沙箱对 managed-python 的 stdout 拦截层在进程经捕获管道写出较大数据（query.py `--read-full` JSON ≈29KB+、trivial 写 50KB 均复现）时，非确定性触发 access-violation（exit -1073741819 / 0xC0000005）。**非尺寸阈值**（64KB 成功而 50KB 崩溃），是拦截层时序竞态；纯 Python 脚本（仅 json/pathlib）也复现 → 非 torch/LanceDB 原生库问题。**规避**：`--read-full` 及任何 >~20KB stdout 一律 `> tmp/out.json 2> tmp/err.log` 重定向到文件再 Read；小输出可直走管道；禁用 `| head` 等管道。
+- **stdout 大输出段错误（2026-07-14 定位）**：沙箱对 managed-python 的 stdout 拦截层在进程经捕获管道写出较大数据（query.py `--mode full` JSON ≈29KB+、trivial 写 50KB 均复现）时，非确定性触发 access-violation（exit -1073741819 / 0xC0000005）。**非尺寸阈值**（64KB 成功而 50KB 崩溃），是拦截层时序竞态；纯 Python 脚本（仅 json/pathlib）也复现 → 非 torch/LanceDB 原生库问题。**规避**：`--mode full` 及任何 >~20KB stdout 一律 `> tmp/out.json 2> tmp/err.log` 重定向到文件再 Read；小输出可直走管道；禁用 `| head` 等管道。
 - embedding 模型从 modelscope.cn 下载（HF 镜像对权重文件分发有问题）
 - LanceDB 在系统 Temp 目录被沙箱拦截，conftest.py 将 pytest basetemp 改到项目内
 - Obsidian vault 根目录 = `Wiki/`，不可设为 project_root（否则 Raw/sources/ 中 `.md` 文件混入图谱）

@@ -493,6 +493,25 @@ class WikiIndex:
             return []
         return [self._hit_from_row(r, "fts") for r in rows]
 
+    def search_fts_terms(self, lexical_terms, exact_terms, k: int = 20) -> List[ChunkHit]:
+        """#6：直接消费 Query Planner 的通道专用 FTS 词项（不再二次分词）。
+
+        ``lexical_terms``（来自 #2 ``fts_terms``）+ ``exact_terms``（型号/错误码/路径/
+        数字/单位/CLI 参数）以空格拼接后交给 LanceDB whitespace FTS，与索引端
+        ``fts_text`` 的构造完全一致（共享同一 tokenizer schema 与词典）。
+        """
+        q = " ".join(list(lexical_terms) + list(exact_terms))
+        if not q.strip():
+            return []
+        table = self._get_lance_table()
+        try:
+            rows = table.search(q, query_type="fts").limit(k * 4).to_list()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("search_fts_terms 失败: %s", e)
+            return []
+        return [self._hit_from_row(r, "fts") for r in rows]
+
     def search_vector(self, query: str, k: int = 20) -> List[ChunkHit]:
         """向量检索（仅 dense 行）。返回 chunk 级命中（按 page_id 归并前）。"""
         embedder = self._get_embedder()

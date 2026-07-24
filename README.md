@@ -222,16 +222,16 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/update_wiki.py <proj
 ### 检索（agent 核心）
 
 ```bash
-# snippet 模式（默认，每结果 200 字片段）
-PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<query>" --k 5 --json
+# 默认：把用户原始问题原样传入，Query Planner 自动做查询预处理（禁止调用前改写）
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<用户原始问题>" --k 5 --json
 
 # 全文模式（问具体数值/流程/对比时用，必须 --out 落盘）
-PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<query>" --k 5 --read-full --json --out <project_root>/tmp/rf_out.json
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<用户原始问题>" --mode full --k 5 --json --out <project_root>/tmp/rf_out.json
 ```
 
-**查询预处理**（agent 调用前必做）：提取产品名/术语 → 中英互译扩展 → 拼接增强查询。例（虚构的工业相机知识库）：`"Acme 前向相机的帧率"` → `"Acme 前向相机 VisionCam Front 帧率 frame rate fps"`。
+**查询预处理已内置于 Query Planner**（issue #6）：agent **无需、也不得**在调用前手工提取关键词、做中英互译或拼接增强查询——直接把用户原始问题原样传入 `query.py` 即可。`query.py` 内部会生成 FTS 词项（`lexical_terms`+`exact_terms`，型号/错误码/数字单位原样保留）、向量语义查询（`semantic_queries`，原始问题恒为第 0 条）、图谱实体（`entities`），并按意图选择 `context_mode`。无 LLM 时仍可确定性规划与检索。
 
-**score 解读**：RRF 融合后典型范围 0.015–0.035，看相对 gap 不看绝对值——top1 是 top2 的 2 倍以上为高置信。`method` 字段：`fused`（三路融合）/ `bm25`（仅关键词）/ `vector`（仅语义）/ `graph`（图谱邻居，置信度低）。
+**score 解读**：RRF 融合后典型范围 0.015–0.035，看相对 gap 不看绝对值——top1 是 top2 的 2 倍以上为高置信。`method`(inclusion_reason) 字段：`rrf`（FTS+向量 page-level RRF 融合）/ `graph_expansion`（图谱 1-hop 扩展，置信度低）/ `image`（图片命中）。
 
 ### 图谱邻域查询
 
@@ -349,7 +349,7 @@ if printf '%s' "$INPUT" | grep -qiE "$KB_RE"; then
     printf '{}'   # 入库任务，不强制查询
   else
     cat <<'JSON'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"【强制检索指令】本问题与知识库相关：你必须先调用本 skill 的 query.py 检索，再基于结果回答；禁止未检索直接凭模型自身知识回答。每个事实须标注 [来源: Wiki/xxx.md]。若检索为空，明确告知用户此答基于模型自身知识或网页搜索。"}}
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"【强制检索指令】本问题与知识库相关：必须先调用本 skill 的 query.py，并把用户本轮原始问题原样传入；禁止在调用前自行改写、翻译或拼接关键词。query.py 内部 Query Planner 会生成 FTS、向量和图谱所需的通道专用查询。回答时必须使用 query.py 返回的 original_query、query_plan 和 context_text，并按要求标注来源。若检索为空，明确说明未找到。"}}
 JSON
   fi
 else
@@ -365,6 +365,7 @@ fi
 - **cwd 假设**：命令用相对路径 `bash .codebuddy/hooks/...`，前提是宿主调用 hook 时工作目录为项目根；不确定就改用绝对路径。
 - **首次启用**：部分宿主需在设置界面「信任 / 批准」该 hook 后才生效。
 - **可移植性**：此 hook 属于**使用者的项目**，不随本 skill 分发；不同项目按需各自配置。
+- **旧 hook 迁移（Query Planner 上线后）**：本 skill 的 `query.py` 已内置 Query Planner，**不再要求 agent 在调用前手工构造增强查询**。若你已按旧版 README 部署过 hook，请把上面 `additionalContext` 模板替换为新版本（核心变化：要求"把用户本轮原始问题**原样**传入 query.py，禁止调用前改写/翻译/拼接关键词"，并改为使用返回的 `original_query` / `query_plan` / `context_text`）。**仓库 README 更新不会自动改动你已部署的 hook**——需你手动替换注入文本。保留一个版本兼容：旧模板仍可用，但会多一道 agent 层冗余改写（不影响正确性，仅损失可复现性与评测一致性）。
 
 > **要不要在 `SKILL.md` 里也写 hook？——不需要。** `SKILL.md` 是给模型读的行为指令，而 hook 由宿主框架在对话外触发、不由模型执行；在 `SKILL.md` 写 hook 配置模型既不会也无法执行。"加载后必须先 query" 的行为约束已由 `SKILL.md` 的「强制检索规则」段覆盖，hook 只是框架层再加固一道，两者互补、无需重复。
 
