@@ -24,6 +24,50 @@ VECTOR_METRIC = "cosine"
 # embedding 不做 L2 归一化（保持 MiniLM 原始输出，cosine metric 已处理模长）
 NORMALIZE_EMBEDDINGS = False
 
+# 切片（chunking）参数：向量索引按切片粒度嵌入，而非整页。
+# 动机：① 整页（如 Birolini 2MB 全文）直接 encode 会被一次性 tokenize 成巨量
+#       token，内存峰值触发段错误；② 切片后每片 ≈ MiniLM 上下文窗口，嵌入不被
+#       截断，检索精度显著高于"整页只取前 128 token"；③ 切片粒度召回后按源页面
+#       归并，最终 fusion/budget/graph 仍以页面为单位，query.py 其余逻辑无需改动。
+MAX_CHUNK_CHARS = 800
+CHUNK_OVERLAP = 150
+VECTOR_ENCODE_BATCH = 64   # 每次 encode 的切片数，控制内存峰值
+
+
+def split_into_chunks(text: str, max_chars: int = MAX_CHUNK_CHARS,
+                      overlap: int = CHUNK_OVERLAP):
+    """按段落/标题切分文本为语义连贯的切片，供向量嵌入。
+
+    - 以空行分段（paragraph）为积累单元，遇标题(#/##/###)记录层级上下文；
+    - 当前段累计超过 max_chars 时落盘一个切片，并以 overlap 字符的尾部作为下
+      一切片的重叠，避免切断语义；
+    - 每个切片在嵌入时前置最近标题，保留层级上下文。
+    """
+    lines = text.split("\n")
+    chunks = []
+    cur = []
+    cur_len = 0
+    last_heading = ""
+    for line in lines:
+        h = re.match(r"^(#{1,3})\s+(.*)", line)
+        if h:
+            last_heading = line.strip()
+        add = len(line) + 1
+        if cur_len + add > max_chars and cur:
+            seg = "\n".join(cur).strip()
+            if seg:
+                chunks.append((last_heading, seg))
+            tail = "\n".join(cur)[-overlap:] if overlap else ""
+            cur = [tail] if tail.strip() else []
+            cur_len = len(cur[0]) + 1 if cur else 0
+        cur.append(line)
+        cur_len += add
+    if cur:
+        seg = "\n".join(cur).strip()
+        if seg:
+            chunks.append((last_heading, seg))
+    return chunks
+
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
@@ -115,7 +159,7 @@ class WikiIndex:
                 vec_dim = dim or 384  # 兜底 MiniLM-L12-v2 维度，避免无 dim 调用建错 schema
                 self._lance_table = db.create_table("wiki_pages", data=[
                     {"path": "", "title": "", "page_type": "", "content": "",
-                     "sources": "", "vector": [0.0] * vec_dim}
+                     "sources": "", "chunk_idx": 0, "vector": [0.0] * vec_dim}
                 ])
                 self._lance_table.delete('path = ""')
         return self._lance_table
@@ -207,12 +251,32 @@ class WikiIndex:
 
     def _build_vector(self):
         embedder = self._get_embedder()
-        texts = [p.title + "\n" + p.content for p in self.pages]
-        # ISSUE-15：索引侧与查询侧必须用相同 normalize_embeddings 配置
-        vectors = embedder.encode(
-            texts, show_progress_bar=False,
-            normalize_embeddings=NORMALIZE_EMBEDDINGS,
-        ).tolist()
+        # 切片嵌入：每个页面切成若干语义切片，各自嵌入为独立 LanceDB 行；行内 path
+        # 仍指向源页面，便于 query.py 按页面归并（RRF/budget/graph 逻辑不变）。
+        rows_meta = []    # (path, title, page_type, snippet, sources_json, chunk_idx)
+        chunk_texts = []  # 嵌入用文本（标题 + 切片正文）
+        for p in self.pages:
+            base = (p.title + "\n" + p.content).strip()
+            if not base:
+                continue
+            for ci, (heading, seg) in enumerate(split_into_chunks(base)):
+                embed_text = (heading + "\n" + seg) if heading else seg
+                rows_meta.append((
+                    str(p.path), p.title, p.page_type,
+                    seg[:2000], json.dumps(p.sources, ensure_ascii=False), ci,
+                ))
+                chunk_texts.append(embed_text)
+        if not chunk_texts:
+            return
+        # 分批 encode，控制内存峰值（避免整批 tokenize 触发段错误）
+        vectors = []
+        for i in range(0, len(chunk_texts), VECTOR_ENCODE_BATCH):
+            batch = chunk_texts[i:i + VECTOR_ENCODE_BATCH]
+            v = embedder.encode(
+                batch, show_progress_bar=False,
+                normalize_embeddings=NORMALIZE_EMBEDDINGS,
+            ).tolist()
+            vectors.extend(v)
         # ISSUE-10：建表时传入动态维度（而非硬编码 384），换模型时 schema 正确
         table = self._get_lance(dim=self._embedding_dim())
         try:
@@ -223,17 +287,15 @@ class WikiIndex:
             logging.getLogger(__name__).debug("_build_vector: 跳过 delete（可能首次建表）: %s", e)
         data = [
             {
-                "path": str(p.path),
-                "title": p.title,
-                "page_type": p.page_type,
-                "content": p.content[:2000],
-                "sources": json.dumps(p.sources, ensure_ascii=False),
-                "vector": v,
+                "path": m[0], "title": m[1], "page_type": m[2],
+                "content": m[3], "sources": m[4], "chunk_idx": m[5],
+                "vector": vec,
             }
-            for p, v in zip(self.pages, vectors)
+            for m, vec in zip(rows_meta, vectors)
         ]
-        if data:
-            table.add(data)
+        # 分批写入，避免超大 list 瞬时内存峰值
+        for i in range(0, len(data), 2000):
+            table.add(data[i:i + 2000])
 
     def _write_manifest(self):
         manifest_file = self.index_dir / "manifest.json"
@@ -347,7 +409,12 @@ class WikiIndex:
         return results
 
     def search_vector(self, query: str, k: int = 20) -> List[RetrievedPage]:
-        """ISSUE-15：显式指定 cosine metric，用 normalize_vector_score 替换旧 1/(1+d)。"""
+        """向量检索：LanceDB 按切片粒度命中，归并到源页面后返回 top-k 页面。
+
+        LanceDB 中每行是一个切片（path 指向源页面）。命中后按 path 归并，取每个
+        页面距离最小（最相似）的切片作为代表，snippet 为该切片正文；最终以页面为
+        单位参与 RRF/budget/graph（query.py 其余逻辑不变）。
+        """
         embedder = self._get_embedder()
         qv = embedder.encode(
             [query], show_progress_bar=False,
@@ -356,14 +423,21 @@ class WikiIndex:
         table = self._get_lance()
         from vector_scoring import apply_vector_metric, normalize_vector_score
         query_builder = apply_vector_metric(table.search(qv), VECTOR_METRIC)
-        rows = query_builder.limit(k).to_list()
-        results = []
+        # 多取切片（每页可能多个切片命中），归并后再取 top-k 页面
+        rows = query_builder.limit(max(k * 4, 60)).to_list()
+        best: dict = {}
         for r in rows:
             # _distance 必须存在，缺失则报错（不伪造默认值）
             if "_distance" not in r:
                 raise RuntimeError(
                     f"LanceDB result missing '_distance' field: {r}"
                 )
+            key = str(r["path"])
+            if key not in best or r["_distance"] < best[key]["_distance"]:
+                best[key] = r
+        ranked = sorted(best.values(), key=lambda r: r["_distance"])[:k]
+        results = []
+        for r in ranked:
             distance = float(r["_distance"])
             score = normalize_vector_score(
                 distance, VECTOR_METRIC,
