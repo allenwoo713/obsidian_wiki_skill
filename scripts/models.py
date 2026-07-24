@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Set
 
 
 @dataclass
@@ -68,3 +68,88 @@ class ManifestEntry:
     status: str  # 'new' | 'processed' | 'modified' | 'deleted'
     wiki_pages: List[str]
     last_processed: Optional[str]  # ISO datetime
+
+
+# --------------------------------------------------------------------------
+# Retrieval v2 shared data model (GitHub issues #1/#3/#4/#5)
+# These define the cross-module contract consumed by chunking, fusion,
+# context packing and graph expansion.
+# --------------------------------------------------------------------------
+@dataclass
+class GraphPath:
+    """A relation path from a seed page to a graph candidate."""
+    source_id: str
+    target_id: str
+    edge_type: str          # explicit: wikilink|derived_from_source|same_source
+                            # inferred: adamic_adar|type_affinity
+    is_inferred: bool
+    weight: float
+    hop: int
+
+
+@dataclass
+class EvidenceHit:
+    """A single chunk hit on one retrieval channel."""
+    chunk_id: str
+    channel: str            # 'sparse' | 'dense'
+    rank: int
+    raw_score: float
+    text: str
+    section_path: List[str]
+
+
+@dataclass
+class PageCandidate:
+    """A fused page candidate carrying evidence from both channels."""
+    page_id: str
+    path: Path
+    title: str
+    rrf_score: float
+    sparse_rank: Optional[int]
+    dense_rank: Optional[int]
+    sparse_evidence: List[EvidenceHit] = field(default_factory=list)
+    dense_evidence: List[EvidenceHit] = field(default_factory=list)
+    graph_paths: List[GraphPath] = field(default_factory=list)
+
+
+@dataclass
+class ContextItem:
+    """A page/source included in the final LLM context bundle."""
+    page_id: str
+    path: str
+    title: str
+    inclusion_reason: str
+    scope: str              # chunk|adjacent|section|full_page|full_source
+    evidence: List[EvidenceHit] = field(default_factory=list)
+    text: str = ""
+    sources: List[str] = field(default_factory=list)
+    graph_paths: List[GraphPath] = field(default_factory=list)
+    token_count: int = 0
+    truncated: bool = False
+    truncation_reason: Optional[str] = None
+
+
+@dataclass
+class ContextBundle:
+    """Final retrieval output — directly consumable by the LLM."""
+    query: str
+    mode: str
+    items: List[ContextItem] = field(default_factory=list)
+    context_text: str = ""
+    token_count: int = 0
+    max_context_tokens: int = 0
+    omitted_items: List[dict] = field(default_factory=list)
+
+
+@dataclass
+class IndexState:
+    """manifest v2 `index_state` (issues #1/#2/#7/#8/#11)."""
+    schema_version: int = 2
+    chunk_schema_version: int = 2
+    tokenizer_schema_version: int = 1
+    embedding_model: str = ""
+    embedding_model_revision: str = ""
+    embedding_dimension: int = 384
+    vector_metric: str = "cosine"
+    fts_config_hash: str = ""
+    chunk_config_hash: str = ""
