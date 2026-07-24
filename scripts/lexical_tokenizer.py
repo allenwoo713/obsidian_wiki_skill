@@ -39,6 +39,7 @@ _EXACT_SPECS: List[Tuple[str, str]] = [
     (r"\b\d+(?:\.\d+)?\s?(?:mm|cm|m|km|kg|g|mg|s|ms|µs|Hz|kHz|MHz|GHz|Mbps|Gbps|Mbps|V|mV|A|mA|W|kW|°C|%|fps|rpm|px)\b",
      "numunit"),
     (r"\b(?:0x)?[A-Z]{1,4}-?\d{2,}(?:\.\d+)*\b", "code"),
+    (r"(?:0[xX])[0-9A-Fa-f]+\b", "hex"),
     (r"\b\d{2,}(?:\.\d+)?\b", "number"),
 ]
 
