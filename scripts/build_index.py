@@ -369,7 +369,12 @@ class WikiIndex:
         # 5) 自适应向量索引（#8）
         self._build_vector_index(table, len(all_rows), dim)
 
-        # 清理 checkpoint
+        # 写 manifest（必须在清理 checkpoint 之前）：
+        # 沙箱 safe-delete 守卫会拦截 >50 文件的 rmtree 并可能中止进程，
+        # 若写在清理之后则 manifest 永不被写入，query.py 会判 legacy 拒检索。
+        self._write_manifest()
+
+        # 清理 checkpoint（失败不致命，忽略）
         try:
             import shutil
             shutil.rmtree(ckpt, ignore_errors=True)
