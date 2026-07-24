@@ -39,7 +39,9 @@ def attach_captions(text: str, images: List[ImageRef]) -> Tuple[str, List[ImageR
             if candidate and _CAPTION_RE.match(candidate):
                 caption = candidate
                 break
-        images[img_idx].caption = caption
+        # 保留已有 caption（如适配器从 MinerU alt 拿到的图注），仅当附近真有
+        # "Figure X / 图 X" 文本时才覆盖，避免被空值清掉。
+        images[img_idx].caption = caption or images[img_idx].caption
         lines[line_no] = line.replace("图注: 待补", f"图注: {caption or '[无图注]'}")
         img_idx += 1
     return "\n".join(lines), images
@@ -58,4 +60,6 @@ def replace_image_placeholders(text: str) -> str:
         if caption and caption != "[无图注]":
             return f"![[{filename}]]  \n{caption}"
         return f"![[{filename}]]"
-    return re.sub(r"\{\{IMG\|([^|]+)\|图注: ([^}]*)\}\}", _repl, text)
+    # DOTALL + 非贪婪：caption 可能含 LaTeX 的 "}"（如 $g _ { r }$），
+    # 旧版 [^}]* 遇首个 "}" 即中止导致整条 {{IMG}} 无法转换（图不渲染）。
+    return re.sub(r"\{\{IMG\|([^|]+)\|图注: (.*?)\}\}", _repl, text, flags=re.DOTALL)
