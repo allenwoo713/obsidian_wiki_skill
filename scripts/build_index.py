@@ -383,16 +383,19 @@ class WikiIndex:
         index_type = "IVF_HNSW_SQ" if n_rows >= SQ_INDEX_MIN_ROWS else "IVF_HNSW_FLAT"
         num_partitions = max(2, int(math.sqrt(n_rows)))
         try:
+            # lancedb 0.33: create_index 首参是 metric（非列名），列名用 vector_column_name=
             table.create_index(
-                "vector", metric=VECTOR_METRIC, index_type=index_type,
-                num_partitions=num_partitions,
+                metric=VECTOR_METRIC, vector_column_name="vector",
+                index_type=index_type, num_partitions=num_partitions,
+                replace=True,
             )
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(
                 "create_index(%s) 失败，回退默认索引: %s", index_type, e)
             try:
-                table.create_index("vector", metric=VECTOR_METRIC)
+                # lancedb 0.33: 列名用 vector_column_name=，首参是 metric
+                table.create_index(metric=VECTOR_METRIC, vector_column_name="vector", replace=True)
             except Exception as e2:
                 logging.getLogger(__name__).warning("默认 create_index 也失败: %s", e2)
 
