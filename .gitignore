@@ -26,3 +26,6 @@ __pycache__/
 
 # 系统文件
 .DS_Store
+
+# 临时计划文档（修改计划的草稿，不入库）
+docs/plan-*.md
