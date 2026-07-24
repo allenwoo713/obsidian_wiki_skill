@@ -60,6 +60,7 @@ class ChunkRecord:
     path: Path
     title: str
     page_type: str
+    chunk_kind: str      # 'sparse' (section context) | 'dense' (retrieval leaf)
     section_path: List[str]
     heading: str
     chunk_index: int
@@ -344,7 +345,8 @@ def chunk_page(page_id: str, path: Path, title: str, page_type: str,
             cid = _make_chunk_id(page_id, sec.section_path, sp_text, occ)
             records.append(ChunkRecord(
                 chunk_id=cid, page_id=page_id, path=Path(path), title=title,
-                page_type=page_type, section_path=list(sec.section_path),
+                page_type=page_type, chunk_kind="sparse",
+                section_path=list(sec.section_path),
                 heading=sec.heading, chunk_index=idx,
                 parent_section_id=None, text=sp_text,
                 start_char=sec.start_char, end_char=sec.start_char + len(sec_text),
@@ -371,7 +373,8 @@ def chunk_page(page_id: str, path: Path, title: str, page_type: str,
             cid = _make_chunk_id(page_id, sec.section_path, dtext, occ)
             records.append(ChunkRecord(
                 chunk_id=cid, page_id=page_id, path=Path(path), title=title,
-                page_type=page_type, section_path=list(sec.section_path),
+                page_type=page_type, chunk_kind="dense",
+                section_path=list(sec.section_path),
                 heading=sec.heading, chunk_index=idx,
                 parent_section_id=psec_id, text=dtext,
                 start_char=sec.start_char, end_char=sec.start_char + len(dtext),

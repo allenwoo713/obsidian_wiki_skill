@@ -142,6 +142,25 @@ class ContextBundle:
 
 
 @dataclass
+class ChunkHit:
+    """A single chunk-level retrieval hit returned by WikiIndex.search_fts /
+    search_vector. query.py fuses these into PageCandidates via page-level RRF.
+    """
+    chunk_id: str
+    page_id: str
+    path: str
+    title: str
+    page_type: str
+    section_path: List[str]
+    heading: str
+    chunk_kind: str        # 'dense' | 'sparse'
+    text: str
+    channel: str           # 'fts' | 'vector'
+    score: float
+    distance: Optional[float] = None
+
+
+@dataclass
 class IndexState:
     """manifest v2 `index_state` (issues #1/#2/#7/#8/#11)."""
     schema_version: int = 2

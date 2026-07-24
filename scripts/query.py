@@ -1,5 +1,11 @@
-"""Hybrid FTS+RAG 检索：BM25 + 向量 + 图谱 → RRF 融合 → 预算控制。
-用法：python query.py <project_root> "<query>" [--k 5] [--max-tokens 4096] [--json] [--read-full]
+"""Hybrid FTS+RAG 检索（Retrieval v2，GitHub issues #3/#4/#5）。
+
+流程：chunk 级 FTS + 向量 → page-level RRF 融合 → 图谱 1-hop 独立扩展 →
+按 token 预算装配 ContextBundle（直接可喂 LLM）。答案须标注出处 [来源: ...]。
+
+用法：
+    python query.py <project_root> "<query>" [--k 5] [--max-tokens 4096]
+                     [--mode snippet|summary|full] [--json] [--out FILE]
 """
 from __future__ import annotations
 import argparse
@@ -7,266 +13,196 @@ import json
 import logging
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
-import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在 build_index 的向量检索触发前执行
+import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 
-from models import RetrievedPage
+from models import PageCandidate, ContextBundle, ContextItem, GraphPath
+from fusion import assemble_context, render_context_markdown
 
-# ISSUE-07：异常不再静默吞没，至少 warning 到 stderr（不污染 stdout 管道）
 logger = logging.getLogger(__name__)
 
 
-_FM_RE = re.compile(r"^---\n.*?\n---\n(.*)$", re.DOTALL)
-
-
 @dataclass
-class SearchResults:
-    """检索结果，分离 text 与 image chunks。"""
-    text: List[RetrievedPage]
-    images: List[RetrievedPage]
+class HybridResult:
+    query: str
+    bundle: ContextBundle
+    candidates: List[PageCandidate] = field(default_factory=list)
+    text_items: List[ContextItem] = field(default_factory=list)
+    image_items: List[ContextItem] = field(default_factory=list)
 
 
-def split_text_image(results: List[RetrievedPage]) -> Tuple[List[RetrievedPage], List[RetrievedPage]]:
-    """按 path 推断：含 'assets/' 的归 image，其余归 text。"""
+def _split_text_image(items: List[ContextItem]):
     text, images = [], []
-    for r in results:
-        ps = str(r.path).replace("\\", "/")
-        if "assets/" in ps:
-            images.append(r)
+    for it in items:
+        ps = str(it.path).replace("\\", "/")
+        if "assets/" in ps or it.page_id.endswith(".png") or it.page_id.endswith(".jpg"):
+            images.append(it)
         else:
-            text.append(r)
+            text.append(it)
     return text, images
 
 
-def rrf_fuse(bm25_results: List[RetrievedPage], vector_results: List[RetrievedPage],
-             graph_results: List[RetrievedPage], k_rrf: int = 60,
-             graph_rank_offset: int = 10) -> List[RetrievedPage]:
-    """RRF 融合三路结果。
+def graph_expand(wi, top_page_ids: List[str], wiki_dir: Path, k: int = 10,
+                 hop: int = 1) -> List[PageCandidate]:
+    """图谱 1-hop 扩展（issue #5）：从 top 命中的 page_id 出发找邻居。
 
-    ISSUE-16：原实现三路等权 RRF，图谱召回置信度本应低于直接命中（BM25/向量），
-    等权会让图谱噪声挤占 top 结果。改进：给图谱路一个 rank 偏移（rank 从
-    graph_rank_offset+1 开始计），相当于在 RRF 公式中降低图谱路的贡献。
-
-    Args:
-        graph_rank_offset: 图谱路 rank 偏移量。设为 0 则退化为等权（向后兼容）。
-            默认 10：图谱第 1 名的 rank 相当于 BM25/向量第 11 名。
-    """
-    scores: dict = {}
-    meta: dict = {}
-    # BM25 与向量：rank 从 1 开始
-    for results in [bm25_results, vector_results]:
-        for rank, r in enumerate(results, 1):
-            key = str(r.path)
-            scores[key] = scores.get(key, 0) + 1.0 / (k_rrf + rank)
-            meta[key] = r
-    # 图谱：rank 从 graph_rank_offset+1 开始，降低贡献
-    for rank, r in enumerate(graph_results, 1):
-        key = str(r.path)
-        scores[key] = scores.get(key, 0) + 1.0 / (k_rrf + graph_rank_offset + rank)
-        meta[key] = r
-    fused = []
-    for key, score in sorted(scores.items(), key=lambda x: -x[1]):
-        r = meta[key]
-        fused.append(RetrievedPage(
-            path=r.path, title=r.title, score=score,
-            snippet=r.snippet, sources=r.sources, retrieval_method="fused",
-        ))
-    return fused
-
-
-def budget_control(pages: List[RetrievedPage], max_tokens: int = 4096,
-                   char_per_token: int = 4) -> List[RetrievedPage]:
-    budget_chars = max_tokens * char_per_token
-    selected = []
-    used = 0
-    for p in pages:
-        snippet_len = len(p.snippet) + len(p.title) + 100
-        if used + snippet_len > budget_chars:
-            break
-        selected.append(p)
-        used += snippet_len
-    return selected
-
-
-def graph_expand(wi, top_paths: List[Path], wiki_dir: Path, k: int = 10) -> List[RetrievedPage]:
-    """图谱 2 跳扩展：从 BM25/向量 top 命中的页面出发，找图谱邻居。
-
-    ISSUE-09：节点匹配改为规范化绝对路径精确匹配优先，stem 仅作 fallback。
-    此前同名 stem（不同目录下同名 .md，如 entities/foo.md 与 concepts/foo.md）
-    会误匹配到错误节点，导致图谱扩展召回噪声。
+    节点用 page_id（规范化绝对路径）精确匹配；默认 1-hop（hop=1）。图谱结果
+    作为独立通道返回 PageCandidate（带 graph_paths），由上层合并，不进主 RRF，
+    避免噪声挤占 top（ISSUE-16 图谱降权思路的演进：彻底移出主 RRF）。
     """
     idx_file = wiki_dir.parent / ".index" / "graph.json"
     if not idx_file.exists():
         return []
-    data = json.loads(idx_file.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(idx_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("graph_expand: graph.json 解析失败: %s", e)
+        return []
+    nodes = {n["id"]: n for n in data.get("nodes", [])}
     edges = data.get("edges", [])
-    nodes = {n["title"]: n for n in data.get("nodes", [])}
-    # 路径索引：规范化绝对路径 → title，用于精确匹配
-    path_to_title: Dict[str, str] = {}
-    stem_to_titles: Dict[str, List[str]] = {}  # stem fallback（同名 stem 可能多个）
-    for t, n in nodes.items():
-        np = (n.get("path") or "").replace("\\", "/").lower()
-        if np:
-            path_to_title[np] = t
-        stem_to_titles.setdefault(Path(t).stem.lower(), []).append(t)
-
-    neighbors: dict = {}
+    neighbors: Dict[str, List[tuple]] = {}
     for e in edges:
-        neighbors.setdefault(e["source"], []).append((e["target"], e.get("weight", 1)))
-        neighbors.setdefault(e["target"], []).append((e["source"], e.get("weight", 1)))
+        s, t = e.get("source"), e.get("target")
+        w = float(e.get("weight", 1.0))
+        etype = e.get("signal") or e.get("type") or "unknown"
+        is_inf = "inferred" in str(etype).lower() or etype in ("adamic_adar", "type_affinity")
+        neighbors.setdefault(s, []).append((t, w, etype, is_inf))
+        neighbors.setdefault(t, []).append((s, w, etype, is_inf))
 
-    # 精确路径匹配优先，stem 仅 fallback
-    top_titles = set()
-    for p in top_paths:
-        p_norm = str(p).replace("\\", "/").lower()
-        # 1. 精确路径匹配
-        if p_norm in path_to_title:
-            top_titles.add(path_to_title[p_norm])
-            continue
-        # 2. endswith 匹配（兼容 graph.json 里存的绝对路径与传入的相对路径）
-        matched = False
-        for npath, ntitle in path_to_title.items():
-            if npath.endswith(p_norm) or p_norm.endswith(npath):
-                top_titles.add(ntitle)
-                matched = True
-                break
-        if matched:
-            continue
-        # 3. stem fallback（同名 stem 可能多个，全部加入，让图谱扩展自然处理）
-        stem = p.stem.lower()
-        for t in stem_to_titles.get(stem, []):
-            top_titles.add(t)
-
-    seen = set(top_titles)
-    expanded = []
-    for title in top_titles:
-        for nbr, w in neighbors.get(title, []):
-            if nbr not in seen:
+    seeds = set(top_page_ids)
+    expanded: List[PageCandidate] = []
+    seen = set(seeds)
+    frontier = list(seeds)
+    for h in range(hop):
+        nxt = []
+        for pid in frontier:
+            for (nbr, w, etype, is_inf) in neighbors.get(pid, []):
+                if nbr in seen:
+                    continue
                 seen.add(nbr)
                 n = nodes.get(nbr, {})
-                expanded.append(RetrievedPage(
-                    path=Path(n.get("path", "")), title=nbr, score=w,
-                    snippet="", sources=n.get("sources", []),
-                    retrieval_method="graph",
+                gp = GraphPath(source_id=pid, target_id=nbr, edge_type=etype,
+                                is_inferred=is_inf, weight=w, hop=h + 1)
+                expanded.append(PageCandidate(
+                    page_id=nbr,
+                    path=Path(n.get("path", nbr)),
+                    title=n.get("title", nbr),
+                    rrf_score=0.0,
+                    sparse_rank=None,
+                    dense_rank=None,
+                    graph_paths=[gp],
                 ))
+                nxt.append(nbr)
+                if len(expanded) >= k:
+                    break
             if len(expanded) >= k:
                 break
+        frontier = nxt
+        if len(expanded) >= k:
+            break
     return expanded[:k]
 
 
-def read_full_content(path: Path, max_chars: int = 8000) -> str:
-    """读取 wiki 页面完整内容（去 frontmatter），截断到 max_chars。
-
-    ISSUE-07：异常不再静默吞没。读文件失败时 warning 到 stderr 并返回空串，
-    让上层（hybrid_search）按"无内容可读"处理，而非把异常当作"文件无内容"。
-    两者语义不同：前者是 I/O 故障，后者是合法空页。
-    """
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        logger.warning("read_full_content: 读取失败 %s: %s", path, e)
-        return ""
-    m = _FM_RE.match(raw)
-    content = m.group(1).strip() if m else raw
-    if len(content) > max_chars:
-        content = content[:max_chars] + "\n...[截断，完整内容见原文件]"
-    return content
-
-
 def hybrid_search(wi, query: str, k: int = 5, max_tokens: int = 4096,
-                  wiki_dir: Path = None, read_full: bool = False) -> SearchResults:
-    bm25_results = wi.search_bm25(query, k=20)
-    vector_results = wi.search_vector(query, k=20)
-    top_paths = [r.path for r in bm25_results[:5]]
-    graph_results = graph_expand(wi, top_paths, wiki_dir, k=10) if wiki_dir else []
-    fused = rrf_fuse(bm25_results, vector_results, graph_results)
-    selected = budget_control(fused[:k * 3], max_tokens=max_tokens)[:k]
-    if read_full:
-        for r in selected:
-            ps = str(r.path).replace("\\", "/")
-            if "assets/" not in ps:
-                full = read_full_content(r.path)
-                if full:
-                    r.snippet = full
-    text_chunks, image_chunks = split_text_image(selected)
-    return SearchResults(text=text_chunks, images=image_chunks)
+                  wiki_dir: Path = None, mode: str = "snippet") -> HybridResult:
+    # 1) chunk 级 FTS + 向量 → page-level RRF
+    candidates = wi.search(query, k=k * 3)
+    top_ids = [c.page_id for c in candidates[:5]]
+
+    # 2) 图谱 1-hop 独立扩展（不在主 RRF 内）
+    graph_cands: List[PageCandidate] = []
+    if wiki_dir:
+        graph_cands = graph_expand(wi, top_ids, wiki_dir, k=10, hop=1)
+
+    # 3) 合并（图谱候选去重追加）
+    by_id = {c.page_id: c for c in candidates}
+    for gc in graph_cands:
+        if gc.page_id not in by_id:
+            by_id[gc.page_id] = gc
+    merged = list(by_id.values())
+    # 保持 RRF 候选在前、图谱候选在后
+    merged.sort(key=lambda c: (c.rrf_score <= 0, -c.rrf_score))
+
+    # 4) 按 token 预算装配 ContextBundle
+    bundle = assemble_context(merged, wi, mode=mode, max_tokens=max_tokens,
+                              token_counter=wi.count_tokens)
+    text_items, image_items = _split_text_image(bundle.items)
+    return HybridResult(query=query, bundle=bundle, candidates=merged,
+                        text_items=text_items, image_items=image_items)
 
 
-def format_for_agent(results: SearchResults, read_full: bool = False) -> str:
-    label = "全文" if read_full else "片段"
-    lines = [f"## 检索结果（hybrid FTS+RAG，{label}模式）\n"]
-    if results.text:
-        lines.append("### 文本片段\n")
-        for i, r in enumerate(results.text, 1):
-            lines.append(f"### [{i}] {r.title}")
-            lines.append(f"- 路径: {r.path}")
-            lines.append(f"- 相关度: {r.score:.4f} ({r.retrieval_method})")
-            lines.append(f"- 源文档: {', '.join(r.sources) if r.sources else 'N/A'}")
-            lines.append(f"- {label}:\n```\n{r.snippet}\n```")
-            lines.append("")
-    if results.images:
-        lines.append("### 相关图片（caption 命中）\n")
-        for i, r in enumerate(results.images, 1):
-            lines.append(f"### [图{i}] {r.title}")
-            lines.append(f"- 路径: {r.path}")
-            lines.append(f"- 相关度: {r.score:.4f} ({r.retrieval_method})")
-            lines.append(f"- 源文档: {', '.join(r.sources) if r.sources else 'N/A'}")
-            lines.append(f"- 图注/caption:\n```\n{r.snippet}\n```")
-            lines.append(f"- 嵌入建议: ![[{r.path.name}]]")
-            lines.append("")
-    if not results.text and not results.images:
-        return "[无检索结果]"
-    return "\n".join(lines)
+def format_for_agent(result: HybridResult) -> str:
+    """markdown 渲染（替代旧 format_for_agent）。"""
+    return render_context_markdown(result.bundle)
+
+
+def _rrf_score_by_id(candidates: List[PageCandidate]) -> Dict[str, float]:
+    return {c.page_id: c.rrf_score for c in candidates}
+
+
+def result_to_json(result: HybridResult) -> dict:
+    rrf = _rrf_score_by_id(result.candidates)
+
+    def item_entry(it: ContextItem):
+        ps = str(it.path).replace("\\", "/")
+        return {
+            "page_id": it.page_id,
+            "path": str(it.path),
+            "title": it.title,
+            "score": round(rrf.get(it.page_id, 0.0), 6),
+            "snippet": it.text,
+            "sources": it.sources,
+            "method": it.inclusion_reason,
+            "scope": it.scope,
+            "tokens": it.token_count,
+            "embed": f"![[{Path(it.path).name}]]" if "assets/" in ps else None,
+        }
+
+    return {
+        "query": result.query,
+        "mode": result.bundle.mode,
+        "token_count": result.bundle.token_count,
+        "max_context_tokens": result.bundle.max_context_tokens,
+        "text": [item_entry(it) for it in result.text_items],
+        "images": [item_entry(it) for it in result.image_items],
+        "omitted": result.bundle.omitted_items,
+    }
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    """ISSUE-06：用 argparse 替代手写 sys.argv 循环，自动生成 --help、参数校验、
-    避免 --k/--max-tokens/--out 后无值时 IndexError。"""
     p = argparse.ArgumentParser(
         prog="query.py",
-        description="Hybrid FTS+RAG 检索：BM25 + 向量 + 图谱 → RRF 融合 → 预算控制",
+        description="Hybrid FTS+RAG 检索：分层分块 + LanceDB FTS + 自适应向量 + 图谱 → RRF → ContextBundle",
     )
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/ 与 .index/）")
     p.add_argument("query", help="检索查询串（建议先做关键词提取与中英互译扩展）")
-    p.add_argument("--k", type=int, default=5, help="返回 top-K 结果（默认 5）")
-    p.add_argument("--max-tokens", type=int, default=4096, help="预算控制上限（默认 4096 tokens）")
+    p.add_argument("--k", type=int, default=5, help="返回 top-K 页面（默认 5）")
+    p.add_argument("--max-tokens", type=int, default=4096, help="ContextBundle token 预算上限（默认 4096）")
+    p.add_argument("--mode", choices=["summary", "snippet", "full"], default="snippet",
+                   help="展开粒度：summary=概要前200字 / snippet=证据chunk（默认） / full=命中页全文")
     p.add_argument("--json", dest="as_json", action="store_true", help="输出 JSON 格式（默认输出 markdown）")
-    p.add_argument("--read-full", action="store_true", help="读取命中页面全文（适合问具体数值/流程/对比）")
     p.add_argument("--out", dest="out_path", default=None, help="输出落盘路径（大输出必须用，绕开沙箱 stdout 拦截段错误）")
     return p
 
 
 def main():
-    # ISSUE-07：stderr 日志（不污染 stdout 管道），WARNING 级别即打印
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="[%(levelname)s] %(name)s: %(message)s")
-
     args = _build_arg_parser().parse_args()
     proj = Path(args.project_root)
     from build_index import WikiIndex
     wi = WikiIndex(proj / ".index")
     wi.load()
-    results = hybrid_search(wi, args.query, k=args.k, max_tokens=args.max_tokens,
-                             wiki_dir=proj / "Wiki", read_full=args.read_full)
-    payload = json.dumps({
-        "text": [{"path": str(r.path), "title": r.title, "score": r.score,
-                  "distance": r.distance, "vector_metric": r.vector_metric,
-                  "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method}
-                 for r in results.text],
-        "images": [{"path": str(r.path), "title": r.title, "score": r.score,
-                    "distance": r.distance, "vector_metric": r.vector_metric,
-                    "snippet": r.snippet, "sources": r.sources, "method": r.retrieval_method,
-                    "embed": f"![[{r.path.name}]]"}
-                   for r in results.images],
-        "read_full": args.read_full,
-    }, ensure_ascii=False, indent=2) if args.as_json else format_for_agent(results, read_full=args.read_full)
+    result = hybrid_search(wi, args.query, k=args.k, max_tokens=args.max_tokens,
+                           wiki_dir=proj / "Wiki", mode=args.mode)
+    payload = (json.dumps(result_to_json(result), ensure_ascii=False, indent=2)
+               if args.as_json else format_for_agent(result))
     if args.out_path:
         op = Path(args.out_path)
         op.parent.mkdir(parents=True, exist_ok=True)
         op.write_text(payload, encoding="utf-8")
-        # 仅向 stdout 输出一行小确认（管道安全）；大 payload 落盘，绕开沙箱 stdout 拦截段错误
         print(f"wrote {op} ({len(payload)} bytes)")
     else:
         print(payload)
