@@ -18,6 +18,38 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 from models import WikiPage, RetrievedPage, ManifestEntry
 
 
+# ISSUE-16（关键）：pyarrow 必须早于 torch 导入，否则在「已加载 torch 的进程里再
+# import pyarrow（经 lancedb）」会触发 Windows access violation 段错误（RC=139）——
+# 这是本模块历史上 build_index 反复崩溃的真正根因（此前误判为 encode 的 OpenMP
+# race）。二者都携带各自的原生库，torch 先占用后 pyarrow 加载 DLL 冲突。
+# 故在模块导入期 *先* 引入 lancedb（间接加载 pyarrow），再让下方 torch 配置导入 torch。
+try:
+    import lancedb  # noqa: F401  # 仅为固定「pyarrow 先于 torch」的导入顺序
+except Exception:
+    lancedb = None  # 无 lancedb 时向量索引不可用，但 BM25 仍可建；延后到使用点报错
+
+
+def _configure_torch_threads():
+    """ISSUE-16：固定 torch CPU intra-op 线程数，须在模块导入期（任何 torch 并行区
+    初始化之前）调用；惰性放在 _get_embedder 里已太晚。
+
+    默认 1；稳定的大机器可用 WIKI_TORCH_THREADS 调高提速（对小模型 / 短文本批量
+    收益有限，因每个 encode 是 many-small-ops，线程池同步开销常抵消收益）。
+    注：本项设置与上面的 pyarrow-先导入是两件事——线程数管 encode 期稳定/性能，
+    导入顺序管 lance 写入期不崩，二者都需要。
+    """
+    try:
+        import torch
+        n = int(os.environ.get("WIKI_TORCH_THREADS", "1") or "1")
+        torch.set_num_threads(max(1, n))
+        torch.set_grad_enabled(False)  # 推理无需梯度，省内存并减少线程活动
+    except Exception:
+        pass  # 无 torch / API 差异不应阻断建索引
+
+
+_configure_torch_threads()
+
+
 # ISSUE-15：向量检索 metric contract —— 固定配置，索引侧与查询侧一致
 # 默认 cosine：不受向量模长影响，语义稳定，0~1 score 含义明确
 VECTOR_METRIC = "cosine"
@@ -123,6 +155,8 @@ class WikiIndex:
 
     def _get_embedder(self):
         if self._embedder is None:
+            # ISSUE-16：torch 线程数已在模块导入期由 _configure_torch_threads() 固定
+            # （必须早于并行区初始化，此处再设已太晚，见该函数注释）。
             from sentence_transformers import SentenceTransformer
             # 优先本地模型路径（已从 modelscope 预下载），回退 HF 在线下载
             local_path = os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or \
@@ -268,17 +302,73 @@ class WikiIndex:
                 chunk_texts.append(embed_text)
         if not chunk_texts:
             return
-        # 分批 encode，控制内存峰值（避免整批 tokenize 触发段错误）
-        vectors = []
-        for i in range(0, len(chunk_texts), VECTOR_ENCODE_BATCH):
-            batch = chunk_texts[i:i + VECTOR_ENCODE_BATCH]
+        # ISSUE-16：维度必须在释放 embedder *之前* 取，否则下方 _get_lance(dim=...)
+        # 会重新触发 _get_embedder 把模型再加载回内存（前功尽弃）。
+        dim = self._embedding_dim()
+
+        # ISSUE-16：crash-safe 可断点续的分批 encode。
+        # 动机：大库整轮 encode 需数分钟，中途段错误/超时会全丢。改为逐批 encode
+        # 后立即落盘（.npy + done.json），崩溃/超时重跑时跳过已完成批次，从断点续。
+        # checkpoint 目录放在 .index 下（项目私有，非 skill 仓库），成功后清理。
+        import numpy as np
+        import gc
+        n_batches = (len(chunk_texts) + VECTOR_ENCODE_BATCH - 1) // VECTOR_ENCODE_BATCH
+        ckpt = self.index_dir / ".vec_ckpt"
+        ckpt.mkdir(parents=True, exist_ok=True)
+        done_path = ckpt / "done.json"
+        meta_path = ckpt / "meta.json"
+        # ISSUE-16：陈旧性保护——checkpoint 只有在 chunk 数（内容签名）一致时才可复用。
+        # 若 wiki 在崩溃与续跑之间被编辑，旧 .npy 批次会与新切片错位，导致向量与
+        # 元数据张冠李戴。签名不符则丢弃整份 checkpoint、从头 encode（正确性优先）。
+        sig = {"n_chunks": len(chunk_texts), "batch": VECTOR_ENCODE_BATCH,
+               "dim": dim, "model": os.environ.get("WIKI_EMBEDDER_LOCAL_PATH", "")}
+        done = set()
+        prev_sig = None
+        if meta_path.exists():
+            try:
+                prev_sig = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                prev_sig = None
+        if prev_sig == sig and done_path.exists():
+            try:
+                done = {int(x) for x in json.loads(done_path.read_text(encoding="utf-8"))}
+            except Exception:
+                done = set()  # 损坏的 done.json 视为从头开始
+        else:
+            # 签名不符或首次：清掉可能存在的陈旧批次，避免错位复用
+            for old in ckpt.glob("batch_*.npy"):
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+        meta_path.write_text(json.dumps(sig, ensure_ascii=False), encoding="utf-8")
+        for bi in range(n_batches):
+            if bi in done:
+                continue  # 已落盘，断点续
+            s = bi * VECTOR_ENCODE_BATCH
+            batch = chunk_texts[s:s + VECTOR_ENCODE_BATCH]
             v = embedder.encode(
                 batch, show_progress_bar=False,
                 normalize_embeddings=NORMALIZE_EMBEDDINGS,
-            ).tolist()
-            vectors.extend(v)
+            )
+            np.save(ckpt / f"batch_{bi:05d}.npy", np.asarray(v, dtype="float32"))
+            done.add(bi)
+            done_path.write_text(json.dumps(sorted(done)), encoding="utf-8")
+
+        # ISSUE-16：写 lance 前释放 embedder（内存卫生——大库 encode 后释放模型再做
+        # lance 写入，降低内存峰值）。注意：lance 写入不崩的关键是模块顶部「pyarrow
+        # 先于 torch 导入」的顺序修复，而非此处释放；这里仅为省内存。
+        self._embedder = None
+        embedder = None
+        gc.collect()
+
+        # 从 checkpoint 按批次顺序回载全部向量（顺序与 rows_meta 对齐）
+        vectors = []
+        for bi in range(n_batches):
+            vectors.extend(np.load(ckpt / f"batch_{bi:05d}.npy").tolist())
+
         # ISSUE-10：建表时传入动态维度（而非硬编码 384），换模型时 schema 正确
-        table = self._get_lance(dim=self._embedding_dim())
+        table = self._get_lance(dim=dim)
         try:
             table.delete("path != ''")
         except Exception as e:
@@ -296,6 +386,14 @@ class WikiIndex:
         # 分批写入，避免超大 list 瞬时内存峰值
         for i in range(0, len(data), 2000):
             table.add(data[i:i + 2000])
+
+        # ISSUE-16：写入成功后清理 checkpoint（best-effort，失败不影响结果；
+        # 残留的 .vec_ckpt 只是磁盘占用，下次成功重建会覆盖）
+        try:
+            import shutil
+            shutil.rmtree(ckpt, ignore_errors=True)
+        except Exception:
+            pass
 
     def _write_manifest(self):
         manifest_file = self.index_dir / "manifest.json"

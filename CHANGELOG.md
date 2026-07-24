@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### Fixed — ISSUE-16：向量重建段错误根因（pyarrow/torch 导入顺序）+ crash-safe 断点续
+
+- **根因定位（重要）**：`build_index.py` 长期在 `build()` 阶段非确定性 RC=139 段错误，此前归因为「encode 阶段 OpenMP/torch 多线程 race」。经 `faulthandler` 追踪确认真实根因是 **在已加载 torch 的进程里再经 `lancedb` `import pyarrow` 触发 Windows access violation（原生 DLL 加载冲突）**，与 encode 线程无关。
+- **修复**：`build_index.py` 模块导入期**先 `import lancedb`（从而先加载 pyarrow）再配置 torch**，固定导入顺序；实测同进程「encode + 写 lance」端到端 EXIT=0。
+- **`_build_vector` 重构为 crash-safe 断点续**：逐批 encode 落盘到 `.index/.vec_ckpt`（`batch_*.npy` + `done.json` + `meta.json` 签名），崩溃/超时重跑自动续；内容签名（chunk 数/batch/dim/model）变更时丢弃陈旧 checkpoint 重新 encode，避免向量与元数据错位。lance 写入前释放 embedder + `gc.collect()`（内存卫生）。
+- **`WIKI_TORCH_THREADS` 环境变量**：torch intra-op 线程数改为可配置，默认 `1`（沙箱唯一稳定值）；稳定大机器可调高，但小模型 + 短切片收益有限。
+- **README「已知约束」**：新增 pyarrow-before-torch 导入顺序、`WIKI_TORCH_THREADS`、crash-safe 向量重建、超大库 torch-free 兜底 4 条说明。
+
+### Added — ISSUE-16 脱敏自检
+
+- **`tests/test_image_retrieval.py`**（脱敏，工业相机领域）：覆盖 图片 caption 建索引并被 `split_text_image` 正确归类为图片、空 caption 图片不入检索、内容变更时陈旧 checkpoint 不复用（幂等/防错位）、损坏 checkpoint 可恢复重建。与 `tests/` 一致不随公开仓库发布。
+
+### Added — Roadmap
+
+- **README**：新增 Roadmap 章节，记录「本地小 VLM（Florence-2/Moondream）离线补全空 caption」为将来方向（暂不实现）。
+
 ### Changed — 通用化改造（让 skill 可被他人复用）
 
 #### 路径变量化

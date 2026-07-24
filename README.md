@@ -281,6 +281,10 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <proje
 - **Obsidian vault 根**：必须指向 `Wiki/`，不可设为 `project_root`（否则 `Raw/sources/` 下 `.md` 文件混入图谱成孤立幽灵节点）
 - **小 corpus BM25**：默认 BM25Plus（BM25Okapi 的 IDF 在 < 100 文档时易产生 0 值）
 - **前端资源本地化**：图谱 HTML 在 `file://` 协议下 CORS 拦截 CDN，前端库已本地化到 `lib/`
+- **pyarrow 必须早于 torch 导入（重要）**：在已加载 torch 的进程里再 `import pyarrow`（经 lancedb）会触发 Windows access violation 段错误（RC=139）。`build_index.py` 已在模块导入期先 `import lancedb` 再配置 torch 以固定顺序。若你在别处编写「同进程既 encode 又写 lance」的脚本，务必让 `import lancedb`/`pyarrow` 出现在任何 torch 导入之前。
+- **CPU 线程数 `WIKI_TORCH_THREADS`**：向量 encode 的 torch intra-op 线程数，默认 `1`（受限/沙箱环境唯一稳定值；多线程易触发 OpenMP race）。稳定的大机器可设 `WIKI_TORCH_THREADS=4` 等提速——但对本 skill 用的小模型（MiniLM）+ 短切片，收益有限（many-small-ops，线程同步开销常抵消收益）。
+- **crash-safe 向量重建**：`_build_vector` 逐批 encode 后落盘到 `.index/.vec_ckpt`（`.npy` + `done.json` + `meta.json` 签名），崩溃/超时重跑自动断点续；内容变更（chunk 签名不符）则丢弃陈旧 checkpoint 从头 encode，避免向量与元数据错位。成功后 best-effort 清理（禁删回收站的沙箱里可能残留 `.vec_ckpt`，无害）。
+- **超大库兜底（极端情况）**：正常情况下导入顺序修复已让「同进程 encode + 写 lance」稳定。万一在超大库上 lance 写入仍崩，可从 `.index/.vec_ckpt` 的 `.npy` 用一个**完全不 import torch** 的独立脚本单独执行 `table.add`（仅 `numpy.load` + lancedb 写入），彻底隔离原生库冲突。
 
 ## 出处标注规范
 
@@ -381,3 +385,10 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> -m pytest -p no:cacheprovider
 - **融合**：RRF (Reciprocal Rank Fusion, k=60)
 - **解析**：MinerU Cloud/Local + python-docx + PyMuPDF（仅拆页）
 - **存储**：Obsidian vault（Markdown + 双链 + frontmatter）
+
+## Roadmap（规划中，尚未实现）
+
+- **本地小 VLM 离线补全空 caption**：目前图片 caption 依赖解析阶段（MinerU Cloud/Local）产出，若源文档未给出图注则该图 `caption_text` 为空、不进检索。规划引入一个**本地小型视觉语言模型**（如 [Florence-2](https://huggingface.co/microsoft/Florence-2-base) / [Moondream](https://huggingface.co/vikhyatk/moondream2)，均可 CPU 离线运行、体积小），在导入/建索引阶段对空 caption 的图片自动生成描述性 caption，从而把「无图注图片」也纳入检索。
+  - 设计约束：与 embedding 模型一致走「env var 指定本地路径 → `~/.workbuddy/...` → HF 在线下载」三级回退；默认关闭，通过开关（如 `WIKI_VLM_CAPTION=1`）显式启用，避免拖慢常规建索引。
+  - 触发范围：仅对 `caption_text` 为空的图片调用，已有图注的图片不重复生成，保证幂等与增量友好。
+  - 现状：**暂不实现**，先记录为将来方向。
