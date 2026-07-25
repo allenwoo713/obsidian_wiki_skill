@@ -14,11 +14,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# 0xC0000005 修复（与 build_index.py 同源）：torch 必须在任何可能拉起后台 asyncio
+# 事件循环线程的导入（如经 build_index 间接引入的 lancedb）之前完成原生模块加载，
+# 否则在 PowerShell 启动的 managed-python 下，torch 原生加载会与宿主注入的后台事件
+# 循环线程时序 race → 段错误。pyarrow 也须先于 torch（ISSUE-16）。
+import pyarrow  # noqa: F401
+import torch
+torch.set_num_threads(int(os.environ.get("WIKI_TORCH_THREADS", "1") or "1"))
+torch.set_grad_enabled(False)
 
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 

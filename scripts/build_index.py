@@ -18,6 +18,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
+# ISSUE-16 + 0xC0000005 修复：
+#  - pyarrow 必须早于 torch 导入（在已加载 torch 的进程里再 import pyarrow 会触发
+#    Windows access violation，RC=139）。
+#  - torch 必须在任何可能拉起后台 asyncio 事件循环线程的导入（如 lancedb）之前完成
+#    原生模块加载。否则在部分宿主（如 PowerShell 启动的 managed-python）下，torch 原生
+#    加载会与宿主注入的后台事件循环线程时序 race → 0xC0000005（无 traceback、~8s 崩溃）。
+#    故把 pyarrow + torch 提到模块最顶部（仅晚于标准库），并立即固定线程数。
+import pyarrow  # noqa: F401  # 先于 torch（ISSUE-16）
+import torch
+torch.set_num_threads(int(os.environ.get("WIKI_TORCH_THREADS", "1") or "1"))
+torch.set_grad_enabled(False)  # 推理无需梯度，省内存并减少线程活动
+
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在下方 setdefault 之前执行
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
@@ -32,29 +44,11 @@ from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
 
-# ISSUE-16（关键）：pyarrow 必须早于 torch 导入，否则在「已加载 torch 的进程里再
-# import pyarrow（经 lancedb）」会触发 Windows access violation 段错误（RC=139）。
-# 故在模块导入期 *先* 引入 lancedb（间接加载 pyarrow），再让下方 torch 配置导入 torch。
+# 仅固定「pyarrow 先于 torch」的导入顺序（ISSUE-16）；torch 已于上方最顶部加载完毕。
 try:
-    import lancedb  # noqa: F401  # 仅为固定「pyarrow 先于 torch」的导入顺序
+    import lancedb  # noqa: F401
 except Exception:
     lancedb = None  # 无 lancedb 时向量索引不可用；延后到使用点报错
-
-
-def _configure_torch_threads():
-    """ISSUE-16：固定 torch CPU intra-op 线程数，须在模块导入期（任何 torch 并行区
-    初始化之前）调用。默认 1；稳定的大机器可用 WIKI_TORCH_THREADS 调高提速。
-    """
-    try:
-        import torch
-        n = int(os.environ.get("WIKI_TORCH_THREADS", "1") or "1")
-        torch.set_num_threads(max(1, n))
-        torch.set_grad_enabled(False)  # 推理无需梯度，省内存并减少线程活动
-    except Exception:
-        pass
-
-
-_configure_torch_threads()
 
 
 # ISSUE-15：向量检索 metric contract —— 固定配置，索引侧与查询侧一致
@@ -518,8 +512,13 @@ class WikiIndex:
                 except Exception as e:
                     log.warning("页缓存写入失败 %s: %s", cache_file, e)
 
-            # 清理本次 ckpt（逐文件 unlink，规避 >50 文件 rmtree 触发守卫中止进程）
-            self._safe_clear_dir(ckpt)
+            # 注意：此处**不再**清理 .vec_ckpt。沙箱 safe-delete 守卫对单次 turn 内
+            # 删除 >50 个文件要求交互确认，build 进程内无法确认 → 抛异常并使后续
+            # 写 lance / manifest / _publish 永不执行（本次真实 KB 迁移曾因此失败、
+            # builds/ 为空）。保留 ckpt 作为 crash-safe 续传产物：0-miss（命中页缓存）
+            # 时根本不读取它，无副作用；若需释放空间，可手动 `rm -rf .index/.vec_ckpt`
+            # 或在 dangerouslyDisableSandbox 下运行清理。
+            # self._safe_clear_dir(ckpt)  # 已禁用：避免触发 safe-delete 守卫
 
         # 记录本次构建的模型/维度，供 _write_manifest 复用（0-miss 时免加载 torch）
         self._built_dim = dim
