@@ -135,6 +135,10 @@ class WikiIndex:
         self._lance_table = None
         self._lexicon = set()
         self._project_root: Optional[Path] = None
+        # #11 索引原子发布：build 期指向新建 builds/<id>/lance_db（及 manifest 目标）；
+        # 否则为 None，查询时经 _resolve_active_lance_dir() 走 ACTIVE_INDEX 指针。
+        self._lance_dir: Optional[Path] = None
+        self._manifest_target: Optional[Path] = None
 
     # ---- embedder ----
     def _get_embedder(self):
@@ -178,7 +182,7 @@ class WikiIndex:
                          sample: dict = None):
         if self._lance_table is None:
             import lancedb
-            db = lancedb.connect(str(self.index_dir / "lance_db"))
+            db = lancedb.connect(str(self._lance_dir or self._resolve_active_lance_dir()))
             try:
                 self._lance_table = db.open_table("chunks")
             except Exception:
@@ -191,16 +195,57 @@ class WikiIndex:
                 self._lance_table.delete("chunk_id != ''")
         return self._lance_table
 
+    # ---- 活动索引解析（#11 指针方案） ----
+    def _resolve_active_lance_dir(self) -> Path:
+        """经 ACTIVE_INDEX 指针解析当前活动 lance 目录；无指针回退顶层 lance_db。"""
+        pointer = self.index_dir / "ACTIVE_INDEX"
+        if pointer.exists():
+            try:
+                data = json.loads(pointer.read_text(encoding="utf-8"))
+                rel = data.get("active_lance")
+                if rel:
+                    cand = Path(rel) if os.path.isabs(rel) else (self.index_dir / rel)
+                    if cand.exists():
+                        return cand
+            except (json.JSONDecodeError, OSError):
+                pass
+        return self.index_dir / "lance_db"
+
+    def _resolve_active_manifest(self) -> Path:
+        return self._resolve_active_lance_dir().parent / "manifest.json"
+
+    def _content_hashes(self):
+        """#11 内容签名：tokenizer / 分块配置哈希；变化时作废旧向量、强制全量重 encode。"""
+        return (
+            "whitespace+" + ("jieba" if _jieba_available() else "bigram"),
+            f"v{CHUNK_SCHEMA_VERSION}:{chunking.DENSE_TARGET_TOKENS}:{chunking.DENSE_OVERLAP_TOKENS}",
+        )
+
     # ---- build ----
     def build(self, wiki_dir: Path):
         self._project_root = wiki_dir.parent
         self._lexicon = load_lexicon(self._project_root)
         self.pages = scan_wiki(wiki_dir, self._project_root)
-        image_pages = self._load_image_caption_pages(wiki_dir.parent / ".index")
+        image_pages = self._load_image_caption_pages(self.index_dir)
         self.pages.extend(image_pages)
         self._page_by_id = {page_id_of(p.path): p for p in self.pages}
-        self._build_chunks()
-        self._write_manifest()
+
+        # #11 索引原子发布：构建写入全新 builds/<id>/lance_db（不碰活动目录）；校验
+        # 通过后仅原子翻转 ACTIVE_INDEX 指针文件。崩溃时指针不变 → 活动索引（旧成功版）不受影响。
+        build_id = "build_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        build_dir = self.index_dir / "builds" / build_id
+        build_dir.mkdir(parents=True, exist_ok=True)
+        self._lance_dir = build_dir / "lance_db"
+        self._manifest_target = build_dir / "manifest.json"
+        try:
+            self._build_chunks()
+            if not self._validate_build(build_dir):
+                raise RuntimeError(
+                    "build 校验未通过，放弃发布；活动索引保持不变（指针未翻转）")
+            self._publish(build_id)
+        finally:
+            self._lance_dir = None
+            self._manifest_target = None
 
     def _load_image_caption_pages(self, idx_dir: Path) -> List[WikiPage]:
         manifest_file = idx_dir / "manifest.json"
@@ -304,8 +349,10 @@ class WikiIndex:
         ckpt.mkdir(parents=True, exist_ok=True)
         done_path = ckpt / "done.json"
         meta_path = ckpt / "meta.json"
+        fts_hash, chunk_hash = self._content_hashes()
         sig = {"n_dense": len(dense_texts), "batch": VECTOR_ENCODE_BATCH,
-               "dim": dim, "model": os.environ.get("WIKI_EMBEDDER_LOCAL_PATH", "")}
+               "dim": dim, "model": os.environ.get("WIKI_EMBEDDER_LOCAL_PATH", ""),
+               "fts_config_hash": fts_hash, "chunk_config_hash": chunk_hash}
         done = set()
         prev_sig = None
         if meta_path.exists():
@@ -372,7 +419,7 @@ class WikiIndex:
         # 写 manifest（必须在清理 checkpoint 之前）：
         # 沙箱 safe-delete 守卫会拦截 >50 文件的 rmtree 并可能中止进程，
         # 若写在清理之后则 manifest 永不被写入，query.py 会判 legacy 拒检索。
-        self._write_manifest()
+        self._write_manifest(self._manifest_target)
 
         # 清理 checkpoint（失败不致命，忽略）
         try:
@@ -404,10 +451,18 @@ class WikiIndex:
             except Exception as e2:
                 logging.getLogger(__name__).warning("默认 create_index 也失败: %s", e2)
 
-    def _write_manifest(self):
-        manifest_file = self.index_dir / "manifest.json"
+    def _write_manifest(self, target: Optional[Path] = None):
+        manifest_file = target or (self.index_dir / "manifest.json")
+        # 合并源：构建期 target 在 builds/<id>/，需从顶层 .index/manifest.json 继承
+        # images/entries（caption / 增量调度共享），避免丢失。
+        source = self.index_dir / "manifest.json"
         existing = {}
-        if manifest_file.exists():
+        if manifest_file != source and source.exists():
+            try:
+                existing = json.loads(source.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        elif manifest_file.exists():
             try:
                 existing = json.loads(manifest_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError) as e:
@@ -425,12 +480,13 @@ class WikiIndex:
         except Exception:
             model_name = os.environ.get("WIKI_EMBEDDER_LOCAL_PATH", "")
             dim = 384
+        fts_hash, chunk_hash = self._content_hashes()
         state = IndexState(
             embedding_model=model_name,
             embedding_dimension=dim,
             vector_metric=VECTOR_METRIC,
-            fts_config_hash="whitespace+" + ("jieba" if _jieba_available() else "bigram"),
-            chunk_config_hash=f"v{CHUNK_SCHEMA_VERSION}:{chunking.DENSE_TARGET_TOKENS}:{chunking.DENSE_OVERLAP_TOKENS}",
+            fts_config_hash=fts_hash,
+            chunk_config_hash=chunk_hash,
         )
         existing["index_state"] = {
             "schema_version": state.schema_version,
@@ -457,9 +513,44 @@ class WikiIndex:
         manifest_file.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # ---- 发布校验 / 原子发布（#11） ----
+    def _validate_build(self, build_dir: Path) -> bool:
+        """发布前校验构建产物完整性：行数>0、双索引齐备、index_state 匹配。"""
+        try:
+            import lancedb
+            db = lancedb.connect(str(build_dir / "lance_db"))
+            t = db.open_table("chunks")
+            n = t.count_rows()
+            if n == 0:
+                return False
+            idxs = {i.name for i in t.list_indices()}
+            if "fts_text_idx" not in idxs:
+                return False
+            if n > EXACT_INDEX_MAX_ROWS and "vector_idx" not in idxs:
+                return False
+            m = json.loads((build_dir / "manifest.json").read_text(encoding="utf-8"))
+            st = m.get("index_state")
+            if st is None or st.get("vector_metric") != VECTOR_METRIC:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _publish(self, build_id: str) -> None:
+        """#11 原子发布：仅以 os.replace 翻转 ACTIVE_INDEX 指针文件（单文件，Windows 安全），
+        不动已验证的 builds/<id>/lance_db。活动索引即切换为新建版本。"""
+        pointer = self.index_dir / "ACTIVE_INDEX"
+        tmp = self.index_dir / ".ACTIVE_INDEX.tmp"
+        tmp.write_text(json.dumps({
+            "active_lance": f"builds/{build_id}/lance_db",
+            "published_at": datetime.now().isoformat(),
+            "schema_version": 2,
+        }, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp), str(pointer))
+
     # ---- load ----
     def load(self):
-        manifest_file = self.index_dir / "manifest.json"
+        manifest_file = self._resolve_active_manifest()
         if not manifest_file.exists():
             raise RuntimeError("索引未找到，请先运行 build_index.py")
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -584,7 +675,7 @@ def main():
     idx_dir = proj / ".index"
     wi = WikiIndex(idx_dir)
     wi.build(wiki)
-    print(f"索引构建完成: {len(wi.pages)} 页 → chunks 表, manifest → {idx_dir / 'manifest.json'}")
+    print(f"索引构建完成: {len(wi.pages)} 页 → 活动索引指针 {idx_dir / 'ACTIVE_INDEX'}")
 
 
 if __name__ == "__main__":
