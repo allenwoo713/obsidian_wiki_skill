@@ -140,22 +140,19 @@ def assemble_context(
     graph_budget = max(0, max_tokens - dense_budget - page_budget - image_budget)
 
     used = 0
+    used_by_type = {"dense": 0, "page": 0, "image": 0, "graph": 0}
     for c in candidates:
         _p = str(c.path).replace("\\", "/").lower()
         is_image = ("assets/" in _p) or _p.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
         is_graph = bool(c.graph_paths)
         if is_image:
-            budget = image_budget
-            scope = "chunk"
+            budget, scope, type_key = image_budget, "chunk", "image"
         elif is_graph:
-            budget = graph_budget
-            scope = "chunk"
+            budget, scope, type_key = graph_budget, "chunk", "graph"
         elif mode == "full":
-            budget = page_budget
-            scope = "full_page"
+            budget, scope, type_key = page_budget, "full_page", "page"
         else:
-            budget = dense_budget
-            scope = "chunk"
+            budget, scope, type_key = dense_budget, "chunk", "dense"
 
         # 渲染文本
         if scope == "full_page":
@@ -167,7 +164,15 @@ def assemble_context(
                 text = text[:200]
 
         tc = token_counter(text)
-        # 全局预算保护：超出 max_tokens 的后续项进入 omitted
+        # 四路预算强制（issue #3）：每类有独立预算，超出该类预算即省略，
+        # 避免某一路（如 dense）挤占 image/graph/page 的配额。
+        if used_by_type[type_key] + tc > budget:
+            bundle.omitted_items.append({
+                "page_id": c.page_id, "title": c.title,
+                "reason": f"{type_key}_budget_exhausted",
+            })
+            continue
+        # 全局硬上限（安全兜底；正常情况下四路预算之和 = max_tokens 已覆盖）
         if used + tc > max_tokens:
             bundle.omitted_items.append({
                 "page_id": c.page_id, "title": c.title,
@@ -183,6 +188,7 @@ def assemble_context(
         )
         bundle.items.append(item)
         used += tc
+        used_by_type[type_key] += tc
 
     bundle.token_count = used
     bundle.context_text = "\n\n".join(
