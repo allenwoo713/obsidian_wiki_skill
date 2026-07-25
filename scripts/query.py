@@ -165,7 +165,13 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
 
 
 def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> Optional[HybridResult]:
-    """issue #10 占位：global intent 路由到 community reports（若已构建）。"""
+    """issue #10 GraphRAG global：路由到 community reports（与 local retrieval 分离）。
+
+    map 阶段：按 query 词项与报告文本（summary+key_entities+title）的相关性检索
+    相关社区报告；reduce 阶段：按 token 预算聚合为 ContextBundle。
+    无 LLM 时为结构化聚合（非自然语言 map/reduce 摘要）；社区报告由
+    ``build_community_reports.py`` 构建。
+    """
     cr_file = wi.index_dir / "community_reports.jsonl"
     if not cr_file.exists():
         return None
@@ -173,18 +179,35 @@ def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> Optional[H
         lines = [json.loads(l) for l in cr_file.read_text(encoding="utf-8").splitlines() if l.strip()]
     except (json.JSONDecodeError, OSError):
         return None
+    # map：检索相关社区报告（query 词项与报告文本重叠度排序）
+    qtokens = set()
+    for t in list(plan.lexical_terms) + list(plan.exact_terms) + list(plan.entities):
+        if t:
+            qtokens.add(t.lower())
+    for w in (plan.original_query or "").lower().split():
+        if w:
+            qtokens.add(w)
+
+    def _rep_score(rep):
+        text = ((rep.get("summary") or "") + " "
+                + " ".join(rep.get("key_entities") or [])
+                + " " + (rep.get("title") or "")).lower()
+        return sum(1 for t in qtokens if t in text)
+
+    ranked = sorted(lines, key=lambda r: (-_rep_score(r), r.get("community_id", 0)))
     items = []
     used = 0
-    for rep in lines[:k]:
+    for rep in ranked[:k]:
         text = rep.get("summary") or rep.get("content") or ""
         title = rep.get("title") or rep.get("id") or "community_report"
         tc = max(1, len(text) // 4)
         if used + tc > max_tokens:
             break
         items.append(ContextItem(
-            page_id=rep.get("id", title), path=str(rep.get("id", title)), title=title,
-            inclusion_reason="global_community_report", scope="full_page",
-            evidence=[], text=text, sources=[], graph_paths=[], token_count=tc))
+            page_id=str(rep.get("community_id", title)), path=str(rep.get("community_id", title)),
+            title=title, inclusion_reason="global_community_report", scope="full_page",
+            evidence=[], text=text, sources=rep.get("source_pages", []),
+            graph_paths=[], token_count=tc))
         used += tc
     bundle = ContextBundle(query=plan.original_query, mode="summary",
                            max_context_tokens=max_tokens, items=items, token_count=used)
