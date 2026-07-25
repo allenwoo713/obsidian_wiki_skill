@@ -163,6 +163,29 @@ def assemble_context(
                 # 仅保留前 200 字作为概要
                 text = text[:200]
 
+        # issue #12 多模态：图片命中回溯父文档/页码/section/附近正文
+        item_sources: List[str] = []
+        if is_image and wi is not None:
+            _meta = getattr(wi, "get_image_meta", lambda p: None)(c.path)
+            if _meta:
+                _src_line = f"[来源: {_meta.get('source_doc') or '?'}"
+                if _meta.get("source_page") is not None:
+                    _src_line += f", 页 {_meta['source_page']}"
+                _sec = _meta.get("source_section")
+                if _sec:
+                    _src_line += (f", section {'/'.join(_sec)}"
+                                  if isinstance(_sec, (list, tuple)) else f", section {_sec}")
+                _src_line += "]"
+                _nearby = (_meta.get("nearby_text") or "").strip()
+                if _nearby:
+                    text = (text or "") + f"\n\n{_src_line}\n[附近正文] {_nearby}"
+                else:
+                    text = (text or "") + f"\n\n{_src_line}\n[注: 该图片附近无可用正文上下文]"
+                if _meta.get("source_doc"):
+                    item_sources = [_meta["source_doc"]]
+            else:
+                text = (text or "") + "\n\n[注: 该图片无父文档元数据]"
+
         tc = token_counter(text)
         # 四路预算强制（issue #3）：每类有独立预算，超出该类预算即省略，
         # 避免某一路（如 dense）挤占 image/graph/page 的配额。
@@ -183,7 +206,7 @@ def assemble_context(
             page_id=c.page_id, path=str(c.path), title=c.title,
             inclusion_reason=("graph_expansion" if is_graph else ("image" if is_image else "rrf")),
             scope=scope, evidence=c.dense_evidence,
-            text=text, sources=[], graph_paths=c.graph_paths,
+            text=text, sources=item_sources, graph_paths=c.graph_paths,
             token_count=tc,
         )
         bundle.items.append(item)

@@ -144,6 +144,8 @@ class WikiIndex:
         self._built_dim: Optional[int] = None
         self._built_model_name: Optional[str] = None
         self._force_encode: bool = False  # --full-rebuild 时置 True，忽略页缓存强制重编码
+        # #12 多模态：图片父文档回溯元数据（rel_path → meta），由 _load_image_meta 填充
+        self._image_meta: Dict[str, dict] = {}
 
     # ---- embedder ----
     def _get_embedder(self):
@@ -297,6 +299,53 @@ class WikiIndex:
             logging.getLogger(__name__).warning(
                 "_load_image_caption_pages: 跳过 %d 条 rel_path 缺失的图片条目", skipped)
         return pages
+
+    def _load_image_meta(self):
+        """#12 多模态：从 manifest images[] 加载图片父文档回溯元数据。
+
+        每条记录按 rel_path 索引，含 source_doc/source_page/source_section/
+        parent_page_id/nearby_text 等可选字段（由 parser 填充，缺失则回退标记）。
+        查询期 assemble_context 据 get_image_meta() 回溯父文档/页码/附近正文。
+        """
+        try:
+            manifest_file = self._resolve_active_manifest()
+        except Exception:
+            manifest_file = self.index_dir / "manifest.json"
+        if not manifest_file.exists():
+            self._image_meta = {}
+            return
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            self._image_meta = {}
+            return
+        meta: Dict[str, dict] = {}
+        for img in manifest.get("images", []):
+            rel = img.get("rel_path")
+            if not rel:
+                continue
+            meta[rel] = {
+                "source_doc": img.get("source_doc", ""),
+                "source_page": img.get("source_page"),
+                "source_section": img.get("source_section"),
+                "parent_page_id": img.get("parent_page_id"),
+                "nearby_text": img.get("nearby_text", ""),
+                "figure_caption": img.get("figure_caption", ""),
+                "caption_text": img.get("caption_text", ""),
+            }
+        self._image_meta = meta
+
+    def get_image_meta(self, path) -> Optional[dict]:
+        """#12：按图片路径（绝对路径或 rel_path）查父文档回溯元数据。"""
+        if not self._image_meta:
+            return None
+        p = str(path).replace("\\", "/")
+        if p in self._image_meta:
+            return self._image_meta[p]
+        for rel, m in self._image_meta.items():
+            if p.endswith(rel):
+                return m
+        return None
 
     def _chunk_rows_for_page(self, p: WikiPage, dim: int):
         """为单页生成 chunks 表的行（dense leaf + sparse section）。"""
@@ -710,6 +759,7 @@ class WikiIndex:
                 f"current code expects '{VECTOR_METRIC}'. Rebuild the index.")
         self._project_root = Path(self.index_dir).parent
         self._lexicon = load_lexicon(self._project_root)
+        self._load_image_meta()  # #12 多模态：加载图片父文档回溯元数据
         self._page_by_id = {}
         self.pages = []
         for p in manifest.get("pages", []):
