@@ -75,14 +75,58 @@ obsidian_wiki_skill/
 │   ├── purpose.template.md  # 知识库目标模板
 │   └── schema.template.md   # 页面类型与 frontmatter 规范模板
 ├── lib/                      # 前端库（vis-network / tom-select，图谱可视化用）
-├── .github/workflows/ci.yml # GitHub Actions CI（语法检查 + import 健康 + .env 未入库）
+├── .github/workflows/eval.yml # CI：单元测试 + 检索评测回归检查
 ├── requirements.txt          # 核心依赖
 ├── requirements-mineru.txt   # 本地 MinerU venv 依赖锁定（含 torch/transformers）
+├── tests/                    # 单元测试（公开，离线可跑）
+│   ├── conftest.py           # pytest 配置 + tiny_kb fixture
+│   ├── fixtures/wiki/        # 脱敏评测 fixture（虚构 Acme VisionCam / Columbus 雷达）
+│   ├── fixtures/raw/         # 样本源文件
+│   ├── fixtures/gen_fixtures.py  # fixture 与 queries.jsonl 生成器
+│   └── test_*.py             # chunking / tokenizer / FTS / vector / fusion / context / graph / incremental ...
+├── eval/                     # 检索评测（issue #9）
+│   ├── queries.jsonl         # >=100 条带金标查询
+│   ├── run_eval.py           # 评测脚本（构建→检索→指标→回归对比）
+│   ├── baselines.json        # 质量与性能基线（回归对照）
+│   └── results.json          # 最近一次评测结果（CI 产出）
 ├── conftest.py               # pytest 配置（LanceDB basetemp 改到项目内）
 └── .env.example              # 配置模板
 ```
 
-> **tests/** 目录为本地开发用，**不在公开发布的 skill 仓库中包含**（已在 `.gitignore` 中排除）。如需测试用例，请联系作者。
+## 评测与测试
+
+### 快速测试
+
+```bash
+pip install -r requirements.txt pytest
+# 全套单元测试（离线，使用 tests/fixtures 脱敏数据）
+pytest -p no:cacheprovider --basetemp=/tmp/owb_pytest
+```
+
+### 检索评测（回归检查）
+
+```bash
+# 首次初始化基线（把当前指标写入 eval/baselines.json）
+python eval/run_eval.py --init-baseline
+
+# 后续每次改动后对比基线（Recall 下降 >2pp / overflow>0 / graph-only>0 时退出码 1）
+python eval/run_eval.py
+```
+
+评测在 `tests/fixtures/wiki`（虚构工业相机/雷达，可公开）上构建索引，对 `eval/queries.jsonl`（105 条带金标）跑混合检索，计算：
+
+| 指标 | 目标 |
+|---|---|
+| Page Recall@5 | ≥ 0.90 |
+| Evidence Recall@10 | ≥ 0.85 |
+| Exact lookup Hit@3 | ≥ 0.95 |
+| MRR@10 | ≥ 0.75 |
+| ANN Recall@10 | ≥ 0.98 |
+| Context overflow / Graph-only unsupported | = 0 |
+
+并记录性能（构建/增量时间、embedding 数、索引磁盘、P50/95/99 延迟、peak memory、ContextBundle token）。CI（`.github/workflows/eval.yml`）在 PR 上自动运行测试 + 评测，结果与 `baselines.json` 对比，回归超阈值即失败。
+
+> **tests/** 与 **eval/** 目录已公开（issue #9），含可复现的脱敏评测集与单元测试，无需外部私有文档即可运行。
 
 ### 项目侧目录（skill 运行时操作的工作区）
 

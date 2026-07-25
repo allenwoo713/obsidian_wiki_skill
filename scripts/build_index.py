@@ -229,13 +229,15 @@ class WikiIndex:
         )
 
     # ---- build ----
-    def build(self, wiki_dir: Path, full_rebuild: bool = False):
+    def build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto"):
         """构建（默认增量）：未变页命中页级向量缓存跳过编码；full_rebuild=True 强制全量重编码。
 
         无论增量与否都写入全新 builds/<id>/lance_db（删除页自然不入表 → 无残留），
         校验通过后经 #11 指针原子发布。增量的加速点在于跳过未变页的 torch 编码。
         """
         self._force_encode = bool(full_rebuild)
+        self._vector_index_mode = vector_index_mode
+        self._lance_table = None  # 重置缓存：load()/上次 build() 可能已缓存活动索引表
         self._project_root = wiki_dir.parent
         self._lexicon = load_lexicon(self._project_root)
         self.pages = scan_wiki(wiki_dir, self._project_root)
@@ -252,13 +254,14 @@ class WikiIndex:
         self._manifest_target = build_dir / "manifest.json"
         try:
             self._build_chunks()
-            if not self._validate_build(build_dir):
+            if not self._validate_build(build_dir, vector_index_mode=vector_index_mode):
                 raise RuntimeError(
                     "build 校验未通过，放弃发布；活动索引保持不变（指针未翻转）")
             self._publish(build_id)
         finally:
             self._lance_dir = None
             self._manifest_target = None
+            self._lance_table = None  # 重置缓存，允许同一 WikiIndex 实例重复 build（增量/重跑）
 
     def _load_image_caption_pages(self, idx_dir: Path) -> List[WikiPage]:
         manifest_file = idx_dir / "manifest.json"
@@ -611,16 +614,25 @@ class WikiIndex:
             log.warning("create_fts_index 失败（FTS 检索不可用）: %s", e)
 
         # 6) 自适应向量索引（#8）
-        self._build_vector_index(table, len(all_rows), dim)
+        self._build_vector_index(table, len(all_rows), dim, self._vector_index_mode)
 
         # 7) 写 manifest（必须在任何可能触发守卫的清理之前）
         self._write_manifest(self._manifest_target)
 
-    def _build_vector_index(self, table, n_rows: int, dim: int):
-        """#8 自适应向量索引：exact → IVF_HNSW_FLAT → IVF_HNSW_SQ。"""
-        if n_rows <= EXACT_INDEX_MAX_ROWS:
-            return  # 数据量小：LanceDB 暴力精确检索，recall=1
-        index_type = "IVF_HNSW_SQ" if n_rows >= SQ_INDEX_MIN_ROWS else "IVF_HNSW_FLAT"
+    def _build_vector_index(self, table, n_rows: int, dim: int, mode: str = "auto"):
+        """#8 自适应向量索引：exact → IVF_HNSW_FLAT → IVF_HNSW_SQ。
+
+        ``mode`` 可强制覆盖自适应选择（评测用）：``auto`` 走阈值逻辑，
+        ``exact`` 不建索引（暴力精确），``ivf-hnsw-flat`` / ``ivf-hnsw-sq`` 强制对应类型。
+        """
+        if mode == "exact":
+            return
+        if mode in ("ivf-hnsw-flat", "ivf-hnsw-sq"):
+            index_type = "IVF_HNSW_SQ" if mode == "ivf-hnsw-sq" else "IVF_HNSW_FLAT"
+        else:  # auto
+            if n_rows <= EXACT_INDEX_MAX_ROWS:
+                return  # 数据量小：LanceDB 暴力精确检索，recall=1
+            index_type = "IVF_HNSW_SQ" if n_rows >= SQ_INDEX_MIN_ROWS else "IVF_HNSW_FLAT"
         num_partitions = max(2, int(math.sqrt(n_rows)))
         try:
             # lancedb 0.33: create_index 首参是 metric（非列名），列名用 vector_column_name=
@@ -708,7 +720,7 @@ class WikiIndex:
             json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # ---- 发布校验 / 原子发布（#11） ----
-    def _validate_build(self, build_dir: Path) -> bool:
+    def _validate_build(self, build_dir: Path, vector_index_mode: str = "auto") -> bool:
         """发布前校验构建产物完整性：行数>0、双索引齐备、index_state 匹配。"""
         try:
             import lancedb
@@ -866,12 +878,15 @@ def main():
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
     p.add_argument("--full-rebuild", action="store_true",
                    help="忽略页级向量缓存，强制全量重编码（模型/分块配置变更或缓存疑似损坏时使用）")
+    p.add_argument("--vector-index", default="auto",
+                   choices=["auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"],
+                   help="向量索引类型（默认 auto：依数据量自适应；评测可强制 exact/ivf-hnsw-flat/sq）")
     args = p.parse_args()
     proj = Path(args.project_root)
     wiki = proj / "Wiki"
     idx_dir = proj / ".index"
     wi = WikiIndex(idx_dir)
-    wi.build(wiki, full_rebuild=args.full_rebuild)
+    wi.build(wiki, full_rebuild=args.full_rebuild, vector_index_mode=args.vector_index)
     mode = "全量重建" if args.full_rebuild else "增量"
     print(f"索引构建完成（{mode}）: {len(wi.pages)} 页 → 活动索引指针 {idx_dir / 'ACTIVE_INDEX'}")
 

@@ -1,0 +1,38 @@
+name: eval
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - 'eval/**'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+jobs:
+  test-and-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Unit tests
+        run: |
+          pytest -p no:cacheprovider --basetemp=/tmp/owb_pytest
+      - name: Retrieval eval (regression check)
+        run: |
+          python eval/run_eval.py --work-dir /tmp/owb_eval
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: |
+            eval/results.json
+            eval/detail.jsonl

@@ -1,0 +1,2 @@
+Acme VisionCam X200 分辨率 1920×1080，接口 GigE Vision，工作温度 -20~60°C。
+Columbus Front Radar CFR-100 频段 77GHz，探测距离 250m，接口 CAN FD。

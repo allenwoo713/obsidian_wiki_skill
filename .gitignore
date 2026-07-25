@@ -4,8 +4,8 @@ pytest-cache-files-*/
 tmp_*/
 tmp/
 
-# 测试代码（本地开发保留，不公开发布）
-tests/
+# 测试代码现已公开（issue #9：可复现评测集与单元测试）
+# tests/ 不再排除
 
 # 误建的重复前端库副本（与根 lib/ 内容相同，不入库）
 scripts/lib/
@@ -29,3 +29,7 @@ __pycache__/
 
 # 临时计划文档（修改计划的草稿，不入库）
 docs/plan-*.md
+
+# 评测运行产物（queries.jsonl / baselines.json 入库；results/detail 为每次运行产物）
+eval/results.json
+eval/detail.jsonl
