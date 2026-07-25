@@ -27,7 +27,14 @@ from typing import List, Dict, Optional
 #    故把 pyarrow + torch 提到模块最顶部（仅晚于标准库），并立即固定线程数。
 import pyarrow  # noqa: F401  # 先于 torch（ISSUE-16）
 import torch
-torch.set_num_threads(int(os.environ.get("WIKI_TORCH_THREADS", "1") or "1"))
+# 多线程 encode 实测安全且 ~2.7x 更快（5120 条压测：8 线程 88s vs 1 线程 ~240s，
+# faulthandler 80 批次无段错误；完整 build 路径 8 线程 test_index_safety 全过）。
+# 早期「强制单线程」是对 0xC0000005 的误判兜底——真正根因是 torch 原生加载与宿主
+# asyncio 后台线程的时序 race，已由上方「torch 先行 import」修复；多线程 encode
+# 本身稳定。默认 min(cpu, 8)，WIKI_TORCH_THREADS 可覆盖（设 1 回退单线程）。
+_default_threads = min(os.cpu_count() or 4, 8)
+_wiki_threads = int(os.environ.get("WIKI_TORCH_THREADS") or _default_threads)
+torch.set_num_threads(max(1, _wiki_threads))
 torch.set_grad_enabled(False)  # 推理无需梯度，省内存并减少线程活动
 
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01），须在下方 setdefault 之前执行
