@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -522,17 +523,21 @@ class WikiIndex:
                     prev_sig = json.loads(meta_path.read_text(encoding="utf-8"))
                 except Exception:
                     prev_sig = None
-            if prev_sig == sig and done_path.exists():
+            # --full-rebuild（force）必须忽略任何旧 checkpoint，走全新全量编码；
+            # 否则全量构建的 sig 确定性命中旧 done.json → 误判为可断点续 → 缺文件崩溃。
+            if (not force) and prev_sig == sig and done_path.exists():
                 try:
                     done = {int(x) for x in json.loads(done_path.read_text(encoding="utf-8"))}
+                    # 防御：done.json 声称为"已完成"的 batch 必须实际存在 .npy，
+                    # 否则视为未完成、回退重编码（避免缺文件直接 np.load 崩溃）。
+                    done = {bi for bi in done if (ckpt / f"batch_{bi:05d}.npy").exists()}
                 except Exception:
                     done = set()
             else:
-                for old in ckpt.glob("batch_*.npy"):
-                    try:
-                        old.unlink()
-                    except Exception:
-                        pass
+                # 不主动删除旧 batch_*.npy：np.save 会按批次名覆盖写入，且加载仅读取
+                # range(n_batches) 的实际批次，残留旧批次文件无害。
+                # （沙箱 safe-delete 守卫会拦截 os.unlink 并杀进程，故此处不删除。）
+                pass
             meta_path.write_text(json.dumps(sig, ensure_ascii=False), encoding="utf-8")
             for bi in range(n_batches):
                 if bi in done:
@@ -742,6 +747,33 @@ class WikiIndex:
         except Exception:
             return False
 
+    def _atomic_replace(self, src: Path, dst: Path, attempts: int = 15, delay: float = 0.5) -> None:
+        """Windows 友好原子替换：os.replace 可能因目标被 Obsidian/杀软持锁而抛
+        PermissionError(WinError 5 / 32)。先重试若干次（锁通常是瞬时态），
+        仍失败则原位覆盖 pointer 内容作为兜底；皆失败才上抛并给出可操作信息。"""
+        last = None
+        for i in range(attempts):
+            try:
+                os.replace(str(src), str(dst))
+                return
+            except (PermissionError, OSError) as e:
+                last = e
+                time.sleep(delay)
+        # 重试耗尽：尝试原位写入（不依赖重命名目录项）
+        try:
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            try:
+                src.unlink()
+            except Exception:
+                pass
+            return
+        except (PermissionError, OSError) as e:
+            last = e
+        raise RuntimeError(
+            f"原子发布失败：无法翻转 ACTIVE_INDEX 指针（{type(last).__name__}: {last}）。"
+            f"请确认 {dst} 未被 Obsidian/杀软独占，或手动将 {src} 重命名为 {dst} 后重试。"
+        ) from last
+
     def _publish(self, build_id: str) -> None:
         """#11 原子发布：仅以 os.replace 翻转 ACTIVE_INDEX 指针文件（单文件，Windows 安全），
         不动已验证的 builds/<id>/lance_db。活动索引即切换为新建版本。"""
@@ -752,7 +784,7 @@ class WikiIndex:
             "published_at": datetime.now().isoformat(),
             "schema_version": 2,
         }, ensure_ascii=False), encoding="utf-8")
-        os.replace(str(tmp), str(pointer))
+        self._atomic_replace(tmp, pointer)
 
     # ---- load ----
     def load(self):
