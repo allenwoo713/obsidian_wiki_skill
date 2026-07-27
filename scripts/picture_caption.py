@@ -32,7 +32,11 @@ def save_manifest(project_root: Path, manifest: Dict):
 
 
 def list_pending(project_root: Path, limit: int = None) -> List[Dict]:
-    """列出所有 caption_text 为空的图片，输出简略 JSON 供 Box 填充。
+    """列出待 VLM 处理的图片（status != "captioned"），输出简略 JSON 供 Box 填充。
+
+    过滤规则：以 status 字段为准（pending_vlm 等）；status 缺失的旧条目视为 pending。
+    figure_caption 仅作 Box 读图时的参考线索，**不**自动写为 caption_text——
+    caption_text 由 VLM（Box 读图）确认后写入，避免缺少关键信息。
 
     stdout 输出 pending JSON 数组（供 apply 消费）；stderr 输出 total/done/pending
     统计 + 按 source_doc 分组，防止调用方把 pending 切片误当成全集。
@@ -42,27 +46,28 @@ def list_pending(project_root: Path, limit: int = None) -> List[Dict]:
     pending = []
     per_doc: Dict[str, int] = {}
     for img in all_imgs:
-        if not img.get("caption_text", "").strip():
-            pending.append({
-                "filename": img["filename"],
-                "rel_path": img.get("rel_path", f"assets/{img['filename']}"),
-                "figure_caption": img.get("figure_caption", ""),
-                "source_doc": img.get("source_doc", ""),
-                # 以下由 Box 填充
-                "vlm_caption": {
-                    "description": "",
-                    "key_values": [],
-                    "category": "",
-                },
-                "caption_text": "",
-            })
-            doc = img.get("source_doc", "(unknown)")
-            # 取文件名部分，避免绝对路径刷屏
-            short = doc.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] or doc
-            per_doc[short] = per_doc.get(short, 0) + 1
+        if (img.get("status") or "") == "captioned":
+            continue
+        pending.append({
+            "filename": img["filename"],
+            "rel_path": img.get("rel_path", f"assets/{img['filename']}"),
+            "figure_caption": img.get("figure_caption", ""),
+            "source_doc": img.get("source_doc", ""),
+            # 以下由 Box 填充
+            "vlm_caption": {
+                "description": "",
+                "key_values": [],
+                "category": "",
+            },
+            "caption_text": "",
+        })
+        doc = img.get("source_doc", "(unknown)")
+        # 取文件名部分，避免绝对路径刷屏
+        short = doc.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] or doc
+        per_doc[short] = per_doc.get(short, 0) + 1
 
     total = len(all_imgs)
-    done = total - len(pending)
+    done = sum(1 for i in all_imgs if (i.get("status") or "") == "captioned")
     # 统计走 stderr，不污染 stdout 的 JSON
     print(f"[caption 统计] 总图: {total}, 已标注: {done}, 待标注: {len(pending)}", file=sys.stderr)
     if per_doc:
@@ -105,6 +110,8 @@ def apply_captions(project_root: Path, captions_file: Path):
                     ct = "\n".join(parts)
                     healed += 1
             img["caption_text"] = ct
+            # status 与 caption_text 联动：有 caption_text 视为 captioned，否则 pending_vlm
+            img["status"] = "captioned" if ct else "pending_vlm"
             updated += 1
 
     save_manifest(project_root, manifest)

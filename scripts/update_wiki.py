@@ -196,6 +196,10 @@ def main():
     existing_images = manifest.get("images", [])
     new_or_mod = diff["new"] + diff["modified"]
     image_manifest = extract_images_for_diff(new_or_mod, diff["unchanged"], assets_dir, existing_images)
+    # 图片注册自愈：扫描全库 ![[ref]] 补登未注册引用图（status=pending_vlm）
+    healed = heal_image_registration(proj, {"images": image_manifest}, assets_dir)
+    if healed:
+        print(f"\n[图片自愈] 补登 {healed} 张未注册引用图 -> status=pending_vlm")
     need_caption = [img for img in image_manifest if not img.get("caption_text")]
     if need_caption:
         print(f"\n需 Box 生成 caption 的图片: {len(need_caption)} 张")
@@ -227,6 +231,62 @@ def main():
         build_wiki_index_md(proj)
     except Exception as e:
         print(f"[WARN] index.md 自动重建失败（不影响主流程）: {e}")
+
+
+def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path) -> int:
+    """扫描 Wiki/**/*.md 的全部 ![[ref]] 引用，把引用了但未注册进 manifest.images 的图
+    自动补登为 status='pending_vlm'（case-insensitive 比对，避免 Windows 下 6t8r/6T8R 误判）。
+    同时对全部条目兜底回填 status（无 status 时按 caption_text 推导），保证 picture_caption.py
+    list 能按 status 过滤出待 VLM 清单。返回新增补登记数。
+    说明：本函数只补“注册缺口”，不填 caption、不进索引；VLM 解读与 build_index 仍需后续步骤。
+    """
+    WIKILINK = re.compile(r"!\[\[([^\]]+)\]\]")
+    wiki_dir = project_root / "Wiki"
+    md_files = [p for p in wiki_dir.rglob("*.md")
+                if ".obsidian" not in p.parts and ".graph" not in p.parts]
+    refs: Dict[str, List[Path]] = {}
+    for md in md_files:
+        try:
+            txt = md.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for ref in WIKILINK.findall(txt):
+            fn = ref.split("|")[0].strip()
+            if fn:
+                refs.setdefault(fn, []).append(md)
+
+    images = manifest.setdefault("images", [])
+    reg_ci = {(e.get("filename") or Path(e.get("rel_path", "")).name).lower()
+              for e in images}
+
+    added = 0
+    for fn, mds in refs.items():
+        if fn.lower() in reg_ci:
+            continue
+        asset = assets_dir / fn
+        if not asset.exists():
+            continue  # 真断链（磁盘缺失），不补登，留给 audit_images.py 报告
+        source_doc = norm_key(str(mds[0]))
+        images.append({
+            "filename": fn,
+            "rel_path": f"assets/{fn}",
+            "sha256": compute_sha256(asset),
+            "source_doc": source_doc,
+            "source_media": Path(source_doc).stem,
+            "page_or_section": "",
+            "figure_caption": "",
+            "vlm_caption": None,
+            "caption_text": "",
+            "status": "pending_vlm",
+        })
+        reg_ci.add(fn.lower())
+        added += 1
+
+    # 兜底回填 status：无 status 的条目按 caption_text 推导
+    for img in images:
+        if not img.get("status"):
+            img["status"] = "captioned" if (img.get("caption_text") or "").strip() else "pending_vlm"
+    return added
 
 
 def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_images=None):
@@ -272,6 +332,7 @@ def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_ima
                 "figure_caption": ref.caption or (prev.get("figure_caption", "") if prev else ""),
                 "vlm_caption": prev.get("vlm_caption") if prev else None,
                 "caption_text": prev.get("caption_text", "") if prev else (ref.caption or ""),
+                "status": "captioned" if (prev.get("caption_text") or (ref.caption or "")).strip() else "pending_vlm",
             })
 
     # 4) unchanged：旧条目已在第 1 步保留，跳过

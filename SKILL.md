@@ -460,6 +460,7 @@ python -m venv <mineru_venv>
 | `parsers/*.py` | 仅返回对象，不写盘 | 任何文件 |
 | `parse_sources.py` | `Wiki/assets/`（经 extract_assets） | `Wiki/*.md` / `Raw/` / `.index/` |
 | `update_wiki.py` | `Wiki/assets/` / `.index/manifest.json` | `Wiki/*.md` / `Raw/` |
+| `audit_images.py` | `.index/manifest.json`（仅 --fix 时写；默认只读报告） | `.obsidian/` / `Raw/` / `Wiki/*.md` / `Wiki/assets/` |
 | `picture_caption.py` | `.index/manifest.json` | `Wiki/assets/` / `Raw/` / `Wiki/*.md` |
 | `build_index.py` | `.index/`（merge 模式） | `Wiki/assets/` / `Raw/` / `Wiki/*.md` |
 | `query.py` | 只读检索 | 任何文件 |
@@ -500,6 +501,27 @@ python -m venv <mineru_venv>
    ```bash
    PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root>
    ```
+
+### 图片注册审计与自愈（status 字段）
+
+图片在 `manifest.images` 中的生命周期由 `status` 字段标记，VLM 解读与索引检索都依赖它：
+
+| status | 含义 | 进索引/可检索 | 由谁设置 |
+|---|---|---|---|
+| `pending_vlm` | 已注册，待 VLM（agent 读图）解读 | 否（build_index 跳过空 caption_text） | `update_wiki.py` 自愈补登 / `audit_images.py --fix` |
+| `captioned` | 已写 caption_text，可检索 | 是 | `picture_caption.py apply` |
+
+**自愈（已内置 `update_wiki.py` 增量阶段）**：每次增量更新会扫描 `Wiki/**/*.md` 的全部 `![[ref]]` 引用，把引用了但未注册进 `manifest.images` 的图自动补登为 `status="pending_vlm"`（case-insensitive 比对，避免 Windows 下 `6t8r`/`6T8R` 误判）。因此正常走增量流程不会再出现“未注册引用”。
+
+**独立诊断工具 `audit_images.py`**（只读报告 + 可选 `--fix`）：
+```bash
+# 报告模式（不改任何文件）：扫描全库，输出 已注册/未注册(磁盘有)/真断链/孤儿资产/status 分布
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/audit_images.py <project_root>
+
+# 补登模式：把“引用但未注册(磁盘有)”写入 manifest.images（幂等，status=pending_vlm）
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/audit_images.py <project_root> --fix
+```
+> 自愈只补“注册缺口”，不填 caption、不进索引。补登后的图仍需 `picture_caption.py list` → agent 逐张 Read 写 caption → `apply` → `build_index` 才能被检索。
 
 ### agent 检索答案合成工作流
 
