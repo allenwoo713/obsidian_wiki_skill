@@ -20,6 +20,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 
+
+# The embedding model is an asset of this skill.  Keep it beside the skill
+# instead of falling back to an unrelated user-level cache: that makes builds
+# reproducible and lets a copied skill remain self-contained.
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+EMBEDDING_MODEL_ID = "paraphrase-multilingual-MiniLM-L12-v2"
+SKILL_EMBEDDER_DIR = SKILL_ROOT / "models" / EMBEDDING_MODEL_ID
+
 # ISSUE-16 + 0xC0000005 修复：
 #  - pyarrow 必须早于 torch 导入（在已加载 torch 的进程里再 import pyarrow 会触发
 #    Windows access violation，RC=139）。
@@ -153,20 +161,19 @@ class WikiIndex:
     def _get_embedder(self):
         if self._embedder is None:
             from sentence_transformers import SentenceTransformer
-            local_path = os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or \
-                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.dirname(os.path.abspath(__file__))))),
-                    "binaries", "python", "envs", "default", "models",
-                    "paraphrase-multilingual-MiniLM-L12-v2")
-            candidate_paths = [
-                local_path,
-                os.path.expanduser("~/.workbuddy/binaries/python/envs/default/models/paraphrase-multilingual-MiniLM-L12-v2"),
+            configured_path = os.environ.get("WIKI_EMBEDDER_LOCAL_PATH")
+            candidate_paths = ([configured_path] if configured_path else []) + [
+                str(SKILL_EMBEDDER_DIR),
             ]
             for p in candidate_paths:
                 if os.path.isdir(p) and os.path.exists(os.path.join(p, "model.safetensors")):
                     self._embedder = SentenceTransformer(p)
                     return self._embedder
-            self._embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+            raise RuntimeError(
+                "本地 embedding 模型不存在。请运行 "
+                f"`python scripts/download_embedding_model.py` 将 {EMBEDDING_MODEL_ID} "
+                f"部署到 {SKILL_EMBEDDER_DIR}，或设置 WIKI_EMBEDDER_LOCAL_PATH。"
+            )
         return self._embedder
 
     def count_tokens(self, text: str) -> int:

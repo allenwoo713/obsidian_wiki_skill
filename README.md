@@ -167,7 +167,13 @@ from modelscope import snapshot_download
 snapshot_download('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 ```
 
-下载后放到 `<venv>/models/paraphrase-multilingual-MiniLM-L12-v2/` 下，`build_index.py` 会优先从该位置加载。
+下载后放到 `<skill_dir>/models/paraphrase-multilingual-MiniLM-L12-v2/` 下，`build_index.py` 会优先从该位置加载。推荐直接运行：
+
+```bash
+python scripts/download_embedding_model.py
+```
+
+该脚本通过 ModelScope 部署，并将模型与下载缓存都限制在 `<skill_dir>/models/` 和 `<skill_dir>/.cache/`；构建流程不会再隐式从 HuggingFace 或用户级缓存下载模型。
 
 ### 3. 文档解析后端（可选但推荐）
 

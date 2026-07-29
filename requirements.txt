@@ -1,5 +1,6 @@
 lancedb>=0.33
 sentence-transformers>=2.7
+modelscope>=1.38,<2
 jieba>=0.42
 networkx>=3.0
 pyarrow>=15
