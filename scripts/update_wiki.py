@@ -31,7 +31,11 @@ def norm_key(p) -> str:
     s = str(Path(p).resolve())
     if len(s) >= 2 and s[1] == ":":
         s = s[0].upper() + s[1:]
-    return s.replace("/", "\\")
+    # 统一为当前 OS 的原生分隔符：Windows 保持 '\\'，POSIX 保持 '/'。
+    # 旧实现无条件 replace('/', '\\') 在 Linux 下会把路径全部变成反斜杠，
+    # 导致 manifest 键永远匹配不到磁盘路径，diff_manifest 在 CI/Linux 上
+    # 把所有 entry 误判为 new（unchanged/modified/deleted 全为 0）。
+    return s.replace("\\", os.sep).replace("/", os.sep)
 
 
 class SourceState(Enum):
