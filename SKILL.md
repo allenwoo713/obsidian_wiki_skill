@@ -46,8 +46,10 @@ read_when:
 - ⚠️ 所有 Python 运行必须设 `PYTHONDONTWRITEBYTECODE=1`
 - ⚠️ pytest 运行加 `-p no:cacheprovider`
 - ⚠️ git commit 在 junction 路径需 `dangerouslyDisableSandbox: true`
-- embedding 模型: `paraphrase-multilingual-MiniLM-L12-v2`（多语言，~50MB，CPU 友好，可从 [ModelScope](https://modelscope.cn) 或 HuggingFace 下载到 venv/models/ 下）
+- embedding 模型: `paraphrase-multilingual-MiniLM-L12-v2`（多语言，~50MB，CPU 友好；运行 `python scripts/download_embedding_model.py` 从 [ModelScope](https://modelscope.cn) 部署到 `<skill_dir>/models/`，所有缓存位于 `<skill_dir>/.cache/`）
 - Skill 路径: `<skill_dir>`（即本 `SKILL.md` 所在目录）
+
+核心依赖由 `<skill_dir>/requirements.in` 定义，锁定文件 `<skill_dir>/requirements.txt` 必须通过 `python <skill_dir>/scripts/compile_requirements.py` 生成；不要手动编辑锁定文件。使用 `--check` 验证两者同步。MinerU Local 仍使用单独的 `requirements-mineru.txt`。
 
 ## 标准调用模板（按本机路径替换占位符）
 

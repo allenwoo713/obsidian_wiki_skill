@@ -1,0 +1,74 @@
+"""Download the skill's embedding model into the skill-local models directory.
+
+This is intentionally an explicit bootstrap step.  Index builds must use an
+already-local model so a production build never silently changes provider or
+pollutes a user-wide Hugging Face/ModelScope cache.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+from pathlib import Path
+
+
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_DIR = SKILL_ROOT / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
+CACHE_DIR = SKILL_ROOT / ".cache" / "modelscope"
+
+
+def _model_is_complete(path: Path) -> bool:
+    return (path / "model.safetensors").is_file()
+
+
+def main() -> None:
+    if _model_is_complete(MODEL_DIR):
+        print(f"embedding model already available: {MODEL_DIR}")
+        return
+
+    try:
+        from modelscope import snapshot_download
+    except ImportError as exc:
+        raise SystemExit(
+            "ModelScope is required for this bootstrap. Install requirements.txt "
+            "or run `uv run --with modelscope python scripts/download_embedding_model.py`."
+        ) from exc
+
+    MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Keep every ModelScope intermediate under this skill as well.  `local_dir`
+    # is supported by the pinned ModelScope release and puts usable model files
+    # directly at MODEL_DIR.
+    os.environ.setdefault("MODELSCOPE_CACHE", str(CACHE_DIR))
+    downloaded = Path(snapshot_download(
+        MODEL_ID,
+        local_dir=str(MODEL_DIR),
+        cache_dir=str(CACHE_DIR),
+        # SentenceTransformer needs PyTorch weights plus tokenizer/config files;
+        # do not pull the optional ONNX export variants (~1.4 GB) into a skill
+        # that indexes with sentence-transformers.
+        allow_file_pattern=[
+            "*.json",
+            "*.safetensors",
+            "*.txt",
+            "*.model",
+            "tokenizer*",
+            "vocab*",
+            "merges*",
+        ],
+    ))
+
+    if downloaded != MODEL_DIR and not _model_is_complete(MODEL_DIR):
+        # Defensive compatibility path for ModelScope versions that return a
+        # cache path despite local_dir.  Copy only into the skill-local target.
+        shutil.copytree(downloaded, MODEL_DIR, dirs_exist_ok=True)
+
+    if not _model_is_complete(MODEL_DIR):
+        raise RuntimeError(
+            f"ModelScope returned without model.safetensors in {MODEL_DIR}"
+        )
+    print(f"embedding model deployed: {MODEL_DIR}")
+
+
+if __name__ == "__main__":
+    main()

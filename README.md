@@ -77,6 +77,7 @@ obsidian_wiki_skill/
 ├── lib/                      # 前端库（vis-network / tom-select，图谱可视化用）
 ├── .github/workflows/eval.yml # CI：单元测试 + 检索评测回归检查
 ├── requirements.txt          # 核心依赖
+├── requirements.in           # 核心直接依赖（requirements.txt 的生成输入）
 ├── requirements-mineru.txt   # 本地 MinerU venv 依赖锁定（含 torch/transformers）
 ├── tests/                    # 单元测试（公开，离线可跑）
 │   ├── conftest.py           # pytest 配置 + tiny_kb fixture
@@ -102,6 +103,17 @@ pip install -r requirements.txt pytest
 # 全套单元测试（离线，使用 tests/fixtures 脱敏数据）
 pytest -p no:cacheprovider --basetemp=/tmp/owb_pytest
 ```
+
+### 更新核心依赖
+
+`requirements.in` 是人工审核的直接依赖清单；`requirements.txt` 是由 uv 锁定的生成物，禁止手改。新增或升级核心依赖后运行：
+
+```bash
+python scripts/compile_requirements.py
+python scripts/compile_requirements.py --check
+```
+
+该脚本将 uv 缓存与校验临时输出保留在 skill 目录的 `.cache/` 和 `.review-tmp/` 下。MinerU Local 继续使用独立的 `requirements-mineru.txt`。
 
 ### 检索评测（回归检查）
 
@@ -167,7 +179,13 @@ from modelscope import snapshot_download
 snapshot_download('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 ```
 
-下载后放到 `<venv>/models/paraphrase-multilingual-MiniLM-L12-v2/` 下，`build_index.py` 会优先从该位置加载。
+下载后放到 `<skill_dir>/models/paraphrase-multilingual-MiniLM-L12-v2/` 下，`build_index.py` 会优先从该位置加载。推荐直接运行：
+
+```bash
+python scripts/download_embedding_model.py
+```
+
+该脚本通过 ModelScope 部署，并将模型与下载缓存都限制在 `<skill_dir>/models/` 和 `<skill_dir>/.cache/`；构建流程不会再隐式从 HuggingFace 或用户级缓存下载模型。
 
 ### 3. 文档解析后端（可选但推荐）
 

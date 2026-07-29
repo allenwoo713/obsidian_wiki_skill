@@ -17,6 +17,14 @@ venv/
 build/
 dist/
 
+# Skill-local runtime assets.  The reusable bootstrap script downloads the
+# embedding model and keeps all dependency/model caches under the skill root;
+# they are deployment artifacts, never source-controlled files.
+.cache/
+.tools/
+models/
+.review-tmp/
+
 # Python 编译缓存
 __pycache__/
 *.pyc
