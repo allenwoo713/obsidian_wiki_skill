@@ -27,6 +27,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: embed-model-${{ hashFiles('scripts/download_embedding_model.py') }}
+      - name: Bootstrap local embedding model
+        # PR #24 changed the embedder to local-first (no HuggingFace fallback),
+        # so the weight file must exist before any test that builds a real index.
+        # download_embedding_model.py is a no-op if the model is already present
+        # (e.g. warm CI cache), otherwise it pulls it via ModelScope.
+        run: |
+          python scripts/download_embedding_model.py
       - name: Unit tests
         run: |
           pytest -p no:cacheprovider --basetemp=/tmp/owb_pytest
