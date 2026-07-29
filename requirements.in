@@ -1,0 +1,22 @@
+# Direct dependencies for the core skill runtime.
+#
+# Do not edit requirements.txt by hand. Regenerate it with:
+#   python scripts/compile_requirements.py
+# MinerU Local remains isolated in requirements-mineru.txt.
+beautifulsoup4>=4.12
+jieba>=0.42
+lancedb>=0.33
+modelscope>=1.38,<2
+networkx>=3.0
+numpy>=1.26
+Pillow>=10.0
+pyarrow>=15
+PyMuPDF>=1.24
+python-docx>=1.1
+python-dotenv>=1.0
+python-louvain>=0.16
+PyYAML>=6.0
+pyvis>=0.3.2
+rank-bm25>=0.2.2
+requests>=2.31
+sentence-transformers>=2.7

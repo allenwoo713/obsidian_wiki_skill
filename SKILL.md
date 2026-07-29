@@ -49,6 +49,8 @@ read_when:
 - embedding 模型: `paraphrase-multilingual-MiniLM-L12-v2`（多语言，~50MB，CPU 友好；运行 `python scripts/download_embedding_model.py` 从 [ModelScope](https://modelscope.cn) 部署到 `<skill_dir>/models/`，所有缓存位于 `<skill_dir>/.cache/`）
 - Skill 路径: `<skill_dir>`（即本 `SKILL.md` 所在目录）
 
+核心依赖由 `<skill_dir>/requirements.in` 定义，锁定文件 `<skill_dir>/requirements.txt` 必须通过 `python <skill_dir>/scripts/compile_requirements.py` 生成；不要手动编辑锁定文件。使用 `--check` 验证两者同步。MinerU Local 仍使用单独的 `requirements-mineru.txt`。
+
 ## 标准调用模板（按本机路径替换占位符）
 
 所有 `scripts/*.py` 调用都用以下模板。关键三点已固化：**venv python 路径、设 `PYTHONDONTWRITEBYTECODE=1`、query 大输出走 `--out` 落盘**。
