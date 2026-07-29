@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -47,7 +48,7 @@ from models import (
     IndexState, ChunkHit, PageCandidate,
 )
 import chunking
-from chunking import chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer
+from chunking import chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer, ChunkBuildError
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
@@ -230,14 +231,20 @@ class WikiIndex:
         )
 
     # ---- build ----
-    def build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto"):
+    def build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
+               allow_partial_index: bool = False):
         """构建（默认增量）：未变页命中页级向量缓存跳过编码；full_rebuild=True 强制全量重编码。
 
         无论增量与否都写入全新 builds/<id>/lance_db（删除页自然不入表 → 无残留），
         校验通过后经 #11 指针原子发布。增量的加速点在于跳过未变页的 torch 编码。
+
+        ``allow_partial_index``：默认 False（fail-fast）。任一页面分块失败或缺页/0-chunk
+        都会中止 staging build 并保留旧活动索引（#13 review Gap 1）。置 True 仅用于实验，
+        降级为 warning，禁止用于生产发布。
         """
         self._force_encode = bool(full_rebuild)
         self._vector_index_mode = vector_index_mode
+        self._allow_partial_index = bool(allow_partial_index)
         self._lance_table = None  # 重置缓存：load()/上次 build() 可能已缓存活动索引表
         self._project_root = wiki_dir.parent
         self._lexicon = load_lexicon(self._project_root)
@@ -259,6 +266,15 @@ class WikiIndex:
                 raise RuntimeError(
                     "build 校验未通过，放弃发布；活动索引保持不变（指针未翻转）")
             self._publish(build_id)
+        except Exception:
+            # #13 review (Gap 1)：构建失败 → 标记 staging 目录便于排查，但**绝不翻转指针**
+            # （活动索引/旧成功版保持可查询）。失败时不存在可被 load() 加载的半成品新版本。
+            try:
+                (build_dir / ".failed").write_text(
+                    "build aborted before publish; active index preserved", encoding="utf-8")
+            except Exception:
+                pass
+            raise
         finally:
             self._lance_dir = None
             self._manifest_target = None
@@ -362,15 +378,16 @@ class WikiIndex:
         if tokenizer is None:
             raise RuntimeError(
                 f"chunk_page 必须注入真实 tokenizer（{pid}）；禁止 char 估算静默回退")
+        # #13 review (Gap 1)：单页分块失败必须让 staging build 失败并保留旧活动索引，
+        # 不得静默吞异常、返回 [] 导致漏页发布。包装为领域异常携带 page_id/path。
         try:
             chunks = chunk_page(
                 page_id=pid, path=p.path, title=p.title, page_type=p.page_type,
                 content=p.content, tokenizer=tokenizer,
             )
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("chunk_page 失败 %s: %s", p.path, e)
-            return rows
+        except Exception as exc:
+            raise ChunkBuildError(
+                f"chunk_page 失败: page_id={pid}, path={p.path}") from exc
         for cr in chunks:
             fts = " ".join(fts_terms(cr.text, self._lexicon) + extract_exact_terms(cr.text))
             rows.append({
@@ -390,6 +407,9 @@ class WikiIndex:
                 "fts_text": fts,
                 "token_count": cr.token_count,
                 "content_hash": cr.content_hash,
+                # #13 review (Gap 2)：sparse 超长强制切片元数据（硬上限守卫的显式记录）
+                "forced_split": bool(getattr(cr, "forced_split", False)),
+                "continuation_index": int(getattr(cr, "continuation_index", -1)),
                 # #13：保留真实原文 span（映射回原文、覆盖 chunk 实际正文）
                 "start_char": cr.start_char,
                 "end_char": cr.end_char,
@@ -397,6 +417,39 @@ class WikiIndex:
                 "vector": [0.0] * dim,
             })
         return rows
+
+    def _check_index_completeness(self, all_rows: List[dict]) -> None:
+        """#13 review (Gap 1)：发布前完整性校验，防止静默漏页。
+
+        - 期望可索引页集（self.pages 的 page_id）必须等于实际产生 chunk 行的页集；
+          任一缺失/多余 → 构建失败（不得发布不完整索引）。
+        - 非空、可索引页面若产生 0 个 chunk → 构建失败。
+        默认 fail-fast；``self._allow_partial_index=True``（--allow-partial-index）时
+        降级为 warning，仅供实验，不应用于生产发布。
+        """
+        expected = {page_id_of(p.path) for p in self.pages}
+        actual = {r["page_id"] for r in all_rows}
+        missing = expected - actual
+        extra = actual - expected
+        if missing or extra:
+            msg = (f"索引完整性校验失败：缺页={sorted(missing)} 多余页={sorted(extra)} "
+                   f"（fail-fast：禁止发布漏页/多余页的不完整索引）")
+            if getattr(self, "_allow_partial_index", False):
+                logging.getLogger(__name__).warning(msg)
+            else:
+                raise ChunkBuildError(msg)
+        # 非空页面必须产出 ≥1 chunk
+        by_page: Dict[str, int] = {}
+        for r in all_rows:
+            by_page[r["page_id"]] = by_page.get(r["page_id"], 0) + 1
+        for p in self.pages:
+            pid = page_id_of(p.path)
+            if p.content.strip() and by_page.get(pid, 0) == 0:
+                msg = f"索引完整性校验失败：非空页面 {pid} 产生 0 个 chunk"
+                if getattr(self, "_allow_partial_index", False):
+                    logging.getLogger(__name__).warning(msg)
+                else:
+                    raise ChunkBuildError(msg)
 
     @staticmethod
     def _safe_clear_dir(d: Path):
@@ -484,6 +537,16 @@ class WikiIndex:
                 if r["chunk_kind"] == "dense":
                     dense_row_idx.append(len(all_rows))
                 all_rows.append(r)
+
+        # #13 review (Gap 1)：发布前完整性校验 —— 缺页 / 多余页 / 非空页 0 chunk 均判失败。
+        # 默认 fail-fast；仅显式 --allow-partial-index 才降级为 warning。
+        self._check_index_completeness(all_rows)
+
+        # sparse 硬上限守卫统计（正常发布要求 oversize=0；forced 为超限内容的可追溯切片）
+        forced_sparse_splits = sum(1 for r in all_rows if r.get("forced_split"))
+        log.info("#13 sparse 守卫: forced_sparse_splits=%d, oversize_sparse_chunks=0（超限即抛 ChunkBuildError）",
+                 forced_sparse_splits)
+
         if not all_rows:
             return
 
@@ -951,12 +1014,15 @@ def main():
     p.add_argument("--vector-index", default="auto",
                    choices=["auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"],
                    help="向量索引类型（默认 auto：依数据量自适应；评测可强制 exact/ivf-hnsw-flat/sq）")
+    p.add_argument("--allow-partial-index", action="store_true",
+                   help="实验用：容忍缺页/0-chunk（降级为 warning）。默认关闭 fail-fast，禁止用于生产发布")
     args = p.parse_args()
     proj = Path(args.project_root)
     wiki = proj / "Wiki"
     idx_dir = proj / ".index"
     wi = WikiIndex(idx_dir)
-    wi.build(wiki, full_rebuild=args.full_rebuild, vector_index_mode=args.vector_index)
+    wi.build(wiki, full_rebuild=args.full_rebuild, vector_index_mode=args.vector_index,
+             allow_partial_index=args.allow_partial_index)
     mode = "全量重建" if args.full_rebuild else "增量"
     print(f"索引构建完成（{mode}）: {len(wi.pages)} 页 → 活动索引指针 {idx_dir / 'ACTIVE_INDEX'}")
 

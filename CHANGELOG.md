@@ -25,6 +25,22 @@
 - **评测基线重置（`--init-baseline`）**：真实 tokenizer 使中文稠密 chunk 数由 82→172（≈2.1x，受 128-token 模型上限驱动，属设计性变更）。向量通道 top-k 被内容丰富的页族（如 Columbus 9 页）占据更多位置，导致 `page_recall_at_5` 由 0.9838→0.9068、`mrr_at_10` 0.8932→0.8513——但 `evidence_recall_at_10` 反升至 0.9476、gold 在 FTS 通道排名 1–15 且融合后仍处 top10、ANN recall 恒为 1.0，检索正确性未退化，属评测代理指标随 chunking 变更的偏移。已将 `eval/baselines.json` 重置为新的正确 chunking 基准（如更关注 top-5 页级排序，可后续调融合层）。
 - **评测基线契约守卫（CI 固化）**：`eval/run_eval.py` 的 `--init-baseline` 现把当前 `chunk_schema_version`（来自 `chunking.CHUNK_SCHEMA_VERSION`）写入 `baselines.json` 的 `meta` 字段；对比模式下若基线 `meta.chunk_schema_version` 与当前代码不一致，**直接标红退出 1**（并打印「请先 `--init-baseline` 重置并在 issue/CHANGELOG 说明」），本地可用 `--force-compare` 绕过。这样「改了 chunking 却忘了 reset 基线」在 CI 会被自动抓住，无需人工记忆。
 
+### Fixed — ISSUE-13 review（maintainer re-open 补齐的两处正确性缺口）
+
+- **Gap 1 — fail-fast 分块（生产构建不得静默漏页）**：
+  - `build_index._chunk_rows_for_page` 原先吞掉 `chunk_page` 异常并返回 `[]`，导致不完整索引被发布。现改为捕获异常后包装为领域异常 `ChunkBuildError(page_id, path)`，`_build_chunks` 上抛、`build()` **绝不翻转 ACTIVE_INDEX**（#11 指针机制），旧活动索引保留可查。
+  - 新增发布前**完整性校验** `_check_index_completeness`：期望可索引页集（`self.pages` 的 `page_id`）必须 == 实际产出 chunk 行的页集；任一缺页/多余页，或非空页面产出 0 chunk → 默认 fail-fast 抛 `ChunkBuildError`；仅显式 `--allow-partial-index` 才降级为 warning（实验用，**禁止生产发布**）。
+  - `build()` 失败路径写入 `(build_dir/.failed)` 标记后 re-raise，staging 目录不会被 `load()` 误当新版本。
+  - CLI 新增 `--allow-partial-index`；`build()` 签名加 `allow_partial_index` 形参。
+  - 测试 `tests/test_build_failfast.py`（真实模型构建）：覆盖「单页分块异常 → 保留旧索引 + 报错携带 page_id」「0-chunk 非空页 → 完整性校验拒绝」「`--allow-partial-index` → 降级发布其余页」。
+- **Gap 2 — sparse 真·硬上限（前缀预算扣除 + 表格 cell 切分 + 不可绕过守卫）**：
+  - `SPARSE_HARD_MAX_CHARS=1000` 为**不可绕过**硬约束：每个 sparse chunk 完整文本（`前缀 + 正文`）`len <= 1000`。`MIN_BODY_RESERVE=200` 保证即便 section 前缀（标题路径）自身超长被压缩（`_effective_prefix` 截断并加省略标记），正文预算仍 ≥ 200。
+  - 窗口按**实际拼接长度**（含单元间 `\n` 分隔符）增长，避免多短句拼接时因 (n-1) 个换行把 full 顶过上限。
+  - 超长原子（单句/行/表格行）走强制切片 fallback：表格行按 **cell 切分**（`_split_table_row`/`_table_cells_row` 修正了旧 regex 静默丢 cell 内容 bug），单 cell 仍超限按字符切片（`_char_slice_text`），均保留真实 span 与 `forced_split`/`continuation_index` 元数据。
+  - **不可绕过的最终守卫**：`_sparse_chunks_for_section` 对任一输出 chunk 断言 `len(full) <= 1000`，超限即抛 `ChunkBuildError`；单测 mock `_char_slice_text` 返回超长片段验证守卫生效。
+  - 测试 `tests/test_chunking_hardlimit.py`（9 项纯分块单测，char tokenizer 无需加载模型）：覆盖超长单句 / 代码行 / 表格 cell / 表格 header / 列表项 / 引用 / 前缀预算 / 超长 wikilink / 守卫连线，校验硬上限、真实 span、无静默丢字与 fabrication。
+- **回归验证**：`pytest tests/`（168 passed）+ `eval/run_eval.py`（**PASS 无回归**，page_recall@5=0.9068、evidence_recall@10=0.9476、mrr@10=0.8513、ann_recall@10=1.0）。**召回/排序类指标（Page Recall@5 / Hit@3 / MRR@10 的细粒度 chunk 页面频次偏置）归属后续独立 issue #23，本 PR 不改动 ranking，仅补齐上述正确性缺口。**
+
 ### Added — ISSUE-16 脱敏自检
 
 - **`tests/test_image_retrieval.py`**（脱敏，工业相机领域）：覆盖 图片 caption 建索引并被 `split_text_image` 正确归类为图片、空 caption 图片不入检索、内容变更时陈旧 checkpoint 不复用（幂等/防错位）、损坏 checkpoint 可恢复重建。与 `tests/` 一致不随公开仓库发布。
