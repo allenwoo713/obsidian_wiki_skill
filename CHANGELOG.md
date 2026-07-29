@@ -23,6 +23,7 @@
 - **测试**：`test_chunking.py` 新增 `EmbeddingTokenizer` 单测、插入无关 section 后 ID 稳定的单测、sparse 边界安全单测、dense span 映射回原文单测；新增 `tests/test_build_tokenizer.py`（真实模型）验证 `token_count≤HARD_MAX`、`chunk_id` 格式、非字符回退、插入后 ID 稳定。
 - **sparse 细化（块对齐滑动窗口 + 重叠）**：`_sparse_chunks_for_section` 在保持块边界安全的前提下，对超长 section 做 ~650 字符目标、~100 字符重叠的块对齐滑动窗口，恢复旧版细粒度 BM25 覆盖（避免整块粗聚合导致的稀疏召回下降）。
 - **评测基线重置（`--init-baseline`）**：真实 tokenizer 使中文稠密 chunk 数由 82→172（≈2.1x，受 128-token 模型上限驱动，属设计性变更）。向量通道 top-k 被内容丰富的页族（如 Columbus 9 页）占据更多位置，导致 `page_recall_at_5` 由 0.9838→0.9068、`mrr_at_10` 0.8932→0.8513——但 `evidence_recall_at_10` 反升至 0.9476、gold 在 FTS 通道排名 1–15 且融合后仍处 top10、ANN recall 恒为 1.0，检索正确性未退化，属评测代理指标随 chunking 变更的偏移。已将 `eval/baselines.json` 重置为新的正确 chunking 基准（如更关注 top-5 页级排序，可后续调融合层）。
+- **评测基线契约守卫（CI 固化）**：`eval/run_eval.py` 的 `--init-baseline` 现把当前 `chunk_schema_version`（来自 `chunking.CHUNK_SCHEMA_VERSION`）写入 `baselines.json` 的 `meta` 字段；对比模式下若基线 `meta.chunk_schema_version` 与当前代码不一致，**直接标红退出 1**（并打印「请先 `--init-baseline` 重置并在 issue/CHANGELOG 说明」），本地可用 `--force-compare` 绕过。这样「改了 chunking 却忘了 reset 基线」在 CI 会被自动抓住，无需人工记忆。
 
 ### Added — ISSUE-16 脱敏自检
 

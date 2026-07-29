@@ -10,15 +10,19 @@
     "graph_only_unsupported_count": 0
   },
   "performance": {
-    "full_build_time_s": 31.31,
-    "incremental_build_time_s": 1.52,
+    "full_build_time_s": 35.16,
+    "incremental_build_time_s": 2.09,
     "embedding_count": 33,
-    "index_disk_mb": 0.49,
-    "latency_p50_s": 0.1442,
-    "latency_p95_s": 0.1583,
-    "latency_p99_s": 0.1816,
+    "index_disk_mb": 2.24,
+    "latency_p50_s": 0.1522,
+    "latency_p95_s": 0.1712,
+    "latency_p99_s": 0.2152,
     "peak_memory_mb": 227.2,
     "mean_contextbundle_tokens": 1335.8,
-    "ann_build_time_s": 11.29
+    "ann_build_time_s": 13.36
+  },
+  "meta": {
+    "chunk_schema_version": 3,
+    "note": "由 run_eval.py --init-baseline 生成。chunking 契约（chunk_id 格式 / 分块策略）变更导致指标含义或分布变化时，须重新执行 --init-baseline 重置本基线，并在对应 issue / CHANGELOG 说明重置原因；CI 会在 schema 版本不匹配时直接标红。"
   }
 }

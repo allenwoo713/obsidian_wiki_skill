@@ -3,7 +3,8 @@
 用法：
     python eval/run_eval.py                              # 用 tests/fixtures 构建并评测，对比 baselines.json
     python eval/run_eval.py --work-dir D:/tmp/eval       # 指定构建临时目录（避免 C: 沙箱虚拟化）
-    python eval/run_eval.py --init-baseline              # 首次：把当前指标写入 baselines.json 并退出 0
+    python eval/run_eval.py --init-baseline              # 首次/契约变更后：把当前指标写入 baselines.json（含 chunk_schema_version）并退出 0
+    python eval/run_eval.py --force-compare              # 忽略 chunk_schema_version 不匹配，强制对比旧基线（仅本地调试，CI 禁用）
 
 指标：
     质量：Page Recall@5, Evidence Recall@10, Exact lookup Hit@3, MRR@10,
@@ -36,6 +37,7 @@ from build_index import WikiIndex  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search  # noqa: E402
 import build_graph as _bg  # noqa: E402
+from chunking import CHUNK_SCHEMA_VERSION  # noqa: E402
 
 
 def _page_hit(candidate, gold_pages):
@@ -254,6 +256,8 @@ def main():
     ap.add_argument("--no-ann", action="store_true", help="跳过 ANN 索引构建")
     ap.add_argument("--regression-pp", type=float, default=2.0, help="Recall 下降百分点阈值")
     ap.add_argument("--init-baseline", action="store_true", help="把当前指标写为 baselines.json 并退出 0")
+    ap.add_argument("--force-compare", action="store_true",
+                    help="忽略 chunk_schema_version 不匹配，强制对比旧基线（仅本地调试用，CI 不应使用）")
     args = ap.parse_args()
 
     if not args.wiki.exists():
@@ -273,9 +277,17 @@ def main():
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
     if args.init_baseline:
-        args.baselines.write_text(json.dumps(metrics, ensure_ascii=False, indent=2),
+        baseline_obj = dict(metrics)
+        baseline_obj["meta"] = {
+            "chunk_schema_version": CHUNK_SCHEMA_VERSION,
+            "note": "由 run_eval.py --init-baseline 生成。chunking 契约（chunk_id 格式 / 分块策略）"
+                    "变更导致指标含义或分布变化时，须重新执行 --init-baseline 重置本基线，"
+                    "并在对应 issue / CHANGELOG 说明重置原因；CI 会在 schema 版本不匹配时直接标红。",
+        }
+        args.baselines.write_text(json.dumps(baseline_obj, ensure_ascii=False, indent=2),
                                   encoding="utf-8")
-        print(f"[info] baselines.json 已初始化: {args.baselines}", file=sys.stderr)
+        print(f"[info] baselines.json 已初始化: {args.baselines} "
+              f"(chunk_schema_version={CHUNK_SCHEMA_VERSION})", file=sys.stderr)
         return 0
 
     if not args.baselines.exists():
@@ -284,6 +296,18 @@ def main():
         return 0
 
     base = json.loads(args.baselines.read_text(encoding="utf-8"))
+    base_meta = base.get("meta", {})
+    base_schema = base_meta.get("chunk_schema_version")
+    if not args.force_compare and base_schema != CHUNK_SCHEMA_VERSION:
+        print(
+            f"[FAIL] baselines.json 契约不匹配：基线生成于 chunk_schema_version="
+            f"{base_schema}，当前代码为 {CHUNK_SCHEMA_VERSION}。\n"
+            f"       chunking 契约已变更，请先执行 "
+            f"`python eval/run_eval.py --init-baseline` 重新建立基线\n"
+            f"       （并在对应 issue / CHANGELOG 说明重置原因），或加 --force-compare 强制对比旧基线。",
+            file=sys.stderr,
+        )
+        return 1
     bq, bp = base["quality"], base["performance"]
     mq = metrics["quality"]
     failures = []
