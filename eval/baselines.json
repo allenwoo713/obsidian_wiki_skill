@@ -1,24 +1,24 @@
 {
   "n_queries": 105,
   "quality": {
-    "page_recall_at_5": 0.9838,
-    "evidence_recall_at_10": 0.8952,
-    "exact_lookup_hit_at_3": 0.9692,
-    "mrr_at_10": 0.8932,
+    "page_recall_at_5": 0.9068,
+    "evidence_recall_at_10": 0.9476,
+    "exact_lookup_hit_at_3": 0.9231,
+    "mrr_at_10": 0.8513,
     "ann_recall_at_10": 1.0,
     "context_overflow_count": 0,
     "graph_only_unsupported_count": 0
   },
   "performance": {
-    "full_build_time_s": 30.12,
-    "incremental_build_time_s": 2.79,
+    "full_build_time_s": 31.31,
+    "incremental_build_time_s": 1.52,
     "embedding_count": 33,
-    "index_disk_mb": 1.57,
-    "latency_p50_s": 0.1749,
-    "latency_p95_s": 0.2378,
-    "latency_p99_s": 0.297,
-    "peak_memory_mb": 226.6,
-    "mean_contextbundle_tokens": 2675.0,
-    "ann_build_time_s": 9.49
+    "index_disk_mb": 0.49,
+    "latency_p50_s": 0.1442,
+    "latency_p95_s": 0.1583,
+    "latency_p99_s": 0.1816,
+    "peak_memory_mb": 227.2,
+    "mean_contextbundle_tokens": 1335.8,
+    "ann_build_time_s": 11.29
   }
 }

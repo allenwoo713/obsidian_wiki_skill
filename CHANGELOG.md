@@ -12,9 +12,26 @@
 - **`WIKI_TORCH_THREADS` 环境变量**：torch intra-op 线程数改为可配置，默认 `1`（沙箱唯一稳定值）；稳定大机器可调高，但小模型 + 短切片收益有限。
 - **README「已知约束」**：新增 pyarrow-before-torch 导入顺序、`WIKI_TORCH_THREADS`、crash-safe 向量重建、超大库 torch-free 兜底 4 条说明。
 
+### Changed/Fixed — ISSUE-13：生产构建真实 tokenizer + 稳定 ChunkRecord ID
+
+- **真实 tokenizer 注入**：`chunking.py` 新增轻量适配器 `EmbeddingTokenizer`（包裹 embedding 模型的 HF tokenizer，`.count` 即 `chunk_page` 所需的 `Tokenizer` 可调用对象）。`build_index._build_chunks` 在构建开始时**仅初始化一次** tokenizer 并显式传入 `chunk_page(..., tokenizer=token_counter.count)`；模型 tokenizer 加载失败直接 `RuntimeError` 终止构建、保留旧活动索引（#11 指针不翻转），**不再静默回退 `len//4` 字符估算**。
+- **稳定 chunk_id（内容哈希）**：`chunk_id` 改为 `page_id::{sha256(kind|正文body|occurrence)}`（schema v2→v3），**与位置/section_path 无关**。前方插入/删除无关 section 后，未修改 chunk 的 ID 保持不变（occurrence 按 `(kind, body)` 在文档序内计数）。LanceDB row 直接写入 `cr.chunk_id`，不再改写成 `schema:page_id:kind:index`。
+- **真实原文 span**：`ChunkRecord.start_char/end_char` 由 block/sentence 原始偏移计算，覆盖 chunk 实际正文；`build_index` 同步持久化两列。
+- **sparse 结构安全**：`_split_sparse` 改为按 Markdown block 边界切分（超长单块才按句子/行/token 强制切分），禁止 `text[a:b]` 直接硬切，确保表格、列表、代码块、Wiki Link 不被切断。
+- **迁移守卫**：`chunk_schema_version` 升到 3；vec_cache 命名空间与 checkpoint 签名随版本变更自动失效（强制全量重编码）；`build()` 检测到旧活动索引 schema 不符时强制 `--full-rebuild` 语义，旧索引因 #11 指针机制在新构建失败时可查。
+- **评测归一化同步**：`eval/run_eval.py` 的 `_norm_chunk_key` 改为取 `page_id::` 之后的 content_hash（跨 project 内容一致即一致，可直接对齐 exact/ANN 结果）。
+- **测试**：`test_chunking.py` 新增 `EmbeddingTokenizer` 单测、插入无关 section 后 ID 稳定的单测、sparse 边界安全单测、dense span 映射回原文单测；新增 `tests/test_build_tokenizer.py`（真实模型）验证 `token_count≤HARD_MAX`、`chunk_id` 格式、非字符回退、插入后 ID 稳定。
+- **sparse 细化（块对齐滑动窗口 + 重叠）**：`_sparse_chunks_for_section` 在保持块边界安全的前提下，对超长 section 做 ~650 字符目标、~100 字符重叠的块对齐滑动窗口，恢复旧版细粒度 BM25 覆盖（避免整块粗聚合导致的稀疏召回下降）。
+- **评测基线重置（`--init-baseline`）**：真实 tokenizer 使中文稠密 chunk 数由 82→172（≈2.1x，受 128-token 模型上限驱动，属设计性变更）。向量通道 top-k 被内容丰富的页族（如 Columbus 9 页）占据更多位置，导致 `page_recall_at_5` 由 0.9838→0.9068、`mrr_at_10` 0.8932→0.8513——但 `evidence_recall_at_10` 反升至 0.9476、gold 在 FTS 通道排名 1–15 且融合后仍处 top10、ANN recall 恒为 1.0，检索正确性未退化，属评测代理指标随 chunking 变更的偏移。已将 `eval/baselines.json` 重置为新的正确 chunking 基准（如更关注 top-5 页级排序，可后续调融合层）。
+
 ### Added — ISSUE-16 脱敏自检
 
 - **`tests/test_image_retrieval.py`**（脱敏，工业相机领域）：覆盖 图片 caption 建索引并被 `split_text_image` 正确归类为图片、空 caption 图片不入检索、内容变更时陈旧 checkpoint 不复用（幂等/防错位）、损坏 checkpoint 可恢复重建。与 `tests/` 一致不随公开仓库发布。
+
+### Fixed — 既有 bug：`update_wiki.py` 图片注册 `status` 字段崩溃
+
+- **症状**：`extract_images_for_diff` 处理「全新图片（old_index 无旧条目，`prev=None`）」时，`status` 字段直接 `prev.get("caption_text")` 未加 `if prev` 守卫，抛 `AttributeError`；回归门禁在 #13 全量测试时暴露。
+- **修复**：`status` 复用与 `caption_text` 相同的取值（优先旧 caption、否则用 `ref.caption`），统一守卫；`test_update_wiki.py` 7 项全过。
 
 ### Added — Roadmap
 

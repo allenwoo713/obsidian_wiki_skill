@@ -164,7 +164,7 @@ class ChunkHit:
 class IndexState:
     """manifest v2 `index_state` (issues #1/#2/#7/#8/#11)."""
     schema_version: int = 2
-    chunk_schema_version: int = 2
+    chunk_schema_version: int = 3  # #13：chunk_id 改为内容哈希（page_id::{sha256}），与位置无关
     tokenizer_schema_version: int = 1
     embedding_model: str = ""
     embedding_model_revision: str = ""

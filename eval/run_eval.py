@@ -84,14 +84,13 @@ def _build(project_root: Path, wiki_src: Path, vector_index_mode: str, full_rebu
 
 
 def _norm_chunk_key(cid: str) -> str:
-    """chunk_id 含绝对路径（盘符/项目目录），跨 project 比较时需归一化为
-    `<filename>:<kind>:<idx>`，使 exact 与 ANN 两个独立 project 的结果可对齐。"""
+    """#13：chunk_id 现为 `page_id::{content_hash}`（content_hash 由正文内容决定，
+    与位置/路径无关）。跨 project（不同根路径、相同内容）content_hash 一致，故归一化
+    只需取 `::` 之后的 hash 部分即可对齐 exact 与 ANN 两个独立 project 的结果。"""
     try:
-        *rest, kind, idx = cid.rsplit(":", 2)
-        fn = Path(":".join(rest)).name.lower()
-        return f"{fn}:{kind}:{idx}"
+        return cid.split("::", 1)[-1]
     except Exception:
-        return cid.lower()
+        return cid
 
 
 def _chunk_ids(wi: WikiIndex, query: str, k: int = 10):

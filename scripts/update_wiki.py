@@ -324,6 +324,7 @@ def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_ima
             continue
         for ref in parsed.images:
             prev = old_index.get(_norm(ref.filename))
+            caption_text = prev.get("caption_text", "") if prev else (ref.caption or "")
             image_manifest.append({
                 "filename": ref.filename, "rel_path": ref.rel_path,
                 "sha256": ref.sha256, "source_doc": norm_key(p),
@@ -331,8 +332,8 @@ def extract_images_for_diff(new_or_modified, unchanged, assets_dir, existing_ima
                 "page_or_section": ref.page_or_section,
                 "figure_caption": ref.caption or (prev.get("figure_caption", "") if prev else ""),
                 "vlm_caption": prev.get("vlm_caption") if prev else None,
-                "caption_text": prev.get("caption_text", "") if prev else (ref.caption or ""),
-                "status": "captioned" if (prev.get("caption_text") or (ref.caption or "")).strip() else "pending_vlm",
+                "caption_text": caption_text,
+                "status": "captioned" if caption_text.strip() else "pending_vlm",
             })
 
     # 4) unchanged：旧条目已在第 1 步保留，跳过

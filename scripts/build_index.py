@@ -47,7 +47,7 @@ from models import (
     IndexState, ChunkHit, PageCandidate,
 )
 import chunking
-from chunking import chunk_page, CHUNK_SCHEMA_VERSION
+from chunking import chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
@@ -351,14 +351,21 @@ class WikiIndex:
                 return m
         return None
 
-    def _chunk_rows_for_page(self, p: WikiPage, dim: int):
-        """为单页生成 chunks 表的行（dense leaf + sparse section）。"""
+    def _chunk_rows_for_page(self, p: WikiPage, dim: int, tokenizer):
+        """为单页生成 chunks 表的行（dense leaf + sparse section）。
+
+        ``tokenizer`` 必须是真实 embedding tokenizer（``EmbeddingTokenizer.count``），
+        由 ``_build_chunks`` 注入；禁止传 ``None`` 回退字符估算（issue #13）。
+        """
         pid = page_id_of(p.path)
         rows = []
+        if tokenizer is None:
+            raise RuntimeError(
+                f"chunk_page 必须注入真实 tokenizer（{pid}）；禁止 char 估算静默回退")
         try:
             chunks = chunk_page(
                 page_id=pid, path=p.path, title=p.title, page_type=p.page_type,
-                content=p.content, tokenizer=None,  # char 估算兜底；不在此加载 embedder（规避早启 torch/pyarrow 冲突）
+                content=p.content, tokenizer=tokenizer,
             )
         except Exception as e:
             import logging
@@ -366,9 +373,10 @@ class WikiIndex:
             return rows
         for cr in chunks:
             fts = " ".join(fts_terms(cr.text, self._lexicon) + extract_exact_terms(cr.text))
-            is_dense = (cr.chunk_kind == "dense")
             rows.append({
-                "chunk_id": f"{CHUNK_SCHEMA_VERSION}:{pid}:{cr.chunk_kind}:{cr.chunk_index}",
+                # #13：直接使用 ChunkRecord.chunk_id（内容哈希，稳定），不再改写成
+                # schema:page_id:kind:index（位置相关，会漂移）。
+                "chunk_id": cr.chunk_id,
                 "page_id": pid,
                 "path": str(p.path),
                 "title": p.title,
@@ -382,6 +390,9 @@ class WikiIndex:
                 "fts_text": fts,
                 "token_count": cr.token_count,
                 "content_hash": cr.content_hash,
+                # #13：保留真实原文 span（映射回原文、覆盖 chunk 实际正文）
+                "start_char": cr.start_char,
+                "end_char": cr.end_char,
                 # dense 带真实向量；sparse 填零向量（向量检索由 chunk_kind 过滤）
                 "vector": [0.0] * dim,
             })
@@ -437,11 +448,38 @@ class WikiIndex:
         if dim is None:
             dim = self._embedding_dim()
 
+        # #13 迁移守卫：若现有活动索引的 chunk_schema_version 与当前不符，强制全量
+        # 重编码。页缓存命名空间已随 schema 变化自动失效（_content_hashes 含版本），
+        # 此处再确保跳过断点续传 checkpoint，避免旧 done.json 误命中。旧活动索引
+        # 因 #11 指针机制不受影响（指针仅在发布成功时翻转）。
+        try:
+            active_mf = self._resolve_active_manifest()
+            if active_mf.exists():
+                old_state = json.loads(active_mf.read_text(encoding="utf-8")).get("index_state", {})
+                old_v = old_state.get("chunk_schema_version")
+                if old_v is not None and old_v != CHUNK_SCHEMA_VERSION:
+                    log.warning("检测到旧 chunk schema v%s，强制全量重建（当前 v%s）",
+                                old_v, CHUNK_SCHEMA_VERSION)
+                    self._force_encode = True
+        except Exception:
+            pass
+
+        # #13：生产构建注入真实 embedding tokenizer（仅初始化一次），禁止字符估算
+        # 回退。模型 tokenizer 加载失败 → 抛错终止构建，保留旧活动索引（指针不翻转）。
+        try:
+            _emb = self._get_embedder()
+            _hf_tok = getattr(_emb, "tokenizer", None)
+            token_counter = EmbeddingTokenizer(_hf_tok)
+        except Exception as e:
+            raise RuntimeError(
+                f"无法加载 embedding tokenizer，终止构建以保留旧活动索引: {e}")
+        real_tokenizer = token_counter.count
+
         # 1) 生成所有 chunk 元数据行（向量暂填零，稍后回填 dense 行）
         all_rows: List[dict] = []
         dense_row_idx: List[int] = []   # all_rows 中对应 dense 行的下标
         for p in self.pages:
-            rows = self._chunk_rows_for_page(p, dim)
+            rows = self._chunk_rows_for_page(p, dim, real_tokenizer)
             for r in rows:
                 if r["chunk_kind"] == "dense":
                     dense_row_idx.append(len(all_rows))
