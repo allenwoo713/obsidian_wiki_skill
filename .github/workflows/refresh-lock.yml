@@ -1,0 +1,33 @@
+name: refresh-lock
+
+# One-off utility to regenerate the committed dependency lock from requirements.in
+# using the same toolchain as CI, then commit it back. Useful when
+# `eval`/`ci` reports "requirements.txt is stale". Triggered manually.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v6
+      - name: Regenerate requirements.txt
+        run: python scripts/compile_requirements.py
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add requirements.txt
+          if git diff --cached --quiet; then
+            echo "requirements.txt already current; nothing to commit"
+          else
+            git commit -m "chore(deps): refresh requirements.txt lock"
+            git push
+          fi
