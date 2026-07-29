@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import uuid
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -262,9 +263,26 @@ class WikiIndex:
 
         # #11 索引原子发布：构建写入全新 builds/<id>/lance_db（不碰活动目录）；校验
         # 通过后仅原子翻转 ACTIVE_INDEX 指针文件。崩溃时指针不变 → 活动索引（旧成功版）不受影响。
-        build_id = "build_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-        build_dir = self.index_dir / "builds" / build_id
-        build_dir.mkdir(parents=True, exist_ok=True)
+        # A staging directory must never alias the directory resolved by the
+        # active pointer.  Second-resolution timestamps previously allowed a
+        # failed retry to write into the live build.  A nanosecond+UUID name
+        # and exclusive mkdir keep every attempt isolated, including callers
+        # that start in the same clock tick.
+        builds_dir = self.index_dir / "builds"
+        builds_dir.mkdir(parents=True, exist_ok=True)
+        active_build_dir = self._resolve_active_lance_dir().parent.resolve()
+        for _ in range(10):
+            build_id = f"build_{time.time_ns()}_{uuid.uuid4().hex}"
+            build_dir = builds_dir / build_id
+            if build_dir.resolve() == active_build_dir:
+                continue
+            try:
+                build_dir.mkdir(parents=False, exist_ok=False)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError("无法创建唯一 staging build 目录；活动索引未变更")
         self._lance_dir = build_dir / "lance_db"
         self._manifest_target = build_dir / "manifest.json"
         try:
@@ -425,7 +443,14 @@ class WikiIndex:
             })
         return rows
 
-    def _check_index_completeness(self, all_rows: List[dict]) -> None:
+    def _contract_failure(self, message: str) -> None:
+        """Raise by default; the experimental partial mode is warning-only."""
+        if getattr(self, "_allow_partial_index", False):
+            logging.getLogger(__name__).warning(message)
+        else:
+            raise ChunkBuildError(message)
+
+    def _check_index_completeness(self, all_rows: List[dict]) -> set[tuple[str, str, str]]:
         """#13 review (Gap 1)：发布前完整性校验，防止静默漏页。
 
         - 期望可索引页集（self.pages 的 page_id）必须等于实际产生 chunk 行的页集；
@@ -441,22 +466,41 @@ class WikiIndex:
         if missing or extra:
             msg = (f"索引完整性校验失败：缺页={sorted(missing)} 多余页={sorted(extra)} "
                    f"（fail-fast：禁止发布漏页/多余页的不完整索引）")
-            if getattr(self, "_allow_partial_index", False):
-                logging.getLogger(__name__).warning(msg)
-            else:
-                raise ChunkBuildError(msg)
-        # 非空页面必须产出 ≥1 chunk
-        by_page: Dict[str, int] = {}
+            self._contract_failure(msg)
+
+        # Each non-empty page must have both retrieval representations.  A
+        # union-of-page-ids check accepts dense-only or sparse-only pages,
+        # making one retrieval path silently blind.
+        by_page: Dict[str, set[str]] = {}
         for r in all_rows:
-            by_page[r["page_id"]] = by_page.get(r["page_id"], 0) + 1
+            by_page.setdefault(r["page_id"], set()).add(r["chunk_kind"])
         for p in self.pages:
             pid = page_id_of(p.path)
-            if p.content.strip() and by_page.get(pid, 0) == 0:
-                msg = f"索引完整性校验失败：非空页面 {pid} 产生 0 个 chunk"
-                if getattr(self, "_allow_partial_index", False):
-                    logging.getLogger(__name__).warning(msg)
-                else:
-                    raise ChunkBuildError(msg)
+            if p.content.strip() and by_page.get(pid, set()) != {"dense", "sparse"}:
+                self._contract_failure(
+                    f"索引完整性校验失败：非空页面 {pid} 的 retrieval kinds="
+                    f"{sorted(by_page.get(pid, set()))}，期望 ['dense', 'sparse']")
+
+        contract = {(r["chunk_id"], r["page_id"], r["chunk_kind"]) for r in all_rows}
+        if len(contract) != len(all_rows):
+            self._contract_failure("索引完整性校验失败：staging 计划中存在重复 chunk_id/page/kind")
+        return contract
+
+    def _check_persisted_chunk_contract(self, table, expected: set[tuple[str, str, str]]) -> None:
+        """Verify the staged LanceDB table contains exactly the planned rows.
+
+        This closes the gap between in-memory chunking and persistence: a
+        partial/failed table write must abort before ACTIVE_INDEX can flip.
+        """
+        rows = table.to_arrow().to_pylist()
+        actual = {(r["chunk_id"], r["page_id"], r["chunk_kind"]) for r in rows}
+        if actual != expected or len(rows) != len(expected):
+            missing = expected - actual
+            extra = actual - expected
+            self._contract_failure(
+                "staging 持久化完整性校验失败："
+                f"missing={len(missing)} extra={len(extra)} "
+                f"rows={len(rows)} expected={len(expected)}")
 
     @staticmethod
     def _safe_clear_dir(d: Path):
@@ -547,7 +591,7 @@ class WikiIndex:
 
         # #13 review (Gap 1)：发布前完整性校验 —— 缺页 / 多余页 / 非空页 0 chunk 均判失败。
         # 默认 fail-fast；仅显式 --allow-partial-index 才降级为 warning。
-        self._check_index_completeness(all_rows)
+        expected_contract = self._check_index_completeness(all_rows)
 
         # sparse 硬上限守卫统计（正常发布要求 oversize=0；forced 为超限内容的可追溯切片）
         forced_sparse_splits = sum(1 for r in all_rows if r.get("forced_split"))
@@ -719,6 +763,9 @@ class WikiIndex:
             log.debug("_build_chunks: 跳过 delete（可能首次建表）: %s", e)
         for i in range(0, len(all_rows), 2000):
             table.add(all_rows[i:i + 2000])
+
+        # Validate the actual staged rows, not merely the in-memory plan.
+        self._check_persisted_chunk_contract(table, expected_contract)
 
         # 5) FTS 索引（#2：whitespace 预分词，规避中文模型下载）
         try:

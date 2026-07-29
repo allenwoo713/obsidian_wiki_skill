@@ -154,8 +154,11 @@ def parse_blocks(text: str) -> List[Block]:
     offset = 0  # running char offset for start/end accounting
 
     def _push(kind, buf_lines, level=0, start=0):
-        body = "\n".join(buf_lines).strip()
-        if body:
+        # Retain the exact source slice.  Trimming here makes the stored text
+        # disagree with its advertised offsets whenever a block has leading or
+        # trailing whitespace.
+        body = "\n".join(buf_lines)
+        if body.strip():
             blocks.append(Block(kind=kind, text=body, level=level,
                                 start_char=start, end_char=start + len("\n".join(buf_lines))))
 
@@ -313,16 +316,47 @@ def _force_split_with_spans(text: str, start_char: int, tokenizer: Tokenizer,
             else:
                 atoms.append((piece, offset))
                 offset += len(piece)
+    def _split_oversize_atom(atom: str, atom_off: int) -> List[tuple]:
+        """Split only an atom that itself violates the hard limit.
+
+        Best-effort atom boundaries (including Wiki Links) are preserved until
+        one atom is too large.  At that point the hard token contract wins;
+        binary-search a character prefix with the *real* tokenizer so every
+        emitted fragment fits and retains an exact source offset.
+        """
+        if tokenizer(atom) <= max_tokens:
+            return [(atom, atom_off)]
+        pieces: List[tuple] = []
+        pos = 0
+        while pos < len(atom):
+            lo, hi, best = 1, len(atom) - pos, 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if tokenizer(atom[pos:pos + mid]) <= max_tokens:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best == 0:
+                raise ChunkBuildError(
+                    f"单字符已超过 dense hard limit ({max_tokens} tokens)")
+            pieces.append((atom[pos:pos + best], atom_off + pos))
+            pos += best
+        return pieces
+
     # 2) pack atoms by token budget with overlap tail
     out: List[tuple] = []
     cur: List[tuple] = []
     cur_tok = 0
+    expanded_atoms: List[tuple] = []
     for a, a_off in atoms:
+        expanded_atoms.extend(_split_oversize_atom(a, a_off))
+    for a, a_off in expanded_atoms:
         t = tokenizer(a)
         if cur and cur_tok + t > max_tokens:
             s0 = cur[0][1]
             s1 = cur[-1][1] + len(cur[-1][0])
-            out.append(("".join(x[0] for x in cur).strip(),
+            out.append(("".join(x[0] for x in cur),
                         start_char + s0, start_char + s1))
             tail_tok = 0
             kept: List[tuple] = []
@@ -339,7 +373,7 @@ def _force_split_with_spans(text: str, start_char: int, tokenizer: Tokenizer,
     if cur:
         s0 = cur[0][1]
         s1 = cur[-1][1] + len(cur[-1][0])
-        out.append(("".join(x[0] for x in cur).strip(),
+        out.append(("".join(x[0] for x in cur),
                     start_char + s0, start_char + s1))
     return out
 
@@ -517,31 +551,18 @@ def _sparse_chunks_for_section(sec: "Section", prefix: str,
     body_budget = SPARSE_HARD_MAX_CHARS - prefix_len
     if body_budget < MIN_BODY_RESERVE:
         body_budget = MIN_BODY_RESERVE
-    target = min(SPARSE_TARGET_CHARS, body_budget)
-    overlap = min(SPARSE_OVERLAP_CHARS, max(1, body_budget // 2))
-
     units = _sparse_atomic_units(sec.blocks)
     if not units:
         return
 
-    n = len(units)
-    i = 0
-    while i < n:
-        # grow window from i until the JOINED body reaches the target.
-        # 必须按「实际拼接后的长度」约束（含 unit 间的 '\n' 分隔符），否则多短句
-        # 拼起来会因 (n-1) 个换行把 full = prefix+body 顶过硬上限。
-        j = i
-        cur_joined = 0
-        while j < n:
-            add = len(units[j].text) + (1 if cur_joined > 0 else 0)
-            if cur_joined > 0 and cur_joined + add > target:
-                break
-            cur_joined += add
-            j += 1
-        grp = units[i:j]
-        if len(grp) == 1 and len(grp[0].text) > body_budget:
-            # 单个超限原子 → 强制切片 fallback
-            for piece_text, ps, pe, cidx in _force_split_sparse_unit(grp[0], body_budget):
+    # A single ChunkRecord has one [start,end) interval.  Do not manufacture a
+    # joined body from disjoint/normalised units and then claim it is one source
+    # slice.  Persist one exact atomic source interval per sparse record; the
+    # retrieval layer still receives every sentence/line/row and no citation
+    # can point at text that was never in its span.
+    for unit in units:
+        if len(unit.text) > body_budget:
+            for piece_text, ps, pe, cidx in _force_split_sparse_unit(unit, body_budget):
                 full = (eff_prefix + piece_text) if eff_prefix else piece_text
                 if len(full) > SPARSE_HARD_MAX_CHARS:
                     raise ChunkBuildError(
@@ -549,23 +570,12 @@ def _sparse_chunks_for_section(sec: "Section", prefix: str,
                 yield (full, eff_prefix, ps, pe, True, cidx)
                 if stats is not None:
                     stats["forced_sparse_splits"] += 1
-        else:
-            body = "\n".join(u.text for u in grp)
-            full = (eff_prefix + body) if eff_prefix else body
-            if len(full) > SPARSE_HARD_MAX_CHARS:
-                raise ChunkBuildError(
-                    f"sparse 硬上限被违反: len={len(full)} > {SPARSE_HARD_MAX_CHARS}")
-            yield (full, eff_prefix, grp[0].start_char, grp[-1].end_char, False, -1)
-        if j >= n:
-            break
-        # overlap: next window starts at adv and re-includes units[adv:j]
-        # (≈ overlap chars), always advancing ≥1 unit to guarantee progress
-        adv = i + 1
-        tail = sum(len(u.text) for u in units[adv:j])
-        while adv + 1 < j and tail >= overlap:
-            adv += 1
-            tail = sum(len(u.text) for u in units[adv:j])
-        i = adv
+            continue
+        full = (eff_prefix + unit.text) if eff_prefix else unit.text
+        if len(full) > SPARSE_HARD_MAX_CHARS:
+            raise ChunkBuildError(
+                f"sparse 硬上限被违反: len={len(full)} > {SPARSE_HARD_MAX_CHARS}")
+        yield (full, eff_prefix, unit.start_char, unit.end_char, False, -1)
 
 
 def _sparse_atomic_units(blocks: List["Block"]) -> List["Block"]:
@@ -591,22 +601,18 @@ def _sparse_atomic_units(blocks: List["Block"]) -> List["Block"]:
                                   start_char=b.start_char + st,
                                   end_char=b.start_char + st + len(s)))
                 offset = st + len(s)
-        elif b.kind == "code":
-            for ln in b.text.split("\n"):
-                if ln == "":
-                    continue
-                ls = b.text.find(ln)
-                units.append(Block(kind="code", text=ln,
-                                  start_char=b.start_char + (ls if ls >= 0 else 0),
-                                  end_char=b.start_char + (ls if ls >= 0 else 0) + len(ln)))
-        elif b.kind == "table":
-            for row in b.text.split("\n"):
-                if not row.strip():
-                    continue
-                rs = b.text.find(row)
-                units.append(Block(kind="table", text=row,
-                                  start_char=b.start_char + (rs if rs >= 0 else 0),
-                                  end_char=b.start_char + (rs if rs >= 0 else 0) + len(row)))
+        elif b.kind in ("code", "table"):
+            # splitlines(keepends=True) plus a rolling cursor is essential for
+            # repeated identical rows/lines: ``find`` from zero maps every
+            # duplicate to its first occurrence.
+            cursor = 0
+            for raw in b.text.splitlines(keepends=True):
+                line = raw.rstrip("\r\n")
+                if line.strip():
+                    units.append(Block(kind=b.kind, text=line,
+                                      start_char=b.start_char + cursor,
+                                      end_char=b.start_char + cursor + len(line)))
+                cursor += len(raw)
         else:
             units.append(b)
     return units
@@ -648,35 +654,34 @@ def _split_table_row(row_unit: "Block", body_budget: int):
     即 ``[cells[lo][1]-1, cells[hi][2]+1]``（cell 内容的 rel 起止 ±1 个管道）；
     单 cell 字符切片片段同理取 ``[ps-1, pe+1]``。
     """
-    cells = _table_cells_row(row_unit.text)
-    if not cells:
-        return [(row_unit.text, row_unit.start_char, row_unit.end_char)]
-    base = row_unit.start_char
+    # Fragment exact source slices rather than synthesising leading/trailing
+    # pipes.  This handles optional trailing pipes and escaped/duplicate cell
+    # text without claiming an out-of-range or fabricated span.  Prefer table
+    # separators as cut points; an overlong cell falls through to the mandatory
+    # character fallback.
+    text = row_unit.text
+    cuts = [0]
+    escaped = False
+    for i, ch in enumerate(text):
+        if ch == "|" and not escaped and i > 0:
+            cuts.append(i + 1)
+        escaped = (ch == "\\" and not escaped)
+        if ch != "\\":
+            escaped = False
+    cuts.append(len(text))
+    cuts = sorted(set(cuts))
     frags: List[tuple] = []
-    cur: List[int] = []   # 当前累积的单元格下标
-
-    def _emit(group: List[int]):
-        # group 内 cell 拼成的片段，span 同时覆盖首尾管道
-        lo, hi = group[0], group[-1]
-        text = "|" + "|".join(cells[k][0] for k in group) + "|"
-        return (text, base + cells[lo][1] - 1, base + cells[hi][2] + 1)
-
-    for idx, (ctext, cstart, cend) in enumerate(cells):
-        cand = "|" + "|".join(cells[k][0] for k in cur + [idx]) + "|"
-        if cur and len(cand) > body_budget:
-            frags.append(_emit(cur))   # 当前 group 仍 <= 预算，先落盘
-            cur = []
-        # 单个单元格自身超限 → 按字符切片。cell 内容内切片在源中没有对应管道，
-        # 故片段【不加管道】、span 取真实源区间 [ps, pe]，保证「真实 span」逐字符一致
-        # （调用方负责标记 forced_split / continuation_index）。
-        if len("|" + ctext + "|") > body_budget:
-            for pt, ps, pe in _char_slice_text(ctext, body_budget, base + cstart):
-                frags.append((pt, ps, pe))
-            cur = []
-            continue
-        cur.append(idx)
-    if cur:
-        frags.append(_emit(cur))
+    start = 0
+    while start < len(text):
+        end = min(start + body_budget, len(text))
+        candidates = [c for c in cuts if start < c <= end]
+        if candidates:
+            end = max(candidates)
+        if end <= start:
+            end = min(start + body_budget, len(text))
+        piece = text[start:end]
+        frags.append((piece, row_unit.start_char + start, row_unit.start_char + end))
+        start = end
     return frags
 
 
@@ -729,6 +734,24 @@ def _mk_block(text: str, start_char: int, end_char: int) -> "Block":
     return Block(kind="paragraph", text=text, start_char=start_char, end_char=end_char)
 
 
+def _dense_prefix_with_budget(prefix: str, tok: Tokenizer) -> str:
+    """Return a display prefix that leaves room for at least one body token."""
+    if not prefix or tok(prefix) < DENSE_HARD_MAX_TOKENS:
+        return prefix
+    cap = DENSE_HARD_MAX_TOKENS - 1
+    lo, hi, best = 0, len(prefix), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if tok(prefix[:mid]) <= cap:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best == 0:
+        raise ChunkBuildError("dense section prefix exceeds the token hard limit")
+    return prefix[:best]
+
+
 def _pack_dense(prefix: str, segs: List["_Seg"], tok: Tokenizer):
     """Pack ``_Seg`` pieces into dense chunks ≤DENSE_HARD_MAX_TOKENS.
 
@@ -737,12 +760,10 @@ def _pack_dense(prefix: str, segs: List["_Seg"], tok: Tokenizer):
     and the budget is prefix-aware so the stored token count (prefix + body)
     never exceeds the hard max even for nested section paths.
     """
+    prefix = _dense_prefix_with_budget(prefix, tok)
     prefix_tok = tok(prefix) if prefix else 0
     hard = DENSE_HARD_MAX_TOKENS - prefix_tok
-    target = max(1, DENSE_TARGET_TOKENS - prefix_tok)
-    if hard < 1:
-        hard = DENSE_HARD_MAX_TOKENS
-        target = DENSE_TARGET_TOKENS
+    target = max(1, min(DENSE_TARGET_TOKENS - prefix_tok, hard))
 
     out: List[tuple] = []
     cur: List[_Seg] = []
@@ -752,19 +773,50 @@ def _pack_dense(prefix: str, segs: List["_Seg"], tok: Tokenizer):
         if not cur:
             return
         body = " ".join(s.text for s in cur)
-        out.append((prefix + body, cur[0].start_char, cur[-1].end_char))
+        full = prefix + body
+        if tok(full) > DENSE_HARD_MAX_TOKENS:
+            raise ChunkBuildError(
+                f"dense 硬上限被违反: tokens={tok(full)} > {DENSE_HARD_MAX_TOKENS}")
+        out.append((full, cur[0].start_char, cur[-1].end_char))
+
+    def _split_for_prefix(seg: _Seg) -> List[_Seg]:
+        """Ensure each body piece fits when its synthetic prefix is included."""
+        if tok(prefix + seg.text) <= DENSE_HARD_MAX_TOKENS:
+            return [seg]
+        pieces: List[_Seg] = []
+        pos = 0
+        while pos < len(seg.text):
+            lo, hi, best = 1, len(seg.text) - pos, 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate = seg.text[pos:pos + mid]
+                if tok(prefix + candidate) <= DENSE_HARD_MAX_TOKENS:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best == 0:
+                raise ChunkBuildError("dense prefix leaves no token budget for a body character")
+            pieces.append(_Seg(seg.text[pos:pos + best], seg.start_char + pos,
+                               seg.start_char + pos + best))
+            pos += best
+        return pieces
 
     for raw in segs:
         # a single over-long segment → force-split by tokens (preserves spans)
-        if tok(raw.text) > hard:
+        if tok(prefix + raw.text) > DENSE_HARD_MAX_TOKENS:
             sub = _force_split_with_spans(raw.text, raw.start_char, tok,
-                                         target, DENSE_OVERLAP_TOKENS)
+                                         hard, DENSE_OVERLAP_TOKENS)
             sub_segs = [_Seg(t, s, e) for (t, s, e) in sub]
         else:
             sub_segs = [raw]
-        for seg in sub_segs:
+        prefixed_sub_segs: List[_Seg] = []
+        for sub_seg in sub_segs:
+            prefixed_sub_segs.extend(_split_for_prefix(sub_seg))
+        for seg in prefixed_sub_segs:
             t = tok(seg.text)
-            if cur and cur_tok + t > target:
+            candidate = prefix + " ".join(s.text for s in cur + [seg])
+            if cur and tok(candidate) > target:
                 _flush()
                 # overlap: keep trailing complete segments up to budget
                 tail_tok = 0
@@ -777,12 +829,16 @@ def _pack_dense(prefix: str, segs: List["_Seg"], tok: Tokenizer):
                     tail_tok += st
                 cur = kept
                 cur_tok = prefix_tok + tail_tok
+                # Joining pieces adds separator tokens with some tokenizers.
+                # Drop overlap until the next full record fits the hard cap.
+                while cur and tok(prefix + " ".join(s.text for s in cur + [seg])) > DENSE_HARD_MAX_TOKENS:
+                    cur.pop(0)
             cur.append(seg)
-            cur_tok += t
-            if cur_tok > hard and len(cur) > 1:
-                # hard cap guard: drop leading segment(s)
-                while cur_tok > hard and len(cur) > 1:
-                    dropped = cur.pop(0)
-                    cur_tok -= tok(dropped.text)
+            cur_tok = tok(prefix + " ".join(s.text for s in cur))
+            if cur_tok > DENSE_HARD_MAX_TOKENS:
+                # A single segment that cannot fit even after forced splitting
+                # is a build error, never a silently truncated embedding.
+                raise ChunkBuildError(
+                    f"dense segment exceeds hard limit: tokens={cur_tok}")
     _flush()
     return out
