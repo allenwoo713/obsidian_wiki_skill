@@ -272,8 +272,8 @@ def assemble_context(
 
         # issue #12 多模态：图片命中回溯父文档/页码/section/附近正文
         item_sources: List[str] = []
-        if is_image and wi is not None:
-            _meta = getattr(wi, "get_image_meta", lambda p: None)(c.path)
+        if is_image and repository is not None:
+            _meta = getattr(repository, "get_image_meta", lambda p: None)(c.path)
             if _meta:
                 _src_line = f"[来源: {_meta.get('source_doc') or '?'}"
                 if _meta.get("source_page") is not None:
