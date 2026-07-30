@@ -85,6 +85,7 @@ class GraphPath:
     is_inferred: bool
     weight: float
     hop: int
+    edge_signals: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -127,6 +128,7 @@ class ContextItem:
     token_count: int = 0
     truncated: bool = False
     truncation_reason: Optional[str] = None
+    omitted_ranges: List[dict] = field(default_factory=list)
 
 
 @dataclass

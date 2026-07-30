@@ -299,7 +299,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         mode = mode_override
         mult = 1.0
     eff_tokens = int(max_tokens * mult)
-    bundle = assemble_context(merged, wi, mode=mode, max_tokens=eff_tokens,
+    bundle = assemble_context(merged, repository=wi, mode=mode,
+                              scope=("full_page" if mode == "full" else plan.context_mode), max_tokens=eff_tokens,
                               token_counter=wi.count_tokens)
     text_items, image_items = _split_text_image(bundle.items)
     return HybridResult(query=original_query, bundle=bundle, plan=plan,
@@ -327,9 +328,21 @@ def result_to_json(result: HybridResult) -> dict:
             "score": round(rrf.get(it.page_id, 0.0), 6),
             "snippet": it.text,
             "sources": it.sources,
+            "evidence": [{
+                "chunk_id": hit.chunk_id, "channel": hit.channel, "rank": hit.rank,
+                "raw_score": hit.raw_score, "section_path": hit.section_path,
+            } for hit in it.evidence],
+            "graph_paths": [{
+                "source_id": path.source_id, "target_id": path.target_id,
+                "edge_type": path.edge_type, "edge_signals": path.edge_signals,
+                "is_inferred": path.is_inferred, "weight": path.weight, "hop": path.hop,
+            } for path in it.graph_paths],
             "method": it.inclusion_reason,
             "scope": it.scope,
             "tokens": it.token_count,
+            "truncated": it.truncated,
+            "truncation_reason": it.truncation_reason,
+            "omitted_ranges": it.omitted_ranges,
             "embed": f"![[{Path(it.path).name}]]" if "assets/" in ps else None,
         }
 

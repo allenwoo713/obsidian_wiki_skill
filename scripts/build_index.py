@@ -91,6 +91,16 @@ _FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 
+def _read_page_content(path: Path) -> str:
+    """Read complete Markdown body for the read-only ContextRepository port."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = _FM_RE.match(raw)
+    return (match.group(2) if match else raw).strip()
+
+
 def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
     raw = path.read_text(encoding="utf-8", errors="replace")
     m = _FM_RE.match(raw)
@@ -1020,6 +1030,51 @@ class WikiIndex:
             logging.getLogger(__name__).warning("search_vector 失败: %s", e)
             return []
         return [self._hit_from_row(r, "vector") for r in rows]
+
+    # ---- Context repository port (issue #14) ----
+    def _rows_where(self, predicate: str) -> List[dict]:
+        """Small read-only adapter for context assembly; never exposes LanceDB to fusion."""
+        try:
+            return self._get_lance_table().search().where(predicate).to_list()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("context repository read failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _sql(value: str) -> str:
+        return str(value).replace("'", "''")
+
+    def get_chunk(self, chunk_id: str) -> Optional[ChunkHit]:
+        rows = self._rows_where(f"chunk_id = '{self._sql(chunk_id)}'")
+        return self._hit_from_row(rows[0], "fts") if rows else None
+
+    def get_neighbors(self, chunk_id: str) -> List[ChunkHit]:
+        anchor = self.get_chunk(chunk_id)
+        if anchor is None:
+            return []
+        rows = self._rows_where(f"page_id = '{self._sql(anchor.page_id)}' AND chunk_kind = 'dense'")
+        hits = [self._hit_from_row(row, "fts") for row in rows]
+        hits.sort(key=lambda hit: hit.chunk_id)
+        for pos, hit in enumerate(hits):
+            if hit.chunk_id == chunk_id:
+                return hits[max(0, pos - 1):pos] + hits[pos + 1:pos + 2]
+        return []
+
+    def get_parent_section(self, chunk_id: str) -> List[ChunkHit]:
+        anchor = self.get_chunk(chunk_id)
+        if anchor is None:
+            return []
+        rows = self._rows_where(f"page_id = '{self._sql(anchor.page_id)}'")
+        hits = [self._hit_from_row(row, "fts") for row in rows]
+        return [hit for hit in hits if hit.section_path == anchor.section_path] or [anchor]
+
+    def get_page_sources(self, page_id: str) -> List[str]:
+        page = self._page_by_id.get(page_id)
+        return list(page.sources) if page else []
+
+    def read_page(self, page_id: str) -> str:
+        page = self._page_by_id.get(page_id)
+        return _read_page_content(page.path) if page else ""
 
     def search(self, query: str, k: int = 5) -> List[PageCandidate]:
         """端到端：chunk 级 FTS + 向量 → page-level RRF → 返回 PageCandidate。"""
