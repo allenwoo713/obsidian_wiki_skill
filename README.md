@@ -297,6 +297,8 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 
 **证据优先与引用保证（issue #14/#15）：** 图谱候选同时从直接 RRF 页面和已解析实体 seed，并在候选自身 `page_id` 的 restricted retrieval 中取得非空正文 evidence 后才进入 answer context；只有 inferred 信号、没有文本支持的路径会被拒绝。relation 查询保留显式 edge signals 及其支持文本，所有 graph signals 都随 graph path 输出。每个 `context_text` 项均可独立引用：包含 page ID、Wiki path、frontmatter sources、Evidence IDs、scope、正文，以及适用时的 graph path；JSON 也提供相同字段。双通道命中保留 sparse/dense provenance，token 不足则显式返回 `truncated`、原因和 omitted range。
 
+**预算口径（token 预算契约）：** `--max-tokens` 是**基础预算**，最终上限由意图倍率决定——`comparison → multiple_sections → 1.4×`（如 4096→5734），其余意图 `1.0×`。即 `effective = min( 基础预算 × 意图倍率 , 硬上限（若提供） )`。agent 调 LLM 前必须按输出中的 `effective_budget_tokens` 预留上下文，而非 `--max-tokens`；有严格窗口/成本限制时传 `--hard-max-tokens N`，超出部分会显式标注 `truncated` / `truncation_reason` / omitted range，绝不静默丢弃。预算由 `query.py` 唯一决定并经 Bundle 暴露，下游不得复制倍率表。
+
 ### 图谱邻域查询
 
 图谱边是导航信号，不是可直接引用的事实。使用 `query.py` 的 `graph_expansion` 结果可获得已验证的同页文本；如果手动读取 `graph.json`，必须再通过 `query.py` 取得 evidence 和引用字段，不能用 inferred-only 路径写入答案。

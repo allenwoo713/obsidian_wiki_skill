@@ -41,15 +41,44 @@ from query_plan_models import (
 
 logger = logging.getLogger(__name__)
 
-# planner.context_mode → (ContextBundle mode, token 预算倍数)
+# ---------------------------------------------------------------------------
+# 预算策略（budget policy）
+#
+# 契约：effective = min(base × multiplier, hard_max_tokens if supplied)
+#   base       = 调用方给的 --max-tokens（基础预算，不是最终上限）
+#   multiplier = planner.context_mode → 倍率（下表；显式 --mode 覆盖时恒为 1.0）
+#   hard_max   = 调用方的绝对上限（模型窗口 / 成本约束），可选
+#
+# 预算由 hybrid_search() 唯一决定，并通过 ContextBundle 的 budget 字段对外暴露；
+# 任何下游（eval / 宿主）都不得复制本表，只能读 bundle.effective_budget_tokens。
+# ---------------------------------------------------------------------------
+BUDGET_POLICY = "context_mode_multiplier_v1"
+
+# planner.context_mode → (ContextBundle mode, token 预算倍率)
 _CONTEXT_MODE_MAP = {
     "section": ("snippet", 1.0),
     "parent_section": ("snippet", 1.0),
-    "multiple_sections": ("snippet", 1.4),
+    "multiple_sections": ("snippet", 1.4),   # comparison：需并列多个 section
     "evidence": ("snippet", 1.0),
     "chunk": ("snippet", 1.0),
     "global": ("summary", 1.0),
 }
+
+
+def resolve_budget(context_mode: str, base_tokens: int,
+                   mode_override: Optional[str] = None,
+                   hard_max_tokens: Optional[int] = None):
+    """把 (context_mode, 基础预算, 硬上限) 解析成本次实际生效的预算。
+
+    返回 ``(mode, multiplier, planned_tokens, effective_tokens)``。
+    """
+    mode, mult = _CONTEXT_MODE_MAP.get(context_mode, ("snippet", 1.0))
+    if mode_override:
+        # 调用方显式指定展开粒度 → 意图倍率失效，按基础预算执行
+        mode, mult = mode_override, 1.0
+    planned = int(base_tokens * mult)
+    effective = min(planned, int(hard_max_tokens)) if hard_max_tokens else planned
+    return mode, mult, planned, effective
 
 
 @dataclass
@@ -321,7 +350,9 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                   context: Optional[PlannerContext] = None,
                   k: int = 5, max_tokens: int = 4096, wiki_dir: Optional[Path] = None,
                   intent_override: str = "auto", rewrite_override: str = "auto",
-                  mode_override: Optional[str] = None) -> HybridResult:
+                  mode_override: Optional[str] = None,
+                  hard_max_tokens: Optional[int] = None) -> HybridResult:
+    """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。"""
     ctx = context or PlannerContext()
     plan = planner.plan(original_query, ctx)
     if intent_override not in (None, "auto"):
@@ -335,8 +366,13 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
 
     # global intent → issue #10 路由（占位）
     if plan.intent == QueryIntent.GLOBAL.value:
-        gr = _global_retrieve(wi, plan, k, max_tokens)
+        _, g_mult, _, g_eff = resolve_budget(plan.context_mode, max_tokens,
+                                             mode_override, hard_max_tokens)
+        gr = _global_retrieve(wi, plan, k, g_eff)
         if gr is not None:
+            gr.bundle.apply_budget(base_tokens=max_tokens, multiplier=g_mult,
+                                   effective_tokens=g_eff, hard_max_tokens=hard_max_tokens,
+                                   policy=BUDGET_POLICY)
             return gr
         logger.warning("global intent 但 community reports 未构建 (#10)；回退本地检索")
 
@@ -353,15 +389,15 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
             fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan2, k, wiki_dir)
             plan = plan2
 
-    # 7) 按 token 预算装配 ContextBundle（context_mode → mode/倍数）
-    mode, mult = _CONTEXT_MODE_MAP.get(plan.context_mode, ("snippet", 1.0))
-    if mode_override:
-        mode = mode_override
-        mult = 1.0
-    eff_tokens = int(max_tokens * mult)
+    # 7) 按 token 预算装配 ContextBundle（预算策略：context_mode → mode/倍率 + 硬上限）
+    mode, mult, _planned, eff_tokens = resolve_budget(
+        plan.context_mode, max_tokens, mode_override, hard_max_tokens)
     bundle = assemble_context(merged, repository=wi, mode=mode,
                               scope=("full_page" if mode == "full" else plan.context_mode), max_tokens=eff_tokens,
                               token_counter=wi.count_tokens)
+    bundle.apply_budget(base_tokens=max_tokens, multiplier=mult,
+                        effective_tokens=eff_tokens, hard_max_tokens=hard_max_tokens,
+                        policy=BUDGET_POLICY)
     text_items, image_items = _split_text_image(bundle.items)
     return HybridResult(query=original_query, bundle=bundle, plan=plan,
                         candidates=merged, text_items=text_items, image_items=image_items,
@@ -412,7 +448,9 @@ def result_to_json(result: HybridResult) -> dict:
         "query_plan": result.plan.to_json(),
         "mode": result.bundle.mode,
         "token_count": result.bundle.token_count,
-        "max_context_tokens": result.bundle.max_context_tokens,
+        # 预算契约：调用 LLM 前应按 effective_budget_tokens 预留上下文，
+        # 而不是想当然认为等于 requested_base_budget_tokens。
+        **result.bundle.budget_to_json(),
         "text": [item_entry(it) for it in result.text_items],
         "images": [item_entry(it) for it in result.image_items],
         "omitted": result.bundle.omitted_items,
@@ -427,7 +465,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/ 与 .index/）")
     p.add_argument("query", help="用户本轮原始问题（原样传入，禁止调用前改写/拼接关键词）")
     p.add_argument("--k", type=int, default=5, help="返回 top-K 页面（默认 5）")
-    p.add_argument("--max-tokens", type=int, default=4096, help="ContextBundle token 预算上限（默认 4096）")
+    p.add_argument("--max-tokens", type=int, default=4096,
+                   help="基础 token 预算（默认 4096）。最终上限 = 基础预算 × 意图倍率"
+                        "（comparison→multiple_sections→1.4×，其余 1.0×），"
+                        "见输出的 effective_budget_tokens")
+    p.add_argument("--hard-max-tokens", type=int, default=None,
+                   help="硬上限：最终 ContextBundle 绝不超过该值（模型窗口/成本约束）；"
+                        "effective = min(基础预算 × 倍率, 硬上限)")
     p.add_argument("--mode", choices=["summary", "snippet", "full"], default=None,
                    help="展开粒度覆盖（默认由 QueryPlanner.context_mode 决定）：summary/snippet/full")
     p.add_argument("--intent", default="auto",
@@ -483,6 +527,7 @@ def main():
     result = hybrid_search(
         wi, args.query, planner, ctx,
         k=args.k, max_tokens=args.max_tokens,
+        hard_max_tokens=args.hard_max_tokens,
         wiki_dir=proj / "Wiki",
         intent_override=args.intent,
         rewrite_override=args.rewrite,

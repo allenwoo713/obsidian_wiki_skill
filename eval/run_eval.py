@@ -8,11 +8,18 @@
 
 指标：
     质量：Page Recall@5, Evidence Recall@10, Exact lookup Hit@3, MRR@10,
-          ANN Recall@10, Context overflow count, Graph-only unsupported evidence count
+          ANN Recall@10, Context overflow count, Graph-only unsupported evidence count,
+          Budget contract violation count
     性能：全量构建时间, 单页增量时间, embedding 数, 索引磁盘大小,
           P50/P95/P99 查询延迟, peak memory, ContextBundle token 数, exact vs ANN 差异
+    预算：base/effective 预算分布（按意图）、扩张查询数、最大有效预算
 
-退出码：0=通过；1=回归（Recall 下降>阈值 / overflow>0 / graph-only>0 / ANN<0.98）。
+Overflow 判定口径：以 ``bundle.effective_budget_tokens``（hybrid_search 实际分配的
+预算）为准，而不是 CLI 传入的基础预算——预算策略由 query.hybrid_search 唯一决定，
+本脚本不得复制 ``_CONTEXT_MODE_MAP``。
+
+退出码：0=通过；1=回归（Recall 下降>阈值 / overflow>0 / graph-only>0 / ANN<0.98 /
+预算契约漂移）。
 """
 from __future__ import annotations
 
@@ -35,7 +42,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from build_index import WikiIndex  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
-from query import hybrid_search  # noqa: E402
+from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
 from chunking import CHUNK_SCHEMA_VERSION  # noqa: E402
 
@@ -101,7 +108,8 @@ def _chunk_ids(wi: WikiIndex, query: str, k: int = 10):
 
 
 def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: int,
-                   build_ann: bool, regression_pp: float):
+                   build_ann: bool, regression_pp: float,
+                   hard_max_tokens: int | None = None):
     work_dir.mkdir(parents=True, exist_ok=True)
     tracemalloc.start()
 
@@ -121,6 +129,11 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     page_recalls, evid_recalls, mrrs, exact_hits, ann_recalls = [], [], [], [], []
     latencies = []
     context_overflow = 0
+    budget_violations = 0
+    budget_violation_samples = []
+    budget_by_intent = {}          # intent → {"base": Counter, "effective": Counter}
+    expanded_queries = 0           # effective > base（意图倍率生效）
+    max_effective_budget = 0
     graph_only_unsupported = 0
     graph_trigger_queries = 0
     graph_trigger_validated = 0
@@ -135,7 +148,8 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         # direct seed so this evaluation exercises restricted graph validation.
         search_k = 1 if q.get("graph_trigger") else 10
         res = hybrid_search(main_wi, q["query"], planner, k=search_k,
-                            max_tokens=max_tokens, wiki_dir=main_wiki, intent_override="auto")
+                            max_tokens=max_tokens, hard_max_tokens=hard_max_tokens,
+                            wiki_dir=main_wiki, intent_override="auto")
         latencies.append(time.perf_counter() - t0)
 
         cands = res.candidates
@@ -166,9 +180,25 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             ann_ids = set(_chunk_ids(ann_wi, q["query"], 10))
             ann_recalls.append(len(exact_ids & ann_ids) / len(exact_ids) if exact_ids else 1.0)
 
-        # Context overflow：最终上下文超出 max_tokens（assemble_context 已截断 → 应恒 0）
-        if res.bundle.token_count > max_tokens:
+        # Context overflow：以本次实际分配的预算为准（effective = base × 意图倍率，
+        # 再受 hard cap 限制）。assemble_context 按 effective 截断 → 应恒 0。
+        bundle = res.bundle
+        if bundle.token_count > bundle.effective_budget_tokens:
             context_overflow += 1
+        # 防契约漂移：max_context_tokens 必须等于 effective；hard cap 必须被尊重
+        violations = bundle.budget_contract_violations()
+        if violations:
+            budget_violations += 1
+            if len(budget_violation_samples) < 5:
+                budget_violation_samples.append({"query": q["query"], "violations": violations})
+        slot = budget_by_intent.setdefault(res.plan.intent, {"base": {}, "effective": {}})
+        slot["base"][str(bundle.requested_base_budget_tokens)] = \
+            slot["base"].get(str(bundle.requested_base_budget_tokens), 0) + 1
+        slot["effective"][str(bundle.effective_budget_tokens)] = \
+            slot["effective"].get(str(bundle.effective_budget_tokens), 0) + 1
+        if bundle.effective_budget_tokens > bundle.requested_base_budget_tokens:
+            expanded_queries += 1
+        max_effective_budget = max(max_effective_budget, bundle.effective_budget_tokens)
         if q.get("graph_trigger"):
             graph_trigger_queries += 1
             graph_trigger_validated += res.graph_validated_count
@@ -188,6 +218,8 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "facts_found": [f for f in facts if f and f in ctx],
             "facts_missing": [f for f in facts if f and f not in ctx],
             "top5_pages": [Path(c.page_id).name for c in top5],
+            "context_mode": res.plan.context_mode,
+            "budget": {**bundle.budget_to_json(), "token_count": bundle.token_count},
         })
 
     # 4) 性能：增量时间（复用同一 project，单页修改触发增量）
@@ -226,9 +258,19 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "mrr_at_10": round(statistics.mean(mrrs), 4),
             "ann_recall_at_10": round(statistics.mean(ann_recalls), 4) if ann_recalls else None,
             "context_overflow_count": context_overflow,
+            "budget_contract_violation_count": budget_violations,
             "graph_only_unsupported_count": graph_only_unsupported,
             "graph_trigger_query_count": graph_trigger_queries,
             "graph_trigger_validated_count": graph_trigger_validated,
+        },
+        "budget": {
+            "policy": _BUDGET_POLICY,
+            "requested_base_budget_tokens": max_tokens,
+            "hard_max_tokens": hard_max_tokens,
+            "expanded_query_count": expanded_queries,
+            "max_effective_budget_tokens": max_effective_budget,
+            "by_intent": budget_by_intent,
+            "violation_samples": budget_violation_samples,
         },
         "performance": {
             "full_build_time_s": round(build_time, 2),
@@ -262,7 +304,10 @@ def main():
     ap.add_argument("--baselines", type=Path, default=HERE / "baselines.json")
     ap.add_argument("--work-dir", type=Path, default=None,
                     help="构建临时目录（默认系统临时目录；本地建议 D: 盘避免 C: 虚拟化）")
-    ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="基础 token 预算；实际上限 = 基础预算 × 意图倍率（由 hybrid_search 决定）")
+    ap.add_argument("--hard-max-tokens", type=int, default=None,
+                    help="硬上限：effective budget 与 token_count 均不得超过该值")
     ap.add_argument("--no-ann", action="store_true", help="跳过 ANN 索引构建")
     ap.add_argument("--regression-pp", type=float, default=2.0, help="Recall 下降百分点阈值")
     ap.add_argument("--init-baseline", action="store_true", help="把当前指标写为 baselines.json 并退出 0")
@@ -278,7 +323,8 @@ def main():
     print(f"[info] work-dir = {work_dir}", file=sys.stderr)
 
     metrics, detail = run_evaluation(args.wiki, queries, work_dir, args.max_tokens,
-                             build_ann=not args.no_ann, regression_pp=args.regression_pp)
+                             build_ann=not args.no_ann, regression_pp=args.regression_pp,
+                             hard_max_tokens=args.hard_max_tokens)
 
     (HERE / "results.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
@@ -336,7 +382,13 @@ def main():
     check_drop("ann_recall_at_10", mq["ann_recall_at_10"], bq["ann_recall_at_10"])
 
     if mq["context_overflow_count"] > 0:
-        failures.append(f"context_overflow_count={mq['context_overflow_count']} > 0")
+        failures.append(
+            f"context_overflow_count={mq['context_overflow_count']} > 0"
+            f"（判定口径：token_count > bundle.effective_budget_tokens）")
+    if mq.get("budget_contract_violation_count", 0) > 0:
+        failures.append(
+            f"budget_contract_violation_count={mq['budget_contract_violation_count']} > 0"
+            f"：{metrics['budget']['violation_samples']}")
     if mq["graph_only_unsupported_count"] > 0:
         failures.append(f"graph_only_unsupported_count={mq['graph_only_unsupported_count']} > 0")
     if mq.get("graph_trigger_query_count", 0) <= 0 or mq.get("graph_trigger_validated_count", 0) <= 0:
