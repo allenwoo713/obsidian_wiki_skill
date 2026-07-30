@@ -228,7 +228,40 @@ def assemble_context(
     reserved = {kind: int(max_tokens * fractions[kind]) if kind in active else 0 for kind in fractions}
     used = 0
     used_by_type = {kind: 0 for kind in fractions}
-    for c in candidates:
+    deferred = []
+    included_order = {}
+
+    def admit(order, c, type_key, item_scope, evidence, text, item_sources, allowed):
+        nonlocal used
+        original_tokens = token_counter(text)
+        if original_tokens > allowed and item_scope not in ("full_page", "full_source"):
+            return False
+        selected_text, truncated, omitted_ranges = _truncate_to_budget(
+            text, allowed, token_counter)
+        tc = token_counter(selected_text) if selected_text else 0
+        if not selected_text or tc <= 0:
+            return False
+        sources = list(getattr(repository, "get_page_sources", lambda _pid: [])(c.page_id) or [])
+        item = ContextItem(
+            page_id=c.page_id, path=str(c.path), title=c.title,
+            inclusion_reason=("graph_expansion" if type_key == "graph"
+                              else ("image" if type_key == "image" else "rrf")),
+            scope=item_scope, evidence=evidence,
+            text=selected_text, sources=(item_sources or sources), graph_paths=c.graph_paths,
+            token_count=tc,
+            truncated=truncated,
+            truncation_reason=("full_page_token_limit"
+                               if truncated and item_scope in ("full_page", "full_source")
+                               else "token_limit" if truncated else None),
+            omitted_ranges=omitted_ranges,
+        )
+        bundle.items.append(item)
+        included_order[id(item)] = order
+        used += tc
+        used_by_type[type_key] += tc
+        return True
+
+    for order, c in enumerate(candidates):
         type_key = category_by_id[c.page_id]
         is_image = type_key == "image"
         is_graph = type_key == "graph"
@@ -271,39 +304,24 @@ def assemble_context(
         channel_limit = max_tokens if active == {type_key} else reserved[type_key]
         allowed = min(max(0, channel_limit - used_by_type[type_key]),
                       max(0, max_tokens - used - protected_remaining))
-        if allowed <= 0:
-            bundle.omitted_items.append({
-                "page_id": c.page_id, "title": c.title,
-                "reason": f"{type_key}_budget_exhausted",
-            })
+        if allowed <= 0 or tc > allowed:
+            deferred.append((order, c, type_key, item_scope, evidence, text, item_sources))
             continue
-        if tc > allowed and item_scope not in ("full_page", "full_source"):
-            bundle.omitted_items.append({
-                "page_id": c.page_id, "title": c.title,
-                "reason": f"{type_key}_budget_exhausted",
-            })
-            continue
-        text, truncated, omitted_ranges = _truncate_to_budget(text, allowed, token_counter)
-        tc = token_counter(text) if text else 0
-        if not text or tc <= 0:
-            bundle.omitted_items.append({"page_id": c.page_id, "title": c.title, "reason": "budget_exhausted"})
-            continue
-        sources = list(getattr(repository, "get_page_sources", lambda _pid: [])(c.page_id) or [])
-        item = ContextItem(
-            page_id=c.page_id, path=str(c.path), title=c.title,
-            inclusion_reason=("graph_expansion" if is_graph else ("image" if is_image else "rrf")),
-            scope=item_scope, evidence=evidence,
-            text=text, sources=(item_sources or sources), graph_paths=c.graph_paths,
-            token_count=tc,
-            truncated=truncated,
-            truncation_reason=("full_page_token_limit" if truncated and item_scope in ("full_page", "full_source")
-                               else "token_limit" if truncated else None),
-            omitted_ranges=omitted_ranges,
-        )
-        bundle.items.append(item)
-        used += tc
-        used_by_type[type_key] += tc
+        admit(order, c, type_key, item_scope, evidence, text, item_sources, allowed)
 
+    # Once every active channel has had its reserved opportunity, all remaining
+    # global capacity is shared. Revisit candidates that did not fit their
+    # minimum reservation without weakening the hard cap.
+    for order, c, type_key, item_scope, evidence, text, item_sources in deferred:
+        allowed = max(0, max_tokens - used)
+        if allowed and admit(order, c, type_key, item_scope, evidence, text, item_sources, allowed):
+            continue
+        bundle.omitted_items.append({
+            "page_id": c.page_id, "title": c.title,
+            "reason": f"{type_key}_budget_exhausted",
+        })
+
+    bundle.items.sort(key=lambda item: included_order[id(item)])
     bundle.token_count = used
     bundle.context_text = render_context_markdown(bundle)
     return bundle

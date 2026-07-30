@@ -160,6 +160,7 @@ class ChunkHit:
     channel: str           # 'fts' | 'vector'
     score: float
     distance: Optional[float] = None
+    chunk_index: Optional[int] = None  # persisted document order; content hash is position-independent
 
 
 @dataclass

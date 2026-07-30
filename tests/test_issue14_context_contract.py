@@ -2,8 +2,11 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from fusion import assemble_context, page_level_rrf, render_context_markdown
-from models import ChunkHit, EvidenceHit, PageCandidate
+from build_index import WikiIndex
+from models import ChunkHit, EvidenceHit, GraphPath, PageCandidate
 from query import HybridResult, result_to_json
 
 
@@ -101,6 +104,83 @@ def test_reservations_reflow_without_exceeding_global_cap():
                               token_counter=lambda text: len(text.split()))
     assert len(bundle.items) == 3, "unused page/image/graph reservations should reflow"
     assert bundle.token_count <= 12
+
+
+@pytest.mark.parametrize(
+    ("dense_tokens", "expected_pages"),
+    [
+        (98, ["dense-page", "graph-page"]),
+        (99, ["dense-page", "graph-page"]),
+        (100, ["graph-page"]),
+    ],
+)
+def test_mixed_active_channel_reservations_reflow_after_minima_are_satisfied(
+    dense_tokens, expected_pages
+):
+    dense = _candidate()
+    dense.page_id = "dense-page"
+    dense.path = Path("Wiki/dense-page.md")
+    dense.title = "Dense page"
+    dense.sparse_evidence = []
+    dense.dense_evidence[0].text = " ".join(f"d{index}" for index in range(dense_tokens))
+
+    graph = _candidate()
+    graph.page_id = "graph-page"
+    graph.path = Path("Wiki/graph-page.md")
+    graph.title = "Graph page"
+    graph.sparse_evidence = []
+    graph.dense_evidence[0].text = "graph"
+    graph.graph_paths = [
+        GraphPath("dense-page", "graph-page", "wikilink", False, 1.0, 1, ["wikilink"])
+    ]
+
+    bundle = assemble_context(
+        [dense, graph], scope="chunk", max_tokens=100,
+        token_counter=lambda text: len(text.split()),
+    )
+
+    assert [item.page_id for item in bundle.items] == expected_pages
+    assert bundle.token_count == (dense_tokens + 1 if dense_tokens <= 99 else 1)
+    assert bundle.token_count <= bundle.max_context_tokens
+
+
+def test_wiki_index_neighbors_follow_persisted_chunk_index_not_hash_id_order():
+    rows = [
+        {
+            "chunk_id": "z-anchor", "chunk_index": 1, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "concept",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "anchor",
+        },
+        {
+            "chunk_id": "a-after", "chunk_index": 2, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "concept",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "after",
+        },
+        {
+            "chunk_id": "m-before", "chunk_index": 0, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "concept",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "before",
+        },
+    ]
+
+    class RowBackedWikiIndex:
+        _sql = staticmethod(WikiIndex._sql)
+        _hit_from_row = WikiIndex._hit_from_row
+        get_neighbors = WikiIndex.get_neighbors
+
+        def get_chunk(self, chunk_id):
+            row = next(row for row in rows if row["chunk_id"] == chunk_id)
+            return self._hit_from_row(row, "fts")
+
+        def _rows_where(self, predicate):
+            return rows
+
+    neighbors = RowBackedWikiIndex().get_neighbors("z-anchor")
+
+    assert [hit.chunk_id for hit in neighbors] == ["m-before", "a-after"]
 
 
 def test_rrf_collects_all_channel_evidence_for_one_page():

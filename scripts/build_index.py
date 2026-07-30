@@ -1088,7 +1088,11 @@ class WikiIndex:
             return []
         rows = self._rows_where(f"page_id = '{self._sql(anchor.page_id)}' AND chunk_kind = 'dense'")
         hits = [self._hit_from_row(row, "fts") for row in rows]
-        hits.sort(key=lambda hit: hit.chunk_id)
+        hits.sort(key=lambda hit: (
+            hit.chunk_index is None,
+            hit.chunk_index if hit.chunk_index is not None else 0,
+            hit.chunk_id,
+        ))
         for pos, hit in enumerate(hits):
             if hit.chunk_id == chunk_id:
                 return hits[max(0, pos - 1):pos] + hits[pos + 1:pos + 2]
@@ -1134,6 +1138,7 @@ class WikiIndex:
             section_path=json.loads(r.get("section_path") or "[]"),
             heading=r.get("heading", ""), chunk_kind=r["chunk_kind"],
             text=r["text"], channel=channel, score=score, distance=distance,
+            chunk_index=(int(r["chunk_index"]) if r.get("chunk_index") is not None else None),
         )
 
 
