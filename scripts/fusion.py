@@ -221,7 +221,7 @@ def assemble_context(
     for c in candidates:
         path = str(c.path).replace("\\", "/").lower()
         category_by_id[c.page_id] = ("image" if "assets/" in path or path.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-                                      else "graph" if c.graph_paths
+                                      else "graph" if c.graph_paths and c.rrf_score <= 0
                                       else "page" if requested_scope in ("full_page", "full_source")
                                       else "dense")
     active = set(category_by_id.values())

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from models import ChunkHit, GraphPath, PageCandidate
+from fusion import assemble_context
 from query import _merge_graph_candidates, _validate_graph_candidates, graph_expand, hybrid_search
 from query_plan_models import QueryPlan
 
@@ -161,6 +162,41 @@ def test_graph_provenance_and_evidence_merge_into_existing_direct_candidate():
     assert merged == [direct]
     assert direct.graph_paths == graph.graph_paths
     assert direct.sparse_evidence == [evidence]
+
+
+def test_merged_graph_provenance_preserves_direct_rrf_lane_scope_and_budget():
+    from models import EvidenceHit
+
+    direct = PageCandidate(
+        "top", Path("Wiki/top.md"), "Top", 1.0, 1, None,
+        sparse_evidence=[
+            EvidenceHit("top-chunk", "sparse", 1, 1.0, " ".join(["top"] * 70), [])
+        ],
+    )
+    graph = PageCandidate(
+        "top", Path("Wiki/top.md"), "Top", 0.0, None, None,
+        graph_paths=[
+            GraphPath("seed", "top", "direct_link", False, 1.0, 1, ["direct_link"])
+        ],
+    )
+    lower = PageCandidate(
+        "lower", Path("Wiki/lower.md"), "Lower", 0.5, 2, None,
+        sparse_evidence=[
+            EvidenceHit("lower-chunk", "sparse", 2, 0.5, " ".join(["lower"] * 50), [])
+        ],
+    )
+
+    merged = _merge_graph_candidates([direct, lower], [graph])
+    bundle = assemble_context(
+        merged, scope="full_page", max_tokens=100,
+        token_counter=lambda text: len(text.split()),
+    )
+
+    top = next(item for item in bundle.items if item.page_id == "top")
+    assert top.inclusion_reason == "rrf"
+    assert top.scope == "full_page"
+    assert top.token_count == 70
+    assert top.graph_paths == graph.graph_paths
 
 
 def test_retry_rebuilds_direct_page_seeds_and_only_merges_validated_graph_results(tmp_path):

@@ -154,6 +154,7 @@ def test_mixed_active_channel_reservations_reflow_after_minima_are_satisfied(
     graph.page_id = "graph-page"
     graph.path = Path("Wiki/graph-page.md")
     graph.title = "Graph page"
+    graph.rrf_score = 0.0
     graph.sparse_evidence = []
     graph.dense_evidence[0].text = "graph"
     graph.graph_paths = [
