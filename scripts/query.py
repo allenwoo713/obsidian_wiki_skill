@@ -60,6 +60,7 @@ class HybridResult:
     candidates: List[PageCandidate] = field(default_factory=list)
     text_items: List[ContextItem] = field(default_factory=list)
     image_items: List[ContextItem] = field(default_factory=list)
+    graph_validated_count: int = 0
 
 
 def _split_text_image(items: List[ContextItem]):
@@ -202,17 +203,17 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
     for semantic_query in plan.semantic_queries:
         vec_hits.extend(wi.search_vector(semantic_query, k=20))
     vec_hits = _dedup_chunk_hits(vec_hits)
-    # Keep graph expansion as a genuinely separate post-RRF channel. Returning
-    # every loose vector neighbor here would otherwise pre-deduplicate the very
-    # candidates that graph validation is meant to assess.
-    candidates = page_level_rrf(fts_hits, vec_hits, k=k)
+    # Keep enough direct RRF hits to seed graph expansion, while preserving the
+    # requested direct-result count as a separate post-RRF channel.
+    direct_candidates = page_level_rrf(fts_hits, vec_hits, k=max(k, 5))
+    candidates = direct_candidates[:k]
 
     graph_candidates: List[PageCandidate] = []
     if wiki_dir:
         try:
             graph_file = wiki_dir.parent / ".index" / "graph.json"
             graph_data = json.loads(graph_file.read_text(encoding="utf-8"))
-            direct_seeds = [candidate.page_id for candidate in candidates[:5]]
+            direct_seeds = [candidate.page_id for candidate in direct_candidates[:5]]
             entity_seeds = _resolve_entity_seeds(graph_data, plan.entities)
             seeds = list(dict.fromkeys(direct_seeds + entity_seeds))
             if seeds:
@@ -227,7 +228,7 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
             by_id[candidate.page_id] = candidate
     merged = list(by_id.values())
     merged.sort(key=lambda candidate: (candidate.rrf_score <= 0, -candidate.rrf_score))
-    return fts_hits, vec_hits, candidates, merged
+    return fts_hits, vec_hits, candidates, merged, len(graph_candidates)
 
 
 def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> Optional[HybridResult]:
@@ -305,7 +306,7 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
             return gr
         logger.warning("global intent 但 community reports 未构建 (#10)；回退本地检索")
 
-    fts_hits, vec_hits, candidates, merged = _retrieve_for_plan(wi, plan, k, wiki_dir)
+    fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan, k, wiki_dir)
 
     # 6) 低召回重试（最多 1 次，issue #6）
     sparse_n, dense_n, ev_n = len(fts_hits), len(vec_hits), len(candidates)
@@ -315,7 +316,7 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                                      failure_reason="low_recall")
         plan2 = planner.plan_retry(plan, feedback, ctx)
         if plan2 is not None:
-            fts_hits, vec_hits, candidates, merged = _retrieve_for_plan(wi, plan2, k, wiki_dir)
+            fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan2, k, wiki_dir)
             plan = plan2
 
     # 7) 按 token 预算装配 ContextBundle（context_mode → mode/倍数）
@@ -329,7 +330,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                               token_counter=wi.count_tokens)
     text_items, image_items = _split_text_image(bundle.items)
     return HybridResult(query=original_query, bundle=bundle, plan=plan,
-                        candidates=merged, text_items=text_items, image_items=image_items)
+                        candidates=merged, text_items=text_items, image_items=image_items,
+                        graph_validated_count=graph_validated_count)
 
 
 def format_for_agent(result: HybridResult) -> str:

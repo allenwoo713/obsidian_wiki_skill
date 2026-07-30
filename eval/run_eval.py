@@ -131,7 +131,10 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         gold = q["relevant_pages"]
         plan = planner.plan(q["query"])
         t0 = time.perf_counter()
-        res = hybrid_search(main_wi, q["query"], planner, k=10,
+        # The marked fixture deliberately leaves expansion room after the
+        # direct seed so this evaluation exercises restricted graph validation.
+        search_k = 1 if q.get("graph_trigger") else 10
+        res = hybrid_search(main_wi, q["query"], planner, k=search_k,
                             max_tokens=max_tokens, wiki_dir=main_wiki, intent_override="auto")
         latencies.append(time.perf_counter() - t0)
 
@@ -168,9 +171,7 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             context_overflow += 1
         if q.get("graph_trigger"):
             graph_trigger_queries += 1
-            graph_trigger_validated += sum(
-                1 for item in res.bundle.items if item.inclusion_reason == "graph_expansion"
-            )
+            graph_trigger_validated += res.graph_validated_count
         for it in res.bundle.items:
             if it.inclusion_reason == "graph_expansion" and not it.evidence:
                 graph_only_unsupported += 1
