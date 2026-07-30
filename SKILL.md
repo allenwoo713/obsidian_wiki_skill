@@ -209,6 +209,8 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 
 > 返回的 JSON 含完整 `query_plan`（original_query / intent / semantic_queries / lexical_terms / exact_terms / entities / context_mode / rewrite 来源 / 约束保留 / retry 原因）。用它判断实际检索路径，并用 `context_text` 合成答案。
 
+**证据与引用契约（issue #14/#15，强制）：** `context_text` 中每个条目都自带 page ID、Wiki 路径、frontmatter `sources`、Evidence IDs、scope 和正文；图谱条目还带完整 graph path 与所有 edge signals。普通命中会保留 sparse 与 dense 两路 evidence（正文可去重，证据来源不丢失）。当 token 预算无法容纳所选范围时，结果会明确给出 `truncated`、`truncation_reason` 和 omitted range，绝不静默按字符截断。
+
 **Query Planner 配置（环境变量，均有默认值）：**
 
 | 变量 | 默认 | 说明 |
@@ -227,7 +229,7 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 - RRF 融合后 score 典型范围 0.015–0.035
 - **看相对 gap，不看绝对值**：top1 score 是 top2 的 2 倍以上 → 高置信；gap 小 → 多读几条
 - `method` 字段（inclusion_reason）：`rrf` = FTS+向量 page-level RRF 融合命中，`graph_expansion` = 图谱 1-hop 扩展，`image` = 图片命中
-- 如果 top 结果全是 `graph` 方法 → 说明关键词和向量都没直接命中，是图谱邻居推荐，置信度低
+- 图谱候选由直接 RRF 页面和解析出的实体共同 seed；每个邻居都必须先在**自身 page_id 限定范围**内重新检索到非空正文 evidence 才能进入结果。只有推断信号、没有同页文本支持的路径会被拒绝；relation 查询保留显式边信号和对应支持文本。
 
 **无结果处理：**
 - 返回空结果 → 诚实说"知识库中未找到相关内容"，**绝不编造**
@@ -278,6 +280,8 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 ## 工作流 4：图谱邻域查询
 
 用户问"哪些页面链接到 X" / "X 的关联概念有哪些"：
+
+图谱是推荐和导航信号，不是文本证明。通过 `query.py` 返回的 `graph_expansion` 项已经过页面限定证据校验；直接读取 `graph.json` 得到的邻居**不能**单独作为回答事实，仍须调用 `query.py` 取得它的 evidence、page/path、sources 和 graph path 后引用。
 
 ```bash
 # 方式 1：query.py 检索 + 图谱扩展（已在 hybrid_search 内置）

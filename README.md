@@ -293,9 +293,13 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 
 **查询预处理已内置于 Query Planner**（issue #6）：agent **无需、也不得**在调用前手工提取关键词、做中英互译或拼接增强查询——直接把用户原始问题原样传入 `query.py` 即可。`query.py` 内部会生成 FTS 词项（`lexical_terms`+`exact_terms`，型号/错误码/数字单位原样保留）、向量语义查询（`semantic_queries`，原始问题恒为第 0 条）、图谱实体（`entities`），并按意图选择 `context_mode`。无 LLM 时仍可确定性规划与检索。
 
-**score 解读**：RRF 融合后典型范围 0.015–0.035，看相对 gap 不看绝对值——top1 是 top2 的 2 倍以上为高置信。`method`(inclusion_reason) 字段：`rrf`（FTS+向量 page-level RRF 融合）/ `graph_expansion`（图谱 1-hop 扩展，置信度低）/ `image`（图片命中）。
+**score 解读**：RRF 融合后典型范围 0.015–0.035，看相对 gap 不看绝对值——top1 是 top2 的 2 倍以上为高置信。`method`(inclusion_reason) 字段：`rrf`（FTS+向量 page-level RRF 融合）/ `graph_expansion`（图谱 1-hop 扩展，经过同页文本验证）/ `image`（图片命中）。
+
+**证据优先与引用保证（issue #14/#15）：** 图谱候选同时从直接 RRF 页面和已解析实体 seed，并在候选自身 `page_id` 的 restricted retrieval 中取得非空正文 evidence 后才进入 answer context；只有 inferred 信号、没有文本支持的路径会被拒绝。relation 查询保留显式 edge signals 及其支持文本，所有 graph signals 都随 graph path 输出。每个 `context_text` 项均可独立引用：包含 page ID、Wiki path、frontmatter sources、Evidence IDs、scope、正文，以及适用时的 graph path；JSON 也提供相同字段。双通道命中保留 sparse/dense provenance，token 不足则显式返回 `truncated`、原因和 omitted range。
 
 ### 图谱邻域查询
+
+图谱边是导航信号，不是可直接引用的事实。使用 `query.py` 的 `graph_expansion` 结果可获得已验证的同页文本；如果手动读取 `graph.json`，必须再通过 `query.py` 取得 evidence 和引用字段，不能用 inferred-only 路径写入答案。
 
 ```bash
 <venv_python> <skill_dir>/scripts/query.py <project_root> "<X>" --k 5 --json   # 检索自带图谱扩展
