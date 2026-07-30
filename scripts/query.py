@@ -202,7 +202,10 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
     for semantic_query in plan.semantic_queries:
         vec_hits.extend(wi.search_vector(semantic_query, k=20))
     vec_hits = _dedup_chunk_hits(vec_hits)
-    candidates = page_level_rrf(fts_hits, vec_hits, k=k * 3)
+    # Keep graph expansion as a genuinely separate post-RRF channel. Returning
+    # every loose vector neighbor here would otherwise pre-deduplicate the very
+    # candidates that graph validation is meant to assess.
+    candidates = page_level_rrf(fts_hits, vec_hits, k=k)
 
     graph_candidates: List[PageCandidate] = []
     if wiki_dir:
