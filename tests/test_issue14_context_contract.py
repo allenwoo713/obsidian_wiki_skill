@@ -92,6 +92,32 @@ def test_requested_scopes_use_repository_content_and_report_token_aware_fallback
     assert full.omitted_ranges
 
 
+def test_non_full_scope_over_budget_is_selected_with_explicit_truncation():
+    first = _candidate()
+    first.page_id = "first"
+    first.path = Path("Wiki/first.md")
+    first.sparse_evidence[0].text = "one two three"
+    first.dense_evidence = []
+    second = _candidate()
+    second.page_id = "second"
+    second.path = Path("Wiki/second.md")
+    second.sparse_evidence[0].text = "alpha beta gamma delta"
+    second.dense_evidence = []
+
+    bundle = assemble_context(
+        [first, second], scope="chunk", max_tokens=4,
+        token_counter=lambda text: len(text.split()),
+    )
+
+    item = next(item for item in bundle.items if item.page_id == "second")
+    assert item.text == "alpha"
+    assert item.truncated is True
+    assert item.truncation_reason == "token_limit"
+    assert item.omitted_ranges == [
+        {"start_char": len("alpha"), "end_char": len("alpha beta gamma delta"), "reason": "token_limit"}
+    ]
+
+
 def test_reservations_reflow_without_exceeding_global_cap():
     candidates = [_candidate() for _ in range(3)]
     for number, candidate in enumerate(candidates):
@@ -111,7 +137,7 @@ def test_reservations_reflow_without_exceeding_global_cap():
     [
         (98, ["dense-page", "graph-page"]),
         (99, ["dense-page", "graph-page"]),
-        (100, ["graph-page"]),
+        (100, ["dense-page", "graph-page"]),
     ],
 )
 def test_mixed_active_channel_reservations_reflow_after_minima_are_satisfied(
@@ -140,8 +166,10 @@ def test_mixed_active_channel_reservations_reflow_after_minima_are_satisfied(
     )
 
     assert [item.page_id for item in bundle.items] == expected_pages
-    assert bundle.token_count == (dense_tokens + 1 if dense_tokens <= 99 else 1)
+    assert bundle.token_count == min(dense_tokens + 1, 100)
     assert bundle.token_count <= bundle.max_context_tokens
+    dense_item = next(item for item in bundle.items if item.page_id == "dense-page")
+    assert dense_item.truncated is (dense_tokens == 100)
 
 
 def test_wiki_index_neighbors_follow_persisted_chunk_index_not_hash_id_order():
@@ -181,6 +209,53 @@ def test_wiki_index_neighbors_follow_persisted_chunk_index_not_hash_id_order():
     neighbors = RowBackedWikiIndex().get_neighbors("z-anchor")
 
     assert [hit.chunk_id for hit in neighbors] == ["m-before", "a-after"]
+
+
+def test_wiki_index_parent_section_follows_persisted_chunk_index_with_fallback():
+    rows = [
+        {
+            "chunk_id": "z-anchor", "chunk_index": 1, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "procedure",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "anchor",
+        },
+        {
+            "chunk_id": "a-after", "chunk_index": 2, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "procedure",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "after",
+        },
+        {
+            "chunk_id": "m-before", "chunk_index": 0, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "procedure",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "before",
+        },
+        {
+            "chunk_id": "b-legacy", "chunk_index": None, "page_id": "page-a",
+            "path": "Wiki/page-a.md", "title": "Page A", "page_type": "procedure",
+            "section_path": '["Install"]', "heading": "Install",
+            "chunk_kind": "dense", "text": "legacy",
+        },
+    ]
+
+    class RowBackedWikiIndex:
+        _sql = staticmethod(WikiIndex._sql)
+        _hit_from_row = WikiIndex._hit_from_row
+        get_parent_section = WikiIndex.get_parent_section
+
+        def get_chunk(self, chunk_id):
+            row = next(row for row in rows if row["chunk_id"] == chunk_id)
+            return self._hit_from_row(row, "fts")
+
+        def _rows_where(self, predicate):
+            return rows
+
+    section = RowBackedWikiIndex().get_parent_section("z-anchor")
+
+    assert [hit.chunk_id for hit in section] == [
+        "m-before", "z-anchor", "a-after", "b-legacy"
+    ]
 
 
 def test_rrf_collects_all_channel_evidence_for_one_page():

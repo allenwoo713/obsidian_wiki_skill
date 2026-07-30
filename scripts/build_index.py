@@ -1104,7 +1104,13 @@ class WikiIndex:
             return []
         rows = self._rows_where(f"page_id = '{self._sql(anchor.page_id)}'")
         hits = [self._hit_from_row(row, "fts") for row in rows]
-        return [hit for hit in hits if hit.section_path == anchor.section_path] or [anchor]
+        section_hits = [hit for hit in hits if hit.section_path == anchor.section_path] or [anchor]
+        section_hits.sort(key=lambda hit: (
+            hit.chunk_index is None,
+            hit.chunk_index if hit.chunk_index is not None else 0,
+            hit.chunk_id,
+        ))
+        return section_hits
 
     def get_page_sources(self, page_id: str) -> List[str]:
         page = self._page_by_id.get(page_id)

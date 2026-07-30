@@ -2,8 +2,8 @@
 import json
 from pathlib import Path
 
-from models import ChunkHit, PageCandidate
-from query import _validate_graph_candidates, graph_expand, hybrid_search
+from models import ChunkHit, GraphPath, PageCandidate
+from query import _merge_graph_candidates, _validate_graph_candidates, graph_expand, hybrid_search
 from query_plan_models import QueryPlan
 
 
@@ -112,6 +112,55 @@ def test_validation_requires_same_page_evidence_and_nonempty_text():
     validated = _validate_graph_candidates(index, graph_candidates, _plan("relation"))
     assert [candidate.page_id for candidate in validated] == ["supported"]
     assert validated[0].sparse_evidence and validated[0].sparse_evidence[0].chunk_id == "supported-chunk"
+
+
+def test_inferred_only_validation_requires_sparse_query_support_but_explicit_path_does_not():
+    class DenseOnlyIndex:
+        def search_page(self, page_id, plan):
+            hit = _hit(page_id, "unrelated same-page dense text")
+            hit.channel = "vector"
+            return [hit]
+
+    inferred = PageCandidate(
+        "inferred", Path("Wiki/inferred.md"), "Inferred", 0, None, None,
+        graph_paths=[GraphPath("seed", "inferred", "adamic_adar", True, .4, 1, ["adamic_adar"])],
+    )
+    explicit = PageCandidate(
+        "explicit", Path("Wiki/explicit.md"), "Explicit", 0, None, None,
+        graph_paths=[GraphPath("seed", "explicit", "direct_link", False, 1.0, 1, ["direct_link"])],
+    )
+
+    validated = _validate_graph_candidates(DenseOnlyIndex(), [inferred, explicit], _plan("relation"))
+
+    assert [candidate.page_id for candidate in validated] == ["explicit"]
+    assert validated[0].dense_evidence[0].text == "unrelated same-page dense text"
+
+
+def test_graph_provenance_and_evidence_merge_into_existing_direct_candidate():
+    direct = PageCandidate(
+        "target", Path("Wiki/target.md"), "Target", 1.0, 1, None,
+        sparse_evidence=[],
+        dense_evidence=[],
+    )
+    shared = _hit("target", "shared")
+    graph = PageCandidate(
+        "target", Path("Wiki/target.md"), "Target", 0.0, None, None,
+        sparse_evidence=[],
+        dense_evidence=[],
+        graph_paths=[
+            GraphPath("seed", "target", "direct_link", False, 1.0, 1, ["direct_link"])
+        ],
+    )
+    from models import EvidenceHit
+    evidence = EvidenceHit(shared.chunk_id, "sparse", 1, 1.0, shared.text, shared.section_path)
+    direct.sparse_evidence = [evidence]
+    graph.sparse_evidence = [evidence]
+
+    merged = _merge_graph_candidates([direct], [graph])
+
+    assert merged == [direct]
+    assert direct.graph_paths == graph.graph_paths
+    assert direct.sparse_evidence == [evidence]
 
 
 def test_retry_rebuilds_direct_page_seeds_and_only_merges_validated_graph_results(tmp_path):

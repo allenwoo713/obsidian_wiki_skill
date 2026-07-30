@@ -181,6 +181,9 @@ def _validate_graph_candidates(wi, graph_candidates: List[PageCandidate],
         return []
     for candidate in graph_candidates:
         hits = [hit for hit in search_page(candidate.page_id, plan) if hit.page_id == candidate.page_id and hit.text.strip()]
+        inferred_only = bool(candidate.graph_paths) and all(path.is_inferred for path in candidate.graph_paths)
+        if inferred_only:
+            hits = [hit for hit in hits if hit.channel == "fts"]
         if not hits:
             continue
         sparse, dense = [], []
@@ -194,6 +197,41 @@ def _validate_graph_candidates(wi, graph_candidates: List[PageCandidate],
         candidate.dense_evidence = dense
         validated.append(candidate)
     return validated
+
+
+def _merge_graph_candidates(direct_candidates: List[PageCandidate],
+                            graph_candidates: List[PageCandidate]) -> List[PageCandidate]:
+    """Merge validated graph provenance into direct candidates by page_id."""
+    merged = list(direct_candidates)
+    by_id = {candidate.page_id: candidate for candidate in merged}
+    for graph_candidate in graph_candidates:
+        direct = by_id.get(graph_candidate.page_id)
+        if direct is None:
+            merged.append(graph_candidate)
+            by_id[graph_candidate.page_id] = graph_candidate
+            continue
+
+        path_keys = {
+            (path.source_id, path.target_id, path.edge_type, path.is_inferred,
+             path.weight, path.hop, tuple(path.edge_signals))
+            for path in direct.graph_paths
+        }
+        for path in graph_candidate.graph_paths:
+            key = (path.source_id, path.target_id, path.edge_type, path.is_inferred,
+                   path.weight, path.hop, tuple(path.edge_signals))
+            if key not in path_keys:
+                direct.graph_paths.append(path)
+                path_keys.add(key)
+
+        for attr in ("sparse_evidence", "dense_evidence"):
+            evidence = getattr(direct, attr)
+            evidence_keys = {(hit.chunk_id, hit.channel) for hit in evidence}
+            for hit in getattr(graph_candidate, attr):
+                key = (hit.chunk_id, hit.channel)
+                if key not in evidence_keys:
+                    evidence.append(hit)
+                    evidence_keys.add(key)
+    return merged
 
 
 def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
@@ -222,11 +260,7 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("图谱扩展/验证失败: %s", exc)
 
-    by_id = {candidate.page_id: candidate for candidate in candidates}
-    for candidate in graph_candidates:
-        if candidate.page_id not in by_id:
-            by_id[candidate.page_id] = candidate
-    merged = list(by_id.values())
+    merged = _merge_graph_candidates(candidates, graph_candidates)
     merged.sort(key=lambda candidate: (candidate.rrf_score <= 0, -candidate.rrf_score))
     return fts_hits, vec_hits, candidates, merged, len(graph_candidates)
 

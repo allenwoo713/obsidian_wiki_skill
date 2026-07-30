@@ -183,7 +183,7 @@ def _truncate_to_budget(text: str, budget: int, token_counter):
         else:
             high = mid - 1
     prefix = text[:low].rstrip()
-    return prefix, True, [{"start_char": low, "end_char": len(text), "reason": "token_limit"}]
+    return prefix, True, [{"start_char": len(prefix), "end_char": len(text), "reason": "token_limit"}]
 
 
 def assemble_context(
@@ -233,9 +233,6 @@ def assemble_context(
 
     def admit(order, c, type_key, item_scope, evidence, text, item_sources, allowed):
         nonlocal used
-        original_tokens = token_counter(text)
-        if original_tokens > allowed and item_scope not in ("full_page", "full_source"):
-            return False
         selected_text, truncated, omitted_ranges = _truncate_to_budget(
             text, allowed, token_counter)
         tc = token_counter(selected_text) if selected_text else 0
