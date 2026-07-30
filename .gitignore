@@ -25,6 +25,9 @@ dist/
 models/
 .review-tmp/
 
+# GSD local planning state and quick-task artifacts are intentionally local.
+.planning/
+
 # Python 编译缓存
 __pycache__/
 *.pyc
