@@ -1031,6 +1031,40 @@ class WikiIndex:
             return []
         return [self._hit_from_row(r, "vector") for r in rows]
 
+    def search_page(self, page_id: str, plan, sparse_k: int = 20,
+                    dense_k: int = 20) -> List[ChunkHit]:
+        """Retrieve evidence under one page predicate on *both* retrieval paths.
+
+        This is intentionally the only graph-validation adapter: callers cannot
+        accidentally validate a graph recommendation with a similarly named
+        chunk from another page.
+        """
+        predicate = f"page_id = '{self._sql(page_id)}'"
+        out: List[ChunkHit] = []
+        terms = " ".join(list(plan.lexical_terms) + list(plan.exact_terms))
+        if terms.strip():
+            try:
+                rows = self._get_lance_table().search(terms, query_type="fts").where(predicate).limit(sparse_k).to_list()
+                out.extend(self._hit_from_row(row, "fts") for row in rows)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("restricted FTS failed: %s", exc)
+        try:
+            embedder = self._get_embedder()
+            for query in plan.semantic_queries:
+                vector = embedder.encode([query], show_progress_bar=False,
+                                          normalize_embeddings=NORMALIZE_EMBEDDINGS)[0].tolist()
+                rows = apply_vector_metric(self._get_lance_table().search(vector), VECTOR_METRIC).where(
+                    f"{predicate} AND chunk_kind = 'dense'").limit(dense_k).to_list()
+                out.extend(self._hit_from_row(row, "vector") for row in rows)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("restricted vector search failed: %s", exc)
+        best: Dict[tuple, ChunkHit] = {}
+        for hit in out:
+            key = (hit.chunk_id, hit.channel)
+            if hit.page_id == page_id and (key not in best or hit.score > best[key].score):
+                best[key] = hit
+        return list(best.values())
+
     # ---- Context repository port (issue #14) ----
     def _rows_where(self, predicate: str) -> List[dict]:
         """Small read-only adapter for context assembly; never exposes LanceDB to fusion."""

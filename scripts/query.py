@@ -32,7 +32,7 @@ torch.set_grad_enabled(False)
 
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 
-from models import PageCandidate, ContextBundle, ContextItem, GraphPath, ChunkHit
+from models import PageCandidate, ContextBundle, ContextItem, EvidenceHit, GraphPath, ChunkHit
 from fusion import page_level_rrf, assemble_context, render_context_markdown
 from query_planner import DefaultQueryPlanner
 from query_plan_models import (
@@ -126,10 +126,15 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
     for e in edges:
         s, t = e.get("source"), e.get("target")
         w = float(e.get("weight", 1.0))
-        etype = e.get("signal") or e.get("type") or "unknown"
-        is_inf = "inferred" in str(etype).lower() or etype in ("adamic_adar", "type_affinity")
-        neighbors.setdefault(s, []).append((t, w, etype, is_inf))
-        neighbors.setdefault(t, []).append((s, w, etype, is_inf))
+        signals = list(dict.fromkeys(e.get("signals") or [e.get("signal") or e.get("type") or "unknown"]))
+        etype = e.get("signal") or e.get("type") or signals[0]
+        # A mixed explicit/inferred edge remains explicit. It is inferred-only
+        # only when every serialized signal is an inference signal.
+        inferred_signals = {"adamic_adar", "type_affinity"}
+        is_inf = bool(signals) and all(str(signal).lower() in inferred_signals or "inferred" in str(signal).lower()
+                                       for signal in signals)
+        neighbors.setdefault(s, []).append((t, w, etype, is_inf, signals))
+        neighbors.setdefault(t, []).append((s, w, etype, is_inf, signals))
 
     expanded: List[PageCandidate] = []
     seen = set(seed_page_ids)
@@ -137,13 +142,14 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
     for h in range(hop):
         nxt = []
         for pid in frontier:
-            for (nbr, w, etype, is_inf) in neighbors.get(pid, []):
+            for (nbr, w, etype, is_inf, signals) in neighbors.get(pid, []):
                 if nbr in seen:
                     continue
                 seen.add(nbr)
                 n = nodes.get(nbr, {})
                 gp = GraphPath(source_id=pid, target_id=nbr, edge_type=etype,
-                                is_inferred=is_inf, weight=w, hop=h + 1)
+                                is_inferred=is_inf, weight=w, hop=h + 1,
+                                edge_signals=signals)
                 expanded.append(PageCandidate(
                     page_id=nbr,
                     path=Path(n.get("path", nbr)),
@@ -162,6 +168,63 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
         if len(expanded) >= k:
             break
     return expanded[:k]
+
+
+def _validate_graph_candidates(wi, graph_candidates: List[PageCandidate],
+                               plan: QueryPlan) -> List[PageCandidate]:
+    """Admit graph recommendations only after same-page textual validation."""
+    validated: List[PageCandidate] = []
+    search_page = getattr(wi, "search_page", None)
+    if search_page is None:
+        logger.warning("graph validation skipped: index lacks restricted retrieval adapter")
+        return []
+    for candidate in graph_candidates:
+        hits = [hit for hit in search_page(candidate.page_id, plan) if hit.page_id == candidate.page_id and hit.text.strip()]
+        if not hits:
+            continue
+        sparse, dense = [], []
+        for rank, hit in enumerate(hits, 1):
+            evidence = EvidenceHit(hit.chunk_id, "sparse" if hit.channel == "fts" else "dense",
+                                  rank, hit.score, hit.text, hit.section_path)
+            (sparse if hit.channel == "fts" else dense).append(evidence)
+        # Relation answers still retain explicit graph signals, but no signal
+        # (including an explicit one) substitutes for supporting page text.
+        candidate.sparse_evidence = sparse
+        candidate.dense_evidence = dense
+        validated.append(candidate)
+    return validated
+
+
+def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
+    """One complete retrieval/graph-validation pass, reusable for retries."""
+    fts_hits = wi.search_fts_terms(plan.lexical_terms, plan.exact_terms, k=20)
+    vec_hits: List[ChunkHit] = []
+    for semantic_query in plan.semantic_queries:
+        vec_hits.extend(wi.search_vector(semantic_query, k=20))
+    vec_hits = _dedup_chunk_hits(vec_hits)
+    candidates = page_level_rrf(fts_hits, vec_hits, k=k * 3)
+
+    graph_candidates: List[PageCandidate] = []
+    if wiki_dir:
+        try:
+            graph_file = wiki_dir.parent / ".index" / "graph.json"
+            graph_data = json.loads(graph_file.read_text(encoding="utf-8"))
+            direct_seeds = [candidate.page_id for candidate in candidates[:5]]
+            entity_seeds = _resolve_entity_seeds(graph_data, plan.entities)
+            seeds = list(dict.fromkeys(direct_seeds + entity_seeds))
+            if seeds:
+                graph_candidates = _validate_graph_candidates(
+                    wi, graph_expand(wi, seeds, wiki_dir, k=10, hop=1), plan)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("图谱扩展/验证失败: %s", exc)
+
+    by_id = {candidate.page_id: candidate for candidate in candidates}
+    for candidate in graph_candidates:
+        if candidate.page_id not in by_id:
+            by_id[candidate.page_id] = candidate
+    merged = list(by_id.values())
+    merged.sort(key=lambda candidate: (candidate.rrf_score <= 0, -candidate.rrf_score))
+    return fts_hits, vec_hits, candidates, merged
 
 
 def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> Optional[HybridResult]:
@@ -239,37 +302,7 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
             return gr
         logger.warning("global intent 但 community reports 未构建 (#10)；回退本地检索")
 
-    # 1) FTS：planner 通道专用词项
-    fts_hits = wi.search_fts_terms(plan.lexical_terms, plan.exact_terms, k=20)
-    # 2) 向量：多 semantic query 融合
-    vec_hits: List[ChunkHit] = []
-    for sq in plan.semantic_queries:
-        vec_hits.extend(wi.search_vector(sq, k=20))
-    vec_hits = _dedup_chunk_hits(vec_hits)
-
-    # 3) page-level RRF
-    candidates = page_level_rrf(fts_hits, vec_hits, k=k * 3)
-    top_ids = [c.page_id for c in candidates[:5]]
-
-    # 4) 图谱：由 planner 的 entities 解析 seed 后 1-hop 扩展（不在主 RRF 内）
-    graph_cands: List[PageCandidate] = []
-    if wiki_dir and plan.entities:
-        try:
-            import json as _json
-            gdata = _json.loads((wiki_dir.parent / ".index" / "graph.json").read_text(encoding="utf-8"))
-            seeds = _resolve_entity_seeds(gdata, plan.entities)
-            if seeds:
-                graph_cands = graph_expand(wi, seeds, wiki_dir, k=10, hop=1)
-        except (OSError, _json.JSONDecodeError) as e:
-            logger.warning("图谱实体扩展失败: %s", e)
-
-    # 5) 合并（图谱候选去重追加）
-    by_id = {c.page_id: c for c in candidates}
-    for gc in graph_cands:
-        if gc.page_id not in by_id:
-            by_id[gc.page_id] = gc
-    merged = list(by_id.values())
-    merged.sort(key=lambda c: (c.rrf_score <= 0, -c.rrf_score))
+    fts_hits, vec_hits, candidates, merged = _retrieve_for_plan(wi, plan, k, wiki_dir)
 
     # 6) 低召回重试（最多 1 次，issue #6）
     sparse_n, dense_n, ev_n = len(fts_hits), len(vec_hits), len(candidates)
@@ -279,18 +312,7 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                                      failure_reason="low_recall")
         plan2 = planner.plan_retry(plan, feedback, ctx)
         if plan2 is not None:
-            fts_hits2 = wi.search_fts_terms(plan2.lexical_terms, plan2.exact_terms, k=20)
-            vec_hits2: List[ChunkHit] = []
-            for sq in plan2.semantic_queries:
-                vec_hits2.extend(wi.search_vector(sq, k=20))
-            vec_hits2 = _dedup_chunk_hits(vec_hits2)
-            candidates2 = page_level_rrf(fts_hits2, vec_hits2, k=k * 3)
-            by_id2 = {c.page_id: c for c in candidates2}
-            for gc in graph_cands:
-                if gc.page_id not in by_id2:
-                    by_id2[gc.page_id] = gc
-            merged = list(by_id2.values())
-            merged.sort(key=lambda c: (c.rrf_score <= 0, -c.rrf_score))
+            fts_hits, vec_hits, candidates, merged = _retrieve_for_plan(wi, plan2, k, wiki_dir)
             plan = plan2
 
     # 7) 按 token 预算装配 ContextBundle（context_mode → mode/倍数）

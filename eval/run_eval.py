@@ -122,6 +122,8 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     latencies = []
     context_overflow = 0
     graph_only_unsupported = 0
+    graph_trigger_queries = 0
+    graph_trigger_validated = 0
     bundle_tokens = []
     detail = []
 
@@ -164,6 +166,11 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         # Context overflow：最终上下文超出 max_tokens（assemble_context 已截断 → 应恒 0）
         if res.bundle.token_count > max_tokens:
             context_overflow += 1
+        if q.get("graph_trigger"):
+            graph_trigger_queries += 1
+            graph_trigger_validated += sum(
+                1 for item in res.bundle.items if item.inclusion_reason == "graph_expansion"
+            )
         for it in res.bundle.items:
             if it.inclusion_reason == "graph_expansion" and not it.evidence:
                 graph_only_unsupported += 1
@@ -219,6 +226,8 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "ann_recall_at_10": round(statistics.mean(ann_recalls), 4) if ann_recalls else None,
             "context_overflow_count": context_overflow,
             "graph_only_unsupported_count": graph_only_unsupported,
+            "graph_trigger_query_count": graph_trigger_queries,
+            "graph_trigger_validated_count": graph_trigger_validated,
         },
         "performance": {
             "full_build_time_s": round(build_time, 2),
@@ -329,6 +338,8 @@ def main():
         failures.append(f"context_overflow_count={mq['context_overflow_count']} > 0")
     if mq["graph_only_unsupported_count"] > 0:
         failures.append(f"graph_only_unsupported_count={mq['graph_only_unsupported_count']} > 0")
+    if mq.get("graph_trigger_query_count", 0) <= 0 or mq.get("graph_trigger_validated_count", 0) <= 0:
+        failures.append("graph trigger fixture did not produce a validated graph result")
     if mq["ann_recall_at_10"] is not None and mq["ann_recall_at_10"] < 0.98:
         failures.append(f"ann_recall_at_10={mq['ann_recall_at_10']:.4f} < 0.98")
 
