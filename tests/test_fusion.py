@@ -79,10 +79,10 @@ def test_assemble_context_full_mode_reads_page():
 
 
 def test_assemble_context_per_type_budget_enforced():
-    """issue #3：四路预算独立强制——dense 不应挤占 image/page/graph 配额。"""
+    """Channel minima protect image admission; unused capacity then reflows."""
     from models import PageCandidate, EvidenceHit
-    # 20 个 dense 候选，每个 500 字 → ~125 token；max_tokens=2000 → dense_budget=1200
-    # 最多纳入 9 个（9*125=1125 ≤ 1200，第 10 个 1250 > 1200 省略）
+    # 20 个 dense 候选，每个 500 字 → ~125 token；max_tokens=2000。
+    # Dense initially gets a 1200-token minimum, then may use the shared remainder.
     dense = [
         PageCandidate(
             page_id=f"d{i}", path=Path(f"/wiki/d{i}.md"), title=f"D{i}",
@@ -99,12 +99,12 @@ def test_assemble_context_per_type_budget_enforced():
     bundle = assemble_context(dense + [img], wi=None, mode="snippet", max_tokens=2000)
     dense_items = [i for i in bundle.items if i.inclusion_reason == "rrf"]
     image_items = [i for i in bundle.items if i.inclusion_reason == "image"]
-    # dense 被预算截断（远少于 20），且不超过 dense_budget 允许的上限
+    # Dense cannot displace the image minimum, but may use the shared remainder.
     assert len(dense_items) < 20
-    assert len(dense_items) <= 9
-    assert sum(i.token_count for i in dense_items) <= 1200
+    assert len(dense_items) > 9
     # image 仍纳入（独立预算，未被 dense 挤占）
     assert len(image_items) == 1
+    assert bundle.token_count <= bundle.max_context_tokens
     # 省略原因标明 dense_budget_exhausted
     omitted_reasons = [o["reason"] for o in bundle.omitted_items]
     assert any("dense_budget_exhausted" in r for r in omitted_reasons)

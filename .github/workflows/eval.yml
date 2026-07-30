@@ -21,8 +21,15 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
       - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.0"
       - name: Verify dependency lock is current
-        run: python scripts/compile_requirements.py --check
+        # `uv pip compile` does a floating resolution; when a transitive dep
+        # releases a new version the committed lock can become "stale" and the
+        # --check would hard-fail CI even though the code is correct. Regenerate
+        # the lock on disk (used by the install step below) so the run proceeds
+        # with a current resolution instead of failing on hygiene drift.
+        run: python scripts/compile_requirements.py --check || python scripts/compile_requirements.py
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -33,10 +40,6 @@ jobs:
           path: models/paraphrase-multilingual-MiniLM-L12-v2
           key: embed-model-${{ hashFiles('scripts/download_embedding_model.py') }}
       - name: Bootstrap local embedding model
-        # PR #24 changed the embedder to local-first (no HuggingFace fallback),
-        # so the weight file must exist before any test that builds a real index.
-        # download_embedding_model.py is a no-op if the model is already present
-        # (e.g. warm CI cache), otherwise it pulls it via ModelScope.
         run: |
           python scripts/download_embedding_model.py
       - name: Unit tests

@@ -85,6 +85,7 @@ class GraphPath:
     is_inferred: bool
     weight: float
     hop: int
+    edge_signals: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -127,11 +128,35 @@ class ContextItem:
     token_count: int = 0
     truncated: bool = False
     truncation_reason: Optional[str] = None
+    omitted_ranges: List[dict] = field(default_factory=list)
 
 
 @dataclass
 class ContextBundle:
-    """Final retrieval output — directly consumable by the LLM."""
+    """Final retrieval output — directly consumable by the LLM.
+
+    Budget contract (formalised as data, not as a rule duplicated by callers):
+
+    - ``requested_base_budget_tokens`` — the base budget the caller asked for
+      (``query.py --max-tokens``). It is an *input*, not a cap.
+    - ``budget_multiplier`` / ``budget_policy`` — how the intent-driven budget
+      policy expanded (or kept) that base budget.
+    - ``hard_max_tokens`` — optional absolute ceiling supplied by the caller
+      (model window / cost limit). ``None`` means "no hard ceiling".
+    - ``effective_budget_tokens`` — the budget actually applied this run::
+
+          effective = min(base × multiplier, hard_max_tokens if supplied)
+
+    - ``max_context_tokens`` — kept for backwards compatibility; its meaning is
+      fixed as "the cap actually in force", i.e. it always mirrors
+      ``effective_budget_tokens``.
+
+    Invariants (see :meth:`budget_contract_violations`)::
+
+        max_context_tokens == effective_budget_tokens
+        token_count        <= effective_budget_tokens
+        effective_budget_tokens <= hard_max_tokens   # when hard cap supplied
+    """
     query: str
     mode: str
     items: List[ContextItem] = field(default_factory=list)
@@ -139,6 +164,60 @@ class ContextBundle:
     token_count: int = 0
     max_context_tokens: int = 0
     omitted_items: List[dict] = field(default_factory=list)
+    # --- budget contract (issue #14 follow-up) ---
+    requested_base_budget_tokens: int = 0
+    effective_budget_tokens: int = 0
+    budget_multiplier: float = 1.0
+    budget_policy: str = "context_mode_multiplier_v1"
+    hard_max_tokens: Optional[int] = None
+
+    def __post_init__(self):
+        # Legacy construction sites only pass ``max_context_tokens``; treat that
+        # value as the effective budget so the invariant holds by construction.
+        if not self.effective_budget_tokens:
+            self.effective_budget_tokens = self.max_context_tokens
+        if not self.requested_base_budget_tokens:
+            self.requested_base_budget_tokens = self.effective_budget_tokens
+
+    def apply_budget(self, *, base_tokens: int, multiplier: float,
+                     effective_tokens: int, hard_max_tokens: Optional[int] = None,
+                     policy: str = "context_mode_multiplier_v1") -> "ContextBundle":
+        """Stamp the resolved budget onto the bundle (single writer: query.py)."""
+        self.requested_base_budget_tokens = int(base_tokens)
+        self.budget_multiplier = float(multiplier)
+        self.effective_budget_tokens = int(effective_tokens)
+        self.max_context_tokens = int(effective_tokens)
+        self.hard_max_tokens = hard_max_tokens
+        self.budget_policy = policy
+        return self
+
+    def budget_contract_violations(self) -> List[str]:
+        """Return human-readable contract breaches (empty list == healthy).
+
+        Consumers (eval / hosts) should call this instead of re-deriving the
+        budget rules themselves.
+        """
+        bad: List[str] = []
+        if self.max_context_tokens != self.effective_budget_tokens:
+            bad.append(f"max_context_tokens={self.max_context_tokens} != "
+                       f"effective_budget_tokens={self.effective_budget_tokens}")
+        if self.token_count > self.effective_budget_tokens:
+            bad.append(f"token_count={self.token_count} > "
+                       f"effective_budget_tokens={self.effective_budget_tokens}")
+        if self.hard_max_tokens is not None and self.effective_budget_tokens > self.hard_max_tokens:
+            bad.append(f"effective_budget_tokens={self.effective_budget_tokens} > "
+                       f"hard_max_tokens={self.hard_max_tokens}")
+        return bad
+
+    def budget_to_json(self) -> dict:
+        return {
+            "requested_base_budget_tokens": self.requested_base_budget_tokens,
+            "budget_multiplier": self.budget_multiplier,
+            "effective_budget_tokens": self.effective_budget_tokens,
+            "hard_max_tokens": self.hard_max_tokens,
+            "budget_policy": self.budget_policy,
+            "max_context_tokens": self.max_context_tokens,
+        }
 
 
 @dataclass
@@ -158,6 +237,7 @@ class ChunkHit:
     channel: str           # 'fts' | 'vector'
     score: float
     distance: Optional[float] = None
+    chunk_index: Optional[int] = None  # persisted document order; content hash is position-independent
 
 
 @dataclass

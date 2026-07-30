@@ -32,7 +32,7 @@ torch.set_grad_enabled(False)
 
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 
-from models import PageCandidate, ContextBundle, ContextItem, GraphPath, ChunkHit
+from models import PageCandidate, ContextBundle, ContextItem, EvidenceHit, GraphPath, ChunkHit
 from fusion import page_level_rrf, assemble_context, render_context_markdown
 from query_planner import DefaultQueryPlanner
 from query_plan_models import (
@@ -41,15 +41,44 @@ from query_plan_models import (
 
 logger = logging.getLogger(__name__)
 
-# planner.context_mode → (ContextBundle mode, token 预算倍数)
+# ---------------------------------------------------------------------------
+# 预算策略（budget policy）
+#
+# 契约：effective = min(base × multiplier, hard_max_tokens if supplied)
+#   base       = 调用方给的 --max-tokens（基础预算，不是最终上限）
+#   multiplier = planner.context_mode → 倍率（下表；显式 --mode 覆盖时恒为 1.0）
+#   hard_max   = 调用方的绝对上限（模型窗口 / 成本约束），可选
+#
+# 预算由 hybrid_search() 唯一决定，并通过 ContextBundle 的 budget 字段对外暴露；
+# 任何下游（eval / 宿主）都不得复制本表，只能读 bundle.effective_budget_tokens。
+# ---------------------------------------------------------------------------
+BUDGET_POLICY = "context_mode_multiplier_v1"
+
+# planner.context_mode → (ContextBundle mode, token 预算倍率)
 _CONTEXT_MODE_MAP = {
     "section": ("snippet", 1.0),
     "parent_section": ("snippet", 1.0),
-    "multiple_sections": ("snippet", 1.4),
+    "multiple_sections": ("snippet", 1.4),   # comparison：需并列多个 section
     "evidence": ("snippet", 1.0),
     "chunk": ("snippet", 1.0),
     "global": ("summary", 1.0),
 }
+
+
+def resolve_budget(context_mode: str, base_tokens: int,
+                   mode_override: Optional[str] = None,
+                   hard_max_tokens: Optional[int] = None):
+    """把 (context_mode, 基础预算, 硬上限) 解析成本次实际生效的预算。
+
+    返回 ``(mode, multiplier, planned_tokens, effective_tokens)``。
+    """
+    mode, mult = _CONTEXT_MODE_MAP.get(context_mode, ("snippet", 1.0))
+    if mode_override:
+        # 调用方显式指定展开粒度 → 意图倍率失效，按基础预算执行
+        mode, mult = mode_override, 1.0
+    planned = int(base_tokens * mult)
+    effective = min(planned, int(hard_max_tokens)) if hard_max_tokens else planned
+    return mode, mult, planned, effective
 
 
 @dataclass
@@ -60,6 +89,7 @@ class HybridResult:
     candidates: List[PageCandidate] = field(default_factory=list)
     text_items: List[ContextItem] = field(default_factory=list)
     image_items: List[ContextItem] = field(default_factory=list)
+    graph_validated_count: int = 0
 
 
 def _split_text_image(items: List[ContextItem]):
@@ -126,10 +156,15 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
     for e in edges:
         s, t = e.get("source"), e.get("target")
         w = float(e.get("weight", 1.0))
-        etype = e.get("signal") or e.get("type") or "unknown"
-        is_inf = "inferred" in str(etype).lower() or etype in ("adamic_adar", "type_affinity")
-        neighbors.setdefault(s, []).append((t, w, etype, is_inf))
-        neighbors.setdefault(t, []).append((s, w, etype, is_inf))
+        signals = list(dict.fromkeys(e.get("signals") or [e.get("signal") or e.get("type") or "unknown"]))
+        etype = e.get("signal") or e.get("type") or signals[0]
+        # A mixed explicit/inferred edge remains explicit. It is inferred-only
+        # only when every serialized signal is an inference signal.
+        inferred_signals = {"adamic_adar", "type_affinity"}
+        is_inf = bool(signals) and all(str(signal).lower() in inferred_signals or "inferred" in str(signal).lower()
+                                       for signal in signals)
+        neighbors.setdefault(s, []).append((t, w, etype, is_inf, signals))
+        neighbors.setdefault(t, []).append((s, w, etype, is_inf, signals))
 
     expanded: List[PageCandidate] = []
     seen = set(seed_page_ids)
@@ -137,13 +172,14 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
     for h in range(hop):
         nxt = []
         for pid in frontier:
-            for (nbr, w, etype, is_inf) in neighbors.get(pid, []):
+            for (nbr, w, etype, is_inf, signals) in neighbors.get(pid, []):
                 if nbr in seen:
                     continue
                 seen.add(nbr)
                 n = nodes.get(nbr, {})
                 gp = GraphPath(source_id=pid, target_id=nbr, edge_type=etype,
-                                is_inferred=is_inf, weight=w, hop=h + 1)
+                                is_inferred=is_inf, weight=w, hop=h + 1,
+                                edge_signals=signals)
                 expanded.append(PageCandidate(
                     page_id=nbr,
                     path=Path(n.get("path", nbr)),
@@ -162,6 +198,100 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
         if len(expanded) >= k:
             break
     return expanded[:k]
+
+
+def _validate_graph_candidates(wi, graph_candidates: List[PageCandidate],
+                               plan: QueryPlan) -> List[PageCandidate]:
+    """Admit graph recommendations only after same-page textual validation."""
+    validated: List[PageCandidate] = []
+    search_page = getattr(wi, "search_page", None)
+    if search_page is None:
+        logger.warning("graph validation skipped: index lacks restricted retrieval adapter")
+        return []
+    for candidate in graph_candidates:
+        hits = [hit for hit in search_page(candidate.page_id, plan) if hit.page_id == candidate.page_id and hit.text.strip()]
+        inferred_only = bool(candidate.graph_paths) and all(path.is_inferred for path in candidate.graph_paths)
+        if inferred_only:
+            hits = [hit for hit in hits if hit.channel == "fts"]
+        if not hits:
+            continue
+        sparse, dense = [], []
+        for rank, hit in enumerate(hits, 1):
+            evidence = EvidenceHit(hit.chunk_id, "sparse" if hit.channel == "fts" else "dense",
+                                  rank, hit.score, hit.text, hit.section_path)
+            (sparse if hit.channel == "fts" else dense).append(evidence)
+        # Relation answers still retain explicit graph signals, but no signal
+        # (including an explicit one) substitutes for supporting page text.
+        candidate.sparse_evidence = sparse
+        candidate.dense_evidence = dense
+        validated.append(candidate)
+    return validated
+
+
+def _merge_graph_candidates(direct_candidates: List[PageCandidate],
+                            graph_candidates: List[PageCandidate]) -> List[PageCandidate]:
+    """Merge validated graph provenance into direct candidates by page_id."""
+    merged = list(direct_candidates)
+    by_id = {candidate.page_id: candidate for candidate in merged}
+    for graph_candidate in graph_candidates:
+        direct = by_id.get(graph_candidate.page_id)
+        if direct is None:
+            merged.append(graph_candidate)
+            by_id[graph_candidate.page_id] = graph_candidate
+            continue
+
+        path_keys = {
+            (path.source_id, path.target_id, path.edge_type, path.is_inferred,
+             path.weight, path.hop, tuple(path.edge_signals))
+            for path in direct.graph_paths
+        }
+        for path in graph_candidate.graph_paths:
+            key = (path.source_id, path.target_id, path.edge_type, path.is_inferred,
+                   path.weight, path.hop, tuple(path.edge_signals))
+            if key not in path_keys:
+                direct.graph_paths.append(path)
+                path_keys.add(key)
+
+        for attr in ("sparse_evidence", "dense_evidence"):
+            evidence = getattr(direct, attr)
+            evidence_keys = {(hit.chunk_id, hit.channel) for hit in evidence}
+            for hit in getattr(graph_candidate, attr):
+                key = (hit.chunk_id, hit.channel)
+                if key not in evidence_keys:
+                    evidence.append(hit)
+                    evidence_keys.add(key)
+    return merged
+
+
+def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
+    """One complete retrieval/graph-validation pass, reusable for retries."""
+    fts_hits = wi.search_fts_terms(plan.lexical_terms, plan.exact_terms, k=20)
+    vec_hits: List[ChunkHit] = []
+    for semantic_query in plan.semantic_queries:
+        vec_hits.extend(wi.search_vector(semantic_query, k=20))
+    vec_hits = _dedup_chunk_hits(vec_hits)
+    # Keep enough direct RRF hits to seed graph expansion, while preserving the
+    # requested direct-result count as a separate post-RRF channel.
+    direct_candidates = page_level_rrf(fts_hits, vec_hits, k=max(k, 5))
+    candidates = direct_candidates[:k]
+
+    graph_candidates: List[PageCandidate] = []
+    if wiki_dir:
+        try:
+            graph_file = wiki_dir.parent / ".index" / "graph.json"
+            graph_data = json.loads(graph_file.read_text(encoding="utf-8"))
+            direct_seeds = [candidate.page_id for candidate in direct_candidates[:5]]
+            entity_seeds = _resolve_entity_seeds(graph_data, plan.entities)
+            seeds = list(dict.fromkeys(direct_seeds + entity_seeds))
+            if seeds:
+                graph_candidates = _validate_graph_candidates(
+                    wi, graph_expand(wi, seeds, wiki_dir, k=10, hop=1), plan)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("图谱扩展/验证失败: %s", exc)
+
+    merged = _merge_graph_candidates(candidates, graph_candidates)
+    merged.sort(key=lambda candidate: (candidate.rrf_score <= 0, -candidate.rrf_score))
+    return fts_hits, vec_hits, candidates, merged, len(graph_candidates)
 
 
 def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> Optional[HybridResult]:
@@ -220,7 +350,9 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                   context: Optional[PlannerContext] = None,
                   k: int = 5, max_tokens: int = 4096, wiki_dir: Optional[Path] = None,
                   intent_override: str = "auto", rewrite_override: str = "auto",
-                  mode_override: Optional[str] = None) -> HybridResult:
+                  mode_override: Optional[str] = None,
+                  hard_max_tokens: Optional[int] = None) -> HybridResult:
+    """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。"""
     ctx = context or PlannerContext()
     plan = planner.plan(original_query, ctx)
     if intent_override not in (None, "auto"):
@@ -234,42 +366,17 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
 
     # global intent → issue #10 路由（占位）
     if plan.intent == QueryIntent.GLOBAL.value:
-        gr = _global_retrieve(wi, plan, k, max_tokens)
+        _, g_mult, _, g_eff = resolve_budget(plan.context_mode, max_tokens,
+                                             mode_override, hard_max_tokens)
+        gr = _global_retrieve(wi, plan, k, g_eff)
         if gr is not None:
+            gr.bundle.apply_budget(base_tokens=max_tokens, multiplier=g_mult,
+                                   effective_tokens=g_eff, hard_max_tokens=hard_max_tokens,
+                                   policy=BUDGET_POLICY)
             return gr
         logger.warning("global intent 但 community reports 未构建 (#10)；回退本地检索")
 
-    # 1) FTS：planner 通道专用词项
-    fts_hits = wi.search_fts_terms(plan.lexical_terms, plan.exact_terms, k=20)
-    # 2) 向量：多 semantic query 融合
-    vec_hits: List[ChunkHit] = []
-    for sq in plan.semantic_queries:
-        vec_hits.extend(wi.search_vector(sq, k=20))
-    vec_hits = _dedup_chunk_hits(vec_hits)
-
-    # 3) page-level RRF
-    candidates = page_level_rrf(fts_hits, vec_hits, k=k * 3)
-    top_ids = [c.page_id for c in candidates[:5]]
-
-    # 4) 图谱：由 planner 的 entities 解析 seed 后 1-hop 扩展（不在主 RRF 内）
-    graph_cands: List[PageCandidate] = []
-    if wiki_dir and plan.entities:
-        try:
-            import json as _json
-            gdata = _json.loads((wiki_dir.parent / ".index" / "graph.json").read_text(encoding="utf-8"))
-            seeds = _resolve_entity_seeds(gdata, plan.entities)
-            if seeds:
-                graph_cands = graph_expand(wi, seeds, wiki_dir, k=10, hop=1)
-        except (OSError, _json.JSONDecodeError) as e:
-            logger.warning("图谱实体扩展失败: %s", e)
-
-    # 5) 合并（图谱候选去重追加）
-    by_id = {c.page_id: c for c in candidates}
-    for gc in graph_cands:
-        if gc.page_id not in by_id:
-            by_id[gc.page_id] = gc
-    merged = list(by_id.values())
-    merged.sort(key=lambda c: (c.rrf_score <= 0, -c.rrf_score))
+    fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan, k, wiki_dir)
 
     # 6) 低召回重试（最多 1 次，issue #6）
     sparse_n, dense_n, ev_n = len(fts_hits), len(vec_hits), len(candidates)
@@ -279,31 +386,22 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                                      failure_reason="low_recall")
         plan2 = planner.plan_retry(plan, feedback, ctx)
         if plan2 is not None:
-            fts_hits2 = wi.search_fts_terms(plan2.lexical_terms, plan2.exact_terms, k=20)
-            vec_hits2: List[ChunkHit] = []
-            for sq in plan2.semantic_queries:
-                vec_hits2.extend(wi.search_vector(sq, k=20))
-            vec_hits2 = _dedup_chunk_hits(vec_hits2)
-            candidates2 = page_level_rrf(fts_hits2, vec_hits2, k=k * 3)
-            by_id2 = {c.page_id: c for c in candidates2}
-            for gc in graph_cands:
-                if gc.page_id not in by_id2:
-                    by_id2[gc.page_id] = gc
-            merged = list(by_id2.values())
-            merged.sort(key=lambda c: (c.rrf_score <= 0, -c.rrf_score))
+            fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan2, k, wiki_dir)
             plan = plan2
 
-    # 7) 按 token 预算装配 ContextBundle（context_mode → mode/倍数）
-    mode, mult = _CONTEXT_MODE_MAP.get(plan.context_mode, ("snippet", 1.0))
-    if mode_override:
-        mode = mode_override
-        mult = 1.0
-    eff_tokens = int(max_tokens * mult)
-    bundle = assemble_context(merged, wi, mode=mode, max_tokens=eff_tokens,
+    # 7) 按 token 预算装配 ContextBundle（预算策略：context_mode → mode/倍率 + 硬上限）
+    mode, mult, _planned, eff_tokens = resolve_budget(
+        plan.context_mode, max_tokens, mode_override, hard_max_tokens)
+    bundle = assemble_context(merged, repository=wi, mode=mode,
+                              scope=("full_page" if mode == "full" else plan.context_mode), max_tokens=eff_tokens,
                               token_counter=wi.count_tokens)
+    bundle.apply_budget(base_tokens=max_tokens, multiplier=mult,
+                        effective_tokens=eff_tokens, hard_max_tokens=hard_max_tokens,
+                        policy=BUDGET_POLICY)
     text_items, image_items = _split_text_image(bundle.items)
     return HybridResult(query=original_query, bundle=bundle, plan=plan,
-                        candidates=merged, text_items=text_items, image_items=image_items)
+                        candidates=merged, text_items=text_items, image_items=image_items,
+                        graph_validated_count=graph_validated_count)
 
 
 def format_for_agent(result: HybridResult) -> str:
@@ -327,9 +425,21 @@ def result_to_json(result: HybridResult) -> dict:
             "score": round(rrf.get(it.page_id, 0.0), 6),
             "snippet": it.text,
             "sources": it.sources,
+            "evidence": [{
+                "chunk_id": hit.chunk_id, "channel": hit.channel, "rank": hit.rank,
+                "raw_score": hit.raw_score, "section_path": hit.section_path,
+            } for hit in it.evidence],
+            "graph_paths": [{
+                "source_id": path.source_id, "target_id": path.target_id,
+                "edge_type": path.edge_type, "edge_signals": path.edge_signals,
+                "is_inferred": path.is_inferred, "weight": path.weight, "hop": path.hop,
+            } for path in it.graph_paths],
             "method": it.inclusion_reason,
             "scope": it.scope,
             "tokens": it.token_count,
+            "truncated": it.truncated,
+            "truncation_reason": it.truncation_reason,
+            "omitted_ranges": it.omitted_ranges,
             "embed": f"![[{Path(it.path).name}]]" if "assets/" in ps else None,
         }
 
@@ -338,7 +448,9 @@ def result_to_json(result: HybridResult) -> dict:
         "query_plan": result.plan.to_json(),
         "mode": result.bundle.mode,
         "token_count": result.bundle.token_count,
-        "max_context_tokens": result.bundle.max_context_tokens,
+        # 预算契约：调用 LLM 前应按 effective_budget_tokens 预留上下文，
+        # 而不是想当然认为等于 requested_base_budget_tokens。
+        **result.bundle.budget_to_json(),
         "text": [item_entry(it) for it in result.text_items],
         "images": [item_entry(it) for it in result.image_items],
         "omitted": result.bundle.omitted_items,
@@ -353,7 +465,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/ 与 .index/）")
     p.add_argument("query", help="用户本轮原始问题（原样传入，禁止调用前改写/拼接关键词）")
     p.add_argument("--k", type=int, default=5, help="返回 top-K 页面（默认 5）")
-    p.add_argument("--max-tokens", type=int, default=4096, help="ContextBundle token 预算上限（默认 4096）")
+    p.add_argument("--max-tokens", type=int, default=4096,
+                   help="基础 token 预算（默认 4096）。最终上限 = 基础预算 × 意图倍率"
+                        "（comparison→multiple_sections→1.4×，其余 1.0×），"
+                        "见输出的 effective_budget_tokens")
+    p.add_argument("--hard-max-tokens", type=int, default=None,
+                   help="硬上限：最终 ContextBundle 绝不超过该值（模型窗口/成本约束）；"
+                        "effective = min(基础预算 × 倍率, 硬上限)")
     p.add_argument("--mode", choices=["summary", "snippet", "full"], default=None,
                    help="展开粒度覆盖（默认由 QueryPlanner.context_mode 决定）：summary/snippet/full")
     p.add_argument("--intent", default="auto",
@@ -409,6 +527,7 @@ def main():
     result = hybrid_search(
         wi, args.query, planner, ctx,
         k=args.k, max_tokens=args.max_tokens,
+        hard_max_tokens=args.hard_max_tokens,
         wiki_dir=proj / "Wiki",
         intent_override=args.intent,
         rewrite_override=args.rewrite,

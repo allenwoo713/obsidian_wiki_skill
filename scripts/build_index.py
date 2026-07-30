@@ -91,6 +91,16 @@ _FM_RE = re.compile(r"^---\n(.*?)\n---\n(.*)$", re.DOTALL)
 _LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 
+def _read_page_content(path: Path) -> str:
+    """Read complete Markdown body for the read-only ContextRepository port."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = _FM_RE.match(raw)
+    return (match.group(2) if match else raw).strip()
+
+
 def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
     raw = path.read_text(encoding="utf-8", errors="replace")
     m = _FM_RE.match(raw)
@@ -1021,6 +1031,95 @@ class WikiIndex:
             return []
         return [self._hit_from_row(r, "vector") for r in rows]
 
+    def search_page(self, page_id: str, plan, sparse_k: int = 20,
+                    dense_k: int = 20) -> List[ChunkHit]:
+        """Retrieve evidence under one page predicate on *both* retrieval paths.
+
+        This is intentionally the only graph-validation adapter: callers cannot
+        accidentally validate a graph recommendation with a similarly named
+        chunk from another page.
+        """
+        predicate = f"page_id = '{self._sql(page_id)}'"
+        out: List[ChunkHit] = []
+        terms = " ".join(list(plan.lexical_terms) + list(plan.exact_terms))
+        if terms.strip():
+            try:
+                rows = self._get_lance_table().search(terms, query_type="fts").where(predicate).limit(sparse_k).to_list()
+                out.extend(self._hit_from_row(row, "fts") for row in rows)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("restricted FTS failed: %s", exc)
+        try:
+            embedder = self._get_embedder()
+            for query in plan.semantic_queries:
+                vector = embedder.encode([query], show_progress_bar=False,
+                                          normalize_embeddings=NORMALIZE_EMBEDDINGS)[0].tolist()
+                rows = apply_vector_metric(self._get_lance_table().search(vector), VECTOR_METRIC).where(
+                    f"{predicate} AND chunk_kind = 'dense'").limit(dense_k).to_list()
+                out.extend(self._hit_from_row(row, "vector") for row in rows)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("restricted vector search failed: %s", exc)
+        best: Dict[tuple, ChunkHit] = {}
+        for hit in out:
+            key = (hit.chunk_id, hit.channel)
+            if hit.page_id == page_id and (key not in best or hit.score > best[key].score):
+                best[key] = hit
+        return list(best.values())
+
+    # ---- Context repository port (issue #14) ----
+    def _rows_where(self, predicate: str) -> List[dict]:
+        """Small read-only adapter for context assembly; never exposes LanceDB to fusion."""
+        try:
+            return self._get_lance_table().search().where(predicate).to_list()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("context repository read failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _sql(value: str) -> str:
+        return str(value).replace("'", "''")
+
+    def get_chunk(self, chunk_id: str) -> Optional[ChunkHit]:
+        rows = self._rows_where(f"chunk_id = '{self._sql(chunk_id)}'")
+        return self._hit_from_row(rows[0], "fts") if rows else None
+
+    def get_neighbors(self, chunk_id: str) -> List[ChunkHit]:
+        anchor = self.get_chunk(chunk_id)
+        if anchor is None:
+            return []
+        rows = self._rows_where(f"page_id = '{self._sql(anchor.page_id)}' AND chunk_kind = 'dense'")
+        hits = [self._hit_from_row(row, "fts") for row in rows]
+        hits.sort(key=lambda hit: (
+            hit.chunk_index is None,
+            hit.chunk_index if hit.chunk_index is not None else 0,
+            hit.chunk_id,
+        ))
+        for pos, hit in enumerate(hits):
+            if hit.chunk_id == chunk_id:
+                return hits[max(0, pos - 1):pos] + hits[pos + 1:pos + 2]
+        return []
+
+    def get_parent_section(self, chunk_id: str) -> List[ChunkHit]:
+        anchor = self.get_chunk(chunk_id)
+        if anchor is None:
+            return []
+        rows = self._rows_where(f"page_id = '{self._sql(anchor.page_id)}'")
+        hits = [self._hit_from_row(row, "fts") for row in rows]
+        section_hits = [hit for hit in hits if hit.section_path == anchor.section_path] or [anchor]
+        section_hits.sort(key=lambda hit: (
+            hit.chunk_index is None,
+            hit.chunk_index if hit.chunk_index is not None else 0,
+            hit.chunk_id,
+        ))
+        return section_hits
+
+    def get_page_sources(self, page_id: str) -> List[str]:
+        page = self._page_by_id.get(page_id)
+        return list(page.sources) if page else []
+
+    def read_page(self, page_id: str) -> str:
+        page = self._page_by_id.get(page_id)
+        return _read_page_content(page.path) if page else ""
+
     def search(self, query: str, k: int = 5) -> List[PageCandidate]:
         """端到端：chunk 级 FTS + 向量 → page-level RRF → 返回 PageCandidate。"""
         from fusion import page_level_rrf
@@ -1045,6 +1144,7 @@ class WikiIndex:
             section_path=json.loads(r.get("section_path") or "[]"),
             heading=r.get("heading", ""), chunk_kind=r["chunk_kind"],
             text=r["text"], channel=channel, score=score, distance=distance,
+            chunk_index=(int(r["chunk_index"]) if r.get("chunk_index") is not None else None),
         )
 
 
