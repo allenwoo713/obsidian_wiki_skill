@@ -19,15 +19,18 @@ import threading
 import unicodedata
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from query_plan_models import (
     QueryIntent,
     QueryPlan,
     PlannerContext,
+    PlannerWarning,
     RetrievalFeedback,
     NullRewriteProvider,
+    EntityCatalog,
+    ResolvedEntity,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,9 +77,11 @@ class DefaultQueryPlanner:
 
     def __init__(self, project_root: Optional[Path] = None,
                  rewrite_provider: Optional[Any] = None,
-                 config: Optional[Dict[str, Any]] = None):
+                 config: Optional[Dict[str, Any]] = None,
+                 entity_catalog: Optional[EntityCatalog] = None):
         self.project_root = Path(project_root) if project_root else None
         self.rewrite_provider = rewrite_provider or NullRewriteProvider()
+        self.entity_catalog = entity_catalog or InMemoryEntityCatalog()
         self.config: Dict[str, Any] = {
             "rewrite": _env("QUERY_PLANNER_REWRITE", "auto"),
             "max_semantic_queries": int(_env("QUERY_PLANNER_MAX_SEMANTIC_QUERIES", "3")),
@@ -167,7 +172,7 @@ class DefaultQueryPlanner:
         # auto：仅在确有必要时触发，保证稳定/可复现
         if _PRONOUN_RE.search(normalized) and ctx.conversation_text:
             return True
-        if len(normalized) < self.config["min_query_chars"] or not plan.exact_terms:
+        if len(normalized) < self.config["min_query_chars"]:
             return True
         if intent in (QueryIntent.COMPARISON.value, QueryIntent.RELATION.value) \
                 and len(plan.entities) >= 2:
@@ -180,7 +185,9 @@ class DefaultQueryPlanner:
         normalized = self._normalize(query)
         exact = self._extract_exact(normalized)
         lexical = self._expand_synonyms(list(fts_terms(normalized, self.lexicon)))
-        entities = list(dict.fromkeys(list(exact) + list(ctx.known_entities)))
+        resolved = self.entity_catalog.resolve(normalized, ctx)
+        entities = list(dict.fromkeys(
+            [entity.value for entity in resolved] + list(exact) + list(ctx.known_entities)))
         intent, reason = self._detect_intent(normalized, entities)
         relation_intent = self._relation_intent(normalized, intent)
         context_mode = _CONTEXT_MODE_MAP[QueryIntent(intent)]
@@ -189,9 +196,9 @@ class DefaultQueryPlanner:
             filters["page_type"] = list(ctx.page_types)
 
         hook_enh = _HOOK_ENHANCE_MARKERS.search(original) is not None
-        warnings: Tuple[str, ...] = ()
+        warnings: Tuple[PlannerWarning, ...] = ()
         if hook_enh:
-            warnings = (("hook_injected_enhanced_query",),)
+            warnings = (PlannerWarning("hook_injected_enhanced_query"),)
 
         plan = QueryPlan(
             original_query=original,
@@ -214,6 +221,8 @@ class DefaultQueryPlanner:
             tokenizer_hash=self._tokenizer_hash,
             lexicon_hash=self._lexicon_hash,
             hook_injected_enhanced=hook_enh,
+            rewrite_attempted=False,
+            rewrite_applied=False,
         )
         if self._should_rewrite_l2(normalized, intent, plan, ctx):
             plan = self._apply_rewrite(plan, ctx, None)
@@ -251,45 +260,76 @@ class DefaultQueryPlanner:
     def _apply_rewrite(self, plan: QueryPlan, ctx: PlannerContext,
                        retry_feedback: Optional[RetrievalFeedback]) -> QueryPlan:
         provider = self.rewrite_provider
+        provider_name = getattr(provider, "name", type(provider).__name__)
+        if isinstance(provider, NullRewriteProvider):
+            # The default is a deterministic no-op, not an attempted LLM call.
+            return plan
         try:
             result = self._call_with_timeout(
                 provider.rewrite, plan.original_query, plan, ctx, retry_feedback)
         except Exception as e:  # noqa: BLE001
-            return self._fallback(plan, f"rewrite exception: {e}")
+            return self._fallback(plan, f"rewrite exception: {e}", provider_name)
         if not isinstance(result, dict):
-            return self._fallback(plan, "rewrite returned non-dict")
+            return self._fallback(plan, "rewrite returned non-dict", provider_name)
 
-        extra = list(result.get("semantic_queries") or [])
+        extra = [str(query).strip() for query in (result.get("semantic_queries") or [])
+                 if isinstance(query, str) and query.strip() and query.strip() != plan.original_query]
+        if not result.get("rewrite_used", result.get("rewrite_applied", False)):
+            return self._fallback(plan, "provider_declined_rewrite", provider_name)
+        if not extra:
+            return self._fallback(plan, "no_valid_additional_query", provider_name)
+        supplied_raw = result.get("preserved_constraints") or []
+        if not isinstance(supplied_raw, (list, tuple)) or not all(isinstance(item, str) for item in supplied_raw):
+            return self._fallback(plan, "invalid_preserved_constraints", provider_name)
+        supplied_constraints = set(supplied_raw)
+        if not set(plan.preserved_constraints).issubset(supplied_constraints):
+            return self._fallback(plan, "provider_constraints_unverified", provider_name)
+        provider_entities = result.get("entities") or []
+        if not isinstance(provider_entities, (list, tuple)) or not all(isinstance(item, str) and item.strip()
+                                                                         for item in provider_entities):
+            return self._fallback(plan, "invalid_entities", provider_name)
+        try:
+            confidence = float(result.get("confidence"))
+        except (TypeError, ValueError):
+            return self._fallback(plan, "invalid_confidence", provider_name)
+        if not 0.0 <= confidence <= 1.0:
+            return self._fallback(plan, "invalid_confidence", provider_name)
         combined = [plan.original_query] + extra
         ok, missing, neg_missing = self._constraints_preserved(plan.original_query, combined)
         if not ok:
-            return self._fallback(plan, f"constraint loss: missing={missing} neg_missing={neg_missing}")
+            return self._fallback(plan, f"constraint loss: missing={missing} neg_missing={neg_missing}", provider_name)
 
         maxq = self.config["max_semantic_queries"]
         chosen = [plan.original_query] + extra[: max(0, maxq - 1)]
         semantic = tuple(dict.fromkeys(chosen))
 
         entities = list(plan.entities)
-        if result.get("entities"):
-            entities = list(dict.fromkeys(entities + list(result["entities"])))
+        if provider_entities:
+            entities = list(dict.fromkeys(entities + list(provider_entities)))
         relation_intent = result.get("relation_intent", plan.relation_intent)
 
         return replace(
             plan,
             semantic_queries=semantic,
             rewrite_used=True,
-            rewrite_provider=getattr(provider, "name", type(provider).__name__),
-            rewrite_confidence=float(result.get("confidence", 0.8)),
+            rewrite_provider=provider_name,
+            rewrite_confidence=confidence,
             entities=tuple(entities),
             relation_intent=relation_intent,
             preserved_constraints=tuple(
                 result.get("preserved_constraints") or list(plan.preserved_constraints)),
             rewrite_source=("retry" if retry_feedback is not None else "llm"),
-            warnings=plan.warnings + (("rewrite_applied",) if not plan.rewrite_used else ()),
+            rewrite_attempted=True,
+            rewrite_applied=True,
+            rewrite_failure_reason=None,
+            warnings=plan.warnings + ((PlannerWarning("rewrite_applied"),) if not plan.rewrite_applied else ()),
         )
 
-    def _fallback(self, plan: QueryPlan, reason: str) -> QueryPlan:
-        return replace(plan, warnings=plan.warnings + ((f"rewrite_fallback: {reason}",)))
+    def _fallback(self, plan: QueryPlan, reason: str, provider_name: str) -> QueryPlan:
+        return replace(plan, rewrite_attempted=True, rewrite_applied=False,
+                       rewrite_used=False, rewrite_provider=provider_name,
+                       rewrite_source=None, rewrite_failure_reason=reason,
+                       warnings=plan.warnings + (PlannerWarning("rewrite_fallback", reason),))
 
     # ---------- 低召回重试 ----------
     def plan_retry(self, previous: QueryPlan, feedback: RetrievalFeedback,
@@ -328,8 +368,47 @@ class DefaultQueryPlanner:
             rewrite_used=previous.rewrite_used,
             rewrite_source="retry",
             routing_reason=previous.routing_reason + "|retry",
-            warnings=previous.warnings + (("low_recall_retry",),),
+            warnings=previous.warnings + (PlannerWarning("low_recall_retry"),),
         )
+
+
+class InMemoryEntityCatalog:
+    """Deterministic catalog for page titles, aliases, lexicon and conversation entities.
+
+    The matching policy is deliberately local: longest textual match wins, and ASCII
+    identifiers require token boundaries so ``ARS`` does not match ``ARS5400``.
+    """
+
+    def __init__(self, entries: Iterable[ResolvedEntity] = ()):
+        self._entries = tuple(sorted(entries, key=lambda entry: (-len(entry.matched_text),
+                                                                 entry.matched_text.casefold(), entry.value)))
+
+    def resolve(self, query: str, context: PlannerContext) -> Tuple[ResolvedEntity, ...]:
+        candidates = list(self._entries)
+        candidates.extend(ResolvedEntity(value, value, "conversation") for value in context.known_entities)
+        matched: List[ResolvedEntity] = []
+        occupied: List[Tuple[int, int]] = []
+        for entry in sorted(candidates, key=lambda item: (-len(item.matched_text), item.matched_text.casefold(), item.value)):
+            if not entry.matched_text:
+                continue
+            pattern = _entity_pattern(entry.matched_text)
+            for hit in pattern.finditer(query):
+                span = hit.span()
+                if any(span[0] < end and start < span[1] for start, end in occupied):
+                    continue
+                matched.append(entry)
+                occupied.append(span)
+                break
+        return tuple(dict.fromkeys(matched))
+
+
+def _entity_pattern(text: str):
+    escaped = re.escape(text)
+    if all(char.isascii() and (char.isalnum() or char == "_") for char in text):
+        return re.compile(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])", re.IGNORECASE)
+    return re.compile(escaped, re.IGNORECASE)
+
+
 
 
 def _env(name: str, default: str) -> str:

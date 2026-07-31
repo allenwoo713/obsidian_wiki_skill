@@ -38,6 +38,7 @@ class WikiPage:
     sources: List[str]
     links: List[str]  # [[wikilink]] 目标（无方括号）
     sha256: str
+    aliases: List[str] = field(default_factory=list)
 
 
 @dataclass

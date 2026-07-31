@@ -34,7 +34,7 @@ import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 
 from models import PageCandidate, ContextBundle, ContextItem, EvidenceHit, GraphPath, ChunkHit
 from fusion import page_level_rrf, assemble_context, render_context_markdown
-from query_planner import DefaultQueryPlanner
+from query_planner import DefaultQueryPlanner, InMemoryEntityCatalog, ResolvedEntity
 from query_plan_models import (
     QueryPlan, PlannerContext, RetrievalFeedback, QueryIntent,
 )
@@ -133,6 +133,24 @@ def _resolve_entity_seeds(data: dict, entities: tuple) -> List[str]:
                     seeds.append(nid)
                     break
     return seeds
+
+
+def _catalog_from_index(wi, context: PlannerContext) -> InMemoryEntityCatalog:
+    """Build the planner's read-only entity catalog at the retrieval boundary."""
+    entries = []
+    for page in getattr(wi, "pages", []):
+        page_id = str(getattr(page, "path", ""))
+        title = str(getattr(page, "title", "")).strip()
+        if title:
+            entries.append(ResolvedEntity(title, page_id, "title"))
+        for alias in getattr(page, "aliases", []) or []:
+            alias = str(alias).strip()
+            if alias:
+                entries.append(ResolvedEntity(alias, page_id, "alias"))
+    for term in sorted(getattr(wi, "_lexicon", set())):
+        entries.append(ResolvedEntity(str(term), str(term), "lexicon"))
+    entries.extend(ResolvedEntity(entity, entity, "conversation") for entity in context.known_entities)
+    return InMemoryEntityCatalog(entries)
 
 
 def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
@@ -354,6 +372,11 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                   hard_max_tokens: Optional[int] = None) -> HybridResult:
     """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。"""
     ctx = context or PlannerContext()
+    # The planner stays free of index implementations; query.py injects the
+    # catalog only when the caller did not supply a custom catalog.
+    if isinstance(getattr(planner, "entity_catalog", None), InMemoryEntityCatalog) \
+            and not getattr(planner.entity_catalog, "_entries", ()):
+        planner.entity_catalog = _catalog_from_index(wi, ctx)
     plan = planner.plan(original_query, ctx)
     if intent_override not in (None, "auto"):
         from dataclasses import replace

@@ -33,6 +33,26 @@ class PlannerContext:
 
 
 @dataclass(frozen=True)
+class PlannerWarning:
+    """Stable, JSON-safe diagnostic emitted by the planner."""
+    code: str
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class ResolvedEntity:
+    """A deterministic entity match supplied by an injected catalog."""
+    matched_text: str
+    value: str
+    kind: str
+
+
+class EntityCatalog(Protocol):
+    """Read-only entity matching port; planner never owns index dependencies."""
+    def resolve(self, query: str, context: PlannerContext) -> Tuple[ResolvedEntity, ...]: ...
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     """确定性规划 + 可选 LLM rewrite 的产物；query.py 的唯一查询输入。"""
     original_query: str
@@ -50,11 +70,13 @@ class QueryPlan:
     filters: Dict[str, Any]
     context_mode: str
 
+    # ``rewrite_used`` remains for the only legacy consumer of qp-1 JSON.
+    # New consumers must use the truthful lifecycle fields below.
     rewrite_used: bool
     rewrite_provider: str
     rewrite_confidence: float
     preserved_constraints: Tuple[str, ...]
-    warnings: Tuple[str, ...] = ()
+    warnings: Tuple[PlannerWarning, ...] = ()
 
     # ---- 调试 / 可溯源字段（供评测与 --json 输出）----
     planner_schema_version: str = "qp-1"
@@ -62,10 +84,15 @@ class QueryPlan:
     lexicon_hash: str = ""
     retry_attempt: int = 0
     rewrite_source: Optional[str] = None
+    rewrite_attempted: bool = False
+    rewrite_applied: bool = False
+    rewrite_failure_reason: Optional[str] = None
     hook_injected_enhanced: Optional[bool] = None
 
     def to_json(self) -> Dict[str, Any]:
-        return asdict(self)
+        # JSON round-trip normalizes tuple fields into the list shape exposed by
+        # query.py's public JSON contract.
+        return json.loads(json.dumps(asdict(self), ensure_ascii=False))
 
 
 @dataclass(frozen=True)
