@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 WIKILINK = re.compile(r"!\[\[([^\]]+)\]\]")
 _FRONTMATTER = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
@@ -23,17 +23,21 @@ class ImageResolution:
         return asdict(self)
 
 
-def normalize_embed(reference: str) -> str:
+def normalize_embed(reference: str) -> Optional[str]:
     """Return a case-preserving, vault-relative ``assets/...`` key for an embed."""
     raw = reference.split("|", 1)[0].split("#", 1)[0].strip().replace("\\", "/")
-    raw = raw.lstrip("/")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw):
+        return None
     while raw.startswith("./"):
         raw = raw[2:]
     if raw.lower().startswith("wiki/"):
         raw = raw[5:]
+    if any(part == ".." for part in raw.split("/")):
+        return None
     if not raw.lower().startswith("assets/"):
         raw = f"assets/{raw}"
-    return "/".join(part for part in raw.split("/") if part not in ("", "."))
+    key = "/".join(part for part in raw.split("/") if part not in ("", "."))
+    return key if key and not any(part == ".." for part in key.split("/")) else None
 
 
 def resolve_asset_path(wiki_root: Path, canonical_key: str) -> Optional[Path]:
@@ -85,10 +89,12 @@ def resolve_image_references(project_root: Path, manifest_images: Iterable[dict]
         sources = _frontmatter_sources(content)
         for raw in WIKILINK.findall(content):
             key = normalize_embed(raw)
+            if key is None:
+                continue
             refs.setdefault(key, []).append(page_key)
             candidates.setdefault(key, set()).update(sources)
-    registered = {normalize_embed(entry.get("rel_path") or entry.get("filename", "")): entry
-                  for entry in manifest_images}
+    registered = {key: entry for entry in manifest_images
+                  if (key := normalize_embed(entry.get("rel_path") or entry.get("filename", ""))) is not None}
     resolved = {}
     for key in sorted(refs):
         referrers = tuple(sorted(set(refs[key])))

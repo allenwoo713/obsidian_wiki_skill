@@ -23,6 +23,8 @@ dist/
 .cache/
 .tools/
 models/
+.models/
+eval/graph_detail.jsonl
 .review-tmp/
 
 # GSD local planning state and quick-task artifacts are intentionally local.
