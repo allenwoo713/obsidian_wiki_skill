@@ -57,7 +57,8 @@ from models import (
     IndexState, ChunkHit, PageCandidate,
 )
 import chunking
-from chunking import chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer, ChunkBuildError
+from chunking import (chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer,
+                      ChunkBuildError, count_token_ids)
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
@@ -197,7 +198,7 @@ class WikiIndex:
             emb = self._get_embedder()
             tok = getattr(emb, "tokenizer", None)
             if tok is not None:
-                return len(tok.encode(text))
+                return count_token_ids(tok, text)
         except Exception:
             pass
         return max(1, len(text) // 4)

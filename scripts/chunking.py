@@ -48,6 +48,35 @@ CHUNK_SCHEMA_VERSION = 3
 Tokenizer = Callable[[str], int]
 
 
+def count_token_ids(hf_tokenizer, text: str) -> int:
+    """Count the model input IDs without invoking model-length warnings.
+
+    ``PreTrainedTokenizer.encode`` warns when a *counting* request is longer
+    than the model sequence window, although no inference is about to happen.
+    The callable tokenizer accepts ``verbose=False`` and an explicit
+    ``truncation=False``: this both suppresses that inference-oriented warning
+    and avoids its backend's configured max-length truncation. Include special
+    tokens so the count remains identical to the former ``tokenizer.encode``
+    path.
+    """
+    try:
+        encoded = hf_tokenizer(
+            text,
+            add_special_tokens=True,
+            truncation=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+            verbose=False,
+        )
+        return len(encoded["input_ids"])
+    except (TypeError, KeyError):
+        # Kept for lightweight test doubles and non-fast tokenizer adapters.
+        backend = getattr(hf_tokenizer, "backend_tokenizer", None)
+        if backend is not None:
+            return len(backend.encode(text, add_special_tokens=True).ids)
+        return len(hf_tokenizer.encode(text))
+
+
 class ChunkBuildError(RuntimeError):
     """领域异常：分块/索引构建失败（fail-fast）。
 
@@ -87,7 +116,7 @@ class EmbeddingTokenizer:
 
     def count(self, text: str) -> int:
         """Return the exact token count the embedding model would produce."""
-        return len(self._hf.encode(text))
+        return count_token_ids(self._hf, text)
 
 
 
