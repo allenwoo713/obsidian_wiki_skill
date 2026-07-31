@@ -53,6 +53,10 @@ obsidian_wiki_skill/
 ├── CHANGELOG.md              # 变更记录
 ├── scripts/
 │   ├── _config.py           # 集中配置加载（import 即 load .env，自推导 SKILL_DIR）
+│   ├── obsidian_wiki/       # staged architecture package (pure contracts + Protocol ports)
+│   │   ├── domain/          # QueryPlan and other infrastructure-free data contracts
+│   │   └── ports/           # QueryPlanner / EntityCatalog / RewriteProvider Protocols
+│   ├── query_plan_models.py # legacy facade re-exporting the canonical package contracts
 │   ├── wiki / wiki.cmd      # wrapper 脚本（bash / Windows），免手拼路径
 │   ├── parse_sources.py      # Raw/sources/ → Wiki/*.md（路由到各 parser）
 │   ├── update_wiki.py        # 增量更新（manifest SHA256 追踪，append 不全量重扫；末尾自动重建 index.md）
@@ -103,6 +107,34 @@ pip install -r requirements.txt pytest
 # 全套单元测试（离线，使用 tests/fixtures 脱敏数据）
 pytest -p no:cacheprovider --basetemp=/tmp/owb_pytest
 ```
+
+### 架构契约（GitHub #18 foundation）
+
+`scripts/obsidian_wiki/` 是逐步迁移期间的可导入命名空间；它不会改变现有
+`python scripts/query.py` 或其他脚本式入口。`scripts/query_plan_models.py` 是兼容
+facade，继续为现有 bare imports 提供**同一批 canonical objects**，而不是复制模型。
+
+| 位置 | 拥有内容 | 允许的依赖方向 |
+|---|---|---|
+| `obsidian_wiki.domain` | 纯 `QueryPlan`、planner context、warning、entity、feedback 数据契约 | 仅 Python 标准库；不得导入 ports、CLI 或基础设施 SDK |
+| `obsidian_wiki.ports` | `QueryPlanner`、`EntityCatalog`、`RewriteProvider` Protocol 边界 | 可以导入 domain；不得导入具体 tokenizer、repository、graph、context-builder 或基础设施 SDK |
+| 现有 scripts / CLI | 具体实现与组合根 | 可以通过 facade 或 package 使用 core contracts |
+
+依赖方向只能是 **concrete scripts/CLI → ports → domain**。后续 #17、#20、#21
+工作必须扩展这个受检查的命名空间和端口；不要再创建新的 bare cross-module imports
+来绕过该边界。页面排序（#23）仍不属于这个 architecture foundation。
+
+在仓库根目录、激活项目 Python 环境后，运行以下可复现的本地检查：
+
+```bash
+PIP_CACHE_DIR=.cache/pip python -m pip install import-linter==2.13
+(cd scripts && lint-imports --config ../.importlinter --no-cache)
+PYTHONDONTWRITEBYTECODE=1 python tests/test_architecture_foundation.py
+```
+
+Import Linter 是开发/CI 专用依赖，不加入运行时 requirements。CI 在 Ubuntu 和
+Windows 上分别使用 Python 3.10 与 3.13 运行该 gate；其 cache 和临时路径均位于
+skill 仓库内的 `.cache/` 与 `.review-tmp/`。
 
 ### 更新核心依赖
 
