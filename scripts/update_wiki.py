@@ -259,21 +259,25 @@ def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path
             if fn:
                 refs.setdefault(fn, []).append(md)
 
+    from image_provenance import normalize_embed, resolve_image_references
     images = manifest.setdefault("images", [])
+    resolutions = resolve_image_references(project_root, images)
     reg_ci = {(e.get("filename") or Path(e.get("rel_path", "")).name).lower()
               for e in images}
 
     added = 0
     for fn, mds in refs.items():
-        if fn.lower() in reg_ci:
+        canonical = normalize_embed(fn)
+        if Path(canonical).name.lower() in reg_ci:
             continue
-        asset = assets_dir / fn
+        asset = wiki_dir / canonical
         if not asset.exists():
             continue  # 真断链（磁盘缺失），不补登，留给 audit_images.py 报告
-        source_doc = norm_key(str(mds[0]))
+        resolution = resolutions.get(normalize_embed(fn))
+        source_doc = resolution.source_doc if resolution else ""
         images.append({
-            "filename": fn,
-            "rel_path": f"assets/{fn}",
+            "filename": Path(canonical).name,
+            "rel_path": canonical,
             "sha256": compute_sha256(asset),
             "source_doc": source_doc,
             "source_media": Path(source_doc).stem,
@@ -282,8 +286,11 @@ def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path
             "vlm_caption": None,
             "caption_text": "",
             "status": "pending_vlm",
+            "parent_page_id": resolution.parent_page_id if resolution else "",
+            "referring_wiki_pages": list(resolution.referring_wiki_pages) if resolution else [],
+            "source_candidates": list(resolution.source_candidates) if resolution else [],
         })
-        reg_ci.add(fn.lower())
+        reg_ci.add(Path(canonical).name.lower())
         added += 1
 
     # 兜底回填 status：无 status 的条目按 caption_text 推导

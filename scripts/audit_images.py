@@ -22,6 +22,7 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List
+from image_provenance import normalize_embed, resolve_image_references
 
 WIKILINK = re.compile(r"!\[\[([^\]]+)\]\]")
 
@@ -46,7 +47,11 @@ def main():
     ap.add_argument("project_root", nargs="?", default=".",
                     help="知识库项目根目录（含 Wiki/ 与 .index/），默认当前目录")
     ap.add_argument("--fix", action="store_true",
-                    help="把引用但未注册(磁盘有)的图片写入 manifest.images")
+                    help="兼容别名：等同 --repair-registration（显式写模式）")
+    ap.add_argument("--repair-registration", action="store_true",
+                    help="显式写模式：补登记引用但未注册且磁盘存在的图片")
+    ap.add_argument("--migrate-status", action="store_true",
+                    help="显式写模式：迁移 legacy 条目的 status 字段")
     args = ap.parse_args()
 
     proj = Path(args.project_root).resolve()
@@ -61,7 +66,7 @@ def main():
         raise SystemExit(2)
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    images = manifest.setdefault("images", [])
+    images = manifest.get("images", [])
 
     # status 回填：老条目无 status 时按 caption_text 推导
     #   "captioned"   -> caption_text 非空（已 VLM/已 caption）
@@ -69,11 +74,12 @@ def main():
     # 回填确保 picture_caption.py list 可按 status filter 找出待处理项
     migrated = 0
     for img in images:
-        if not img.get("status"):
+        if args.migrate_status and not img.get("status"):
             img["status"] = "captioned" if (img.get("caption_text") or "").strip() else "pending_vlm"
             migrated += 1
 
-    registered = {(e.get("filename") or Path(e.get("rel_path", "")).name) for e in images}
+    resolutions = resolve_image_references(proj, images)
+    registered = {normalize_embed(e.get("rel_path") or e.get("filename", "")) for e in images}
 
     # 扫描 Wiki/**/*.md（排除 .obsidian / .graph 维护目录）
     md_files = [p for p in (proj / "Wiki").rglob("*.md")
@@ -85,11 +91,11 @@ def main():
         except Exception:
             continue
         for ref in WIKILINK.findall(txt):
-            fn = ref.split("|")[0].strip()
+            fn = normalize_embed(ref)
             if fn:
                 refs.setdefault(fn, []).append(md.relative_to(proj).as_posix())
 
-    disk = {p.name for p in assets_dir.glob("*") if p.is_file()}
+    disk = {p.relative_to(proj / "Wiki").as_posix() for p in assets_dir.rglob("*") if p.is_file()}
     # Windows 大小写不敏感：建小写映射，避免 6t8r_brief vs 6T8R_Brief 误报缺失
     disk_ci = {n.lower(): n for n in disk}
     reg_ci = {n.lower(): n for n in registered}
@@ -133,17 +139,16 @@ def main():
         for f in orphan[:30]:
             print(f"    {f}")
 
-    if args.fix and unreg_present:
+    if (args.fix or args.repair_registration) and unreg_present:
         added = 0
         for f in unreg_present:
-            md_rel = refs[f][0]
-            md = proj / md_rel
-            source_doc = norm_key(md)
+            resolution = resolutions[f]
+            source_doc = resolution.source_doc
             source_media = Path(source_doc).stem
-            asset = assets_dir / f
+            asset = proj / "Wiki" / f
             entry = {
-                "filename": f,
-                "rel_path": f"assets/{f}",
+                "filename": Path(f).name,
+                "rel_path": f,
                 "sha256": sha256_file(asset),
                 "source_doc": source_doc,
                 "source_media": source_media,
@@ -152,13 +157,16 @@ def main():
                 "vlm_caption": None,
                 "caption_text": "",
                 "status": "pending_vlm",
+                "parent_page_id": resolution.parent_page_id,
+                "referring_wiki_pages": list(resolution.referring_wiki_pages),
+                "source_candidates": list(resolution.source_candidates),
             }
             images.append(entry)
             added += 1
         manifest["images"] = images
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n[FIX] 已补登记 {added} 张 -> manifest.images 现 {len(images)}")
-    elif migrated > 0:
+    elif args.migrate_status and migrated > 0:
         # 即使未 --fix，也把回填后的 status 落盘（幂等：无新增则跳过）
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n[MIGRATE] status 回填 {migrated} 条已落盘")
