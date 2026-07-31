@@ -36,6 +36,17 @@ def normalize_embed(reference: str) -> str:
     return "/".join(part for part in raw.split("/") if part not in ("", "."))
 
 
+def resolve_asset_path(wiki_root: Path, canonical_key: str) -> Optional[Path]:
+    """Return a real asset only when symlink resolution stays inside Wiki/assets."""
+    root = (Path(wiki_root) / "assets").resolve()
+    try:
+        resolved = (Path(wiki_root) / canonical_key).resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
 def _frontmatter_sources(text: str) -> List[str]:
     match = _FRONTMATTER.match(text)
     if not match:

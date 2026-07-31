@@ -22,7 +22,7 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List
-from image_provenance import normalize_embed, resolve_image_references
+from image_provenance import normalize_embed, resolve_asset_path, resolve_image_references
 
 WIKILINK = re.compile(r"!\[\[([^\]]+)\]\]")
 
@@ -95,7 +95,10 @@ def main():
             if fn:
                 refs.setdefault(fn, []).append(md.relative_to(proj).as_posix())
 
-    disk = {p.relative_to(proj / "Wiki").as_posix() for p in assets_dir.rglob("*") if p.is_file()}
+    disk = {
+        key for p in assets_dir.rglob("*") if p.is_file()
+        if resolve_asset_path(proj / "Wiki", key := p.relative_to(proj / "Wiki").as_posix()) is not None
+    }
     # Windows 大小写不敏感：建小写映射，避免 6t8r_brief vs 6T8R_Brief 误报缺失
     disk_ci = {n.lower(): n for n in disk}
     reg_ci = {n.lower(): n for n in registered}
@@ -145,7 +148,9 @@ def main():
             resolution = resolutions[f]
             source_doc = resolution.source_doc
             source_media = Path(source_doc).stem
-            asset = proj / "Wiki" / f
+            asset = resolve_asset_path(proj / "Wiki", f)
+            if asset is None:
+                continue
             entry = {
                 "filename": Path(f).name,
                 "rel_path": f,

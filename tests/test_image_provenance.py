@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from image_provenance import normalize_embed, resolve_image_references  # noqa: E402
+from image_provenance import normalize_embed, resolve_asset_path, resolve_image_references  # noqa: E402
 
 
 def _page(root, name, sources, embeds):
@@ -37,6 +37,34 @@ def test_ambiguous_and_unresolved_sources_are_never_guessed(tmp_path):
     assert resolved["assets/missing.png"].status == "unresolved_provenance"
 
 
+def test_normalizer_rejects_out_of_vault_paths_and_keeps_same_basenames_distinct(tmp_path):
+    assert normalize_embed("../secret.png") is None
+    assert normalize_embed("/tmp/secret.png") is None
+    assert normalize_embed("C:\\outside\\secret.png") is None
+    _page(tmp_path, "one.md", ["Raw/sources/a.pdf"], ["![[assets/a/figure.png]]"])
+    _page(tmp_path, "two.md", ["Raw/sources/b.pdf"], ["![[assets/b/figure.png]]"])
+    resolved = resolve_image_references(tmp_path)
+    assert set(resolved) == {"assets/a/figure.png", "assets/b/figure.png"}
+
+
+def test_symlinked_asset_escape_is_never_resolved_or_registered(tmp_path):
+    import pytest
+    wiki = tmp_path / "Wiki"
+    assets = wiki / "assets"
+    assets.mkdir(parents=True)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside")
+    link = assets / "escape.png"
+    try:
+        link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    assert resolve_asset_path(wiki, "assets/escape.png") is None
+    _page(tmp_path, "escape.md", ["Raw/sources/a.pdf"], ["![[escape.png]]"])
+    from update_wiki import heal_image_registration
+    manifest = {"images": []}
+    assert heal_image_registration(tmp_path, manifest, assets) == 0
+    assert manifest["images"] == []
 def test_audit_is_byte_identical_without_explicit_write_mode(tmp_path, monkeypatch):
     _page(tmp_path, "one.md", ["Raw/sources/a.pdf"], ["![[fig.png]]"])
     assets = tmp_path / "Wiki" / "assets"

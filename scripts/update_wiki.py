@@ -259,7 +259,7 @@ def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path
             if fn:
                 refs.setdefault(fn, []).append(md)
 
-    from image_provenance import normalize_embed, resolve_image_references
+    from image_provenance import normalize_embed, resolve_asset_path, resolve_image_references
     images = manifest.setdefault("images", [])
     resolutions = resolve_image_references(project_root, images)
     reg_ci = {(e.get("filename") or Path(e.get("rel_path", "")).name).lower()
@@ -270,8 +270,8 @@ def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path
         canonical = normalize_embed(fn)
         if Path(canonical).name.lower() in reg_ci:
             continue
-        asset = wiki_dir / canonical
-        if not asset.exists():
+        asset = resolve_asset_path(wiki_dir, canonical)
+        if asset is None:
             continue  # 真断链（磁盘缺失），不补登，留给 audit_images.py 报告
         resolution = resolutions.get(normalize_embed(fn))
         source_doc = resolution.source_doc if resolution else ""

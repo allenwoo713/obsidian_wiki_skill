@@ -6,6 +6,7 @@ on:
       - 'scripts/**'
       - 'tests/**'
       - 'eval/**'
+      - 'eval/baselines.json'
       - 'requirements.in'
       - 'requirements.txt'
       - 'scripts/compile_requirements.py'
