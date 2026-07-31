@@ -9,8 +9,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from query_plan_models import PlannerContext, RetrievalFeedback
-from query_planner import DefaultQueryPlanner
+from query_plan_models import PlannerContext, RetrievalFeedback, PlannerWarning
+from query_planner import DefaultQueryPlanner, InMemoryEntityCatalog, ResolvedEntity
 
 
 class FakeRewriteProvider:
@@ -51,6 +51,9 @@ def test_no_llm_still_plans():
     p = _planner()  # 默认 NullRewriteProvider
     plan = p.plan("ARS540 校准步骤")
     assert plan.rewrite_used is False
+    assert plan.rewrite_attempted is False
+    assert plan.rewrite_applied is False
+    assert plan.rewrite_source is None
     assert plan.rewrite_provider == "null"
     assert plan.intent in ("lookup", "procedure", "comparison", "relation", "global")
 
@@ -80,7 +83,8 @@ def test_rewrite_cannot_drop_constraints():
     # original_query 仍作为 semantic_queries[0] 保留 → 型号永不丢失
     p = _planner(provider=FakeRewriteProvider(drop_constraints=True), config={"rewrite": "force"})
     plan = p.plan("ARS540 丢目标")
-    assert plan.rewrite_used is True
+    assert plan.rewrite_used is False
+    assert plan.rewrite_applied is False
     assert plan.semantic_queries[0] == "ARS540 丢目标"
     assert "ARS540" in plan.semantic_queries[0]
 
@@ -154,3 +158,35 @@ def test_synonyms_loaded_from_project_root():
         assert "radar" in plan.lexical_terms
         assert "calibration" in plan.lexical_terms
         assert "MyRadarX" in p.lexicon
+
+
+def test_rewrite_state_requires_valid_new_provider_query():
+    empty = _planner(provider=FakeRewriteProvider(), config={"rewrite": "force"}).plan("ARS540 丢目标")
+    assert empty.rewrite_attempted is True
+    assert empty.rewrite_applied is False
+    assert empty.rewrite_failure_reason == "no_valid_additional_query"
+
+    valid = _planner(provider=FakeRewriteProvider(["ARS540 target loss diagnosis"]),
+                     config={"rewrite": "force"}).plan("ARS540 丢目标")
+    assert valid.rewrite_attempted is True
+    assert valid.rewrite_applied is True
+    assert valid.rewrite_used is True  # legacy compatibility field
+    assert valid.rewrite_confidence == 0.9
+
+
+def test_planner_warnings_are_typed_and_json_serializable():
+    plan = _planner().plan("关键词: 雷达 校准")
+    assert plan.warnings == (PlannerWarning("hook_injected_enhanced_query"),)
+    assert plan.to_json()["warnings"] == [{"code": "hook_injected_enhanced_query", "message": ""}]
+
+
+def test_injected_catalog_uses_longest_match_and_token_boundaries():
+    catalog = InMemoryEntityCatalog((
+        ResolvedEntity("ARS", "ARS", "lexicon"),
+        ResolvedEntity("ARS540", "ARS540", "title"),
+        ResolvedEntity("Front Radar", "FR", "alias"),
+    ))
+    planner = DefaultQueryPlanner(entity_catalog=catalog)
+    plan = planner.plan("ARS540 和 Front Radar 的区别，不是 ARS5400")
+    assert {"ARS540", "FR"}.issubset(plan.entities)
+    assert "ARS" not in plan.entities

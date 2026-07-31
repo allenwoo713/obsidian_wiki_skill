@@ -57,7 +57,8 @@ from models import (
     IndexState, ChunkHit, PageCandidate,
 )
 import chunking
-from chunking import chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer, ChunkBuildError
+from chunking import (chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer,
+                      ChunkBuildError, count_token_ids)
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
@@ -115,6 +116,9 @@ def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
     sources = fm.get("sources", []) or []
     if isinstance(sources, str):
         sources = [sources]
+    aliases = fm.get("aliases", []) or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
     return WikiPage(
         path=path,
         title=fm.get("title", path.stem),
@@ -123,6 +127,7 @@ def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
         sources=[str(s) for s in sources],
         links=links,
         sha256=sha,
+        aliases=[str(alias) for alias in aliases],
     )
 
 
@@ -193,7 +198,7 @@ class WikiIndex:
             emb = self._get_embedder()
             tok = getattr(emb, "tokenizer", None)
             if tok is not None:
-                return len(tok.encode(text))
+                return count_token_ids(tok, text)
         except Exception:
             pass
         return max(1, len(text) // 4)
@@ -883,6 +888,7 @@ class WikiIndex:
                 "title": p.title,
                 "sources": p.sources,
                 "links": p.links,
+                "aliases": p.aliases,
             }
             for p in self.pages
         ]
@@ -976,7 +982,7 @@ class WikiIndex:
                 path=Path(p["path"]), title=p.get("title", Path(p["path"]).stem),
                 page_type=p.get("page_type", "concept"), content="",
                 sources=p.get("sources", []), links=p.get("links", []),
-                sha256=p.get("sha256", ""),
+                sha256=p.get("sha256", ""), aliases=p.get("aliases", []),
             )
             self.pages.append(wp)
             self._page_by_id[p.get("page_id", page_id_of(p["path"]))] = wp

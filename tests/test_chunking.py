@@ -30,9 +30,33 @@ class _FakeHF:
         return list(range(len(t)))
 
 
+class _FastHF:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, text, **kwargs):
+        self.calls.append((text, kwargs))
+        return {"input_ids": list(range(len(text) + 2))}
+
+    def encode(self, _):
+        raise AssertionError("counting must not use encode")
+
+
 def test_embedding_tokenizer_real_count():
     et = EmbeddingTokenizer(_FakeHF())
     assert et.count("abc") == 3
+
+
+def test_embedding_tokenizer_count_disables_truncation_without_model_length_warning():
+    hf = _FastHF()
+    assert EmbeddingTokenizer(hf).count("x" * 500) == 502
+    assert hf.calls == [("x" * 500, {
+        "add_special_tokens": True,
+        "truncation": False,
+        "return_attention_mask": False,
+        "return_token_type_ids": False,
+        "verbose": False,
+    })]
 
 
 def test_embedding_tokenizer_rejects_none():

@@ -13,10 +13,12 @@ import pytest
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+import query as query_module  # noqa: E402
 from query import hybrid_search, _split_text_image  # noqa: E402
 from fusion import page_level_rrf, assemble_context, _read_full_content  # noqa: E402
 from models import ChunkHit, PageCandidate, EvidenceHit, ContextItem  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
+from query_plan_models import PlannerContext  # noqa: E402
 
 
 def _write(wiki, subdir, name, title, body, sources=None):
@@ -122,3 +124,34 @@ def test_split_text_image():
     assert len(tc) == 1
     assert len(ic) == 1
     assert Path(ic[0].path).name == "x_img01.png"
+
+
+def test_retry_entities_are_used_for_graph_seeds(tmp_path, monkeypatch):
+    class EmptyIndex:
+        def search_fts_terms(self, *_args, **_kwargs):
+            return []
+
+        def search_vector(self, *_args, **_kwargs):
+            return []
+
+        def search_page(self, *_args, **_kwargs):
+            return []
+
+        def count_tokens(self, text):
+            return max(1, len(text) // 4)
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    index_dir.mkdir()
+    (index_dir / "graph.json").write_text(
+        json.dumps({"nodes": [{"id": "retry-seed", "title": "Retry Seed"}], "edges": []}),
+        encoding="utf-8")
+    seen_seeds = []
+    monkeypatch.setattr(query_module, "graph_expand", lambda _wi, seeds, *_args, **_kwargs:
+                        seen_seeds.append(seeds) or [])
+
+    planner = DefaultQueryPlanner(config={"max_retries": 1})
+    hybrid_search(EmptyIndex(), "unmatched query", planner,
+                  context=PlannerContext(known_entities=("retry-seed",)), wiki_dir=wiki_dir)
+    assert any("retry-seed" in seeds for seeds in seen_seeds)
