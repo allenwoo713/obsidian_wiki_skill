@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import unittest
 from pathlib import Path
 from typing import Protocol
@@ -114,11 +115,24 @@ class ArchitectureFoundationTests(unittest.TestCase):
         self.assertTrue(issubclass(PackageEntityCatalog, Protocol))
         self.assertTrue(issubclass(PackageQueryPlanner, Protocol))
         self.assertTrue(issubclass(PackageRewriteProvider, Protocol))
-        for root in FORBIDDEN_SDK_ROOTS:
-            self.assertFalse(
-                any(name == root or name.startswith(f"{root}.") for name in sys.modules),
-                f"{root} was imported by a core contract module",
-            )
+        script = """
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from obsidian_wiki.domain import query_models  # noqa: F401
+from obsidian_wiki.ports import query_planning  # noqa: F401
+
+for root in {forbidden_roots!r}:
+    if any(name == root or name.startswith(root + ".") for name in sys.modules):
+        raise SystemExit(f"{{root}} was imported by a core contract module")
+""".format(forbidden_roots=FORBIDDEN_SDK_ROOTS)
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(Path(__file__).resolve().parents[1] / "scripts")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_ci_declares_cross_platform_architecture_gate(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
