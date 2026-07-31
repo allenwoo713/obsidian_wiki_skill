@@ -1,0 +1,43 @@
+[importlinter]
+root_package = obsidian_wiki
+include_external_packages = True
+
+[importlinter:contract:ports-over-domain]
+name = Ports may depend on domain, never the reverse
+type = layers
+layers =
+    obsidian_wiki.ports
+    obsidian_wiki.domain
+
+[importlinter:contract:domain-does-not-import-ports]
+name = Domain cannot depend on ports
+type = forbidden
+source_modules =
+    obsidian_wiki.domain
+forbidden_modules =
+    obsidian_wiki.ports
+
+[importlinter:contract:core-does-not-import-infrastructure]
+name = Domain and ports remain independent of runtime infrastructure
+type = forbidden
+source_modules =
+    obsidian_wiki.domain
+    obsidian_wiki.ports
+forbidden_modules =
+    build_index
+    build_graph
+    fusion
+    lexical_tokenizer
+    query
+    lancedb
+    networkx
+    pyvis
+    sentence_transformers
+    torch
+    transformers
+
+[importlinter:contract:package-siblings-are-acyclic]
+name = Obsidian Wiki package siblings are acyclic
+type = acyclic_siblings
+ancestors =
+    obsidian_wiki
