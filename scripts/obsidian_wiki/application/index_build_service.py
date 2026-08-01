@@ -25,14 +25,19 @@ from obsidian_wiki.ports.chunk_repository import ChunkRepository
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
+BenchmarkObserver = Callable[[IndexStats], BenchmarkObservation]
 
 
 class IndexBuildService:
     """Partition canonical Markdown into physically separate sparse/dense rows."""
 
-    def __init__(self, storage: ChunkRepository, *, fts_config: FtsIndexConfig | None = None):
+    def __init__(
+        self, storage: ChunkRepository, *, fts_config: FtsIndexConfig | None = None,
+        benchmark_observer: BenchmarkObserver | None = None,
+    ):
         self._storage = storage
         self._fts_config = fts_config or FtsIndexConfig()
+        self._benchmark_observer = benchmark_observer
 
     def build(self, wiki_dir: Path, index_dir: Path, *, embed: Embedder) -> StorageArtifact:
         sparse_chunks = self._sparse_plan(wiki_dir)
@@ -72,7 +77,7 @@ class IndexBuildService:
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term
             )
-            benchmark = BenchmarkObservation(
+            benchmark = self._benchmark_observer(vector_stats) if self._benchmark_observer else BenchmarkObservation(
                 recall_at_10=1.0, recall_at_20=1.0, latency_p50_ms=0.0,
                 latency_p95_ms=0.0, build_time_ms=0.0, disk_bytes=self._disk_bytes(build_dir),
             )

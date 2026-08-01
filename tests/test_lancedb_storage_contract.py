@@ -14,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import build_storage_contract  # noqa: E402
 from obsidian_wiki.domain.index_models import RebuildRequiredError  # noqa: E402
 from obsidian_wiki.domain.index_models import (  # noqa: E402
+    BenchmarkObservation,
     DenseChunk,
     VectorIndexConfig,
 )
+from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
 from obsidian_wiki.infrastructure import lancedb_index_repository as repository_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
     LanceDbIndexRepository,
@@ -203,3 +205,25 @@ def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path)
     assert manifest["config_hashes"]["fts_config"]
     assert manifest["sdk_versions"]["lancedb"]
     assert manifest["policy"]["selected_mode"] in {"ann", "exact"}
+
+
+def test_complete_non_promoting_candidate_publishes_exact_policy(tmp_path: Path) -> None:
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Contract\n\nThe standalone exact token is FALLBACKTERM\n")
+    index_dir = tmp_path / ".index"
+    service = IndexBuildService(
+        LanceDbIndexRepository(index_dir),
+        benchmark_observer=lambda _stats: BenchmarkObservation(
+            recall_at_10=0.9, recall_at_20=1.0, latency_p50_ms=1.0,
+            latency_p95_ms=2.0, build_time_ms=3.0, disk_bytes=4,
+        ),
+    )
+
+    artifact = service.build(
+        wiki, index_dir, embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
+    )
+
+    assert (index_dir / "ACTIVE_INDEX").exists()
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["policy"]["selected_mode"] == "exact"
+    assert manifest["policy"]["reason"].startswith("recall@10")
