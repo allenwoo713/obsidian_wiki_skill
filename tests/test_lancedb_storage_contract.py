@@ -13,6 +13,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from build_index import build_storage_contract  # noqa: E402
 from obsidian_wiki.domain.index_models import RebuildRequiredError  # noqa: E402
+from obsidian_wiki.domain.index_models import (  # noqa: E402
+    DenseChunk,
+    VectorIndexConfig,
+)
+from obsidian_wiki.infrastructure import lancedb_index_repository as repository_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
     LanceDbIndexRepository,
 )
@@ -75,3 +80,105 @@ def test_legacy_manifest_requires_rebuild(tmp_path: Path) -> None:
 
     with pytest.raises(RebuildRequiredError, match="rebuild"):
         LanceDbIndexRepository.require_current_layout(manifest)
+
+
+class _QuerySpy:
+    def __init__(self) -> None:
+        self.exact_bypass = False
+        self.metric = None
+        self.predicate = None
+        self.result_limit = None
+
+    def distance_type(self, metric: str) -> "_QuerySpy":
+        self.metric = metric
+        return self
+
+    def bypass_vector_index(self) -> "_QuerySpy":
+        self.exact_bypass = True
+        return self
+
+    def where(self, predicate: str) -> "_QuerySpy":
+        self.predicate = predicate
+        return self
+
+    def limit(self, value: int) -> "_QuerySpy":
+        self.result_limit = value
+        return self
+
+    def to_list(self) -> list[dict[str, str]]:
+        return [{"chunk_id": "dense:1"}]
+
+
+class _DenseTableSpy:
+    def __init__(self) -> None:
+        self.index_call = None
+        self.queries: list[_QuerySpy] = []
+
+    def create_index(self, column: str, **kwargs: object) -> None:
+        self.index_call = (column, kwargs)
+
+    def search(self, vector: list[float]) -> _QuerySpy:
+        query = _QuerySpy()
+        self.queries.append(query)
+        return query
+
+    def count_rows(self) -> int:
+        return 20
+
+    def index_stats(self, index_name: str):
+        return type("Stats", (), {"num_indexed_rows": 20, "num_unindexed_rows": 0})()
+
+
+class _DatabaseSpy:
+    def __init__(self, dense_table: _DenseTableSpy) -> None:
+        self.dense_table = dense_table
+
+    def open_table(self, name: str) -> _DenseTableSpy:
+        assert name == "dense_chunks"
+        return self.dense_table
+
+
+def test_candidate_hnsw_and_exact_bypass_stay_in_adapter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    table = _DenseTableSpy()
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+    config = VectorIndexConfig(
+        index_type="hnsw_flat", metric="cosine", num_partitions=2,
+        m=16, ef_construction=300, dense_chunks_count=20,
+    )
+
+    stats = repository.create_vector_index(config)
+    ann = repository.search_dense([1.0, 0.0], metric="cosine", limit=20, where="page_id = 'safe'")
+    exact = repository.search_dense_exact([1.0, 0.0], metric="cosine", limit=20, where="page_id = 'safe'")
+
+    column, kwargs = table.index_call
+    hnsw = kwargs["config"]
+    assert column == "vector"
+    assert kwargs["name"] == "dense_hnsw"
+    assert hnsw.distance_type == "cosine"
+    assert hnsw.num_partitions == 2
+    assert hnsw.m == 16
+    assert hnsw.ef_construction == 300
+    assert stats.unindexed_dense_rows == 0
+    assert ann == exact == [{"chunk_id": "dense:1"}]
+    assert table.queries[0].exact_bypass is False
+    assert table.queries[1].exact_bypass is True
+    assert table.queries[0].metric == table.queries[1].metric == "cosine"
+    assert table.queries[0].predicate == table.queries[1].predicate == "page_id = 'safe'"
+    assert table.queries[0].result_limit == table.queries[1].result_limit == 20
+
+
+def test_adapter_rejects_duplicate_or_nonfinite_dense_vectors(tmp_path: Path) -> None:
+    row = DenseChunk("dense:1", "page", "page.md", "Page", "text", (1.0, 0.0))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        repository.validate_dense_chunks((row, row))
+    with pytest.raises(ValueError, match="finite"):
+        repository.validate_dense_chunks((
+            DenseChunk("dense:2", "page", "page.md", "Page", "text", (float("nan"), 0.0)),
+        ))
+
+
+def test_adapter_escapes_quoted_page_identifiers() -> None:
+    assert LanceDbIndexRepository.page_predicate("O'Reilly") == "page_id = 'O''Reilly'"
