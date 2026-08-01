@@ -15,6 +15,9 @@ import pytest
 sys = __import__("sys")
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import WikiIndex  # noqa: E402
+from build_index import build_storage_contract  # noqa: E402
+from obsidian_wiki.application import index_build_service as build_service_module  # noqa: E402
+from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
 
 def _write_page(wiki: Path, name: str, title: str, body: str, sources=None):
@@ -111,3 +114,35 @@ def test_content_signature_in_ckpt_meta(tmp_path):
     assert "miss_sig" in meta, "#7 sig 缺失 miss_sig"
     assert meta["fts_config_hash"].startswith("whitespace+")
     assert meta["chunk_config_hash"].startswith("v")
+
+
+@pytest.mark.parametrize("boundary", ["manifest", "validation"])
+def test_storage_contract_failure_never_changes_active_pointer(tmp_path, monkeypatch, boundary):
+    """D-04 failures stay in a marked staging build and cannot publish."""
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "storage.md", "Storage", "stable token", ["raw/storage.docx"])
+    embed = lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)]
+    build_storage_contract(wiki, index_dir, embed=embed)
+    old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+
+    if boundary == "manifest":
+        monkeypatch.setattr(
+            build_service_module.FilesystemIndexManifest,
+            "write",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("manifest unavailable")),
+        )
+    else:
+        monkeypatch.setattr(
+            LanceDbIndexRepository,
+            "validate_reopened",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("FTS stats failed")),
+        )
+
+    with pytest.raises((OSError, RuntimeError)):
+        build_storage_contract(wiki, index_dir, embed=embed)
+
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == old_pointer
+    failed_markers = list((index_dir / "builds").glob("*/.failed"))
+    assert failed_markers
+    assert boundary in failed_markers[-1].read_text(encoding="utf-8")
