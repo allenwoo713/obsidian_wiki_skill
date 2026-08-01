@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from obsidian_wiki.domain.index_models import (  # noqa: E402
     VectorIndexConfig,
 )
 from obsidian_wiki.domain.index_policy import PolicyError, select_vector_policy  # noqa: E402
+from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
+from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
 
 def _benchmark(*, recall_at_10: float = 1.0, recall_at_20: float = 1.0) -> BenchmarkObservation:
@@ -105,3 +108,29 @@ def test_vector_config_rejects_non_dense_population_inputs() -> None:
             index_type="hnsw_flat", metric="cosine", num_partitions=0,
             m=16, ef_construction=300, dense_chunks_count=20,
         )
+
+
+def test_service_records_exact_and_candidate_id_sets_before_ann_promotion(tmp_path: Path) -> None:
+    """D-02: promotion evidence is persisted, not inferred from timing."""
+    wiki = tmp_path / "Wiki"
+    for index in range(20):
+        page = wiki / "concepts" / f"page-{index:02d}.md"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(f"# Page {index}\n\nUNIQUE{index:02d}\n", encoding="utf-8")
+
+    artifact = IndexBuildService(LanceDbIndexRepository(tmp_path / ".index")).build(
+        wiki,
+        tmp_path / ".index",
+        embed=lambda texts: [
+            [1.0 if column == row else 0.0 for column in range(20)]
+            for row, _text in enumerate(texts)
+        ],
+    )
+
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    benchmark = manifest["benchmark"]
+    assert benchmark["recall_at_10"] == 1.0
+    assert benchmark["recall_at_20"] == 1.0
+    assert benchmark["exact_result_ids"]
+    assert benchmark["candidate_result_ids"]
+    assert manifest["policy"]["selected_mode"] == "ann"
