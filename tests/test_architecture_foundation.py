@@ -39,6 +39,7 @@ from query_plan_models import (  # noqa: E402
 FORBIDDEN_SDK_ROOTS = (
     "lancedb",
     "networkx",
+    "pyarrow",
     "pyvis",
     "sentence_transformers",
     "torch",
@@ -126,7 +127,9 @@ import sys
 
 sys.path.insert(0, sys.argv[1])
 from obsidian_wiki.domain import query_models  # noqa: F401
+from obsidian_wiki.domain import index_models  # noqa: F401
 from obsidian_wiki.ports import query_planning  # noqa: F401
+from obsidian_wiki.ports import index_storage  # noqa: F401
 
 for root in {forbidden_roots!r}:
     if any(name == root or name.startswith(root + ".") for name in sys.modules):
@@ -139,6 +142,16 @@ for root in {forbidden_roots!r}:
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_import_linter_declares_index_build_layer_direction(self):
+        config = (Path(__file__).resolve().parents[1] / ".importlinter").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[importlinter:contract:index-build-layers]", config)
+        self.assertIn("    obsidian_wiki.infrastructure", config)
+        self.assertIn("    obsidian_wiki.application", config)
+        self.assertIn("    obsidian_wiki.ports", config)
+        self.assertIn("    obsidian_wiki.domain", config)
 
     def test_ci_declares_cross_platform_architecture_gate(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
