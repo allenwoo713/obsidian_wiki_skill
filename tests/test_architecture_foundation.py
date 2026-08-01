@@ -45,6 +45,12 @@ FORBIDDEN_SDK_ROOTS = (
     "transformers",
 )
 
+STORAGE_SDK_CONSTRAINTS = (
+    "lancedb==0.34.0",
+    "pyarrow==25.0.0",
+    "sentence-transformers==5.6.1",
+)
+
 
 class ArchitectureFoundationTests(unittest.TestCase):
     def test_legacy_exports_are_canonical_package_objects(self):
@@ -146,6 +152,22 @@ for root in {forbidden_roots!r}:
         self.assertIn("working-directory: scripts", workflow)
         self.assertIn("lint-imports --config ../.importlinter --no-cache", workflow)
         self.assertIn("python tests/test_architecture_foundation.py", workflow)
+
+    def test_storage_sdk_resolution_is_pinned_and_reported_by_workflows(self):
+        root = Path(__file__).resolve().parents[1]
+        requirements = (root / "requirements.in").read_text(encoding="utf-8")
+        ci_workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        eval_workflow = (root / ".github/workflows/eval.yml").read_text(encoding="utf-8")
+
+        for constraint in STORAGE_SDK_CONSTRAINTS:
+            self.assertIn(constraint, requirements)
+
+        for workflow in (ci_workflow, eval_workflow):
+            self.assertIn("Verify dependency lock is current", workflow)
+            self.assertIn("Report storage SDK versions", workflow)
+            self.assertIn("importlib.metadata", workflow)
+            for package in ("lancedb", "pyarrow", "sentence-transformers"):
+                self.assertIn(package, workflow)
 
 
 if __name__ == "__main__":
