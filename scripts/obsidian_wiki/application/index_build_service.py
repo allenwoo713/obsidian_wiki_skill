@@ -20,9 +20,8 @@ from obsidian_wiki.domain.index_models import (
     VectorIndexConfig,
 )
 from obsidian_wiki.domain.index_policy import select_vector_policy
-from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
-from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 from obsidian_wiki.ports.chunk_repository import ChunkRepository
+from obsidian_wiki.ports.index_manifest import IndexManifestStore
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
@@ -33,10 +32,17 @@ class IndexBuildService:
     """Partition canonical Markdown into physically separate sparse/dense rows."""
 
     def __init__(
-        self, storage: ChunkRepository, *, fts_config: FtsIndexConfig | None = None,
+        self,
+        storage: ChunkRepository,
+        *,
+        reopen_storage: Callable[[Path], ChunkRepository],
+        manifest_store: IndexManifestStore,
+        fts_config: FtsIndexConfig | None = None,
         benchmark_observer: BenchmarkObserver | None = None,
     ):
         self._storage = storage
+        self._reopen_storage = reopen_storage
+        self._manifest_store = manifest_store
         self._fts_config = fts_config or FtsIndexConfig()
         self._benchmark_observer = benchmark_observer
 
@@ -67,7 +73,7 @@ class IndexBuildService:
         try:
             self._storage.persist(lance_dir, sparse_chunks, dense_chunks, self._fts_config)
             # Reopen through a new adapter instance: inputs and an open write handle are not evidence.
-            reopened = LanceDbIndexRepository(lance_dir)
+            reopened = self._reopen_storage(lance_dir)
             dimension = len(dense_chunks[0].vector)
             vector_config = VectorIndexConfig(
                 index_type="hnsw_flat", metric="cosine", num_partitions=1,
@@ -94,7 +100,7 @@ class IndexBuildService:
                 benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
             )
             manifest_path = build_dir / "manifest.json"
-            FilesystemIndexManifest().write(manifest_path, manifest)
+            self._manifest_store.write(manifest_path, manifest)
             self._publish(index_dir, build_dir)
             return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
         except Exception as exc:
@@ -133,7 +139,7 @@ class IndexBuildService:
 
     def _benchmark(
         self,
-        repository: LanceDbIndexRepository,
+        repository: ChunkRepository,
         dense_chunks: Sequence[DenseChunk],
         stats: IndexStats,
         *,

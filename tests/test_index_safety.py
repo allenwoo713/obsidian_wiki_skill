@@ -16,7 +16,7 @@ sys = __import__("sys")
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import WikiIndex  # noqa: E402
 from build_index import build_storage_contract  # noqa: E402
-from obsidian_wiki.application import index_build_service as build_service_module  # noqa: E402
+from obsidian_wiki.infrastructure import filesystem_index_manifest as manifest_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
 
@@ -128,7 +128,7 @@ def test_storage_contract_failure_never_changes_active_pointer(tmp_path, monkeyp
 
     if boundary == "manifest":
         monkeypatch.setattr(
-            build_service_module.FilesystemIndexManifest,
+            manifest_module.FilesystemIndexManifest,
             "write",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("manifest unavailable")),
         )

@@ -23,6 +23,7 @@ from obsidian_wiki.infrastructure import lancedb_index_repository as repository_
 from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
     LanceDbIndexRepository,
 )
+from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest  # noqa: E402
 
 
 def _write_page(wiki: Path, body: str) -> None:
@@ -213,6 +214,8 @@ def test_complete_non_promoting_candidate_publishes_exact_policy(tmp_path: Path)
     index_dir = tmp_path / ".index"
     service = IndexBuildService(
         LanceDbIndexRepository(index_dir),
+        reopen_storage=LanceDbIndexRepository,
+        manifest_store=FilesystemIndexManifest(),
         benchmark_observer=lambda _stats: BenchmarkObservation(
             recall_at_10=0.9, recall_at_20=1.0, latency_p50_ms=1.0,
             latency_p95_ms=2.0, build_time_ms=3.0, disk_bytes=4,

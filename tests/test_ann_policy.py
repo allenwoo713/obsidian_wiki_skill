@@ -19,6 +19,7 @@ from obsidian_wiki.domain.index_models import (  # noqa: E402
 from obsidian_wiki.domain.index_policy import PolicyError, select_vector_policy  # noqa: E402
 from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
+from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest  # noqa: E402
 
 
 def _benchmark(*, recall_at_10: float = 1.0, recall_at_20: float = 1.0) -> BenchmarkObservation:
@@ -118,7 +119,11 @@ def test_service_records_exact_and_candidate_id_sets_before_ann_promotion(tmp_pa
         page.parent.mkdir(parents=True, exist_ok=True)
         page.write_text(f"# Page {index}\n\nUNIQUE{index:02d}\n", encoding="utf-8")
 
-    artifact = IndexBuildService(LanceDbIndexRepository(tmp_path / ".index")).build(
+    artifact = IndexBuildService(
+        LanceDbIndexRepository(tmp_path / ".index"),
+        reopen_storage=LanceDbIndexRepository,
+        manifest_store=FilesystemIndexManifest(),
+    ).build(
         wiki,
         tmp_path / ".index",
         embed=lambda texts: [

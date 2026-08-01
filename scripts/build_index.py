@@ -71,9 +71,14 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed):
     tracer can exercise real LanceDB without loading a model in its tiny test.
     """
     from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
     from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
-    return IndexBuildService(LanceDbIndexRepository(index_dir)).build(
+    return IndexBuildService(
+        LanceDbIndexRepository(index_dir),
+        reopen_storage=LanceDbIndexRepository,
+        manifest_store=FilesystemIndexManifest(),
+    ).build(
         Path(wiki_dir), Path(index_dir), embed=embed)
 
 
