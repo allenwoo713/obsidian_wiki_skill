@@ -158,11 +158,8 @@ class LanceDbIndexRepository:
         )
 
     def search_sparse(self, query: str, *, limit: int = 10) -> list[Mapping[str, object]]:
-        try:
-            return self._sparse_table().search(query, query_type="fts").limit(limit).to_list()
-        except Exception as exc:  # compatibility read path: warn and return no hits
-            logging.getLogger(__name__).warning("sparse LanceDB query failed: %s", exc)
-            return []
+        """Route every sparse request to the native FTS index, never a fallback."""
+        return self._sparse_table().search(query, query_type="fts").limit(limit).to_list()
 
     def search_dense(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
@@ -175,13 +172,9 @@ class LanceDbIndexRepository:
         return self._search_dense(vector, metric=metric, limit=limit, where=where, exact=True)
 
     def search_sparse_for_page(self, query: str, page_id: str, *, limit: int = 10) -> list[Mapping[str, object]]:
-        try:
-            return self._sparse_table().search(query, query_type="fts").where(
-                self.page_predicate(page_id)
-            ).limit(limit).to_list()
-        except Exception as exc:  # compatibility read path: warn and return no hits
-            logging.getLogger(__name__).warning("sparse LanceDB page query failed: %s", exc)
-            return []
+        return self._sparse_table().search(query, query_type="fts").where(
+            self.page_predicate(page_id)
+        ).limit(limit).to_list()
 
     @staticmethod
     def page_predicate(page_id: str) -> str:

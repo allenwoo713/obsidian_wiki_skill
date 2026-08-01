@@ -162,14 +162,12 @@ def scan_wiki(wiki_dir: Path, project_root: Path) -> List[WikiPage]:
 
 
 class WikiIndex:
-    """分层分块 + LanceDB FTS + 自适应向量索引，支持增量构建。
+    """Compatibility facade over the D-01 split sparse/dense index contract.
 
-    表结构（LanceDB ``chunks`` 表）：
-      chunk_id, page_id, path, title, page_type, section_path(json), heading,
-      chunk_kind('dense'|'sparse'), chunk_index, parent_section_id, text,
-      fts_text(应用层预分词), token_count, content_hash, vector
-    - dense leaf chunk：带向量 + fts_text（主检索单元）
-    - sparse section chunk：仅 fts_text（向量列填零向量，向量检索由 chunk_kind 过滤）
+    Public callers keep using ``WikiIndex``.  Storage does not: sparse retrieval
+    is always native FTS against ``sparse_chunks`` and vector retrieval is always
+    against ``dense_chunks``.  The retired single ``chunks`` artifact is rejected
+    on load and is never created by this facade.
     """
 
     def __init__(self, index_dir: Path):
@@ -179,6 +177,7 @@ class WikiIndex:
         self._page_by_id: Dict[str, WikiPage] = {}
         self._embedder = None
         self._lance_table = None
+        self._repository = None
         self._lexicon = set()
         self._project_root: Optional[Path] = None
         # #11 索引原子发布：build 期指向新建 builds/<id>/lance_db（及 manifest 目标）；
@@ -231,20 +230,20 @@ class WikiIndex:
     # ---- LanceDB ----
     def _get_lance_table(self, create_if_missing: bool = False, dim: int = None,
                          sample: dict = None):
-        if self._lance_table is None:
-            import lancedb
-            db = lancedb.connect(str(self._lance_dir or self._resolve_active_lance_dir()))
-            try:
-                self._lance_table = db.open_table("chunks")
-            except Exception:
-                if not create_if_missing or sample is None:
-                    raise
-                vec_dim = dim or 384
-                row = dict(sample)
-                row["vector"] = [0.0] * vec_dim
-                self._lance_table = db.create_table("chunks", data=[row])
-                self._lance_table.delete("chunk_id != ''")
-        return self._lance_table
+        raise RuntimeError(
+            "The retired chunks-table accessor is unavailable. "
+            "Use the split-table repository through WikiIndex search methods."
+        )
+
+    def _get_repository(self):
+        """Open the active D-01 repository only after validating its manifest."""
+        if self._repository is None:
+            from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+            lance_dir = self._resolve_active_lance_dir()
+            LanceDbIndexRepository.require_current_layout(lance_dir.parent / "manifest.json")
+            self._repository = LanceDbIndexRepository(lance_dir)
+        return self._repository
 
     # ---- 活动索引解析（#11 指针方案） ----
     def _resolve_active_lance_dir(self) -> Path:
@@ -284,6 +283,27 @@ class WikiIndex:
         都会中止 staging build 并保留旧活动索引（#13 review Gap 1）。置 True 仅用于实验，
         降级为 warning，禁止用于生产发布。
         """
+        # Keep the long-standing public call signature, but route every actual
+        # build through the D-01 service.  #21/#22 incremental/publisher work and
+        # #23 ranking remain outside this compatibility migration.
+        embedder = self._get_embedder()
+
+        def embed(texts):
+            vectors = embedder.encode(
+                list(texts), show_progress_bar=False,
+                normalize_embeddings=NORMALIZE_EMBEDDINGS,
+            )
+            return [list(vector) for vector in vectors]
+
+        build_storage_contract(Path(wiki_dir), self.index_dir, embed=embed)
+        self._repository = None
+        self._lance_table = None
+        self._project_root = Path(wiki_dir).parent
+        self._lexicon = load_lexicon(self._project_root)
+        self.pages = scan_wiki(Path(wiki_dir), self._project_root)
+        self._page_by_id = {page_id_of(page.path): page for page in self.pages}
+        return
+
         self._force_encode = bool(full_rebuild)
         self._vector_index_mode = vector_index_mode
         self._allow_partial_index = bool(allow_partial_index)
@@ -981,44 +1001,30 @@ class WikiIndex:
         manifest_file = self._resolve_active_manifest()
         if not manifest_file.exists():
             raise RuntimeError("索引未找到，请先运行 build_index.py")
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        st = manifest.get("index_state")
-        if st is None:
-            raise RuntimeError(
-                "Legacy index detected (no index_state in manifest). "
-                "Rebuild the index: python build_index.py <project_root>")
-        if st.get("vector_metric") != VECTOR_METRIC:
-            raise RuntimeError(
-                f"Vector metric mismatch: manifest has '{st.get('vector_metric')}', "
-                f"current code expects '{VECTOR_METRIC}'. Rebuild the index.")
+        from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+        LanceDbIndexRepository.require_current_layout(manifest_file)
         self._project_root = Path(self.index_dir).parent
         self._lexicon = load_lexicon(self._project_root)
         self._load_image_meta()  # #12 多模态：加载图片父文档回溯元数据
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
         self._page_by_id = {}
         self.pages = []
-        for p in manifest.get("pages", []):
-            wp = WikiPage(
-                path=Path(p["path"]), title=p.get("title", Path(p["path"]).stem),
-                page_type=p.get("page_type", "concept"), content="",
-                sources=p.get("sources", []), links=p.get("links", []),
-                sha256=p.get("sha256", ""), aliases=p.get("aliases", []),
+        for page in manifest.get("pages", []):
+            wiki_page = WikiPage(
+                path=Path(page["path"]), title=page.get("title", Path(page["path"]).stem),
+                page_type=page.get("page_type", "concept"), content="",
+                sources=page.get("sources", []), links=page.get("links", []),
+                sha256=page.get("sha256", ""), aliases=page.get("aliases", []),
             )
-            self.pages.append(wp)
-            self._page_by_id[p.get("page_id", page_id_of(p["path"]))] = wp
-        # 触发 LanceDB 表打开
-        self._get_lance_table()
+            self.pages.append(wiki_page)
+            self._page_by_id[page.get("page_id", page_id_of(wiki_page.path))] = wiki_page
+        self._repository = LanceDbIndexRepository(self._resolve_active_lance_dir())
 
     # ---- search ----
     def search_fts(self, query: str, k: int = 20) -> List[ChunkHit]:
         """LanceDB 原生 FTS（whitespace 预分词）。返回 chunk 级命中。"""
         q = " ".join(fts_terms(query, self._lexicon) + extract_exact_terms(query))
-        table = self._get_lance_table()
-        try:
-            rows = table.search(q, query_type="fts").limit(k * 4).to_list()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("search_fts 失败: %s", e)
-            return []
+        rows = self._get_repository().search_sparse(q, limit=k * 4)
         return [self._hit_from_row(r, "fts") for r in rows]
 
     def search_fts_terms(self, lexical_terms, exact_terms, k: int = 20) -> List[ChunkHit]:
@@ -1031,29 +1037,15 @@ class WikiIndex:
         q = " ".join(list(lexical_terms) + list(exact_terms))
         if not q.strip():
             return []
-        table = self._get_lance_table()
-        try:
-            rows = table.search(q, query_type="fts").limit(k * 4).to_list()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("search_fts_terms 失败: %s", e)
-            return []
+        rows = self._get_repository().search_sparse(q, limit=k * 4)
         return [self._hit_from_row(r, "fts") for r in rows]
 
     def search_vector(self, query: str, k: int = 20) -> List[ChunkHit]:
         """向量检索（仅 dense 行）。返回 chunk 级命中（按 page_id 归并前）。"""
         embedder = self._get_embedder()
         qv = embedder.encode([query], show_progress_bar=False,
-                             normalize_embeddings=NORMALIZE_EMBEDDINGS)[0].tolist()
-        table = self._get_lance_table()
-        qb = apply_vector_metric(table.search(qv), VECTOR_METRIC)
-        qb = qb.where("chunk_kind = 'dense'")
-        try:
-            rows = qb.limit(k * 4).to_list()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning("search_vector 失败: %s", e)
-            return []
+                             normalize_embeddings=NORMALIZE_EMBEDDINGS)[0]
+        rows = self._get_repository().search_dense(list(qv), metric=VECTOR_METRIC, limit=k * 4)
         return [self._hit_from_row(r, "vector") for r in rows]
 
     def search_page(self, page_id: str, plan, sparse_k: int = 20,
@@ -1064,22 +1056,21 @@ class WikiIndex:
         accidentally validate a graph recommendation with a similarly named
         chunk from another page.
         """
-        predicate = f"page_id = '{self._sql(page_id)}'"
+        repository = self._get_repository()
         out: List[ChunkHit] = []
         terms = " ".join(list(plan.lexical_terms) + list(plan.exact_terms))
         if terms.strip():
-            try:
-                rows = self._get_lance_table().search(terms, query_type="fts").where(predicate).limit(sparse_k).to_list()
-                out.extend(self._hit_from_row(row, "fts") for row in rows)
-            except Exception as exc:
-                logging.getLogger(__name__).warning("restricted FTS failed: %s", exc)
+            rows = repository.search_sparse_for_page(terms, page_id, limit=sparse_k)
+            out.extend(self._hit_from_row(row, "fts") for row in rows)
         try:
             embedder = self._get_embedder()
             for query in plan.semantic_queries:
                 vector = embedder.encode([query], show_progress_bar=False,
-                                          normalize_embeddings=NORMALIZE_EMBEDDINGS)[0].tolist()
-                rows = apply_vector_metric(self._get_lance_table().search(vector), VECTOR_METRIC).where(
-                    f"{predicate} AND chunk_kind = 'dense'").limit(dense_k).to_list()
+                                          normalize_embeddings=NORMALIZE_EMBEDDINGS)[0]
+                rows = repository.search_dense(
+                    list(vector), metric=VECTOR_METRIC, limit=dense_k,
+                    where=repository.page_predicate(page_id),
+                )
                 out.extend(self._hit_from_row(row, "vector") for row in rows)
         except Exception as exc:
             logging.getLogger(__name__).warning("restricted vector search failed: %s", exc)
@@ -1165,9 +1156,9 @@ class WikiIndex:
                 vectors_are_unit_normalized=NORMALIZE_EMBEDDINGS)
         return ChunkHit(
             chunk_id=r["chunk_id"], page_id=r["page_id"], path=r["path"],
-            title=r["title"], page_type=r["page_type"],
+            title=r["title"], page_type=r.get("page_type", "concept"),
             section_path=json.loads(r.get("section_path") or "[]"),
-            heading=r.get("heading", ""), chunk_kind=r["chunk_kind"],
+            heading=r.get("heading", ""), chunk_kind=r.get("chunk_kind", "dense"),
             text=r["text"], channel=channel, score=score, distance=distance,
             chunk_index=(int(r["chunk_index"]) if r.get("chunk_index") is not None else None),
         )

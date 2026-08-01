@@ -98,6 +98,7 @@ class IndexBuildService:
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
                 benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
+                sparse_chunks=sparse_chunks,
             )
             manifest_path = build_dir / "manifest.json"
             self._manifest_store.write(manifest_path, manifest)
@@ -113,7 +114,8 @@ class IndexBuildService:
             raise
 
     def _manifest(self, *, counts: dict, vector_stats: dict, fts_stats: dict,
-                  vector_config: VectorIndexConfig, benchmark: dict, policy: dict) -> dict:
+                  vector_config: VectorIndexConfig, benchmark: dict, policy: dict,
+                  sparse_chunks: Sequence[SparseChunk]) -> dict:
         fts_config = self._fts_config.to_json()
         vector_config_json = vector_config.to_json()
         return {
@@ -135,6 +137,22 @@ class IndexBuildService:
             },
             "benchmark": benchmark,
             "policy": policy,
+            # Compatibility metadata only; retrieval still reads only the two
+            # physical D-01 tables.  Existing WikiIndex callers use this to
+            # retain titles and source-page context after ``load()``.
+            "pages": [
+                {
+                    "page_id": chunk.page_id,
+                    "path": chunk.path,
+                    "title": chunk.title,
+                    "page_type": "concept",
+                    "sources": [],
+                    "links": [],
+                    "aliases": [],
+                    "sha256": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
+                }
+                for chunk in sparse_chunks
+            ],
         }
 
     def _benchmark(
@@ -229,13 +247,21 @@ class IndexBuildService:
             if ".graph" in path.parts:
                 continue
             raw = path.read_text(encoding="utf-8", errors="replace")
-            body = raw.split("---", 2)[-1].strip() if raw.startswith("---") else raw.strip()
+            front_matter, body = ("", raw.strip())
+            if raw.startswith("---"):
+                parts = raw.split("---", 2)
+                front_matter, body = parts[1], parts[-1].strip()
             if not body:
                 continue
+            title = path.stem
+            for line in front_matter.splitlines():
+                if line.startswith("title:"):
+                    title = line.partition(":")[2].strip().strip("\"'") or title
+                    break
             digest = hashlib.sha256(f"{path.resolve()}\0{body}".encode("utf-8")).hexdigest()
             page_id = str(path.resolve())
             chunks.append(SparseChunk(
                 chunk_id=f"sparse:{digest}", page_id=page_id, path=str(path),
-                title=path.stem, text=body, fts_text=body,
+                title=title, text=body, fts_text=body,
             ))
         return tuple(chunks)

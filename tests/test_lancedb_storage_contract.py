@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from build_index import build_storage_contract  # noqa: E402
+from build_index import WikiIndex, build_storage_contract  # noqa: E402
 from obsidian_wiki.domain.index_models import RebuildRequiredError  # noqa: E402
 from obsidian_wiki.domain.index_models import (  # noqa: E402
     BenchmarkObservation,
@@ -84,6 +84,56 @@ def test_legacy_manifest_requires_rebuild(tmp_path: Path) -> None:
 
     with pytest.raises(RebuildRequiredError, match="rebuild"):
         LanceDbIndexRepository.require_current_layout(manifest)
+
+
+def test_wikiindex_routes_sparse_and_dense_queries_to_split_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The compatibility facade must not reopen the retired ``chunks`` table."""
+    calls: list[tuple[str, object]] = []
+
+    class Repository:
+        def search_sparse(self, query: str, *, limit: int):
+            calls.append(("sparse", (query, limit)))
+            return [{"chunk_id": "s", "page_id": "p", "path": "p.md", "title": "P", "text": "text"}]
+
+        def search_dense(self, vector, *, metric: str, limit: int):
+            calls.append(("dense", (list(vector), metric, limit)))
+            return [{"chunk_id": "d", "page_id": "p", "path": "p.md", "title": "P", "text": "text", "_distance": 0.1}]
+
+    class Embedder:
+        def encode(self, *_args, **_kwargs):
+            return [[1.0, 0.0]]
+
+    index = WikiIndex(tmp_path / ".index")
+    monkeypatch.setattr(index, "_get_repository", lambda: Repository())
+    monkeypatch.setattr(index, "_get_embedder", lambda: Embedder())
+    monkeypatch.setattr(index, "_get_lance_table", lambda *args, **kwargs: pytest.fail("legacy chunks opened"))
+
+    assert index.search_fts("needle", k=2)[0].chunk_id == "s"
+    assert index.search_vector("meaning", k=2)[0].chunk_id == "d"
+    assert [name for name, _ in calls] == ["sparse", "dense"]
+
+
+def test_native_fts_creation_failure_is_fatal_and_preserves_active_pointer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Contract\n\nThe exact token is FTSFAILTERM\n")
+    index_dir = tmp_path / ".index"
+    embed = lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
+    build_storage_contract(wiki, index_dir, embed=embed)
+    original_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+
+    def fail_fts(self, *_args, **_kwargs):
+        raise RuntimeError("native FTS unavailable")
+
+    monkeypatch.setattr(repository_module.LanceDbIndexRepository, "persist", fail_fts)
+    with pytest.raises(RuntimeError, match="native FTS unavailable"):
+        build_storage_contract(wiki, index_dir, embed=embed)
+
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == original_pointer
+    assert list((index_dir / "builds").glob("build_*/.failed"))
 
 
 class _QuerySpy:
