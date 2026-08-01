@@ -3,9 +3,11 @@ import json
 from pathlib import Path
 import pytest
 import sys
+import types
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import WikiIndex
+from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
 
 def _write_page(wiki: Path, name: str, title: str, body: str, sources=None):
@@ -50,3 +52,26 @@ def test_vector_search(tmp_path):
     wi.build(wiki)
     results = wi.search_vector("calibration alignment", k=2)
     assert len(results) > 0
+
+
+def test_sentence_transformer_embedder_loads_only_local_assets(monkeypatch, tmp_path):
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    (model_dir / "model.safetensors").write_bytes(b"local")
+    calls = []
+
+    class FakeModel:
+        def encode(self, texts, **kwargs):
+            calls.append((list(texts), kwargs))
+            return [[1.0, 2.0] for _ in texts]
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", types.SimpleNamespace(
+        SentenceTransformer=lambda path, local_files_only: FakeModel()
+    ))
+    embedder = SentenceTransformerEmbedder(model_dir)
+
+    assert embedder.embed(["dense text"]) == [(1.0, 2.0)]
+    assert calls == [(["dense text"], {"show_progress_bar": False, "normalize_embeddings": False})]
+
+    with pytest.raises(RuntimeError, match="(?i)local embedding model"):
+        SentenceTransformerEmbedder(tmp_path / "missing").embed(["dense text"])
