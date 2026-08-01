@@ -1194,16 +1194,11 @@ def main():
     proj = Path(args.project_root)
     wiki = proj / "Wiki"
     idx_dir = proj / ".index"
-    wi = WikiIndex(idx_dir)
+    from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
-    def embed(texts):
-        vectors = wi._get_embedder().encode(
-            list(texts), show_progress_bar=False,
-            normalize_embeddings=NORMALIZE_EMBEDDINGS,
-        )
-        return vectors.tolist()
-
-    artifact = build_storage_contract(wiki, idx_dir, embed=embed)
+    model_path = Path(os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or SKILL_EMBEDDER_DIR)
+    embedder = SentenceTransformerEmbedder(model_path)
+    artifact = build_storage_contract(wiki, idx_dir, embed=embedder.embed)
     mode = "全量重建" if args.full_rebuild else "增量"
     print(
         f"索引构建完成（{mode}）: sparse={artifact.sparse_count}, "
