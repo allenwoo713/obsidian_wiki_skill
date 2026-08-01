@@ -31,10 +31,20 @@ forbidden_modules =
     query
     lancedb
     networkx
+    pyarrow
     pyvis
     sentence_transformers
     torch
     transformers
+
+[importlinter:contract:index-build-layers]
+name = Index-build infrastructure depends inward through application and ports
+type = layers
+layers =
+    obsidian_wiki.infrastructure
+    obsidian_wiki.application
+    obsidian_wiki.ports
+    obsidian_wiki.domain
 
 [importlinter:contract:package-siblings-are-acyclic]
 name = Obsidian Wiki package siblings are acyclic
