@@ -58,14 +58,7 @@ class IndexBuildService:
                 "layout": "sparse_chunks+dense_chunks",
                 "sparse_count": len(sparse_chunks),
                 "dense_count": len(dense_chunks),
-                "fts_config": {
-                    "base_tokenizer": self._fts_config.base_tokenizer,
-                    "lower_case": self._fts_config.lower_case,
-                    "stem": self._fts_config.stem,
-                    "remove_stop_words": self._fts_config.remove_stop_words,
-                    "ascii_folding": self._fts_config.ascii_folding,
-                    "max_token_length": self._fts_config.max_token_length,
-                },
+                "fts_config": self._fts_config.to_json(),
             }
             manifest_path = build_dir / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

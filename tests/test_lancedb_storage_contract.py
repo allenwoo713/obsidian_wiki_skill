@@ -64,6 +64,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
     assert manifest["fts_config"] == {
+        "column": "fts_text",
         "base_tokenizer": "whitespace",
         "lower_case": False,
         "stem": False,
