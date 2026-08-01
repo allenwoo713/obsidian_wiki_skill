@@ -86,8 +86,13 @@ class IndexBuildService:
             FilesystemIndexManifest().write(manifest_path, manifest)
             self._publish(index_dir, build_dir)
             return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
-        except Exception:
-            (build_dir / ".failed").write_text("storage contract build failed", encoding="utf-8")
+        except Exception as exc:
+            message = str(exc).lower()
+            invariant = "manifest" if "manifest" in message else "validation"
+            (build_dir / ".failed").write_text(
+                f"{invariant} failed before publication: {type(exc).__name__}: {exc}",
+                encoding="utf-8",
+            )
             raise
 
     def _manifest(self, *, counts: dict, vector_stats: dict, fts_stats: dict,
