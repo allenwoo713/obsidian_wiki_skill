@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import os
+import statistics
 import time
 import uuid
 from pathlib import Path
@@ -72,20 +73,25 @@ class IndexBuildService:
                 index_type="hnsw_flat", metric="cosine", num_partitions=1,
                 m=16, ef_construction=300, dense_chunks_count=len(dense_chunks),
             )
+            index_started = time.perf_counter()
             reopened.create_vector_index(vector_config)
+            index_build_ms = (time.perf_counter() - index_started) * 1000
             exact_term = self._exact_term(sparse_chunks)
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term
             )
-            benchmark = self._benchmark_observer(vector_stats) if self._benchmark_observer else BenchmarkObservation(
-                recall_at_10=1.0, recall_at_20=1.0, latency_p50_ms=0.0,
-                latency_p95_ms=0.0, build_time_ms=0.0, disk_bytes=self._disk_bytes(build_dir),
+            benchmark, benchmark_evidence = self._benchmark(
+                reopened,
+                dense_chunks,
+                vector_stats,
+                build_time_ms=index_build_ms,
+                disk_bytes=self._disk_bytes(build_dir),
             )
             policy = select_vector_policy(benchmark, vector_stats)
             manifest = self._manifest(
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
-                benchmark=benchmark.to_json(), policy=policy.to_json(),
+                benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
             )
             manifest_path = build_dir / "manifest.json"
             FilesystemIndexManifest().write(manifest_path, manifest)
@@ -123,6 +129,65 @@ class IndexBuildService:
             },
             "benchmark": benchmark,
             "policy": policy,
+        }
+
+    def _benchmark(
+        self,
+        repository: LanceDbIndexRepository,
+        dense_chunks: Sequence[DenseChunk],
+        stats: IndexStats,
+        *,
+        build_time_ms: float,
+        disk_bytes: int,
+    ) -> tuple[BenchmarkObservation, dict]:
+        """Measure the candidate against exact bypass with the same query contract.
+
+        Latency is evidence only.  The policy consumes only deterministic recall
+        and coverage observations, so runner variance cannot change publication.
+        """
+        if self._benchmark_observer is not None:
+            observation = self._benchmark_observer(stats)
+            return observation, {"exact_result_ids": [], "candidate_result_ids": []}
+
+        exact_ids: list[list[str]] = []
+        candidate_ids: list[list[str]] = []
+        candidate_durations: list[float] = []
+        recalls: dict[int, list[float]] = {10: [], 20: []}
+        for chunk in dense_chunks:
+            exact = repository.search_dense_exact(
+                chunk.vector, metric="cosine", limit=20, where=None
+            )
+            started = time.perf_counter()
+            candidate = repository.search_dense(
+                chunk.vector, metric="cosine", limit=20, where=None
+            )
+            candidate_durations.append((time.perf_counter() - started) * 1000)
+            exact_row_ids = [str(row["chunk_id"]) for row in exact]
+            candidate_row_ids = [str(row["chunk_id"]) for row in candidate]
+            if not exact_row_ids:
+                raise RuntimeError("Exact benchmark query returned no dense rows")
+            exact_ids.append(exact_row_ids)
+            candidate_ids.append(candidate_row_ids)
+            for limit in recalls:
+                truth = set(exact_row_ids[:limit])
+                observed = set(candidate_row_ids[:limit])
+                recalls[limit].append(len(truth & observed) / len(truth))
+
+        def percentile_95(samples: Sequence[float]) -> float:
+            ordered = sorted(samples)
+            return ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+
+        observation = BenchmarkObservation(
+            recall_at_10=min(recalls[10]),
+            recall_at_20=min(recalls[20]),
+            latency_p50_ms=statistics.median(candidate_durations),
+            latency_p95_ms=percentile_95(candidate_durations),
+            build_time_ms=build_time_ms,
+            disk_bytes=disk_bytes,
+        )
+        return observation, {
+            "exact_result_ids": exact_ids,
+            "candidate_result_ids": candidate_ids,
         }
 
     @staticmethod
