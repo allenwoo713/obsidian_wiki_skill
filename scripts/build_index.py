@@ -63,6 +63,20 @@ from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
 
+def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed):
+    """Direct-script facade for the D-01/D-04 storage-contract build path.
+
+    The public script remains the entry point while orchestration and storage are
+    delegated to their package tiers.  ``embed`` is injected so the persisted
+    tracer can exercise real LanceDB without loading a model in its tiny test.
+    """
+    from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    return IndexBuildService(LanceDbIndexRepository(index_dir)).build(
+        Path(wiki_dir), Path(index_dir), embed=embed)
+
+
 # 仅固定「pyarrow 先于 torch」的导入顺序（ISSUE-16）；torch 已于上方最顶部加载完毕。
 try:
     import lancedb  # noqa: F401
@@ -1181,10 +1195,20 @@ def main():
     wiki = proj / "Wiki"
     idx_dir = proj / ".index"
     wi = WikiIndex(idx_dir)
-    wi.build(wiki, full_rebuild=args.full_rebuild, vector_index_mode=args.vector_index,
-             allow_partial_index=args.allow_partial_index)
+
+    def embed(texts):
+        vectors = wi._get_embedder().encode(
+            list(texts), show_progress_bar=False,
+            normalize_embeddings=NORMALIZE_EMBEDDINGS,
+        )
+        return vectors.tolist()
+
+    artifact = build_storage_contract(wiki, idx_dir, embed=embed)
     mode = "全量重建" if args.full_rebuild else "增量"
-    print(f"索引构建完成（{mode}）: {len(wi.pages)} 页 → 活动索引指针 {idx_dir / 'ACTIVE_INDEX'}")
+    print(
+        f"索引构建完成（{mode}）: sparse={artifact.sparse_count}, "
+        f"dense={artifact.dense_count} → {artifact.lance_dir}"
+    )
 
 
 if __name__ == "__main__":

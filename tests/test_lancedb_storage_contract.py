@@ -36,9 +36,9 @@ def _write_page(wiki: Path, body: str) -> None:
 
 def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> None:
     """The direct script wrapper crosses service/port/adapter into LanceDB."""
-    long_term = "x" * 180
+    long_term = "D01ExactTerm" + "abc123" * 29
     wiki = tmp_path / "Wiki"
-    _write_page(wiki, f"# Contract\n\nThe exact storage token is {long_term}.")
+    _write_page(wiki, f"# Contract\n\nThe exact storage token is\n{long_term}\n")
 
     artifact = build_storage_contract(
         wiki,
@@ -54,6 +54,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     assert "vector" in dense.schema.names
     assert sparse.count_rows() > 0
     assert dense.count_rows() > 0
+    assert "fts_text_idx" in {index.name for index in sparse.list_indices()}
 
     manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
