@@ -183,3 +183,23 @@ def test_adapter_rejects_duplicate_or_nonfinite_dense_vectors(tmp_path: Path) ->
 
 def test_adapter_escapes_quoted_page_identifiers() -> None:
     assert LanceDbIndexRepository.page_predicate("O'Reilly") == "page_id = 'O''Reilly'"
+
+
+def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path) -> None:
+    """D-01: only a newly reopened, fully validated two-table build can publish."""
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Contract\n\nThe standalone exact token is VALIDATIONTERM\n")
+    index_dir = tmp_path / ".index"
+
+    artifact = build_storage_contract(
+        wiki, index_dir, embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
+    )
+
+    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    assert (index_dir / "ACTIVE_INDEX").exists()
+    assert manifest["format_version"] >= 4
+    assert manifest["validation"]["schema_counts"] == {"sparse_chunks_count": 1, "dense_chunks_count": 1}
+    assert manifest["validation"]["exact_term_validated"] is True
+    assert manifest["config_hashes"]["fts_config"]
+    assert manifest["sdk_versions"]["lancedb"]
+    assert manifest["policy"]["selected_mode"] in {"ann", "exact"}
