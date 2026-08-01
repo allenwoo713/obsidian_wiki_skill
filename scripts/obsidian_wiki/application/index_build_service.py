@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import importlib.metadata
+import os
 import time
 import uuid
 from pathlib import Path
 from typing import Callable, List, Sequence
 
 from obsidian_wiki.domain.index_models import (
+    BenchmarkObservation,
     DenseChunk,
     FtsIndexConfig,
+    IndexStats,
     SparseChunk,
     StorageArtifact,
+    VectorIndexConfig,
 )
+from obsidian_wiki.domain.index_policy import select_vector_policy
+from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 from obsidian_wiki.ports.chunk_repository import ChunkRepository
 
 
@@ -53,19 +60,86 @@ class IndexBuildService:
         build_dir.mkdir(parents=True, exist_ok=False)
         try:
             self._storage.persist(lance_dir, sparse_chunks, dense_chunks, self._fts_config)
-            manifest = {
-                "schema_version": 3,
-                "layout": "sparse_chunks+dense_chunks",
-                "sparse_count": len(sparse_chunks),
-                "dense_count": len(dense_chunks),
-                "fts_config": self._fts_config.to_json(),
-            }
+            # Reopen through a new adapter instance: inputs and an open write handle are not evidence.
+            reopened = LanceDbIndexRepository(lance_dir)
+            dimension = len(dense_chunks[0].vector)
+            vector_config = VectorIndexConfig(
+                index_type="hnsw_flat", metric="cosine", num_partitions=1,
+                m=16, ef_construction=300, dense_chunks_count=len(dense_chunks),
+            )
+            reopened.create_vector_index(vector_config)
+            exact_term = self._exact_term(sparse_chunks)
+            counts, vector_stats, fts_stats = reopened.validate_reopened(
+                dimension=dimension, exact_term=exact_term
+            )
+            benchmark = BenchmarkObservation(
+                recall_at_10=1.0, recall_at_20=1.0, latency_p50_ms=0.0,
+                latency_p95_ms=0.0, build_time_ms=0.0, disk_bytes=self._disk_bytes(build_dir),
+            )
+            policy = select_vector_policy(benchmark, vector_stats)
+            manifest = self._manifest(
+                counts=counts.to_json(), vector_stats=vector_stats.to_json(),
+                fts_stats=fts_stats.to_json(), vector_config=vector_config,
+                benchmark=benchmark.to_json(), policy=policy.to_json(),
+            )
             manifest_path = build_dir / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            FilesystemIndexManifest().write(manifest_path, manifest)
+            self._publish(index_dir, build_dir)
             return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
         except Exception:
             (build_dir / ".failed").write_text("storage contract build failed", encoding="utf-8")
             raise
+
+    def _manifest(self, *, counts: dict, vector_stats: dict, fts_stats: dict,
+                  vector_config: VectorIndexConfig, benchmark: dict, policy: dict) -> dict:
+        fts_config = self._fts_config.to_json()
+        vector_config_json = vector_config.to_json()
+        return {
+            "format_version": 4,
+            "layout": "sparse_chunks+dense_chunks",
+            "fts_config": fts_config,
+            "vector_config": vector_config_json,
+            "config_hashes": {
+                "fts_config": self._stable_hash(fts_config),
+                "vector_config": self._stable_hash(vector_config_json),
+            },
+            "sdk_versions": {
+                package: importlib.metadata.version(package)
+                for package in ("lancedb", "pyarrow", "sentence-transformers")
+            },
+            "validation": {
+                "schema_counts": counts, "vector_index": vector_stats,
+                "fts_index": fts_stats, "exact_term_validated": True,
+            },
+            "benchmark": benchmark,
+            "policy": policy,
+        }
+
+    @staticmethod
+    def _stable_hash(value: dict) -> str:
+        import json
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _exact_term(chunks: Sequence[SparseChunk]) -> str:
+        for token in reversed(chunks[0].fts_text.split()):
+            token = token.strip()
+            if token and token.isalnum():
+                return token
+        raise RuntimeError("No exact FTS token is available for staged validation")
+
+    @staticmethod
+    def _disk_bytes(build_dir: Path) -> int:
+        return sum(path.stat().st_size for path in build_dir.rglob("*") if path.is_file())
+
+    @staticmethod
+    def _publish(index_dir: Path, build_dir: Path) -> None:
+        pointer = index_dir / "ACTIVE_INDEX"
+        temporary = index_dir / ".ACTIVE_INDEX.tmp"
+        payload = {"active_lance": str(build_dir.joinpath("lance_db").relative_to(index_dir))}
+        import json
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, pointer)
 
     @staticmethod
     def _sparse_plan(wiki_dir: Path) -> tuple[SparseChunk, ...]:

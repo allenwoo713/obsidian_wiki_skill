@@ -15,6 +15,7 @@ from obsidian_wiki.domain.index_models import (
     DenseChunk,
     FtsIndexConfig,
     FtsIndexStats,
+    IndexSchemaCounts,
     IndexStats,
     RebuildRequiredError,
     SparseChunk,
@@ -115,6 +116,46 @@ class LanceDbIndexRepository:
         if stats is None:
             raise RuntimeError(f"FTS index statistics unavailable for {index_name}")
         return FtsIndexStats(index_name=index_name, indexed_rows=stats.num_indexed_rows)
+
+    def validate_reopened(self, *, dimension: int, exact_term: str) -> tuple[IndexSchemaCounts, IndexStats, FtsIndexStats]:
+        """Inspect persisted data through a new connection, never cached input rows."""
+        if not exact_term or not exact_term.strip() or any(char.isspace() for char in exact_term.strip()):
+            raise ValueError("Exact-term validation requires one non-empty token")
+        db = lancedb.connect(str(self._lance_dir))
+        if set(db.table_names()) != {"sparse_chunks", "dense_chunks"}:
+            raise RuntimeError("Persisted artifact must contain exactly sparse_chunks and dense_chunks")
+        sparse = db.open_table("sparse_chunks")
+        dense = db.open_table("dense_chunks")
+        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text"}
+        required_dense = {"chunk_id", "page_id", "path", "title", "text", "vector"}
+        if set(sparse.schema.names) != required_sparse or set(dense.schema.names) != required_dense:
+            raise RuntimeError("Persisted table schemas do not satisfy the two-table contract")
+        sparse_rows = sparse.to_arrow().to_pylist()
+        dense_rows = dense.to_arrow().to_pylist()
+        if not sparse_rows or not dense_rows:
+            raise RuntimeError("Persisted sparse and dense tables must both contain rows")
+        for rows, name in ((sparse_rows, "sparse"), (dense_rows, "dense")):
+            ids = [str(row["chunk_id"]) for row in rows]
+            if len(ids) != len(set(ids)):
+                raise RuntimeError(f"Persisted {name} table contains duplicate chunk IDs")
+        for row in dense_rows:
+            vector = row["vector"]
+            if len(vector) != dimension or not all(math.isfinite(float(value)) for value in vector):
+                raise RuntimeError("Persisted dense vectors must be finite and fixed-dimension")
+        fts_names = {index.name for index in sparse.list_indices()}
+        if "fts_text_idx" not in fts_names:
+            raise RuntimeError("Persisted sparse table is missing the native FTS index")
+        fts_stats = self.fts_index_stats()
+        if fts_stats.indexed_rows < len(sparse_rows):
+            raise RuntimeError("Native FTS statistics show unindexed sparse rows")
+        if not self.search_sparse(exact_term, limit=1):
+            raise RuntimeError("Native FTS exact-term validation failed")
+        vector_stats = self.vector_index_stats("dense_hnsw")
+        return (
+            IndexSchemaCounts(len(sparse_rows), len(dense_rows)),
+            vector_stats,
+            fts_stats,
+        )
 
     def search_sparse(self, query: str, *, limit: int = 10) -> list[Mapping[str, object]]:
         try:
