@@ -24,21 +24,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-          cache: 'pip'
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.0"
+      - name: Configure repository-local caches and temporary paths
+        run: |
+          echo "PIP_CACHE_DIR=${{ github.workspace }}/.cache/pip" >> "$GITHUB_ENV"
+          echo "UV_CACHE_DIR=${{ github.workspace }}/.cache/uv" >> "$GITHUB_ENV"
+          echo "TMPDIR=${{ github.workspace }}/.review-tmp/eval" >> "$GITHUB_ENV"
+          echo "TEMP=${{ github.workspace }}/.review-tmp/eval" >> "$GITHUB_ENV"
+          echo "TMP=${{ github.workspace }}/.review-tmp/eval" >> "$GITHUB_ENV"
       - name: Verify dependency lock is current
-        # `uv pip compile` does a floating resolution; when a transitive dep
-        # releases a new version the committed lock can become "stale" and the
-        # --check would hard-fail CI even though the code is correct. Regenerate
-        # the lock on disk (used by the install step below) so the run proceeds
-        # with a current resolution instead of failing on hygiene drift.
-        run: python scripts/compile_requirements.py --check || python scripts/compile_requirements.py
+        run: python scripts/compile_requirements.py --check
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
+      - name: Report storage SDK versions
+        run: >
+          python -c "import importlib.metadata as metadata;
+          print(', '.join(f'{package}={metadata.version(package)}' for package in
+          ('lancedb', 'pyarrow', 'sentence-transformers')))"
       - name: Cache embedding model
         uses: actions/cache@v4
         with:
@@ -49,7 +55,7 @@ jobs:
           python scripts/download_embedding_model.py
       - name: Unit tests
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider --basetemp=/tmp/owb_pytest
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider --basetemp=.review-tmp/pytest
       - name: Protect evaluation baseline on pull requests
         if: github.event_name == 'pull_request'
         run: |
@@ -78,7 +84,7 @@ jobs:
           fi
       - name: Retrieval eval (regression check)
         run: |
-          python eval/run_eval.py --work-dir /tmp/owb_eval
+          python eval/run_eval.py --work-dir .review-tmp/eval
       - name: Upload eval results
         if: always()
         uses: actions/upload-artifact@v4
