@@ -104,6 +104,15 @@ class IndexBuildService:
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term
             )
+            if (
+                counts.sparse_chunks_count != len(sparse_chunks)
+                or counts.dense_chunks_count != len(dense_chunks)
+            ):
+                raise RuntimeError(
+                    "staging 持久化完整性校验失败："
+                    f"sparse={counts.sparse_chunks_count}/{len(sparse_chunks)} "
+                    f"dense={counts.dense_chunks_count}/{len(dense_chunks)}"
+                )
             benchmark, benchmark_evidence = self._benchmark(
                 reopened,
                 dense_chunks,

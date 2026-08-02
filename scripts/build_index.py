@@ -10,6 +10,7 @@ Retrieval v2（GitHub issues #1/#2/#8）：
 """
 from __future__ import annotations
 import json
+import hashlib
 import math
 import os
 import re
@@ -299,15 +300,43 @@ class WikiIndex:
 
         self._project_root = Path(wiki_dir).parent
         self._lexicon = load_lexicon(self._project_root)
+        # Preserve the established image-caption ingestion path.  The source
+        # manifest lives at the index root before the first D-01 publication;
+        # its image metadata is copied into the staged manifest below.
+        source_manifest = self.index_dir / "manifest.json"
+        try:
+            source_images = json.loads(source_manifest.read_text(encoding="utf-8")).get("images", [])
+        except (OSError, json.JSONDecodeError):
+            source_images = []
         self.pages = scan_wiki(Path(wiki_dir), self._project_root)
+        self.pages.extend(self._load_image_caption_pages(self.index_dir))
         self._page_by_id = {page_id_of(page.path): page for page in self.pages}
         tokenizer = EmbeddingTokenizer(getattr(embedder, "tokenizer", None))
         canonical_chunks = []
         for page in self.pages:
-            for record in chunk_page(
-                page_id=page_id_of(page.path), path=page.path, title=page.title,
-                page_type=page.page_type, content=page.content, tokenizer=tokenizer.count,
-            ):
+            page_id = page_id_of(page.path)
+            try:
+                records = list(chunk_page(
+                    page_id=page_id, path=page.path, title=page.title,
+                    page_type=page.page_type, content=page.content, tokenizer=tokenizer.count,
+                ))
+            except Exception as exc:
+                self._mark_preflight_failure(exc)
+                raise ChunkBuildError(
+                    f"chunk_page 失败: page_id={page_id}, path={page.path}"
+                ) from exc
+            kinds = {record.chunk_kind for record in records}
+            if page.content.strip() and (not records or kinds != {"dense", "sparse"}):
+                message = (
+                    f"索引完整性校验失败：非空页面 {page_id} 的 retrieval kinds="
+                    f"{sorted(kinds)}，期望 ['dense', 'sparse']"
+                )
+                if allow_partial_index:
+                    logging.getLogger(__name__).warning(message)
+                    continue
+                self._mark_preflight_failure(RuntimeError(message))
+                raise ChunkBuildError(message)
+            for record in records:
                 canonical_chunks.append(SparseChunk(
                     chunk_id=record.chunk_id, page_id=record.page_id, path=str(record.path),
                     title=record.title, text=record.text,
@@ -320,10 +349,123 @@ class WikiIndex:
                     forced_split=record.forced_split, continuation_index=record.continuation_index,
                     start_char=record.start_char, end_char=record.end_char,
                 ))
-        build_storage_contract(Path(wiki_dir), self.index_dir, embed=embed, sparse_chunks=canonical_chunks)
+        dense_sources = [chunk for chunk in canonical_chunks if chunk.chunk_kind == "dense"]
+        vectors_by_position = self._cached_dense_vectors(
+            dense_sources, embedder, full_rebuild=full_rebuild
+        )
+
+        def embed_cached(texts):
+            if len(texts) != len(vectors_by_position):
+                raise RuntimeError("Dense chunk plan changed during cached embedding")
+            return vectors_by_position
+
+        try:
+            artifact = build_storage_contract(
+                Path(wiki_dir), self.index_dir, embed=embed_cached,
+                sparse_chunks=canonical_chunks,
+            )
+        except Exception:
+            raise
+        if source_images or self.pages:
+            manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+            # The service deliberately owns storage evidence; the facade owns
+            # caller-facing page metadata that query/context consumers already
+            # rely on.  Keep one record per page rather than one per chunk.
+            manifest["pages"] = [
+                {
+                    "page_id": page_id_of(page.path), "path": str(page.path),
+                    "title": page.title, "page_type": page.page_type,
+                    "sources": page.sources, "links": page.links,
+                    "aliases": page.aliases, "sha256": page.sha256,
+                }
+                for page in self.pages
+            ]
+            if source_images:
+                manifest["images"] = source_images
+            artifact.manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         self._repository = None
         self._lance_table = None
         return
+
+    def _mark_preflight_failure(self, exc: Exception) -> None:
+        """Keep the fail-fast forensic marker even when chunking fails pre-stage."""
+        build_dir = self.index_dir / "builds" / f"build_{time.time_ns()}_{uuid.uuid4().hex}"
+        try:
+            build_dir.mkdir(parents=True, exist_ok=False)
+            (build_dir / ".failed").write_text(
+                f"chunk plan failed before persistence: {type(exc).__name__}: {exc}",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _cached_dense_vectors(self, dense_chunks, embedder, *, full_rebuild: bool):
+        """Retain the existing snapshot-build page cache without touching D-01 storage.
+
+        Cache files are a local build acceleration only.  The published artifact
+        remains a fresh, fully validated pair of LanceDB tables on every build.
+        """
+        from collections import OrderedDict
+        import numpy as np
+
+        model_tag = os.path.basename(
+            os.environ.get("WIKI_EMBEDDER_LOCAL_PATH", "") or SKILL_EMBEDDER_DIR.name
+        )
+        namespace = re.sub(r"[^0-9A-Za-z._-]", "_", f"{model_tag}__v{CHUNK_SCHEMA_VERSION}")
+        cache_dir = self.index_dir / "vec_cache" / namespace
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        by_page = OrderedDict()
+        for position, chunk in enumerate(dense_chunks):
+            by_page.setdefault(chunk.page_id, []).append(position)
+        result = [None] * len(dense_chunks)
+        current_files = set()
+        misses = []
+        hits = 0
+        dimension = self._embedding_dim()
+        for _page_id, positions in by_page.items():
+            digest = hashlib.sha256()
+            for position in positions:
+                digest.update(dense_chunks[position].content_hash.encode("utf-8"))
+                digest.update(b"\x1f")
+            cache_file = cache_dir / f"{digest.hexdigest()}.npy"
+            current_files.add(cache_file.name)
+            if not full_rebuild and cache_file.exists():
+                try:
+                    cached = np.load(cache_file)
+                    if cached.shape == (len(positions), dimension):
+                        for position, vector in zip(positions, cached.tolist()):
+                            result[position] = vector
+                        hits += 1
+                        continue
+                except Exception:
+                    pass
+            misses.append((cache_file, positions))
+        if misses:
+            miss_positions = [position for _file, positions in misses for position in positions]
+            encoded = embedder.encode(
+                [dense_chunks[position].text for position in miss_positions],
+                show_progress_bar=False, normalize_embeddings=NORMALIZE_EMBEDDINGS,
+            )
+            for position, vector in zip(miss_positions, encoded):
+                result[position] = list(vector)
+            cursor = 0
+            for cache_file, positions in misses:
+                count = len(positions)
+                np.save(cache_file, np.asarray(encoded[cursor:cursor + count], dtype="float32"))
+                cursor += count
+        for cache_file in cache_dir.glob("*.npy"):
+            if cache_file.name not in current_files:
+                try:
+                    cache_file.unlink()
+                except OSError:
+                    pass
+        logging.getLogger(__name__).info(
+            "#7 增量向量缓存: 命中 %d 页, 需编码 %d 页 / %d dense chunks（force=%s）",
+            hits, len(misses), len(dense_chunks), full_rebuild,
+        )
+        return result
 
         self._force_encode = bool(full_rebuild)
         self._vector_index_mode = vector_index_mode
