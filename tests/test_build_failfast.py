@@ -34,7 +34,9 @@ def _make_wiki(n=3):
 
 
 def _count_rows(wi):
-    return wi._get_lance_table().count_rows()
+    # D-01 retired the private mixed ``chunks`` table.  Sparse rows are the
+    # canonical non-vector population for compatibility/context reads.
+    return len(wi._get_repository().context_rows("1 = 1"))
 
 
 def test_failfast_on_chunk_exception_preserves_old_index():
@@ -98,7 +100,7 @@ def test_allow_partial_index_degrades_to_publish():
         wi.build(wiki, allow_partial_index=True)
 
     wi.load()
-    rows = wi._get_lance_table().to_arrow().to_pylist()
+    rows = wi._get_repository().context_rows("1 = 1")
     pids = {r["page_id"] for r in rows}
     assert p1 not in pids
     assert str((wiki / "p0.md").resolve()) in pids

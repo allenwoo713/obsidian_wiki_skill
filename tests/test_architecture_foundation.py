@@ -23,6 +23,10 @@ from obsidian_wiki.ports.query_planning import (  # noqa: E402
     QueryPlanner as PackageQueryPlanner,
     RewriteProvider as PackageRewriteProvider,
 )
+from obsidian_wiki.ports.chunk_repository import ChunkRepository  # noqa: E402
+from obsidian_wiki.ports.embedding import EmbeddingProvider  # noqa: E402
+from obsidian_wiki.ports.index_build import IndexPublisher  # noqa: E402
+from obsidian_wiki.ports.index_manifest import IndexManifestStore  # noqa: E402
 from query_plan_models import (  # noqa: E402
     EntityCatalog,
     PlannerContext,
@@ -39,10 +43,17 @@ from query_plan_models import (  # noqa: E402
 FORBIDDEN_SDK_ROOTS = (
     "lancedb",
     "networkx",
+    "pyarrow",
     "pyvis",
     "sentence_transformers",
     "torch",
     "transformers",
+)
+
+STORAGE_SDK_CONSTRAINTS = (
+    "lancedb==0.34.0",
+    "pyarrow==25.0.0",
+    "sentence-transformers==5.6.1",
 )
 
 
@@ -115,12 +126,22 @@ class ArchitectureFoundationTests(unittest.TestCase):
         self.assertTrue(issubclass(PackageEntityCatalog, Protocol))
         self.assertTrue(issubclass(PackageQueryPlanner, Protocol))
         self.assertTrue(issubclass(PackageRewriteProvider, Protocol))
+        self.assertTrue(issubclass(ChunkRepository, Protocol))
+        self.assertTrue(issubclass(EmbeddingProvider, Protocol))
+        self.assertTrue(issubclass(IndexManifestStore, Protocol))
+        self.assertTrue(issubclass(IndexPublisher, Protocol))
         script = """
 import sys
 
 sys.path.insert(0, sys.argv[1])
 from obsidian_wiki.domain import query_models  # noqa: F401
+from obsidian_wiki.domain import index_models  # noqa: F401
 from obsidian_wiki.ports import query_planning  # noqa: F401
+from obsidian_wiki.ports import index_storage  # noqa: F401
+from obsidian_wiki.ports import chunk_repository  # noqa: F401
+from obsidian_wiki.ports import embedding  # noqa: F401
+from obsidian_wiki.ports import index_manifest  # noqa: F401
+from obsidian_wiki.ports import index_build  # noqa: F401
 
 for root in {forbidden_roots!r}:
     if any(name == root or name.startswith(root + ".") for name in sys.modules):
@@ -134,6 +155,16 @@ for root in {forbidden_roots!r}:
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_import_linter_declares_index_build_layer_direction(self):
+        config = (Path(__file__).resolve().parents[1] / ".importlinter").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[importlinter:contract:index-build-layers]", config)
+        self.assertIn("    obsidian_wiki.infrastructure", config)
+        self.assertIn("    obsidian_wiki.application", config)
+        self.assertIn("    obsidian_wiki.ports", config)
+        self.assertIn("    obsidian_wiki.domain", config)
+
     def test_ci_declares_cross_platform_architecture_gate(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
             encoding="utf-8"
@@ -146,6 +177,22 @@ for root in {forbidden_roots!r}:
         self.assertIn("working-directory: scripts", workflow)
         self.assertIn("lint-imports --config ../.importlinter --no-cache", workflow)
         self.assertIn("python tests/test_architecture_foundation.py", workflow)
+
+    def test_storage_sdk_resolution_is_pinned_and_reported_by_workflows(self):
+        root = Path(__file__).resolve().parents[1]
+        requirements = (root / "requirements.in").read_text(encoding="utf-8")
+        ci_workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        eval_workflow = (root / ".github/workflows/eval.yml").read_text(encoding="utf-8")
+
+        for constraint in STORAGE_SDK_CONSTRAINTS:
+            self.assertIn(constraint, requirements)
+
+        for workflow in (ci_workflow, eval_workflow):
+            self.assertIn("Verify dependency lock is current", workflow)
+            self.assertIn("Report storage SDK versions", workflow)
+            self.assertIn("importlib.metadata", workflow)
+            for package in ("lancedb", "pyarrow", "sentence-transformers"):
+                self.assertIn(package, workflow)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ import pytest
 import build_index
 import chunking
 from build_index import ChunkBuildError, WikiIndex
+from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
 
 def _wiki(tmp_path: Path, pages: int = 2) -> Path:
@@ -23,7 +24,7 @@ def _wiki(tmp_path: Path, pages: int = 2) -> Path:
 def _active_rows(index_dir: Path):
     loaded = WikiIndex(index_dir)
     loaded.load()
-    return loaded._get_lance_table().to_arrow().to_pylist()
+    return loaded._get_repository().context_rows("1 = 1")
 
 
 def test_rejects_dense_only_page_and_preserves_active_index(tmp_path):
@@ -46,31 +47,23 @@ def test_rejects_dense_only_page_and_preserves_active_index(tmp_path):
     assert _active_rows(index_dir) == old_rows
 
 
-def test_rejects_silent_persisted_row_loss_before_publish(tmp_path):
+def test_rejects_silent_persisted_row_loss_before_publish(tmp_path, monkeypatch):
     wiki = _wiki(tmp_path)
     index_dir = tmp_path / ".index"
     wi = WikiIndex(index_dir)
     wi.build(wiki)
     old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
 
-    original = wi._get_lance_table
+    original_persist = LanceDbIndexRepository.persist
 
-    class _DropLastWrite:
-        def __init__(self, table):
-            self._table = table
+    def _drop_sparse_row(self, lance_dir, sparse_chunks, dense_chunks, fts_config):
+        # Exercise the physical D-01 sparse write, not the retired private
+        # mixed-table accessor.  Reopened validation must reject row loss.
+        return original_persist(self, lance_dir, sparse_chunks[:-1], dense_chunks, fts_config)
 
-        def __getattr__(self, name):
-            return getattr(self._table, name)
-
-        def add(self, rows):
-            return self._table.add(rows[:-1])
-
-    def _table_with_dropped_row(*args, **kwargs):
-        return _DropLastWrite(original(*args, **kwargs))
-
-    with mock.patch.object(wi, "_get_lance_table", side_effect=_table_with_dropped_row):
-        with pytest.raises(ChunkBuildError, match="持久化完整性"):
-            wi.build(wiki)
+    monkeypatch.setattr(LanceDbIndexRepository, "persist", _drop_sparse_row)
+    with pytest.raises(RuntimeError, match="持久化完整性"):
+        wi.build(wiki)
 
     assert (index_dir / "ACTIVE_INDEX").read_bytes() == old_pointer
 

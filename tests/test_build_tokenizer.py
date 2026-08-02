@@ -42,9 +42,14 @@ def _build_tiny():
     return wi, wiki
 
 
+def _persisted_rows(wi):
+    """Read canonical ChunkRecord metadata through the split-table port."""
+    return wi._get_repository().context_rows("chunk_id IS NOT NULL")
+
+
 def test_build_uses_real_tokenizer():
     wi, _ = _build_tiny()
-    rows = wi._get_lance_table().to_arrow().to_pylist()
+    rows = _persisted_rows(wi)
     dense = [r for r in rows if r["chunk_kind"] == "dense"]
 
     # 1) every dense row respects the hard token budget
@@ -65,7 +70,7 @@ def test_build_uses_real_tokenizer():
 def test_build_stable_ids_under_insertion():
     wi, wiki = _build_tiny()
     before = {(r["chunk_kind"], chunking._norm(_norm_body(r))): r["chunk_id"]
-              for r in wi._get_lance_table().to_arrow().to_pylist()}
+              for r in _persisted_rows(wi)}
 
     # insert an unrelated section at the very top of page a.md
     base = (wiki / "a.md").read_text(encoding="utf-8")
@@ -75,7 +80,7 @@ def test_build_stable_ids_under_insertion():
 
     wi.build(wiki)  # incremental rebuild
     after = {(r["chunk_kind"], chunking._norm(_norm_body(r))): r["chunk_id"]
-             for r in wi._get_lance_table().to_arrow().to_pylist()}
+             for r in _persisted_rows(wi)}
 
     for key, cid in before.items():
         assert after.get(key) == cid, \
