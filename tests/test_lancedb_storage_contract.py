@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from build_index import WikiIndex, build_storage_contract  # noqa: E402
-from obsidian_wiki.domain.index_models import RebuildRequiredError  # noqa: E402
+from obsidian_wiki.domain.index_models import RebuildRequiredError, SparseChunk  # noqa: E402
 from obsidian_wiki.domain.index_models import (  # noqa: E402
     BenchmarkObservation,
     DenseChunk,
@@ -125,15 +125,87 @@ def test_native_fts_creation_failure_is_fatal_and_preserves_active_pointer(
     build_storage_contract(wiki, index_dir, embed=embed)
     original_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
 
-    def fail_fts(self, *_args, **_kwargs):
-        raise RuntimeError("native FTS unavailable")
+    real_connect = repository_module.lancedb.connect
 
-    monkeypatch.setattr(repository_module.LanceDbIndexRepository, "persist", fail_fts)
+    class SparseTableWithBrokenFts:
+        def __init__(self, table):
+            self._table = table
+
+        def create_fts_index(self, *_args, **_kwargs):
+            raise RuntimeError("native FTS unavailable")
+
+        def __getattr__(self, name):
+            return getattr(self._table, name)
+
+    class DatabaseWithBrokenFts:
+        def __init__(self, database):
+            self._database = database
+
+        def create_table(self, name, *args, **kwargs):
+            table = self._database.create_table(name, *args, **kwargs)
+            return SparseTableWithBrokenFts(table) if name == "sparse_chunks" else table
+
+        def __getattr__(self, name):
+            return getattr(self._database, name)
+
+    monkeypatch.setattr(
+        repository_module.lancedb, "connect",
+        lambda *args, **kwargs: DatabaseWithBrokenFts(real_connect(*args, **kwargs)),
+    )
     with pytest.raises(RuntimeError, match="native FTS unavailable"):
         build_storage_contract(wiki, index_dir, embed=embed)
 
     assert (index_dir / "ACTIVE_INDEX").read_bytes() == original_pointer
     assert list((index_dir / "builds").glob("build_*/.failed"))
+
+
+def test_context_reads_use_persisted_sparse_metadata_after_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Context expansion must never fall back to the retired chunks accessor."""
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Install\n\nplaceholder page body\n")
+    index_dir = tmp_path / ".index"
+    records = [
+        SparseChunk(
+            "before", "page-a", "Wiki/page-a.md", "Page A", "before text", "before text",
+            page_type="procedure", section_path='["Install"]', heading="Install",
+            chunk_kind="dense", chunk_index=0, content_hash="before", end_char=11,
+        ),
+        SparseChunk(
+            "anchor", "page-a", "Wiki/page-a.md", "Page A", "anchor text", "anchor text",
+            page_type="procedure", section_path='["Install"]', heading="Install",
+            chunk_kind="dense", chunk_index=1, content_hash="anchor", start_char=12, end_char=23,
+        ),
+        SparseChunk(
+            "after", "page-a", "Wiki/page-a.md", "Page A", "after text", "after text",
+            page_type="procedure", section_path='["Install"]', heading="Install",
+            chunk_kind="dense", chunk_index=2, content_hash="after", start_char=24, end_char=34,
+        ),
+        SparseChunk(
+            "section", "page-a", "Wiki/page-a.md", "Page A", "section text", "section text",
+            page_type="procedure", section_path='["Install"]', heading="Install",
+            chunk_kind="sparse", chunk_index=3, content_hash="section", start_char=0, end_char=34,
+        ),
+    ]
+    build_storage_contract(
+        wiki, index_dir, sparse_chunks=records,
+        embed=lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)],
+    )
+
+    index = WikiIndex(index_dir)
+    index.load()
+    monkeypatch.setattr(index, "_get_lance_table", lambda *args, **kwargs: pytest.fail("legacy chunks opened"))
+
+    anchor = index.get_chunk("anchor")
+    assert anchor is not None
+    assert (anchor.text, anchor.heading, anchor.chunk_index, anchor.page_type) == (
+        "anchor text", "Install", 1, "procedure",
+    )
+    assert [hit.chunk_id for hit in index.get_neighbors("anchor")] == ["before", "after"]
+    assert [hit.chunk_id for hit in index.get_parent_section("anchor")] == [
+        "before", "anchor", "after", "section",
+    ]
 
 
 class _QuerySpy:

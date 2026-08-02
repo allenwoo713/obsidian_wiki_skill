@@ -71,6 +71,21 @@ class SparseChunk(_JsonRecord):
     title: str
     text: str
     fts_text: str
+    # The sparse table is also the SDK-free context-read source.  Keep the
+    # ChunkRecord fields needed by the compatibility facade alongside its FTS
+    # payload; vector data remains exclusively in DenseChunk.
+    page_type: str = "concept"
+    section_path: str = "[]"
+    heading: str = ""
+    chunk_kind: str = "dense"
+    chunk_index: int = 0
+    parent_section_id: str = ""
+    token_count: int = 0
+    content_hash: str = ""
+    forced_split: bool = False
+    continuation_index: int = -1
+    start_char: int = 0
+    end_char: int = 0
 
 
 @dataclass(frozen=True)
@@ -81,6 +96,18 @@ class DenseChunk(_JsonRecord):
     title: str
     text: str
     vector: Tuple[float, ...]
+    page_type: str = "concept"
+    section_path: str = "[]"
+    heading: str = ""
+    chunk_kind: str = "dense"
+    chunk_index: int = 0
+    parent_section_id: str = ""
+    token_count: int = 0
+    content_hash: str = ""
+    forced_split: bool = False
+    continuation_index: int = -1
+    start_char: int = 0
+    end_char: int = 0
 
 
 @dataclass(frozen=True)

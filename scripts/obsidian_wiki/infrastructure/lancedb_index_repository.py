@@ -62,12 +62,24 @@ class LanceDbIndexRepository:
             pa.field("chunk_id", pa.string()), pa.field("page_id", pa.string()),
             pa.field("path", pa.string()), pa.field("title", pa.string()),
             pa.field("text", pa.string()), pa.field(fts_config.column, pa.string()),
+            pa.field("page_type", pa.string()), pa.field("section_path", pa.string()),
+            pa.field("heading", pa.string()), pa.field("chunk_kind", pa.string()),
+            pa.field("chunk_index", pa.int64()), pa.field("parent_section_id", pa.string()),
+            pa.field("token_count", pa.int64()), pa.field("content_hash", pa.string()),
+            pa.field("forced_split", pa.bool_()), pa.field("continuation_index", pa.int64()),
+            pa.field("start_char", pa.int64()), pa.field("end_char", pa.int64()),
         ])
         dense_schema = pa.schema([
             pa.field("chunk_id", pa.string()), pa.field("page_id", pa.string()),
             pa.field("path", pa.string()), pa.field("title", pa.string()),
             pa.field("text", pa.string()),
             pa.field("vector", pa.list_(pa.float32(), list_size=dimensions)),
+            pa.field("page_type", pa.string()), pa.field("section_path", pa.string()),
+            pa.field("heading", pa.string()), pa.field("chunk_kind", pa.string()),
+            pa.field("chunk_index", pa.int64()), pa.field("parent_section_id", pa.string()),
+            pa.field("token_count", pa.int64()), pa.field("content_hash", pa.string()),
+            pa.field("forced_split", pa.bool_()), pa.field("continuation_index", pa.int64()),
+            pa.field("start_char", pa.int64()), pa.field("end_char", pa.int64()),
         ])
         sparse_table = db.create_table("sparse_chunks", schema=sparse_schema, mode="create")
         dense_table = db.create_table("dense_chunks", schema=dense_schema, mode="create")
@@ -126,8 +138,13 @@ class LanceDbIndexRepository:
             raise RuntimeError("Persisted artifact must contain exactly sparse_chunks and dense_chunks")
         sparse = db.open_table("sparse_chunks")
         dense = db.open_table("dense_chunks")
-        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text"}
-        required_dense = {"chunk_id", "page_id", "path", "title", "text", "vector"}
+        context_columns = {
+            "page_type", "section_path", "heading", "chunk_kind", "chunk_index",
+            "parent_section_id", "token_count", "content_hash", "forced_split",
+            "continuation_index", "start_char", "end_char",
+        }
+        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text", *context_columns}
+        required_dense = {"chunk_id", "page_id", "path", "title", "text", "vector", *context_columns}
         if set(sparse.schema.names) != required_sparse or set(dense.schema.names) != required_dense:
             raise RuntimeError("Persisted table schemas do not satisfy the two-table contract")
         sparse_rows = sparse.to_arrow().to_pylist()
@@ -160,6 +177,15 @@ class LanceDbIndexRepository:
     def search_sparse(self, query: str, *, limit: int = 10) -> list[Mapping[str, object]]:
         """Route every sparse request to the native FTS index, never a fallback."""
         return self._sparse_table().search(query, query_type="fts").limit(limit).to_list()
+
+    def context_rows(self, predicate: str) -> list[Mapping[str, object]]:
+        """Read canonical chunk text/metadata from sparse_chunks for context assembly.
+
+        This deliberately never opens the retired ``chunks`` table.  Sparse rows
+        retain every ChunkRecord (including dense leaf metadata), whereas the
+        dense table is intentionally limited to vector-bearing leaves.
+        """
+        return self._sparse_table().search().where(predicate).to_list()
 
     def search_dense(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None

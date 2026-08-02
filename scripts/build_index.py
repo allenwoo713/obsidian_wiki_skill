@@ -63,7 +63,7 @@ from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
 
-def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed):
+def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -79,7 +79,7 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed):
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
     ).build(
-        Path(wiki_dir), Path(index_dir), embed=embed)
+        Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks)
 
 
 # 仅固定「pyarrow 先于 torch」的导入顺序（ISSUE-16）；torch 已于上方最顶部加载完毕。
@@ -295,13 +295,34 @@ class WikiIndex:
             )
             return [list(vector) for vector in vectors]
 
-        build_storage_contract(Path(wiki_dir), self.index_dir, embed=embed)
-        self._repository = None
-        self._lance_table = None
+        from obsidian_wiki.domain.index_models import SparseChunk
+
         self._project_root = Path(wiki_dir).parent
         self._lexicon = load_lexicon(self._project_root)
         self.pages = scan_wiki(Path(wiki_dir), self._project_root)
         self._page_by_id = {page_id_of(page.path): page for page in self.pages}
+        tokenizer = EmbeddingTokenizer(getattr(embedder, "tokenizer", None))
+        canonical_chunks = []
+        for page in self.pages:
+            for record in chunk_page(
+                page_id=page_id_of(page.path), path=page.path, title=page.title,
+                page_type=page.page_type, content=page.content, tokenizer=tokenizer.count,
+            ):
+                canonical_chunks.append(SparseChunk(
+                    chunk_id=record.chunk_id, page_id=record.page_id, path=str(record.path),
+                    title=record.title, text=record.text,
+                    fts_text=" ".join(fts_terms(record.text, self._lexicon) + extract_exact_terms(record.text)),
+                    page_type=record.page_type,
+                    section_path=json.dumps(record.section_path, ensure_ascii=False),
+                    heading=record.heading, chunk_kind=record.chunk_kind,
+                    chunk_index=record.chunk_index, parent_section_id=record.parent_section_id or "",
+                    token_count=record.token_count, content_hash=record.content_hash,
+                    forced_split=record.forced_split, continuation_index=record.continuation_index,
+                    start_char=record.start_char, end_char=record.end_char,
+                ))
+        build_storage_contract(Path(wiki_dir), self.index_dir, embed=embed, sparse_chunks=canonical_chunks)
+        self._repository = None
+        self._lance_table = None
         return
 
         self._force_encode = bool(full_rebuild)
@@ -1085,7 +1106,7 @@ class WikiIndex:
     def _rows_where(self, predicate: str) -> List[dict]:
         """Small read-only adapter for context assembly; never exposes LanceDB to fusion."""
         try:
-            return self._get_lance_table().search().where(predicate).to_list()
+            return list(self._get_repository().context_rows(predicate))
         except Exception as exc:
             logging.getLogger(__name__).warning("context repository read failed: %s", exc)
             return []

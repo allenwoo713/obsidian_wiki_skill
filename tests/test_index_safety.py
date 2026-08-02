@@ -8,8 +8,6 @@
 """
 import json
 from pathlib import Path
-from unittest import mock
-
 import pytest
 
 sys = __import__("sys")
@@ -54,7 +52,7 @@ def test_publish_creates_pointer_and_queryable(tmp_path):
     #     真实运行索引在 D: 盘，不受影响；此处验收的是「指针发布 + 索引可查」契约。
     import lancedb as _lancedb
     _db = _lancedb.connect(str(active))
-    _tbl = _db.open_table("chunks")
+    _tbl = _db.open_table("sparse_chunks")
     assert _tbl.count_rows() > 0, "builds/<id>/lance_db 表为空"
 
     # 2) 顶层 lance_db 不应被本次构建直接写入（指针方案隔离）
@@ -94,26 +92,19 @@ def test_crash_recovery_keeps_old_active(tmp_path):
 
 
 def test_content_signature_in_ckpt_meta(tmp_path):
-    """#11 内容签名：tokenizer/chunk 配置哈希进入续跑 sig；配置变更即作废旧向量。"""
+    """The split-layout manifest records immutable storage configuration hashes."""
     wiki = tmp_path / "Wiki"
     idx_dir = tmp_path / ".index"
     _write_page(wiki, "a.md", "Radar Calibration", "radar calibration procedure angle alignment", ["raw/a.docx"])
 
-    # 阻止末尾 checkpoint 清理，以便检查 meta.json 中的 sig
-    # #7：清理已从 shutil.rmtree 改为 _safe_clear_dir（逐文件 unlink，规避沙箱守卫），
-    # 故 patch 目标改为 _safe_clear_dir。
-    with mock.patch.object(WikiIndex, "_safe_clear_dir", staticmethod(lambda *a, **k: None)):
-        wi = WikiIndex(idx_dir)
-        wi.build(wiki)
+    wi = WikiIndex(idx_dir)
+    wi.build(wiki)
 
-    ckpt = idx_dir / ".vec_ckpt"
-    assert ckpt.exists(), "checkpoint 目录应保留（已 patch 清理）"
-    meta = json.loads((ckpt / "meta.json").read_text(encoding="utf-8"))
-    assert "fts_config_hash" in meta, "sig 缺失 fts_config_hash"
-    assert "chunk_config_hash" in meta, "sig 缺失 chunk_config_hash"
-    assert "miss_sig" in meta, "#7 sig 缺失 miss_sig"
-    assert meta["fts_config_hash"].startswith("whitespace+")
-    assert meta["chunk_config_hash"].startswith("v")
+    active = idx_dir / _resolve_pointer(idx_dir)["active_lance"]
+    manifest = json.loads((active.parent / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["layout"] == "sparse_chunks+dense_chunks"
+    assert manifest["config_hashes"]["fts_config"]
+    assert manifest["config_hashes"]["vector_config"]
 
 
 @pytest.mark.parametrize("boundary", ["manifest", "validation"])

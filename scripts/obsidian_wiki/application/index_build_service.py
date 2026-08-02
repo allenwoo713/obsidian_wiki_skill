@@ -46,12 +46,18 @@ class IndexBuildService:
         self._fts_config = fts_config or FtsIndexConfig()
         self._benchmark_observer = benchmark_observer
 
-    def build(self, wiki_dir: Path, index_dir: Path, *, embed: Embedder) -> StorageArtifact:
-        sparse_chunks = self._sparse_plan(wiki_dir)
+    def build(
+        self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
+        sparse_chunks: Sequence[SparseChunk] | None = None,
+    ) -> StorageArtifact:
+        sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
             raise RuntimeError("No canonical Wiki Markdown pages were available to index")
-        vectors = embed([chunk.text for chunk in sparse_chunks])
-        if len(vectors) != len(sparse_chunks):
+        dense_sources = tuple(chunk for chunk in sparse_chunks if chunk.chunk_kind == "dense")
+        if not dense_sources:
+            raise RuntimeError("Canonical chunk plan contains no dense retrieval chunks")
+        vectors = embed([chunk.text for chunk in dense_sources])
+        if len(vectors) != len(dense_sources):
             raise RuntimeError("Embedder returned a vector count different from the dense chunk plan")
         dense_chunks = tuple(
             DenseChunk(
@@ -61,8 +67,20 @@ class IndexBuildService:
                 title=chunk.title,
                 text=chunk.text,
                 vector=tuple(float(value) for value in vector),
+                page_type=chunk.page_type,
+                section_path=chunk.section_path,
+                heading=chunk.heading,
+                chunk_kind=chunk.chunk_kind,
+                chunk_index=chunk.chunk_index,
+                parent_section_id=chunk.parent_section_id,
+                token_count=chunk.token_count,
+                content_hash=chunk.content_hash,
+                forced_split=chunk.forced_split,
+                continuation_index=chunk.continuation_index,
+                start_char=chunk.start_char,
+                end_char=chunk.end_char,
             )
-            for chunk, vector in zip(sparse_chunks, vectors)
+            for chunk, vector in zip(dense_sources, vectors)
         )
         if not all(chunk.vector for chunk in dense_chunks):
             raise RuntimeError("Dense chunks require non-empty vectors")
@@ -262,6 +280,6 @@ class IndexBuildService:
             page_id = str(path.resolve())
             chunks.append(SparseChunk(
                 chunk_id=f"sparse:{digest}", page_id=page_id, path=str(path),
-                title=title, text=body, fts_text=body,
+                title=title, text=body, fts_text=body, end_char=len(body),
             ))
         return tuple(chunks)
