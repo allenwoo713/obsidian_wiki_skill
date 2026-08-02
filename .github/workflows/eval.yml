@@ -34,6 +34,7 @@ jobs:
           echo "TMPDIR=${{ github.workspace }}/.review-tmp/eval" >> "$GITHUB_ENV"
           echo "TEMP=${{ github.workspace }}/.review-tmp/eval" >> "$GITHUB_ENV"
           echo "TMP=${{ github.workspace }}/.review-tmp/eval" >> "$GITHUB_ENV"
+          mkdir -p .review-tmp
       - name: Verify dependency lock is current
         run: python scripts/compile_requirements.py --check
       - name: Install dependencies

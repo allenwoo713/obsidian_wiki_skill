@@ -145,7 +145,7 @@ python scripts/compile_requirements.py
 python scripts/compile_requirements.py --check
 ```
 
-生成器固定使用与 CI 相同的 uv `0.12.0`（本机版本不同会自动通过 `uvx` 调用该版本），并总是先写入全新临时文件再原子替换锁文件，避免 uv 把旧输出误当为解析约束。`--check` 离线校验写入锁文件的 `requirements.in` SHA-256 指纹；它不会在每次 CI 时重新解析 PyPI 上浮动的间接依赖，因此上游发版不会把已审核的锁文件误判为过期。MinerU Local 继续使用独立的 `requirements-mineru.txt`。
+生成器固定使用与 CI 相同的 uv `0.12.0`（本机版本不同会自动通过 `uvx` 调用该版本），以最低支持版本 Python `3.10` 解析，并总是先写入全新临时文件再原子替换锁文件，避免 uv 把旧输出误当为解析约束。`--check` 离线校验写入锁文件的 `requirements.in` SHA-256 指纹；它不会在每次 CI 时重新解析 PyPI 上浮动的间接依赖，因此上游发版不会把已审核的锁文件误判为过期。MinerU Local 继续使用独立的 `requirements-mineru.txt`。
 
 ### 检索评测（回归检查）
 

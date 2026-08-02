@@ -1,4 +1,4 @@
-# requirements.in-sha256: a33d7aef28f35b9cfb04d0328abd86ae08f985bc672fe289f4547d1412de8553
+# requirements.in-sha256: 8fe6bc025589549025575ca0dd6c0dba4c4c216d5b5053b1019400f93679b2b9
 annotated-doc==0.0.5
     # via typer
 annotated-types==0.8.0
@@ -18,8 +18,14 @@ charset-normalizer==3.4.9
     # via requests
 click==8.4.2
     # via huggingface-hub
+decorator==5.3.1
+    # via ipython
 deprecation==2.1.0
     # via lancedb
+exceptiongroup==1.3.1
+    # via
+    #   anyio
+    #   ipython
 executing==2.2.1
     # via stack-data
 filelock==3.32.2
@@ -50,10 +56,10 @@ idna==3.18
     #   anyio
     #   httpx
     #   requests
-ipython==9.16.0
-    # via pyvis
-ipython-pygments-lexers==1.1.1
-    # via ipython
+ipython==8.39.0
+    # via
+    #   -r requirements.in
+    #   pyvis
 jedi==0.20.0
     # via ipython
 jieba==0.42.1
@@ -88,15 +94,13 @@ modelscope-hub==0.2.0
     # via modelscope
 mpmath==1.3.0
     # via sympy
-narwhals==2.24.0
-    # via scikit-learn
-networkx==3.6.1
+networkx==3.4.2
     # via
     #   -r requirements.in
     #   python-louvain
     #   pyvis
     #   torch
-numpy==2.5.1
+numpy==2.2.6
     # via
     #   -r requirements.in
     #   lancedb
@@ -106,6 +110,8 @@ numpy==2.5.1
     #   scipy
     #   sentence-transformers
     #   transformers
+overrides==7.7.0
+    # via lancedb
 packaging==26.2
     # via
     #   deprecation
@@ -120,8 +126,6 @@ pexpect==4.9.0
 pillow==12.3.0
     # via -r requirements.in
 prompt-toolkit==3.0.53
-    # via ipython
-psutil==7.2.2
     # via ipython
 ptyprocess==0.7.0
     # via pexpect
@@ -140,7 +144,6 @@ pydantic-core==2.46.4
 pygments==2.20.0
     # via
     #   ipython
-    #   ipython-pygments-lexers
     #   rich
 pymupdf==1.28.0
     # via -r requirements.in
@@ -172,9 +175,9 @@ rich==15.0.0
     # via typer
 safetensors==0.8.0
     # via transformers
-scikit-learn==1.9.0
+scikit-learn==1.7.2
     # via sentence-transformers
-scipy==1.18.0
+scipy==1.15.3
     # via
     #   scikit-learn
     #   sentence-transformers
@@ -218,8 +221,11 @@ typer==0.27.0
     # via transformers
 typing-extensions==4.16.0
     # via
+    #   anyio
     #   beautifulsoup4
+    #   exceptiongroup
     #   huggingface-hub
+    #   ipython
     #   lance-namespace-urllib3-client
     #   pydantic
     #   pydantic-core

@@ -109,6 +109,9 @@ jobs:
           print(', '.join(f'{package}={metadata.version(package)}' for package in
           ('lancedb', 'pyarrow', 'sentence-transformers')))"
 
+      - name: Create repository-local test temporary root
+        run: python -c "from pathlib import Path; Path('.review-tmp').mkdir(exist_ok=True)"
+
       # #17 API coverage: adapter call shapes, persisted real artifacts, exact-bypass
       # and ANN policy, SDK-free import boundaries, and installed-version reporting.
       # D-03 timing and resource values are recorded observations, never timing gates.

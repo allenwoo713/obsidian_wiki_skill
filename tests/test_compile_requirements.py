@@ -37,6 +37,7 @@ def test_compile_uses_a_fresh_output_path_not_the_existing_lock(
             "-c",
             (
                 "from pathlib import Path; import sys; "
+                "assert sys.argv[sys.argv.index('--python-version') + 1] == '3.10'; "
                 "Path(sys.argv[sys.argv.index('--output-file') + 1])"
                 ".write_text('fresh==1\\n', encoding='utf-8')"
             ),
@@ -66,3 +67,14 @@ def test_check_uses_embedded_input_fingerprint_without_recompiling(
     lock.main()
 
     assert "matches the current requirements.in fingerprint" in capsys.readouterr().out
+
+
+def test_input_fingerprint_is_stable_across_git_line_endings(tmp_path: Path) -> None:
+    lock = _load_lock_module()
+    source = tmp_path / "requirements.in"
+    source.write_bytes(b"demo>=1\r\nnext==2\r\n")
+    lock.INPUT = source
+    windows_hash = lock._input_hash()
+    source.write_text("demo>=1\nnext==2\n", encoding="utf-8")
+
+    assert lock._input_hash() == windows_hash

@@ -5,6 +5,9 @@
 # MinerU Local remains isolated in requirements-mineru.txt.
 beautifulsoup4>=4.12
 jieba>=0.42
+# pyvis pulls IPython for notebook rendering. CI supports Python 3.10, while
+# IPython 9 requires Python 3.11+, so keep this transitive dependency portable.
+ipython>=8,<9
 lancedb==0.34.0
 modelscope>=1.38,<2
 networkx>=3.0

@@ -17,7 +17,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -26,11 +25,15 @@ SKILL_ROOT = Path(__file__).resolve().parent.parent
 INPUT = SKILL_ROOT / "requirements.in"
 OUTPUT = SKILL_ROOT / "requirements.txt"
 UV_VERSION = "0.12.0"
+LOCK_PYTHON_VERSION = "3.10"
 INPUT_HASH_PREFIX = "# requirements.in-sha256: "
 
 
 def _input_hash() -> str:
-    return hashlib.sha256(INPUT.read_bytes()).hexdigest()
+    # Git may check text out as CRLF on Windows.  The lock contract is about
+    # requirements content, not the host checkout's line-ending convention.
+    normalized = INPUT.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _uv_command() -> list[str]:
@@ -74,7 +77,9 @@ def _compile(output: Path) -> None:
     try:
         subprocess.run(
             [
-                *_uv_command(), "pip", "compile", str(INPUT), "--output-file", str(temporary),
+                *_uv_command(), "pip", "compile", str(INPUT),
+                "--python-version", LOCK_PYTHON_VERSION,
+                "--output-file", str(temporary),
                 "--no-header",
                 "--quiet",
             ],
