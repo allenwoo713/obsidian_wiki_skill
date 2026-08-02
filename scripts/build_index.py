@@ -467,61 +467,6 @@ class WikiIndex:
         )
         return result
 
-        self._force_encode = bool(full_rebuild)
-        self._vector_index_mode = vector_index_mode
-        self._allow_partial_index = bool(allow_partial_index)
-        self._lance_table = None  # 重置缓存：load()/上次 build() 可能已缓存活动索引表
-        self._project_root = wiki_dir.parent
-        self._lexicon = load_lexicon(self._project_root)
-        self.pages = scan_wiki(wiki_dir, self._project_root)
-        image_pages = self._load_image_caption_pages(self.index_dir)
-        self.pages.extend(image_pages)
-        self._page_by_id = {page_id_of(p.path): p for p in self.pages}
-
-        # #11 索引原子发布：构建写入全新 builds/<id>/lance_db（不碰活动目录）；校验
-        # 通过后仅原子翻转 ACTIVE_INDEX 指针文件。崩溃时指针不变 → 活动索引（旧成功版）不受影响。
-        # A staging directory must never alias the directory resolved by the
-        # active pointer.  Second-resolution timestamps previously allowed a
-        # failed retry to write into the live build.  A nanosecond+UUID name
-        # and exclusive mkdir keep every attempt isolated, including callers
-        # that start in the same clock tick.
-        builds_dir = self.index_dir / "builds"
-        builds_dir.mkdir(parents=True, exist_ok=True)
-        active_build_dir = self._resolve_active_lance_dir().parent.resolve()
-        for _ in range(10):
-            build_id = f"build_{time.time_ns()}_{uuid.uuid4().hex}"
-            build_dir = builds_dir / build_id
-            if build_dir.resolve() == active_build_dir:
-                continue
-            try:
-                build_dir.mkdir(parents=False, exist_ok=False)
-                break
-            except FileExistsError:
-                continue
-        else:
-            raise RuntimeError("无法创建唯一 staging build 目录；活动索引未变更")
-        self._lance_dir = build_dir / "lance_db"
-        self._manifest_target = build_dir / "manifest.json"
-        try:
-            self._build_chunks()
-            if not self._validate_build(build_dir, vector_index_mode=vector_index_mode):
-                raise RuntimeError(
-                    "build 校验未通过，放弃发布；活动索引保持不变（指针未翻转）")
-            self._publish(build_id)
-        except Exception:
-            # #13 review (Gap 1)：构建失败 → 标记 staging 目录便于排查，但**绝不翻转指针**
-            # （活动索引/旧成功版保持可查询）。失败时不存在可被 load() 加载的半成品新版本。
-            try:
-                (build_dir / ".failed").write_text(
-                    "build aborted before publish; active index preserved", encoding="utf-8")
-            except Exception:
-                pass
-            raise
-        finally:
-            self._lance_dir = None
-            self._manifest_target = None
-            self._lance_table = None  # 重置缓存，允许同一 WikiIndex 实例重复 build（增量/重跑）
-
     def _load_image_caption_pages(self, idx_dir: Path) -> List[WikiPage]:
         manifest_file = idx_dir / "manifest.json"
         if not manifest_file.exists():
