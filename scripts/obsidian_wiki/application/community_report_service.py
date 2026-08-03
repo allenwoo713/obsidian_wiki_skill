@@ -22,7 +22,7 @@ from obsidian_wiki.domain.community_report_models import (
 )
 from obsidian_wiki.ports.community_reports import CommunityReportSetStore
 from obsidian_wiki.ports.graph_snapshot import GraphSnapshot
-from obsidian_wiki.ports.token_counter import TokenCounter
+from obsidian_wiki.ports.token_counter import TokenCounter, TokenCounterUnavailable
 
 
 class CommunityReportService:
@@ -85,8 +85,12 @@ class CommunityReportService:
             reason = manifest.stale_reason or "report set is marked stale"
             return self._rejected(CommunityReportStatus.STALE, reason)
         try:
-            valid, reasons = self._validate(reports, manifest, self._graph.read())
+            snapshot = self._graph.read()
         except Exception:
+            return self._rejected(CommunityReportStatus.STALE, "current graph snapshot is unavailable")
+        try:
+            valid, reasons = self._validate(reports, manifest, snapshot)
+        except TokenCounterUnavailable:
             return self._rejected(CommunityReportStatus.TOKEN_COUNTER_UNAVAILABLE, "report token counter is unavailable")
         if not valid:
             status = CommunityReportStatus.SCHEMA_UNSUPPORTED if any(
@@ -129,9 +133,11 @@ class CommunityReportService:
             except Exception:
                 raise
             if max_tokens is not None and used + actual_count > max_tokens:
-                return tuple(selected), "selected community reports exceed the effective token budget"
+                continue
             selected.append(replace(report, token_count=actual_count))
             used += actual_count
+        if len(selected) != len(ranked):
+            return tuple(selected), "one or more community reports exceeded the effective token budget"
         return tuple(selected), None
 
     def _build_report(
@@ -171,12 +177,19 @@ class CommunityReportService:
             if report.report_schema_version != COMMUNITY_REPORT_SCHEMA_VERSION or report.report_schema_version != manifest.report_schema_version:
                 reasons.append("report schema disagrees with manifest")
                 continue
-            pages = self._pages_for(snapshot, report.member_page_ids)
-            if len(pages) != len(report.member_page_ids):
+            current_ids = snapshot.members_for(report.community_id)
+            community_exists = any(
+                community_id == report.community_id for community_id, _ in snapshot.communities
+            )
+            if not community_exists or tuple(sorted(report.member_page_ids)) != current_ids:
+                reasons.append(f"community {report.community_id} membership is stale")
+                continue
+            pages = self._pages_for(snapshot, current_ids)
+            if len(pages) != len(current_ids):
                 reasons.append(f"community {report.community_id} member source is missing")
             elif member_fingerprint(pages) != report.member_fingerprint:
                 reasons.append(f"community {report.community_id} member fingerprint is stale")
-            if edge_fingerprint(self._edges_for(snapshot.edges, report.member_page_ids)) != report.edge_fingerprint:
+            if edge_fingerprint(self._edges_for(snapshot.edges, current_ids)) != report.edge_fingerprint:
                 reasons.append(f"community {report.community_id} edge fingerprint is stale")
             if hashlib.sha256(report.text.encode("utf-8")).hexdigest() != report.content_hash:
                 reasons.append(f"community {report.community_id} content hash disagrees")

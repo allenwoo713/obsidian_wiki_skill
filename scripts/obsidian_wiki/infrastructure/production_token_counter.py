@@ -4,9 +4,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-
-class TokenCounterUnavailable(RuntimeError):
-    """The configured local tokenizer cannot safely count report text."""
+from obsidian_wiki.ports.token_counter import TokenCounterUnavailable
 
 
 class LocalReportTokenCounter:

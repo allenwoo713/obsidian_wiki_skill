@@ -178,6 +178,108 @@ def test_current_fingerprint_gate_rejects_body_frontmatter_and_edge_changes(tmp_
     assert not any("member fingerprint" in reason for reason in weight_outcome.stale_reasons)
 
 
+def test_current_membership_gate_rejects_members_gained_or_lost_without_source_changes():
+    """The current graph partition, not stored report IDs, authorizes a report."""
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from obsidian_wiki.domain.community_report_models import GraphSnapshotState, PageSnapshot
+
+    graph = _Graph(_fresh_snapshot())
+    store = _ReportStore()
+    service = CommunityReportService(store, graph, _NamedTokenCounter())
+    service.build()
+
+    original = graph._snapshot
+    gained_page = PageSnapshot("Wiki/c.md", "c-full-markdown-hash")
+    graph._snapshot = GraphSnapshotState(
+        pages=(*original.pages, gained_page), edges=original.edges,
+        communities=((7, ("Wiki/a.md", "Wiki/b.md", "Wiki/c.md")),),
+    )
+    gained = service.retrieve()
+    assert gained.reports == ()
+    assert any("membership is stale" in reason for reason in gained.stale_reasons)
+
+    graph._snapshot = GraphSnapshotState(
+        pages=original.pages, edges=(), communities=((7, ("Wiki/a.md",)),),
+    )
+    lost = service.retrieve()
+    assert lost.reports == ()
+    assert any("membership is stale" in reason for reason in lost.stale_reasons)
+
+
+def test_graph_snapshot_failure_is_reported_as_stale_not_token_counter_failure():
+    """A graph read failure must direct operators to graph/report remediation."""
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from obsidian_wiki.domain.community_report_models import CommunityReportStatus
+
+    class FailingGraph(_Graph):
+        def read(self):
+            if self.failed:
+                raise RuntimeError("graph snapshot is unavailable")
+            return super().read()
+
+    graph = FailingGraph(_fresh_snapshot())
+    graph.failed = False
+    store = _ReportStore()
+    service = CommunityReportService(store, graph, _NamedTokenCounter())
+    service.build()
+    graph.failed = True
+
+    outcome = service.retrieve()
+    assert outcome.status is CommunityReportStatus.STALE
+    assert outcome.stale_reasons == ("current graph snapshot is unavailable",)
+
+
+def test_global_report_budget_skips_oversized_report_and_keeps_fitting_lower_rank():
+    """An oversized high-ranked report must not prevent a lower-ranked fit."""
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from obsidian_wiki.domain.community_report_models import GraphSnapshotState, PageSnapshot
+
+    class Counter(_NamedTokenCounter):
+        def count(self, text):
+            return 10 if text.startswith("Community 7") else 2
+
+    snapshot = GraphSnapshotState(
+        pages=(PageSnapshot("Wiki/a.md", "a"), PageSnapshot("Wiki/b.md", "b")),
+        edges=(), communities=((7, ("Wiki/a.md",)), (8, ("Wiki/b.md",))),
+    )
+    store = _ReportStore()
+    service = CommunityReportService(store, _Graph(snapshot), Counter())
+    service.build()
+
+    outcome = service.retrieve(query_terms=("community",), k=2, max_tokens=5)
+    assert outcome.status.value == "community_reports_fresh"
+    assert [report.community_id for report in outcome.reports] == [8]
+    assert outcome.stale_reasons == ("one or more community reports exceeded the effective token budget",)
+
+
+def test_query_preserves_fresh_no_fit_budget_diagnostic(monkeypatch, tmp_path):
+    """A budget omission is fresh-but-empty evidence, never a tokenizer outage."""
+    from obsidian_wiki.domain.community_report_models import CommunityReportStatus, GlobalRetrievalOutcome
+    from query import _global_retrieve
+    from query_planner import DefaultQueryPlanner
+    import query
+
+    class BudgetLimitedService:
+        def retrieve(self, **kwargs):
+            return GlobalRetrievalOutcome(
+                status=CommunityReportStatus.FRESH,
+                stale_reasons=("one or more community reports exceeded the effective token budget",),
+            )
+
+    monkeypatch.setattr(query, "compose_global_report_service", lambda root: BudgetLimitedService())
+
+    class Wiki:
+        index_dir = tmp_path / ".index"
+
+    plan = DefaultQueryPlanner().plan("全局概述")
+    result = _global_retrieve(Wiki(), plan, k=5, max_tokens=1)
+
+    assert result.status == "community_reports_fresh"
+    assert result.community_report_status == "community_reports_fresh"
+    assert result.stale_reasons == ["one or more community reports exceeded the effective token budget"]
+    assert result.bundle.items == []
+
+
 def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatch, tmp_path):
     """The query wrapper exposes fresh report evidence through its normal JSON shape."""
     from obsidian_wiki.application.community_report_service import CommunityReportService

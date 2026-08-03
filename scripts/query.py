@@ -45,7 +45,8 @@ from obsidian_wiki.domain.community_report_models import (
 )
 from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
 from obsidian_wiki.infrastructure.filesystem_graph_snapshot import FilesystemGraphSnapshot
-from obsidian_wiki.infrastructure.production_token_counter import LocalReportTokenCounter, TokenCounterUnavailable
+from obsidian_wiki.infrastructure.production_token_counter import LocalReportTokenCounter
+from obsidian_wiki.ports.token_counter import TokenCounterUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -390,17 +391,10 @@ def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> HybridResu
         )
     if outcome.status is not CommunityReportStatus.FRESH:
         return _report_diagnostic(plan, outcome, max_tokens)
-    if outcome.stale_reasons:
-        # A fresh artifact whose selected text cannot fit is a strict report
-        # outcome, never permission to substitute local retrieval implicitly.
-        return _report_diagnostic(plan, GlobalRetrievalOutcome(
-            status=CommunityReportStatus.TOKEN_COUNTER_UNAVAILABLE,
-            stale_reasons=outcome.stale_reasons,
-        ), max_tokens)
     bundle = _report_bundle(plan, outcome, max_tokens)
     return HybridResult(
         query=plan.original_query, bundle=bundle, plan=plan, text_items=bundle.items,
-        status=outcome.status.value, local_fallback_used=False,
+        status=outcome.status.value, stale_reasons=list(outcome.stale_reasons), local_fallback_used=False,
         community_report_status=outcome.status.value,
     )
 

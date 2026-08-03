@@ -347,6 +347,6 @@ def test_global_reports_recount_selected_text_before_hard_budget():
 
     assert outcome.status is CommunityReportStatus.FRESH
     assert outcome.reports == ()
-    assert outcome.stale_reasons == ("selected community reports exceed the effective token budget",)
+    assert outcome.stale_reasons == ("one or more community reports exceeded the effective token budget",)
     # build + staged validation + query validation + selection recount
     assert counter.calls == 4
