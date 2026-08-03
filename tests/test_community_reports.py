@@ -95,12 +95,21 @@ def test_report_service_rejects_incompatible_contracts_without_text():
 
     manifest = service.build()
     reports, active_manifest = store.active
+    second_report = replace(reports[0], community_id=8)
     cases = (
         (None, CommunityReportStatus.MISSING),
         ((reports, replace(active_manifest, report_schema_version=1)), CommunityReportStatus.SCHEMA_UNSUPPORTED),
         ((reports, replace(active_manifest, report_schema_version=3)), CommunityReportStatus.SCHEMA_UNSUPPORTED),
+        ((reports, replace(reports[0], report_schema_version=1)), CommunityReportStatus.SCHEMA_UNSUPPORTED),
+        ((reports, replace(reports[0], report_schema_version=3)), CommunityReportStatus.SCHEMA_UNSUPPORTED),
+        (
+            ((reports[0], replace(second_report, report_schema_version=1)), replace(active_manifest, report_count=2)),
+            CommunityReportStatus.SCHEMA_UNSUPPORTED,
+        ),
         ((reports, replace(active_manifest, stale_reason="graph_published")), CommunityReportStatus.STALE),
         ((reports[:-1], active_manifest), CommunityReportStatus.SCHEMA_UNSUPPORTED),
+        (((object(),), replace(active_manifest, report_count=1)), CommunityReportStatus.SCHEMA_UNSUPPORTED),
+        ((reports, object()), CommunityReportStatus.SCHEMA_UNSUPPORTED),
     )
     for active, expected in cases:
         store.active = active
