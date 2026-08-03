@@ -70,3 +70,53 @@ def test_reader_rejects_torn_or_escaped_active_pointer(tmp_path):
         assert outcome.reports == ()
     pointer_path.write_bytes(prior)
     assert service.retrieve().status.value == "community_reports_fresh"
+
+
+def test_invalid_staged_set_preserves_previous_active_pointer(tmp_path):
+    from dataclasses import replace
+
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
+    from obsidian_wiki.infrastructure.filesystem_graph_snapshot import FilesystemGraphSnapshot
+
+    _write_graph_fixture(tmp_path)
+    service = _service(tmp_path)
+    service.build()
+    pointer_path = tmp_path / ".index" / "ACTIVE_COMMUNITY_REPORTS"
+    prior = pointer_path.read_bytes()
+    class _BadStageStore(FilesystemCommunityReportStore):
+        def read_staged(self, build_id):
+            reports, manifest = super().read_staged(build_id)
+            return reports, replace(manifest, report_schema_version=1)
+
+    bad_store = _BadStageStore(tmp_path / ".index")
+    try:
+        CommunityReportService(bad_store, FilesystemGraphSnapshot(tmp_path), _Counter()).build()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an unsupported staged set must not activate")
+    assert pointer_path.read_bytes() == prior
+    assert service.retrieve().status.value == "community_reports_fresh"
+    assert list((tmp_path / ".index" / "community_report_builds").glob("*/.failed"))
+
+
+def test_reader_rejects_malformed_or_stale_records_without_text(tmp_path):
+    _write_graph_fixture(tmp_path)
+    service = _service(tmp_path)
+    service.build()
+    pointer = json.loads((tmp_path / ".index" / "ACTIVE_COMMUNITY_REPORTS").read_text())
+    staged = tmp_path / ".index" / pointer["active_build"]
+    reports_path = staged / "reports.jsonl"
+    original = reports_path.read_text()
+    reports_path.write_text("{not json}\n", encoding="utf-8")
+    assert service.retrieve().reports == ()
+    assert service.retrieve().status.value == "community_reports_missing"
+    reports_path.write_text(original, encoding="utf-8")
+    manifest_path = staged / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["stale_reason"] = "graph_published"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    outcome = service.retrieve()
+    assert outcome.status.value == "community_reports_stale"
+    assert outcome.reports == ()
