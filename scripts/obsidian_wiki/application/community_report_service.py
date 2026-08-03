@@ -57,7 +57,19 @@ class CommunityReportService:
         self._store.activate(build_id)
         return manifest
 
-    def retrieve(self) -> GlobalRetrievalOutcome:
+    def retrieve(
+        self,
+        *,
+        query_terms: Iterable[str] = (),
+        k: int | None = None,
+        max_tokens: int | None = None,
+    ) -> GlobalRetrievalOutcome:
+        """Return only fresh reports selected with this service's strict counter.
+
+        Persisted report token counts validate the artifact, but selection always
+        recounts the text admitted to the caller's effective budget.  This keeps
+        the trust boundary in the application layer instead of a query wrapper.
+        """
         active = self._store.read_active()
         if active is None:
             return self._rejected(CommunityReportStatus.MISSING, "active report set is missing")
@@ -80,7 +92,46 @@ class CommunityReportService:
                 "schema" in reason or "count" in reason for reason in reasons
             ) else CommunityReportStatus.STALE
             return self._rejected(status, *reasons)
-        return GlobalRetrievalOutcome(status=CommunityReportStatus.FRESH, reports=tuple(reports))
+        selected, selection_reason = self._select_reports(
+            reports, query_terms=query_terms, k=k, max_tokens=max_tokens
+        )
+        if selection_reason is not None:
+            return GlobalRetrievalOutcome(
+                status=CommunityReportStatus.FRESH,
+                reports=selected,
+                stale_reasons=(selection_reason,),
+            )
+        return GlobalRetrievalOutcome(status=CommunityReportStatus.FRESH, reports=selected)
+
+    def _select_reports(
+        self,
+        reports: Iterable[CommunityReport],
+        *,
+        query_terms: Iterable[str],
+        k: int | None,
+        max_tokens: int | None,
+    ) -> tuple[tuple[CommunityReport, ...], str | None]:
+        terms = {str(term).lower() for term in query_terms if str(term).strip()}
+
+        def score(report: CommunityReport) -> tuple[int, int]:
+            text = f"{report.title} {report.text}".lower()
+            return (-sum(term in text for term in terms), report.community_id)
+
+        ranked = sorted(reports, key=score)
+        if k is not None:
+            ranked = ranked[:k]
+        selected: list[CommunityReport] = []
+        used = 0
+        for report in ranked:
+            try:
+                actual_count = self._token_counter.count(report.text)
+            except Exception:
+                raise
+            if max_tokens is not None and used + actual_count > max_tokens:
+                return tuple(selected), "selected community reports exceed the effective token budget"
+            selected.append(report)
+            used += actual_count
+        return tuple(selected), None
 
     def _build_report(
         self, snapshot: GraphSnapshotState, community_id: int, member_ids: tuple[str, ...], generated_at: str

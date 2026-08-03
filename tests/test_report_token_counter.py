@@ -26,3 +26,17 @@ def test_unavailable_counter_fails_closed(tmp_path):
         assert "token_counter_unavailable" in str(exc)
     else:
         raise AssertionError("missing local tokenizer must not use a character-count fallback")
+
+
+def test_query_root_uses_matching_nontruncating_counter():
+    """The public query composition must use the builder's strict local artifact."""
+    from build_community_reports import DEFAULT_TOKENIZER_DIR, compose_report_service
+    from query import compose_global_report_service
+
+    builder_counter = compose_report_service(Path("."))._token_counter
+    query_counter = compose_global_report_service(Path("."))._token_counter
+
+    assert builder_counter.identity == query_counter.identity
+    assert "truncation=false" in query_counter.identity
+    assert query_counter.count("word " * 1000) == 1002
+    assert DEFAULT_TOKENIZER_DIR.name in query_counter.identity

@@ -175,3 +175,28 @@ def test_current_fingerprint_gate_rejects_body_frontmatter_and_edge_changes(tmp_
     assert weight_outcome.status.value == "community_reports_stale"
     assert any("edge fingerprint" in reason for reason in weight_outcome.stale_reasons)
     assert not any("member fingerprint" in reason for reason in weight_outcome.stale_reasons)
+
+
+def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatch, tmp_path):
+    """The query wrapper exposes fresh report evidence through its normal JSON shape."""
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from query import hybrid_search, result_to_json
+    from query_planner import DefaultQueryPlanner
+    import query
+
+    service = CommunityReportService(_ReportStore(), _Graph(_fresh_snapshot()), _NamedTokenCounter())
+    service.build()
+    monkeypatch.setattr(query, "compose_global_report_service", lambda root: service)
+
+    class Wiki:
+        index_dir = tmp_path / ".index"
+        pages = ()
+
+    result = hybrid_search(Wiki(), "summarize the whole wiki", DefaultQueryPlanner(),
+                           intent_override="global", max_tokens=100)
+    payload = result_to_json(result)
+
+    assert payload["status"] == "community_reports_fresh"
+    assert payload["mode"] == "summary"
+    assert payload["text"] and payload["text"][0]["method"] == "global_community_report"
+    assert result.bundle.budget_contract_violations() == []
