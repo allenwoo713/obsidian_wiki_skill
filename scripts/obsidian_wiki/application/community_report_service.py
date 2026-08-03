@@ -59,7 +59,13 @@ class CommunityReportService:
         active = self._store.read_active()
         if active is None:
             return self._rejected(CommunityReportStatus.MISSING, "active report set is missing")
+        if not isinstance(active, tuple) or len(active) != 2:
+            return self._rejected(CommunityReportStatus.SCHEMA_UNSUPPORTED, "active report set contract is malformed")
         reports, manifest = active
+        if not isinstance(manifest, CommunityReportManifest):
+            return self._rejected(CommunityReportStatus.SCHEMA_UNSUPPORTED, "report manifest contract is malformed")
+        if not isinstance(reports, tuple) or any(not isinstance(report, CommunityReport) for report in reports):
+            return self._rejected(CommunityReportStatus.SCHEMA_UNSUPPORTED, "report record contract is malformed")
         if manifest.is_stale:
             reason = manifest.stale_reason or "report set is marked stale"
             return self._rejected(CommunityReportStatus.STALE, reason)
