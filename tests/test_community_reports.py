@@ -7,6 +7,7 @@
 """
 from pathlib import Path
 import sys
+import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -116,3 +117,61 @@ def test_report_service_rejects_incompatible_contracts_without_text():
         assert outcome.reports == ()
         assert outcome.local_fallback_used is False
         assert outcome.required_action == "build-community-reports"
+
+
+def test_current_fingerprint_gate_rejects_body_frontmatter_and_edge_changes(tmp_path):
+    """Current source facts, not manifest metadata, authorize report retrieval."""
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
+    from obsidian_wiki.infrastructure.filesystem_graph_snapshot import FilesystemGraphSnapshot
+
+    wiki = tmp_path / "Wiki"
+    wiki.mkdir()
+    page_a = wiki / "a.md"
+    page_b = wiki / "b.md"
+    original_a = "---\ntitle: Alpha\ntype: concept\n---\n\nOriginal body"
+    original_b = "---\ntitle: Beta\ntype: concept\n---\n\nSecond body"
+    page_a.write_text(original_a, encoding="utf-8")
+    page_b.write_text(original_b, encoding="utf-8")
+    index = tmp_path / ".index"
+    index.mkdir()
+    graph_path = index / "graph.json"
+    page_ids = [str(page_a), str(page_b)]
+
+    def write_graph(*, signals=("direct_link",), weight=1.0):
+        graph_path.write_text(json.dumps({
+            "nodes": [{"id": page_id} for page_id in page_ids],
+            "edges": [{"source": page_ids[0], "target": page_ids[1], "signals": list(signals), "weight": weight}],
+            "communities": [page_ids],
+        }), encoding="utf-8")
+
+    write_graph()
+    service = CommunityReportService(
+        FilesystemCommunityReportStore(index), FilesystemGraphSnapshot(tmp_path), _NamedTokenCounter()
+    )
+    service.build()
+    assert service.retrieve().status.value == "community_reports_fresh"
+
+    page_a.write_text(original_a.replace("Original", "Changed"), encoding="utf-8")
+    body_outcome = service.retrieve()
+    assert body_outcome.status.value == "community_reports_stale"
+    assert any("member fingerprint" in reason for reason in body_outcome.stale_reasons)
+    page_a.write_text(original_a, encoding="utf-8")
+
+    page_a.write_text(original_a.replace("type: concept", "type: procedure"), encoding="utf-8")
+    frontmatter_outcome = service.retrieve()
+    assert frontmatter_outcome.status.value == "community_reports_stale"
+    assert any("member fingerprint" in reason for reason in frontmatter_outcome.stale_reasons)
+    page_a.write_text(original_a, encoding="utf-8")
+
+    write_graph(signals=("direct_link", "source_overlap", "source_overlap"))
+    signals_outcome = service.retrieve()
+    assert signals_outcome.status.value == "community_reports_stale"
+    assert any("edge fingerprint" in reason for reason in signals_outcome.stale_reasons)
+    assert not any("member fingerprint" in reason for reason in signals_outcome.stale_reasons)
+
+    write_graph(weight=2.0)
+    weight_outcome = service.retrieve()
+    assert weight_outcome.status.value == "community_reports_stale"
+    assert any("edge fingerprint" in reason for reason in weight_outcome.stale_reasons)
+    assert not any("member fingerprint" in reason for reason in weight_outcome.stale_reasons)
