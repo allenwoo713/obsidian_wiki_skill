@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import sys
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -120,3 +121,59 @@ def test_reader_rejects_malformed_or_stale_records_without_text(tmp_path):
     outcome = service.retrieve()
     assert outcome.status.value == "community_reports_stale"
     assert outcome.reports == ()
+
+
+def test_successful_producers_invalidate_only_after_publication(tmp_path, monkeypatch):
+    """Graph/index publication marks the active set stale; producer failures do not."""
+    _write_graph_fixture(tmp_path)
+    service = _service(tmp_path)
+    service.build()
+    pointer = json.loads((tmp_path / ".index" / "ACTIVE_COMMUNITY_REPORTS").read_text())
+    manifest_path = tmp_path / ".index" / pointer["active_build"] / "manifest.json"
+
+    import build_graph
+
+    monkeypatch.setattr(build_graph, "render_html", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["build_graph.py", str(tmp_path)])
+    build_graph.main()
+    graph_stale = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert graph_stale["stale_producer"] == "build_graph"
+    assert graph_stale["stale_reason"] == "graph_published"
+    assert graph_stale["stale_at"]
+    assert (tmp_path / ".index" / "graph.json").is_file()
+
+    graph_state = manifest_path.read_bytes()
+    monkeypatch.setattr(build_graph, "build_graph", lambda _wiki: (_ for _ in ()).throw(RuntimeError("graph failed")))
+    with pytest.raises(RuntimeError, match="graph failed"):
+        build_graph.main()
+    assert manifest_path.read_bytes() == graph_state
+
+    import build_index
+    from obsidian_wiki.application import index_build_service
+
+    class _SuccessfulIndexBuild:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def build(self, *_args, **_kwargs):
+            return object()
+
+    monkeypatch.setattr(index_build_service, "IndexBuildService", _SuccessfulIndexBuild)
+    build_index.build_storage_contract(tmp_path / "Wiki", tmp_path / ".index", embed=lambda _texts: [])
+    first_index_stale = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert first_index_stale["stale_producer"] == "build_index"
+    assert first_index_stale["stale_reason"] == "index_published"
+    first_index_bytes = manifest_path.read_bytes()
+
+    build_index.build_storage_contract(tmp_path / "Wiki", tmp_path / ".index", embed=lambda _texts: [])
+    assert manifest_path.read_bytes() != first_index_bytes
+
+    class _FailedIndexBuild(_SuccessfulIndexBuild):
+        def build(self, *_args, **_kwargs):
+            raise RuntimeError("index failed")
+
+    monkeypatch.setattr(index_build_service, "IndexBuildService", _FailedIndexBuild)
+    failed_index_state = manifest_path.read_bytes()
+    with pytest.raises(RuntimeError, match="index failed"):
+        build_index.build_storage_contract(tmp_path / "Wiki", tmp_path / ".index", embed=lambda _texts: [])
+    assert manifest_path.read_bytes() == failed_index_state
