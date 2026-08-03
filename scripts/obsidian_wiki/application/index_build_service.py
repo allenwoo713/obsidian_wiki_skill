@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, List, Sequence
 
+from obsidian_wiki.application.active_index_pointer import publish_pointer
+from obsidian_wiki.application.build_lock import BuildLock
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
     DenseChunk,
@@ -50,6 +52,22 @@ class IndexBuildService:
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
         sparse_chunks: Sequence[SparseChunk] | None = None,
     ) -> StorageArtifact:
+        """#21 单写者构建：先取 BUILD.lock（进程内可重入），再委托 _build 执行。"""
+        build_id = f"build_{time.time_ns()}_{uuid.uuid4().hex}"
+        lock = BuildLock(index_dir, build_id=build_id)
+        lock.acquire()
+        try:
+            return self._build(
+                wiki_dir, index_dir, embed=embed,
+                sparse_chunks=sparse_chunks, build_id=build_id,
+            )
+        finally:
+            lock.release()
+
+    def _build(
+        self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
+        sparse_chunks: Sequence[SparseChunk] | None = None, build_id: str | None = None,
+    ) -> StorageArtifact:
         sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
             raise RuntimeError("No canonical Wiki Markdown pages were available to index")
@@ -85,7 +103,7 @@ class IndexBuildService:
         if not all(chunk.vector for chunk in dense_chunks):
             raise RuntimeError("Dense chunks require non-empty vectors")
 
-        build_dir = index_dir / "builds" / f"build_{time.time_ns()}_{uuid.uuid4().hex}"
+        build_dir = index_dir / "builds" / (build_id or f"build_{time.time_ns()}_{uuid.uuid4().hex}")
         lance_dir = build_dir / "lance_db"
         build_dir.mkdir(parents=True, exist_ok=False)
         try:
@@ -129,7 +147,7 @@ class IndexBuildService:
             )
             manifest_path = build_dir / "manifest.json"
             self._manifest_store.write(manifest_path, manifest)
-            self._publish(index_dir, build_dir)
+            publish_pointer(index_dir, build_dir)
             return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
         except Exception as exc:
             message = str(exc).lower()
@@ -257,15 +275,6 @@ class IndexBuildService:
     @staticmethod
     def _disk_bytes(build_dir: Path) -> int:
         return sum(path.stat().st_size for path in build_dir.rglob("*") if path.is_file())
-
-    @staticmethod
-    def _publish(index_dir: Path, build_dir: Path) -> None:
-        pointer = index_dir / "ACTIVE_INDEX"
-        temporary = index_dir / ".ACTIVE_INDEX.tmp"
-        payload = {"active_lance": str(build_dir.joinpath("lance_db").relative_to(index_dir))}
-        import json
-        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        os.replace(temporary, pointer)
 
     @staticmethod
     def _sparse_plan(wiki_dir: Path) -> tuple[SparseChunk, ...]:
