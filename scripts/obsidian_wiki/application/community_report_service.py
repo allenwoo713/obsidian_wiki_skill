@@ -48,9 +48,11 @@ class CommunityReportService:
         self._store.stage(build_id, reports, manifest)
         reopened = self._store.read_staged(build_id)
         if reopened is None:
+            self._record_failure(build_id, "staged community-report set could not be reopened")
             raise RuntimeError("staged community-report set could not be reopened")
         valid, reasons = self._validate(*reopened, snapshot)
         if not valid:
+            self._record_failure(build_id, "; ".join(reasons))
             raise RuntimeError("staged community-report validation failed: " + "; ".join(reasons))
         self._store.activate(build_id)
         return manifest
@@ -69,7 +71,10 @@ class CommunityReportService:
         if manifest.is_stale:
             reason = manifest.stale_reason or "report set is marked stale"
             return self._rejected(CommunityReportStatus.STALE, reason)
-        valid, reasons = self._validate(reports, manifest, self._graph.read())
+        try:
+            valid, reasons = self._validate(reports, manifest, self._graph.read())
+        except Exception:
+            return self._rejected(CommunityReportStatus.TOKEN_COUNTER_UNAVAILABLE, "report token counter is unavailable")
         if not valid:
             status = CommunityReportStatus.SCHEMA_UNSUPPORTED if any(
                 "schema" in reason or "count" in reason for reason in reasons
@@ -147,3 +152,8 @@ class CommunityReportService:
             required_action=REBUILD_ACTION,
             local_fallback_used=False,
         )
+
+    def _record_failure(self, build_id: str, reason: str) -> None:
+        recorder = getattr(self._store, "record_failure", None)
+        if recorder is not None:
+            recorder(build_id, reason)
