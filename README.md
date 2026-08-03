@@ -385,6 +385,7 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <proje
 - **CPU 线程数 `WIKI_TORCH_THREADS`**：向量 encode 的 torch intra-op 线程数，默认 `1`（受限/沙箱环境唯一稳定值；多线程易触发 OpenMP race）。稳定的大机器可设 `WIKI_TORCH_THREADS=4` 等提速——但对本 skill 用的小模型（MiniLM）+ 短切片，收益有限（many-small-ops，线程同步开销常抵消收益）。
 - **crash-safe 向量重建**：`_build_vector` 逐批 encode 后落盘到 `.index/.vec_ckpt`（`.npy` + `done.json` + `meta.json` 签名），崩溃/超时重跑自动断点续；内容变更（chunk 签名不符）则丢弃陈旧 checkpoint 从头 encode，避免向量与元数据错位。成功后 best-effort 清理（禁删回收站的沙箱里可能残留 `.vec_ckpt`，无害）。
 - **超大库兜底（极端情况）**：正常情况下导入顺序修复已让「同进程 encode + 写 lance」稳定。万一在超大库上 lance 写入仍崩，可从 `.index/.vec_ckpt` 的 `.npy` 用一个**完全不 import torch** 的独立脚本单独执行 `table.add`（仅 `numpy.load` + lancedb 写入），彻底隔离原生库冲突。
+- **build 退出码误导（WorkBuddy 沙箱）**：在沙箱内跑 `build_index.py` **必然以 `exit 1` 结束**——不是构建失败，而是沙箱的 safe-delete 守卫（无回收站可用时 fail-closed）让收尾的 `lock.release()` 调用 `os.unlink(BUILD.lock)` 永远失败。真正的建库 + 原子发布 `ACTIVE_INDEX` 指针已在 `exit 1` 之前完成。**判据看 `.index` 状态，勿看退出码**：① 新 build 目录存在且 `manifest.json` 的 `format_version`/`layout` 正确；② `ACTIVE_INDEX` 已原子指向它；③ `query.py` 能跑出正确结果。三项全满足即成功；残留 `BUILD.lock` 用 `mv`（rename）清，勿用 `rm`/`os.unlink`（沙箱对非临时文件永远失败）。
 
 ## 出处标注规范
 
