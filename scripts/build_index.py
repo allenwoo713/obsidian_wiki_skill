@@ -257,21 +257,11 @@ class WikiIndex:
             self._repository = LanceDbIndexRepository(lance_dir)
         return self._repository
 
-    # ---- 活动索引解析（#11 指针方案） ----
+    # ---- 活动索引解析（#11/#21 指针方案） ----
     def _resolve_active_lance_dir(self) -> Path:
-        """经 ACTIVE_INDEX 指针解析当前活动 lance 目录；无指针回退顶层 lance_db。"""
-        pointer = self.index_dir / "ACTIVE_INDEX"
-        if pointer.exists():
-            try:
-                data = json.loads(pointer.read_text(encoding="utf-8"))
-                rel = data.get("active_lance")
-                if rel:
-                    cand = Path(rel) if os.path.isabs(rel) else (self.index_dir / rel)
-                    if cand.exists():
-                        return cand
-            except (json.JSONDecodeError, OSError):
-                pass
-        return self.index_dir / "lance_db"
+        """经 ACTIVE_INDEX 指针解析当前活动 lance 目录；指针损坏时回退最近已验证 build。"""
+        from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir
+        return resolve_active_lance_dir(self.index_dir)
 
     def _resolve_active_manifest(self) -> Path:
         return self._resolve_active_lance_dir().parent / "manifest.json"
@@ -294,9 +284,25 @@ class WikiIndex:
         ``allow_partial_index``：默认 False（fail-fast）。任一页面分块失败或缺页/0-chunk
         都会中止 staging build 并保留旧活动索引（#13 review Gap 1）。置 True 仅用于实验，
         降级为 warning，禁止用于生产发布。
+
+        #21 单写者：整个构建（含 embed 阶段）持有 .index/BUILD.lock，并发构建只有一个写者。
         """
+        from obsidian_wiki.application.build_lock import BuildLock
+
+        lock = BuildLock(self.index_dir)
+        lock.acquire()
+        try:
+            self._build(wiki_dir, full_rebuild=full_rebuild,
+                        vector_index_mode=vector_index_mode,
+                        allow_partial_index=allow_partial_index)
+        finally:
+            lock.release()
+
+    def _build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
+               allow_partial_index: bool = False):
+        """build() 的锁内主体。"""
         # Keep the long-standing public call signature, but route every actual
-        # build through the D-01 service.  #21/#22 incremental/publisher work and
+        # build through the D-01 service.  #22 incremental/publisher work and
         # #23 ranking remain outside this compatibility migration.
         embedder = self._get_embedder()
 
@@ -396,6 +402,10 @@ class WikiIndex:
             artifact.manifest_path.write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+            # #21：facade 补充 pages/images 后 manifest 内容已变，重发指针以刷新 checksum；
+            # 失败则保留 service 版指针（旧 checksum 失配 → 读取端安全回退上一代）。
+            from obsidian_wiki.application.active_index_pointer import publish_pointer
+            publish_pointer(self.index_dir, artifact.manifest_path.parent)
         self._repository = None
         self._lance_table = None
         return
@@ -1076,45 +1086,6 @@ class WikiIndex:
         except Exception:
             return False
 
-    def _atomic_replace(self, src: Path, dst: Path, attempts: int = 15, delay: float = 0.5) -> None:
-        """Windows 友好原子替换：os.replace 可能因目标被 Obsidian/杀软持锁而抛
-        PermissionError(WinError 5 / 32)。先重试若干次（锁通常是瞬时态），
-        仍失败则原位覆盖 pointer 内容作为兜底；皆失败才上抛并给出可操作信息。"""
-        last = None
-        for i in range(attempts):
-            try:
-                os.replace(str(src), str(dst))
-                return
-            except (PermissionError, OSError) as e:
-                last = e
-                time.sleep(delay)
-        # 重试耗尽：尝试原位写入（不依赖重命名目录项）
-        try:
-            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
-            try:
-                src.unlink()
-            except Exception:
-                pass
-            return
-        except (PermissionError, OSError) as e:
-            last = e
-        raise RuntimeError(
-            f"原子发布失败：无法翻转 ACTIVE_INDEX 指针（{type(last).__name__}: {last}）。"
-            f"请确认 {dst} 未被 Obsidian/杀软独占，或手动将 {src} 重命名为 {dst} 后重试。"
-        ) from last
-
-    def _publish(self, build_id: str) -> None:
-        """#11 原子发布：仅以 os.replace 翻转 ACTIVE_INDEX 指针文件（单文件，Windows 安全），
-        不动已验证的 builds/<id>/lance_db。活动索引即切换为新建版本。"""
-        pointer = self.index_dir / "ACTIVE_INDEX"
-        tmp = self.index_dir / ".ACTIVE_INDEX.tmp"
-        tmp.write_text(json.dumps({
-            "active_lance": f"builds/{build_id}/lance_db",
-            "published_at": datetime.now().isoformat(),
-            "schema_version": 2,
-        }, ensure_ascii=False), encoding="utf-8")
-        self._atomic_replace(tmp, pointer)
-
     # ---- load ----
     def load(self):
         manifest_file = self._resolve_active_manifest()
@@ -1313,7 +1284,12 @@ def main():
 
     model_path = Path(os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or SKILL_EMBEDDER_DIR)
     embedder = SentenceTransformerEmbedder(model_path)
-    artifact = build_storage_contract(wiki, idx_dir, embed=embedder.embed)
+    from obsidian_wiki.application.build_lock import BuildLockHeldError
+    try:
+        artifact = build_storage_contract(wiki, idx_dir, embed=embedder.embed)
+    except BuildLockHeldError as exc:
+        print(f"索引构建被拒：{exc}", file=sys.stderr)
+        sys.exit(1)
     mode = "全量重建" if args.full_rebuild else "增量"
     print(
         f"索引构建完成（{mode}）: sparse={artifact.sparse_count}, "
