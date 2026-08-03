@@ -8,6 +8,7 @@
 from pathlib import Path
 import sys
 import json
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -200,3 +201,61 @@ def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatc
     assert payload["mode"] == "summary"
     assert payload["text"] and payload["text"][0]["method"] == "global_community_report"
     assert result.bundle.budget_contract_violations() == []
+
+
+def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, tmp_path):
+    """A typed report rejection cannot reach local retrieval without one explicit flag."""
+    from obsidian_wiki.domain.community_report_models import CommunityReportStatus, GlobalRetrievalOutcome
+    from models import ContextBundle, ContextItem
+    from query import _exit_code_for_result, hybrid_search, result_to_json
+    from query_planner import DefaultQueryPlanner
+    import query
+
+    class MissingService:
+        def retrieve(self, **kwargs):
+            return GlobalRetrievalOutcome(
+                status=CommunityReportStatus.MISSING,
+                stale_reasons=("active report set is missing",),
+            )
+
+    calls = []
+    monkeypatch.setattr(query, "compose_global_report_service", lambda root: MissingService())
+    candidate = SimpleNamespace(page_id="local", rrf_score=1.0)
+    monkeypatch.setattr(query, "_retrieve_for_plan", lambda *args: calls.append(args) or ([object()], [], [candidate], [candidate], 0))
+    monkeypatch.setattr(
+        query,
+        "assemble_context",
+        lambda *args, **kwargs: ContextBundle(
+            query="q", mode="snippet", max_context_tokens=kwargs["max_tokens"],
+            items=[ContextItem("local", "Wiki/local.md", "Local", "rrf", "section", text="local evidence", sources=["Raw/a"], token_count=2)],
+            token_count=2,
+        ),
+    )
+
+    class Wiki:
+        index_dir = tmp_path / ".index"
+        pages = ()
+
+        @staticmethod
+        def count_tokens(text):
+            return len(text.split())
+
+    strict = hybrid_search(Wiki(), "summarize globally", DefaultQueryPlanner(), intent_override="global")
+    strict_payload = result_to_json(strict)
+    assert calls == []
+    assert strict_payload["status"] == "community_reports_missing"
+    assert strict_payload["local_fallback_used"] is False
+    assert strict_payload["required_action"] == "build-community-reports"
+    assert _exit_code_for_result(strict) != 0
+
+    fallback = hybrid_search(Wiki(), "summarize globally", DefaultQueryPlanner(),
+                             intent_override="global", allow_local_fallback=True)
+    fallback_payload = result_to_json(fallback)
+    assert len(calls) == 1
+    assert fallback_payload["status"] == "local_fallback_used"
+    assert fallback_payload["mode"] == "local_fallback"
+    assert fallback_payload["community_report_status"] == "community_reports_missing"
+    assert fallback_payload["local_fallback_used"] is True
+    assert fallback_payload["confidence_warning"]
+    assert all(item["method"] != "global_community_report" for item in fallback_payload["text"])
+    assert _exit_code_for_result(fallback) == 0

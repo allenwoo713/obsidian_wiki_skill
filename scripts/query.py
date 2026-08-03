@@ -582,6 +582,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _exit_code_for_result(result: HybridResult) -> int:
+    """Keep CLI success aligned with the public strict/fallback trust contract."""
+    if result.status is None or result.status == CommunityReportStatus.FRESH.value:
+        return 0
+    if result.local_fallback_used and result.text_items:
+        return 0
+    return 2
+
+
 def _load_context(args) -> PlannerContext:
     if args.conversation_context_file:
         fp = Path(args.conversation_context_file)
@@ -637,8 +646,7 @@ def main():
         print(f"wrote {op} ({len(payload)} bytes)")
     else:
         print(payload)
-    return 2 if result.status and result.status != CommunityReportStatus.FRESH.value \
-        and not result.local_fallback_used else 0
+    return _exit_code_for_result(result)
 
 
 if __name__ == "__main__":
