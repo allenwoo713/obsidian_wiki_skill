@@ -38,6 +38,15 @@ from query_planner import DefaultQueryPlanner, InMemoryEntityCatalog, ResolvedEn
 from query_plan_models import (
     QueryPlan, PlannerContext, RetrievalFeedback, QueryIntent,
 )
+from obsidian_wiki.application.community_report_service import CommunityReportService
+from obsidian_wiki.domain.community_report_models import (
+    CommunityReportStatus,
+    GlobalRetrievalOutcome,
+)
+from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
+from obsidian_wiki.infrastructure.filesystem_graph_snapshot import FilesystemGraphSnapshot
+from obsidian_wiki.infrastructure.production_token_counter import LocalReportTokenCounter
+from obsidian_wiki.ports.token_counter import TokenCounterUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +99,12 @@ class HybridResult:
     text_items: List[ContextItem] = field(default_factory=list)
     image_items: List[ContextItem] = field(default_factory=list)
     graph_validated_count: int = 0
+    status: Optional[str] = None
+    stale_reasons: List[str] = field(default_factory=list)
+    required_action: Optional[str] = None
+    local_fallback_used: bool = False
+    community_report_status: Optional[str] = None
+    confidence_warning: Optional[str] = None
 
 
 def _split_text_image(items: List[ContextItem]):
@@ -312,56 +327,76 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
     return fts_hits, vec_hits, candidates, merged, len(graph_candidates)
 
 
-def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> Optional[HybridResult]:
-    """issue #10 GraphRAG global：路由到 community reports（与 local retrieval 分离）。
+def compose_global_report_service(project_root: Path) -> CommunityReportService:
+    """Compose query-time report policy from the same configured local artifact.
 
-    map 阶段：按 query 词项与报告文本（summary+key_entities+title）的相关性检索
-    相关社区报告；reduce 阶段：按 token 预算聚合为 ContextBundle。
-    无 LLM 时为结构化聚合（非自然语言 map/reduce 摘要）；社区报告由
-    ``build_community_reports.py`` 构建。
+    The service validates this counter identity against the active builder
+    manifest before it selects any report, so report text never crosses the
+    query boundary with mismatched tokenizer evidence.
     """
-    cr_file = wi.index_dir / "community_reports.jsonl"
-    if not cr_file.exists():
-        return None
-    try:
-        lines = [json.loads(l) for l in cr_file.read_text(encoding="utf-8").splitlines() if l.strip()]
-    except (json.JSONDecodeError, OSError):
-        return None
-    # map：检索相关社区报告（query 词项与报告文本重叠度排序）
-    qtokens = set()
-    for t in list(plan.lexical_terms) + list(plan.exact_terms) + list(plan.entities):
-        if t:
-            qtokens.add(t.lower())
-    for w in (plan.original_query or "").lower().split():
-        if w:
-            qtokens.add(w)
+    from build_community_reports import DEFAULT_TOKENIZER_DIR
 
-    def _rep_score(rep):
-        text = ((rep.get("summary") or "") + " "
-                + " ".join(rep.get("key_entities") or [])
-                + " " + (rep.get("title") or "")).lower()
-        return sum(1 for t in qtokens if t in text)
+    root = Path(project_root)
+    tokenizer_dir = Path(os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or DEFAULT_TOKENIZER_DIR)
+    return CommunityReportService(
+        FilesystemCommunityReportStore(root / ".index"),
+        FilesystemGraphSnapshot(root),
+        LocalReportTokenCounter(tokenizer_dir),
+    )
 
-    ranked = sorted(lines, key=lambda r: (-_rep_score(r), r.get("community_id", 0)))
-    items = []
+
+def _global_terms(plan: QueryPlan) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        [*plan.lexical_terms, *plan.exact_terms, *plan.entities, *(plan.original_query or "").split()]
+    ))
+
+
+def _report_bundle(plan: QueryPlan, outcome: GlobalRetrievalOutcome, max_tokens: int) -> ContextBundle:
+    items: List[ContextItem] = []
     used = 0
-    for rep in ranked[:k]:
-        text = rep.get("summary") or rep.get("content") or ""
-        title = rep.get("title") or rep.get("id") or "community_report"
-        tc = max(1, len(text) // 4)
-        if used + tc > max_tokens:
-            break
+    for report in outcome.reports:
+        # The service recounted every selected report before this adapter runs;
+        # use that validated count rather than an embedding or character estimate.
         items.append(ContextItem(
-            page_id=str(rep.get("community_id", title)), path=str(rep.get("community_id", title)),
-            title=title, inclusion_reason="global_community_report", scope="full_page",
-            evidence=[], text=text, sources=rep.get("source_pages", []),
-            graph_paths=[], token_count=tc))
-        used += tc
-    bundle = ContextBundle(query=plan.original_query, mode="summary",
-                           max_context_tokens=max_tokens, items=items, token_count=used)
-    bundle.context_text = "\n\n".join(f"### {i.title}\n{i.text}" for i in items)
-    return HybridResult(query=plan.original_query, bundle=bundle, plan=plan,
-                        text_items=items, image_items=[])
+            page_id=str(report.community_id), path=str(report.community_id), title=report.title,
+            inclusion_reason="global_community_report", scope="full_page", evidence=[], text=report.text,
+            sources=list(report.member_page_ids), graph_paths=[], token_count=report.token_count,
+        ))
+        used += report.token_count
+    bundle = ContextBundle(query=plan.original_query, mode="summary", items=items,
+                           token_count=used, max_context_tokens=max_tokens)
+    bundle.context_text = "\n\n".join(f"### {item.title}\n{item.text}" for item in items)
+    return bundle
+
+
+def _report_diagnostic(plan: QueryPlan, outcome: GlobalRetrievalOutcome, max_tokens: int) -> HybridResult:
+    bundle = ContextBundle(query=plan.original_query, mode="global", max_context_tokens=max_tokens)
+    return HybridResult(
+        query=plan.original_query, bundle=bundle, plan=plan,
+        status=outcome.status.value, stale_reasons=list(outcome.stale_reasons),
+        required_action=outcome.required_action, local_fallback_used=False,
+        community_report_status=outcome.status.value,
+    )
+
+
+def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> HybridResult:
+    """Run the typed report gate exactly once, before any local retrieval decision."""
+    try:
+        service = compose_global_report_service(Path(wi.index_dir).parent)
+        outcome = service.retrieve(query_terms=_global_terms(plan), k=k, max_tokens=max_tokens)
+    except (TokenCounterUnavailable, OSError, ValueError):
+        outcome = GlobalRetrievalOutcome(
+            status=CommunityReportStatus.TOKEN_COUNTER_UNAVAILABLE,
+            stale_reasons=("query-time report token counter is unavailable",),
+        )
+    if outcome.status is not CommunityReportStatus.FRESH:
+        return _report_diagnostic(plan, outcome, max_tokens)
+    bundle = _report_bundle(plan, outcome, max_tokens)
+    return HybridResult(
+        query=plan.original_query, bundle=bundle, plan=plan, text_items=bundle.items,
+        status=outcome.status.value, stale_reasons=list(outcome.stale_reasons), local_fallback_used=False,
+        community_report_status=outcome.status.value,
+    )
 
 
 def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
@@ -369,7 +404,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                   k: int = 5, max_tokens: int = 4096, wiki_dir: Optional[Path] = None,
                   intent_override: str = "auto", rewrite_override: str = "auto",
                   mode_override: Optional[str] = None,
-                  hard_max_tokens: Optional[int] = None) -> HybridResult:
+                  hard_max_tokens: Optional[int] = None,
+                  allow_local_fallback: bool = False) -> HybridResult:
     """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。"""
     ctx = context or PlannerContext()
     # The planner stays free of index implementations; query.py injects the
@@ -387,17 +423,19 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         logger.info("rewrite_override=%s (effective config: planner.config['rewrite']=%s)",
                     rewrite_override, planner.config["rewrite"])
 
-    # global intent → issue #10 路由（占位）
+    # Global reports are a distinct evidence contract.  A rejected report gate
+    # must return its diagnostic before any local retrieval can run.
     if plan.intent == QueryIntent.GLOBAL.value:
         _, g_mult, _, g_eff = resolve_budget(plan.context_mode, max_tokens,
                                              mode_override, hard_max_tokens)
         gr = _global_retrieve(wi, plan, k, g_eff)
-        if gr is not None:
-            gr.bundle.apply_budget(base_tokens=max_tokens, multiplier=g_mult,
-                                   effective_tokens=g_eff, hard_max_tokens=hard_max_tokens,
-                                   policy=BUDGET_POLICY)
+        gr.bundle.apply_budget(base_tokens=max_tokens, multiplier=g_mult,
+                               effective_tokens=g_eff, hard_max_tokens=hard_max_tokens,
+                               policy=BUDGET_POLICY)
+        if gr.status == CommunityReportStatus.FRESH.value:
             return gr
-        logger.warning("global intent 但 community reports 未构建 (#10)；回退本地检索")
+        if not allow_local_fallback:
+            return gr
 
     fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan, k, wiki_dir)
 
@@ -422,14 +460,42 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                         effective_tokens=eff_tokens, hard_max_tokens=hard_max_tokens,
                         policy=BUDGET_POLICY)
     text_items, image_items = _split_text_image(bundle.items)
-    return HybridResult(query=original_query, bundle=bundle, plan=plan,
-                        candidates=merged, text_items=text_items, image_items=image_items,
-                        graph_validated_count=graph_validated_count)
+    result = HybridResult(query=original_query, bundle=bundle, plan=plan,
+                          candidates=merged, text_items=text_items, image_items=image_items,
+                          graph_validated_count=graph_validated_count)
+    if plan.intent == QueryIntent.GLOBAL.value:
+        result.bundle.mode = "local_fallback"
+        result.status = "local_fallback_used"
+        result.local_fallback_used = True
+        result.community_report_status = gr.status
+        result.stale_reasons = gr.stale_reasons
+        result.required_action = gr.required_action
+        result.confidence_warning = (
+            "Degraded local evidence only: community reports were rejected; rebuild before relying on Global Search."
+        )
+    return result
 
 
 def format_for_agent(result: HybridResult) -> str:
     """markdown 渲染（替代旧 format_for_agent）。"""
-    return render_context_markdown(result.bundle)
+    rendered = render_context_markdown(result.bundle)
+    if result.status and result.status != CommunityReportStatus.FRESH.value:
+        status_messages = {
+            CommunityReportStatus.MISSING.value: "全局报告尚未构建。",
+            CommunityReportStatus.STALE.value: "全局报告已过期，不能作为 Global Search 结论。",
+            CommunityReportStatus.SCHEMA_UNSUPPORTED.value: "全局报告格式不兼容，需要重新构建。",
+            CommunityReportStatus.TOKEN_COUNTER_UNAVAILABLE.value: "全局报告的 token 校验不可用，不能安全使用报告。",
+            "local_fallback_used": "已返回降级的本地证据，不是 Global Search 结论。",
+        }
+        diagnostics = [status_messages.get(result.status, "Global Search 当前不可用。")]
+        if result.required_action == "build-community-reports":
+            diagnostics.append("请运行：python scripts/build_community_reports.py <知识库根目录>")
+        elif result.required_action:
+            diagnostics.append(f"后续操作：{result.required_action}")
+        if result.confidence_warning:
+            diagnostics.append(f"Warning: {result.confidence_warning}")
+        rendered = "\n".join(diagnostics) + "\n\n" + rendered
+    return rendered
 
 
 def _rrf_score_by_id(candidates: List[PageCandidate]) -> Dict[str, float]:
@@ -470,6 +536,12 @@ def result_to_json(result: HybridResult) -> dict:
         "query": result.query,
         "query_plan": result.plan.to_json(),
         "mode": result.bundle.mode,
+        "status": result.status,
+        "stale_reasons": result.stale_reasons,
+        "required_action": result.required_action,
+        "local_fallback_used": result.local_fallback_used,
+        "community_report_status": result.community_report_status,
+        "confidence_warning": result.confidence_warning,
         "token_count": result.bundle.token_count,
         # 预算契约：调用 LLM 前应按 effective_budget_tokens 预留上下文，
         # 而不是想当然认为等于 requested_base_budget_tokens。
@@ -502,6 +574,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="意图覆盖（默认 auto=由 Planner 识别）")
     p.add_argument("--rewrite", default="auto", choices=["auto", "off", "force"],
                    help="LLM rewrite 策略覆盖（默认 auto）")
+    p.add_argument("--allow-local-fallback", action="store_true",
+                   help="仅当 Global Search 报告被拒绝时，允许返回降级的本地证据；"
+                        "该结果不是 Global Search 结论，可能不完整，仍应先重建报告")
     p.add_argument("--conversation-context", default=None,
                    help="多轮对话的最小必要上下文（只消解指代，不替代原始问题）")
     p.add_argument("--conversation-context-file", default=None,
@@ -509,6 +584,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", dest="as_json", action="store_true", help="输出 JSON 格式（含完整 query_plan）")
     p.add_argument("--out", dest="out_path", default=None, help="输出落盘路径（大输出必须用，绕开沙箱 stdout 拦截段错误）")
     return p
+
+
+def _exit_code_for_result(result: HybridResult) -> int:
+    """Keep CLI success aligned with the public strict/fallback trust contract."""
+    if result.status is None or result.status == CommunityReportStatus.FRESH.value:
+        return 0
+    if result.local_fallback_used and result.text_items:
+        return 0
+    return 2
 
 
 def _load_context(args) -> PlannerContext:
@@ -555,6 +639,7 @@ def main():
         intent_override=args.intent,
         rewrite_override=args.rewrite,
         mode_override=args.mode,
+        allow_local_fallback=args.allow_local_fallback,
     )
     payload = (json.dumps(result_to_json(result), ensure_ascii=False, indent=2)
                if args.as_json else format_for_agent(result))
@@ -565,7 +650,8 @@ def main():
         print(f"wrote {op} ({len(payload)} bytes)")
     else:
         print(payload)
+    return _exit_code_for_result(result)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -75,12 +75,23 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
     from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
     from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
-    return IndexBuildService(
+    artifact = IndexBuildService(
         LanceDbIndexRepository(index_dir),
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
     ).build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks)
+    _mark_community_reports_stale(Path(index_dir))
+    return artifact
+
+
+def _mark_community_reports_stale(index_dir: Path) -> None:
+    """Mark reports stale after a successful ACTIVE_INDEX publication."""
+    from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
+
+    FilesystemCommunityReportStore(index_dir).mark_stale(
+        producer="build_index", reason="index_published"
+    )
 
 
 # 仅固定「pyarrow 先于 torch」的导入顺序（ISSUE-16）；torch 已于上方最顶部加载完毕。
