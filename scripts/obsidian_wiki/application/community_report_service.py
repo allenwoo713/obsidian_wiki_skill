@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import replace
 from typing import Iterable
 
 from obsidian_wiki.domain.community_report_models import (
@@ -129,7 +130,7 @@ class CommunityReportService:
                 raise
             if max_tokens is not None and used + actual_count > max_tokens:
                 return tuple(selected), "selected community reports exceed the effective token budget"
-            selected.append(report)
+            selected.append(replace(report, token_count=actual_count))
             used += actual_count
         return tuple(selected), None
 

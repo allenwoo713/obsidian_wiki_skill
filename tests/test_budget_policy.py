@@ -291,3 +291,62 @@ def test_eval_does_not_duplicate_budget_policy():
     assert "import _CONTEXT_MODE_MAP" not in src
     assert "effective_budget_tokens" in src, "eval 必须按 effective budget 判定 overflow"
     assert "budget_contract_violations" in src, "eval 必须做契约漂移检查"
+
+
+def test_global_reports_recount_selected_text_before_hard_budget():
+    """Stored report counts are evidence only; query selection recounts actual text."""
+    from obsidian_wiki.application.community_report_service import CommunityReportService
+    from obsidian_wiki.domain.community_report_models import CommunityReportStatus
+
+    class NamedCounter:
+        identity = "named-budget-counter/v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def count(self, text):
+            self.calls += 1
+            # The fake deliberately has a stable, named contract: build,
+            # artifact validation, and query-time selection must all measure
+            # the same report text.  The call count proves selection still
+            # invokes the counter instead of trusting stored token_count.
+            return len(text.split())
+
+    class Store:
+        active = None
+
+        def stage(self, build_id, reports, manifest):
+            self.staged = (tuple(reports), manifest)
+
+        def read_staged(self, build_id):
+            return self.staged
+
+        def activate(self, build_id):
+            self.active = self.staged
+
+        def read_active(self):
+            return self.active
+
+    from obsidian_wiki.domain.community_report_models import GraphEdge, GraphSnapshotState, PageSnapshot
+
+    class Graph:
+        def read(self):
+            return GraphSnapshotState(
+                pages=(
+                    PageSnapshot("Wiki/a.md", "a-hash"),
+                    PageSnapshot("Wiki/b.md", "b-hash"),
+                ),
+                edges=(GraphEdge("Wiki/a.md", "Wiki/b.md", ("related",), 1.0),),
+                communities=((7, ("Wiki/a.md", "Wiki/b.md")),),
+            )
+
+    counter = NamedCounter()
+    service = CommunityReportService(Store(), Graph(), counter)
+    service.build()
+    outcome = service.retrieve(query_terms=("community",), k=1, max_tokens=3)
+
+    assert outcome.status is CommunityReportStatus.FRESH
+    assert outcome.reports == ()
+    assert outcome.stale_reasons == ("selected community reports exceed the effective token budget",)
+    # build + staged validation + query validation + selection recount
+    assert counter.calls == 4
