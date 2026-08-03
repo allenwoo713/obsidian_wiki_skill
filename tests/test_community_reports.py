@@ -309,7 +309,7 @@ def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, t
     """A typed report rejection cannot reach local retrieval without one explicit flag."""
     from obsidian_wiki.domain.community_report_models import CommunityReportStatus, GlobalRetrievalOutcome
     from models import ContextBundle, ContextItem
-    from query import _exit_code_for_result, hybrid_search, result_to_json
+    from query import _exit_code_for_result, format_for_agent, hybrid_search, result_to_json
     from query_planner import DefaultQueryPlanner
     import query
 
@@ -349,6 +349,10 @@ def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, t
     assert strict_payload["local_fallback_used"] is False
     assert strict_payload["required_action"] == "build-community-reports"
     assert _exit_code_for_result(strict) != 0
+    strict_rendered = format_for_agent(strict)
+    assert "community_reports_missing" not in strict_rendered
+    assert "全局报告尚未构建" in strict_rendered
+    assert "python scripts/build_community_reports.py <知识库根目录>" in strict_rendered
 
     fallback = hybrid_search(Wiki(), "summarize globally", DefaultQueryPlanner(),
                              intent_override="global", allow_local_fallback=True)
@@ -361,3 +365,5 @@ def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, t
     assert fallback_payload["confidence_warning"]
     assert all(item["method"] != "global_community_report" for item in fallback_payload["text"])
     assert _exit_code_for_result(fallback) == 0
+    fallback_rendered = format_for_agent(fallback)
+    assert "降级的本地证据" in fallback_rendered

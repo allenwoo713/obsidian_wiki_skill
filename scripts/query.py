@@ -480,9 +480,18 @@ def format_for_agent(result: HybridResult) -> str:
     """markdown 渲染（替代旧 format_for_agent）。"""
     rendered = render_context_markdown(result.bundle)
     if result.status and result.status != CommunityReportStatus.FRESH.value:
-        diagnostics = [f"Global Search status: {result.status}"]
-        if result.required_action:
-            diagnostics.append(f"Required action: {result.required_action}")
+        status_messages = {
+            CommunityReportStatus.MISSING.value: "全局报告尚未构建。",
+            CommunityReportStatus.STALE.value: "全局报告已过期，不能作为 Global Search 结论。",
+            CommunityReportStatus.SCHEMA_UNSUPPORTED.value: "全局报告格式不兼容，需要重新构建。",
+            CommunityReportStatus.TOKEN_COUNTER_UNAVAILABLE.value: "全局报告的 token 校验不可用，不能安全使用报告。",
+            "local_fallback_used": "已返回降级的本地证据，不是 Global Search 结论。",
+        }
+        diagnostics = [status_messages.get(result.status, "Global Search 当前不可用。")]
+        if result.required_action == "build-community-reports":
+            diagnostics.append("请运行：python scripts/build_community_reports.py <知识库根目录>")
+        elif result.required_action:
+            diagnostics.append(f"后续操作：{result.required_action}")
         if result.confidence_warning:
             diagnostics.append(f"Warning: {result.confidence_warning}")
         rendered = "\n".join(diagnostics) + "\n\n" + rendered
@@ -566,7 +575,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rewrite", default="auto", choices=["auto", "off", "force"],
                    help="LLM rewrite 策略覆盖（默认 auto）")
     p.add_argument("--allow-local-fallback", action="store_true",
-                   help="仅当 Global Search 社区报告被拒绝时，允许带警告的本地证据回退")
+                   help="仅当 Global Search 报告被拒绝时，允许返回降级的本地证据；"
+                        "该结果不是 Global Search 结论，可能不完整，仍应先重建报告")
     p.add_argument("--conversation-context", default=None,
                    help="多轮对话的最小必要上下文（只消解指代，不替代原始问题）")
     p.add_argument("--conversation-context-file", default=None,

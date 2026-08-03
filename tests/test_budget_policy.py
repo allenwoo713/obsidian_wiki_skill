@@ -280,6 +280,14 @@ def test_cli_exposes_hard_max_tokens_flag():
     assert _build_arg_parser().parse_args(["root", "q"]).hard_max_tokens is None
 
 
+def test_cli_explains_local_fallback_is_degraded_evidence():
+    from query import _build_arg_parser
+
+    help_text = " ".join(_build_arg_parser().format_help().split())
+    assert "不是 Global Search 结论" in help_text
+    assert "可能不完整" in help_text
+
+
 # ---------------------------------------------------------------------------
 # 4) eval 不得复制预算规则
 # ---------------------------------------------------------------------------
