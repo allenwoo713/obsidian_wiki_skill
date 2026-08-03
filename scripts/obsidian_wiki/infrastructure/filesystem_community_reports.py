@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from obsidian_wiki.domain.community_report_models import CommunityReport, CommunityReportManifest
+from obsidian_wiki.domain.community_report_models import CommunityReport, CommunityReportManifest, utc_now
 
 
 class FilesystemCommunityReportStore:
@@ -57,7 +57,33 @@ class FilesystemCommunityReportStore:
         target.mkdir(parents=True, exist_ok=True)
         (target / ".failed").write_text(reason, encoding="utf-8")
 
+    def mark_stale(self, *, producer: str, reason: str) -> bool:
+        """Record producer diagnostics on the active set without removing its evidence."""
+        target = self._active_build_path()
+        if target is None:
+            return False
+        loaded = self._read_set(target)
+        if loaded is None:
+            return False
+        _, manifest = loaded
+        stale_manifest = replace(
+            manifest,
+            stale_at=utc_now(),
+            stale_producer=producer,
+            stale_reason=reason,
+        )
+        temporary = target / ".manifest.json.tmp"
+        temporary.write_text(
+            json.dumps(stale_manifest.to_json(), ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(temporary, target / "manifest.json")
+        return True
+
     def read_active(self) -> tuple[tuple[CommunityReport, ...], CommunityReportManifest] | None:
+        target = self._active_build_path()
+        return self._read_set(target) if target is not None else None
+
+    def _active_build_path(self) -> Path | None:
         if not self._pointer.is_file():
             return None
         try:
@@ -76,7 +102,7 @@ class FilesystemCommunityReportStore:
                 return None
         except (OSError, ValueError, json.JSONDecodeError):
             return None
-        return self._read_set(target)
+        return target
 
     def _build_path(self, build_id: str) -> Path:
         if not build_id or Path(build_id).name != build_id or build_id in {".", ".."}:

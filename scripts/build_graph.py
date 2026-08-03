@@ -137,6 +137,15 @@ def compute_4_signals(G: nx.Graph) -> Dict:
     return stats
 
 
+def _mark_community_reports_stale(project_root: Path) -> None:
+    """Publish graph freshness diagnostics only after graph.json is durable."""
+    from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
+
+    FilesystemCommunityReportStore(project_root / ".index").mark_stale(
+        producer="build_graph", reason="graph_published"
+    )
+
+
 def detect_communities(G: nx.Graph) -> List[List[str]]:
     try:
         import community as community_louvain
@@ -221,6 +230,7 @@ def main():
     idx.mkdir(exist_ok=True)
     (idx / "graph.json").write_text(
         json.dumps(graph_json, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
+    _mark_community_reports_stale(proj)
     render_html(G, wiki / ".graph" / "index.html", title=_read_title(proj))
     print(f"图谱构建完成: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边, {len(comms)} 社区")
     print(f"信号分布: {stats}")
