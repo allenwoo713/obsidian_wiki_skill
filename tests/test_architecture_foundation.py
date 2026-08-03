@@ -27,6 +27,9 @@ from obsidian_wiki.ports.chunk_repository import ChunkRepository  # noqa: E402
 from obsidian_wiki.ports.embedding import EmbeddingProvider  # noqa: E402
 from obsidian_wiki.ports.index_build import IndexPublisher  # noqa: E402
 from obsidian_wiki.ports.index_manifest import IndexManifestStore  # noqa: E402
+from obsidian_wiki.ports.community_reports import CommunityReportSetStore  # noqa: E402
+from obsidian_wiki.ports.graph_snapshot import GraphSnapshot  # noqa: E402
+from obsidian_wiki.ports.token_counter import TokenCounter  # noqa: E402
 from query_plan_models import (  # noqa: E402
     EntityCatalog,
     PlannerContext,
@@ -130,6 +133,9 @@ class ArchitectureFoundationTests(unittest.TestCase):
         self.assertTrue(issubclass(EmbeddingProvider, Protocol))
         self.assertTrue(issubclass(IndexManifestStore, Protocol))
         self.assertTrue(issubclass(IndexPublisher, Protocol))
+        self.assertTrue(issubclass(CommunityReportSetStore, Protocol))
+        self.assertTrue(issubclass(GraphSnapshot, Protocol))
+        self.assertTrue(issubclass(TokenCounter, Protocol))
         script = """
 import sys
 
@@ -142,6 +148,10 @@ from obsidian_wiki.ports import chunk_repository  # noqa: F401
 from obsidian_wiki.ports import embedding  # noqa: F401
 from obsidian_wiki.ports import index_manifest  # noqa: F401
 from obsidian_wiki.ports import index_build  # noqa: F401
+from obsidian_wiki.domain import community_report_models  # noqa: F401
+from obsidian_wiki.ports import community_reports  # noqa: F401
+from obsidian_wiki.ports import graph_snapshot  # noqa: F401
+from obsidian_wiki.ports import token_counter  # noqa: F401
 
 for root in {forbidden_roots!r}:
     if any(name == root or name.startswith(root + ".") for name in sys.modules):
