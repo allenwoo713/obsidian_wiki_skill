@@ -20,10 +20,15 @@ class FilesystemGraphSnapshot:
             if not isinstance(nodes, list) or not isinstance(edges, list) or not isinstance(communities, list):
                 raise ValueError("invalid graph snapshot")
             pages = tuple(PageSnapshot(str(node["id"]), self._content_hash(Path(str(node["id"])))) for node in nodes)
-            graph_edges = tuple(GraphEdge(
-                str(edge["source"]), str(edge["target"]), tuple(sorted(str(signal) for signal in edge.get("signals", []))),
-                float(edge["weight"]),
-            ) for edge in edges)
+            graph_edges = tuple(
+                GraphEdge(
+                    str(edge["source"]),
+                    str(edge["target"]),
+                    tuple(sorted({str(signal) for signal in edge.get("signals", [])})),
+                    float(edge["weight"]),
+                )
+                for edge in edges
+            )
             graph_communities = tuple((index, tuple(sorted(str(member) for member in members))) for index, members in enumerate(communities))
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"graph snapshot is unavailable: {exc}") from exc
