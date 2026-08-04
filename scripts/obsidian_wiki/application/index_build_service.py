@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import json
 import os
 import statistics
 import time
@@ -51,6 +52,8 @@ class IndexBuildService:
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
         sparse_chunks: Sequence[SparseChunk] | None = None,
+        page_metadata: list[dict] | None = None,
+        image_metadata: list[dict] | None = None,
     ) -> StorageArtifact:
         """#21 单写者构建：先取 BUILD.lock（进程内可重入），再委托 _build 执行。"""
         build_id = new_build_id()
@@ -60,6 +63,7 @@ class IndexBuildService:
             return self._build(
                 wiki_dir, index_dir, embed=embed,
                 sparse_chunks=sparse_chunks, build_id=build_id,
+                page_metadata=page_metadata, image_metadata=image_metadata,
             )
         finally:
             lock.release()
@@ -67,6 +71,8 @@ class IndexBuildService:
     def _build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
         sparse_chunks: Sequence[SparseChunk] | None = None, build_id: str | None = None,
+        page_metadata: list[dict] | None = None,
+        image_metadata: list[dict] | None = None,
     ) -> StorageArtifact:
         sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
@@ -139,15 +145,17 @@ class IndexBuildService:
                 disk_bytes=self._disk_bytes(build_dir),
             )
             policy = select_vector_policy(benchmark, vector_stats)
+            generation = self._next_generation(index_dir)
             manifest = self._manifest(
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
                 benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
-                sparse_chunks=sparse_chunks,
+                sparse_chunks=sparse_chunks, generation=generation,
+                page_metadata=page_metadata, image_metadata=image_metadata,
             )
             manifest_path = build_dir / "manifest.json"
             self._manifest_store.write(manifest_path, manifest)
-            publish_pointer(index_dir, build_dir)
+            publish_pointer(index_dir, build_dir, generation=generation, build_id=build_id or "")
             return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
         except Exception as exc:
             message = str(exc).lower()
@@ -160,12 +168,33 @@ class IndexBuildService:
 
     def _manifest(self, *, counts: dict, vector_stats: dict, fts_stats: dict,
                   vector_config: VectorIndexConfig, benchmark: dict, policy: dict,
-                  sparse_chunks: Sequence[SparseChunk]) -> dict:
+                  sparse_chunks: Sequence[SparseChunk], generation: int = 0,
+                  page_metadata: list[dict] | None = None,
+                  image_metadata: list[dict] | None = None) -> dict:
         fts_config = self._fts_config.to_json()
         vector_config_json = vector_config.to_json()
-        return {
+        # facade 提供的 page_metadata 含完整 page_type/sources/links/aliases/sha256；
+        # 否则从 sparse_chunks 生成最小兼容元数据。
+        if page_metadata is not None:
+            pages = page_metadata
+        else:
+            pages = [
+                {
+                    "page_id": chunk.page_id,
+                    "path": chunk.path,
+                    "title": chunk.title,
+                    "page_type": "concept",
+                    "sources": [],
+                    "links": [],
+                    "aliases": [],
+                    "sha256": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
+                }
+                for chunk in sparse_chunks
+            ]
+        manifest = {
             "format_version": 4,
             "layout": "sparse_chunks+dense_chunks",
+            "generation": generation,
             "fts_config": fts_config,
             "vector_config": vector_config_json,
             "config_hashes": {
@@ -182,23 +211,33 @@ class IndexBuildService:
             },
             "benchmark": benchmark,
             "policy": policy,
-            # Compatibility metadata only; retrieval still reads only the two
-            # physical D-01 tables.  Existing WikiIndex callers use this to
-            # retain titles and source-page context after ``load()``.
-            "pages": [
-                {
-                    "page_id": chunk.page_id,
-                    "path": chunk.path,
-                    "title": chunk.title,
-                    "page_type": "concept",
-                    "sources": [],
-                    "links": [],
-                    "aliases": [],
-                    "sha256": hashlib.sha256(chunk.text.encode("utf-8")).hexdigest(),
-                }
-                for chunk in sparse_chunks
-            ],
+            "pages": pages,
         }
+        if image_metadata is not None:
+            manifest["images"] = image_metadata
+        return manifest
+
+    @staticmethod
+    def _next_generation(index_dir: Path) -> int:
+        """扫描 builds/ 分配单调递增 generation（review #2：持锁后分配）。"""
+        builds_dir = index_dir / "builds"
+        if not builds_dir.is_dir():
+            return 1
+        max_gen = 0
+        for entry in builds_dir.iterdir():
+            if not entry.is_dir() or entry.name.startswith(".") or entry.name.startswith("_old"):
+                continue
+            manifest = entry / "manifest.json"
+            if not manifest.is_file():
+                continue
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                gen = data.get("generation", 0) if isinstance(data, dict) else 0
+                if isinstance(gen, (int, float)) and gen > max_gen:
+                    max_gen = int(gen)
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+        return max_gen + 1
 
     def _benchmark(
         self,

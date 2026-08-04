@@ -4,7 +4,7 @@ on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
+    # 对所有分支的 PR 触发 CI（默认行为），包括 base 非 master 的链式 PR（如 #33 基于 #32 分支）
 
 jobs:
   health-check:

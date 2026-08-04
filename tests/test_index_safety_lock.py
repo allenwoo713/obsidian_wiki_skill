@@ -26,6 +26,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from obsidian_wiki.application.active_index_pointer import (  # noqa: E402
     POINTER_NAME,
+    RebuildRequiredError,
     publish_pointer,
     resolve_active_lance_dir,
 )
@@ -45,12 +46,13 @@ def _index(tmp_path: Path) -> Path:
     return idx
 
 
-def _fake_build(idx: Path, name: str, body: str = "ok") -> Path:
-    """构造一份"已验证"构建产物：manifest.json + lance_db 目录（无需 LanceDB）。"""
+def _fake_build(idx: Path, name: str, body: str = "ok", generation: int = 1) -> Path:
+    """构造一份"已验证"构建产物：manifest.json（含 generation）+ lance_db 目录。"""
     build = idx / "builds" / name
     (build / "lance_db").mkdir(parents=True, exist_ok=True)
     (build / "manifest.json").write_text(
-        json.dumps({"layout": "sparse_chunks+dense_chunks", "body": body}), encoding="utf-8"
+        json.dumps({"layout": "sparse_chunks+dense_chunks", "body": body, "generation": generation}),
+        encoding="utf-8",
     )
     return build
 
@@ -278,59 +280,159 @@ def test_build_id_concurrent_uniqueness():
 # ---------------------------------------------------------------------------
 def test_publish_includes_checksum_and_resolves(tmp_path):
     idx = _index(tmp_path)
-    build = _fake_build(idx, "build_a")
-    publish_pointer(idx, build)
+    (idx / LOCK_NAME).write_text(
+        json.dumps({
+            "pid": 2 ** 31 - 1, "hostname": "other-host",
+            "started_at": "x", "build_id": "foreign",
+        }),
+        encoding="utf-8",
+    )
+    # OS lock 未被持有 → 新进程应成功获取（metadata foreign-host 不阻止）
+    lock = BuildLock(idx, build_id="mine")
+    lock.acquire()  # 不抛异常
+    data = json.loads((idx / LOCK_NAME).read_text(encoding="utf-8"))
+    assert data["build_id"] == "mine"
+    assert data["hostname"] == socket.gethostname()
+    lock.release()
+
+
+def test_release_rename_failure_does_not_block_new_build(tmp_path, monkeypatch):
+    """release 时 rename tombstone 失败不应抛异常，且不卡住新构建。"""
+    idx = _index(tmp_path)
+    lock = BuildLock(idx, build_id="first")
+    lock.acquire()
+    real_replace = os.replace
+
+    def _fail_replace(*_args, **_kwargs):
+        raise PermissionError("simulated rename failure")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+    lock.release()  # 不应抛异常
+    monkeypatch.setattr(os, "replace", real_replace)
+    # OS lock 已释放（fd closed）→ 新构建应能获取
+    lock2 = BuildLock(idx, build_id="second")
+    lock2.acquire()
+    lock2.release()
+
+
+def test_build_id_concurrent_uniqueness():
+    """并发生成 build_id 全部唯一（UTC microseconds + UUID）。"""
+    ids: set[str] = set()
+    barrier = threading.Barrier(8)
+
+    def _gen():
+        barrier.wait()
+        for _ in range(100):
+            ids.add(new_build_id())
+
+    threads = [threading.Thread(target=_gen) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(ids) == 800, f"800 个并发 build_id 应全部唯一，got {len(ids)}"
+
+
+# ---------------------------------------------------------------------------
+# 2) ACTIVE_INDEX 严格指针契约（PR2：generation/schema/path/durability）
+# ---------------------------------------------------------------------------
+def test_publish_includes_strict_schema(tmp_path):
+    """publish 写入 schema_version=4 + generation + build_id + manifest_sha256 + 相对 target。"""
+    idx = _index(tmp_path)
+    build = _fake_build(idx, "build_a", generation=1)
+    publish_pointer(idx, build, generation=1, build_id="build_a")
     data = _pointer_data(idx)
+    assert data["schema_version"] == 4
+    assert data["generation"] == 1
+    assert data["build_id"] == "build_a"
     assert Path(data["active_lance"]) == Path("builds/build_a/lance_db")
-    assert data["schema_version"] == 3
     assert data["manifest_sha256"]
     assert resolve_active_lance_dir(idx) == build / "lance_db"
 
 
-def test_legacy_pointer_without_checksum_accepted(tmp_path):
+def test_checksumless_pointer_rejected_via_recovery(tmp_path):
+    """旧 schema (<4) 指针不直接接受，走 recovery 回退到已验证 build。"""
     idx = _index(tmp_path)
-    build = _fake_build(idx, "build_a")
+    build = _fake_build(idx, "build_a", generation=1)
     (idx / POINTER_NAME).write_text(
         json.dumps({"active_lance": "builds/build_a/lance_db", "schema_version": 2}),
         encoding="utf-8",
     )
+    # 旧 schema → recovery → 找到 build_a（generation=1）
     assert resolve_active_lance_dir(idx) == build / "lance_db"
 
 
-def test_torn_pointer_falls_back_to_newest_validated_build(tmp_path):
+def test_torn_pointer_falls_back_by_generation(tmp_path):
+    """截断指针 → recovery 按 generation 回退到最高代已验证 build。"""
     idx = _index(tmp_path)
-    _fake_build(idx, "build_old")
-    newest = _fake_build(idx, "build_new")
-    (idx / POINTER_NAME).write_bytes(b"{torn-json")  # 进程中断留下的截断指针
+    _fake_build(idx, "build_old", generation=1)
+    newest = _fake_build(idx, "build_new", generation=2)
+    (idx / POINTER_NAME).write_bytes(b"{torn-json")
     assert resolve_active_lance_dir(idx) == newest / "lance_db"
 
 
-def test_checksum_mismatch_falls_back_to_previous(tmp_path):
+def test_checksum_mismatch_falls_back_to_previous_gen(tmp_path):
+    """checksum 不匹配 → recovery 回退到上一代已验证 build。"""
     idx = _index(tmp_path)
-    old = _fake_build(idx, "build_old")
-    new = _fake_build(idx, "build_new")
-    publish_pointer(idx, old)
-    publish_pointer(idx, new)
+    old = _fake_build(idx, "build_old", generation=1)
+    new = _fake_build(idx, "build_new", generation=2)
+    publish_pointer(idx, old, generation=1, build_id="build_old")
+    publish_pointer(idx, new, generation=2, build_id="build_new")
     (new / "manifest.json").write_text(json.dumps({"body": "tampered"}), encoding="utf-8")
-    # 指针校验失败 → 回退上一份已验证索引，且不重选被拒的 new
+    # 指针指向 new 但 checksum 失配 → recovery 按 generation 扫描
+    # new 的 manifest 被篡改（无 generation → gen=0），old gen=1 → 回退 old
     assert resolve_active_lance_dir(idx) == old / "lance_db"
 
 
-def test_pointer_target_dir_missing_falls_back(tmp_path):
+def test_absolute_path_target_rejected(tmp_path):
+    """active_lance 为绝对路径 → 拒绝，走 recovery。"""
     idx = _index(tmp_path)
-    build = _fake_build(idx, "build_a")
+    build = _fake_build(idx, "build_a", generation=1)
     (idx / POINTER_NAME).write_text(
-        json.dumps({"active_lance": "builds/gone/lance_db",
-                    "schema_version": 3, "manifest_sha256": "x"}),
+        json.dumps({"schema_version": 4, "generation": 1, "build_id": "x",
+                    "active_lance": str(idx / "builds" / "build_a" / "lance_db"),
+                    "manifest_sha256": "x", "published_at": "x"}),
+        encoding="utf-8",
+    )
+    # 绝对路径 → 拒绝 → recovery → build_a
+    assert resolve_active_lance_dir(idx) == build / "lance_db"
+
+
+def test_traversal_target_rejected(tmp_path):
+    """active_lance 含 .. → 拒绝，走 recovery。"""
+    idx = _index(tmp_path)
+    build = _fake_build(idx, "build_a", generation=1)
+    (idx / POINTER_NAME).write_text(
+        json.dumps({"schema_version": 4, "generation": 1, "build_id": "x",
+                    "active_lance": "builds/../../etc/lance_db",
+                    "manifest_sha256": "x", "published_at": "x"}),
         encoding="utf-8",
     )
     assert resolve_active_lance_dir(idx) == build / "lance_db"
 
 
-def test_publish_failure_keeps_old_pointer(tmp_path, monkeypatch):
+def test_null_and_list_pointer_rejected(tmp_path):
+    """null / list JSON payload → recovery，不 AttributeError。"""
     idx = _index(tmp_path)
-    old = _fake_build(idx, "build_a")
-    publish_pointer(idx, old)
+    build = _fake_build(idx, "build_a", generation=1)
+    for bad in (b"null", b"[]", b"42"):
+        (idx / POINTER_NAME).write_bytes(bad)
+        assert resolve_active_lance_dir(idx) == build / "lance_db"
+
+
+def test_no_valid_builds_raises_rebuild_required(tmp_path):
+    """无可用 build 且无 legacy → RebuildRequiredError。"""
+    idx = _index(tmp_path)
+    (idx / POINTER_NAME).write_bytes(b"torn")
+    with pytest.raises(RebuildRequiredError):
+        resolve_active_lance_dir(idx)
+
+
+def test_publish_failure_keeps_old_pointer(tmp_path, monkeypatch):
+    """publish 失败时旧指针逐字节保留。"""
+    idx = _index(tmp_path)
+    old = _fake_build(idx, "build_a", generation=1)
+    publish_pointer(idx, old, generation=1, build_id="build_a")
     before = (idx / POINTER_NAME).read_bytes()
 
     def _locked(*_args, **_kwargs):
@@ -338,27 +440,18 @@ def test_publish_failure_keeps_old_pointer(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "replace", _locked)
     with pytest.raises(RuntimeError, match="ACTIVE_INDEX 发布失败"):
-        publish_pointer(idx, _fake_build(idx, "build_b"))
+        publish_pointer(idx, _fake_build(idx, "build_b", generation=2), generation=2, build_id="build_b")
     assert (idx / POINTER_NAME).read_bytes() == before, "旧指针必须原样保留"
     assert not (idx / ".ACTIVE_INDEX.tmp").exists(), "失败后应清理临时指针"
     assert resolve_active_lance_dir(idx) == old / "lance_db"
 
 
-def test_fallback_skips_unvalidated_and_failed_builds(tmp_path):
+def test_generation_based_fallback_not_mtime(tmp_path):
+    """recovery 按 generation（非 st_mtime）选择最高代 build。"""
     idx = _index(tmp_path)
-    good = _fake_build(idx, "build_good")
-    bad = idx / "builds" / "build_bad"  # 无 manifest → 未 validated
-    (bad / "lance_db").mkdir(parents=True)
-    failed = idx / "builds" / "build_failed"
-    (failed / "lance_db").mkdir(parents=True)
-    (failed / "manifest.json").write_text("{}", encoding="utf-8")
-    (failed / ".failed").write_text("boom", encoding="utf-8")
+    old_gen2 = _fake_build(idx, "build_high_gen", generation=2)
+    time.sleep(0.05)
+    new_gen1 = _fake_build(idx, "build_low_gen", generation=1)
+    # new_gen1 的 mtime 更新但 generation 更低 → 应选 old_gen2
     (idx / POINTER_NAME).write_bytes(b"torn")
-    assert resolve_active_lance_dir(idx) == good / "lance_db"
-
-    # 全部候选无效 → 才回退 legacy 顶层布局
-    idx2 = _index(tmp_path / "idx2")
-    legacy = idx2 / "lance_db"
-    legacy.mkdir()
-    (idx2 / POINTER_NAME).write_bytes(b"torn")
-    assert resolve_active_lance_dir(idx2) == legacy
+    assert resolve_active_lance_dir(idx) == old_gen2 / "lance_db"

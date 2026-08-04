@@ -64,12 +64,15 @@ from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
 
-def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None):
+def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
+                           page_metadata=None, image_metadata=None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
     delegated to their package tiers.  ``embed`` is injected so the persisted
     tracer can exercise real LanceDB without loading a model in its tiny test.
+    page_metadata / image_metadata are injected into the manifest before the
+    single publish_pointer call (review #3: no second publish from facade).
     """
     from obsidian_wiki.application.index_build_service import IndexBuildService
     from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
@@ -80,7 +83,8 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
     ).build(
-        Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks)
+        Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
+        page_metadata=page_metadata, image_metadata=image_metadata)
     _mark_community_reports_stale(Path(index_dir))
     return artifact
 
@@ -376,36 +380,24 @@ class WikiIndex:
                 raise RuntimeError("Dense chunk plan changed during cached embedding")
             return vectors_by_position
 
-        try:
-            artifact = build_storage_contract(
-                Path(wiki_dir), self.index_dir, embed=embed_cached,
-                sparse_chunks=canonical_chunks,
-            )
-        except Exception:
-            raise
-        if source_images or self.pages:
-            manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
-            # The service deliberately owns storage evidence; the facade owns
-            # caller-facing page metadata that query/context consumers already
-            # rely on.  Keep one record per page rather than one per chunk.
-            manifest["pages"] = [
-                {
-                    "page_id": page_id_of(page.path), "path": str(page.path),
-                    "title": page.title, "page_type": page.page_type,
-                    "sources": page.sources, "links": page.links,
-                    "aliases": page.aliases, "sha256": page.sha256,
-                }
-                for page in self.pages
-            ]
-            if source_images:
-                manifest["images"] = source_images
-            artifact.manifest_path.write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            # #21：facade 补充 pages/images 后 manifest 内容已变，重发指针以刷新 checksum；
-            # 失败则保留 service 版指针（旧 checksum 失配 → 读取端安全回退上一代）。
-            from obsidian_wiki.application.active_index_pointer import publish_pointer
-            publish_pointer(self.index_dir, artifact.manifest_path.parent)
+        page_metadata = [
+            {
+                "page_id": page_id_of(page.path), "path": str(page.path),
+                "title": page.title, "page_type": page.page_type,
+                "sources": page.sources, "links": page.links,
+                "aliases": page.aliases, "sha256": page.sha256,
+            }
+            for page in self.pages
+        ] if self.pages else None
+
+        build_storage_contract(
+            Path(wiki_dir), self.index_dir, embed=embed_cached,
+            sparse_chunks=canonical_chunks,
+            page_metadata=page_metadata,
+            image_metadata=source_images if source_images else None,
+        )
+        # #21 review #3: single publication — service publishes once with
+        # complete manifest (pages/images injected before publish_pointer).
         self._repository = None
         self._lance_table = None
         return
