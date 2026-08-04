@@ -1,12 +1,14 @@
 """#21 Index Safety：单写者构建锁 + ACTIVE_INDEX 指针契约（模型无关）。
 
-覆盖验收点：
-- 并发构建只有一个写者，另一方得到明确 BuildLockHeldError（跨进程子进程实测）；
-- 锁元数据含 pid/hostname/started_at/build_id；stale（pid 已死）自动回收；
-  存活进程的锁不被抢占；同进程双层获取可重入；
-- 指针发布仅原子替换，失败保留旧指针且清理 tmp；
-- 指针含 manifest checksum，读取端校验后才切换；损坏/失配/指向缺失时
-  回退最近已验证 build，绝不盲目用 legacy 顶层目录。
+PR1（Lock + build context）覆盖验收点：
+- 并发构建只有一个写者：barrier 控制的两个独立线程、两个独立进程竞争同一项目，
+  恰好一个 writer；同进程非嵌套（不同线程）调用不得 bypass 文件锁。
+- OS advisory lock 持有期间（即使 metadata 损坏/foreign-host）其它进程不得 reclaim；
+  OS lock 未持有时 foreign-host metadata 不阻止获取（不因本机 PID 不存在而抢占）。
+- build ID 同微秒/并发唯一性；真实 facade lock metadata 完整性。
+- release rename/unlink 失败不卡住新构建。
+
+PR2（Generation publication + recovery）将替换指针测试。
 
 纯 stdlib + 文件系统，可在 ci.yml architecture job（Windows + Linux）运行。
 """
@@ -15,6 +17,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -29,6 +32,7 @@ from obsidian_wiki.application.active_index_pointer import (  # noqa: E402
 from obsidian_wiki.application.build_lock import (  # noqa: E402
     BuildLock,
     BuildLockHeldError,
+    new_build_id,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,9 +60,10 @@ def _pointer_data(idx: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1) 单写者构建锁
+# 1) owner-scoped 单写者构建锁（PR1）
 # ---------------------------------------------------------------------------
 def test_lock_acquire_release_writes_metadata(tmp_path):
+    """acquire 后 BUILD.lock 含完整诊断 metadata；release 后 canonical path 释放。"""
     idx = _index(tmp_path)
     lock = BuildLock(idx, build_id="build_x")
     lock.acquire()
@@ -67,48 +72,120 @@ def test_lock_acquire_release_writes_metadata(tmp_path):
     assert data["hostname"] == socket.gethostname()
     assert data["started_at"]
     assert data["build_id"] == "build_x"
+    assert data["owner_nonce"]
     lock.release()
-    assert not (idx / LOCK_NAME).exists()
+    assert not (idx / LOCK_NAME).exists(), "release 后 canonical path 应释放"
 
 
-def test_lock_reentrant_within_process(tmp_path):
+def test_lock_reentrant_same_thread(tmp_path):
+    """同线程嵌套 acquire（facade + service 双层）可重入；内层 release 不释放外层。"""
     idx = _index(tmp_path)
     outer = BuildLock(idx)
     outer.acquire()
     inner = BuildLock(idx)  # facade + service 双层获取
     inner.acquire()
     assert (idx / LOCK_NAME).exists()
-    outer.release()
-    assert (idx / LOCK_NAME).exists(), "内层仍持有，锁不应被外层释放"
     inner.release()
+    assert (idx / LOCK_NAME).exists(), "内层 release 后外层仍持有"
+    outer.release()
     assert not (idx / LOCK_NAME).exists()
 
 
-def test_lock_held_by_live_pid_is_rejected(tmp_path):
+def test_lock_blocks_different_thread(tmp_path):
+    """同进程不同线程（非嵌套）不得绕过文件锁——review 核心要求。"""
     idx = _index(tmp_path)
-    (idx / LOCK_NAME).write_text(
-        json.dumps({"pid": os.getpid(), "hostname": "h", "started_at": "x", "build_id": ""}),
-        encoding="utf-8",
-    )
-    with pytest.raises(BuildLockHeldError):
-        BuildLock(idx).acquire()
+    outer = BuildLock(idx)
+    outer.acquire()
+    errors = []
+
+    def _try_inner():
+        try:
+            BuildLock(idx).acquire(wait=False)
+        except BuildLockHeldError:
+            errors.append("blocked")
+
+    t = threading.Thread(target=_try_inner)
+    t.start()
+    t.join(timeout=5)
+    assert errors == ["blocked"], "不同线程必须被 RLock 阻止，不得 bypass 文件锁"
+    outer.release()
 
 
-def test_stale_lock_from_dead_pid_is_reclaimed(tmp_path):
+def test_concurrent_threads_one_writer(tmp_path):
+    """barrier 控制的两个独立线程同时竞争：恰好一个 writer。"""
     idx = _index(tmp_path)
-    (idx / LOCK_NAME).write_text(
-        json.dumps({"pid": 2 ** 31 - 1, "hostname": "h", "started_at": "x", "build_id": ""}),
-        encoding="utf-8",
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def _worker():
+        barrier.wait()
+        lock = BuildLock(idx, build_id="t")
+        try:
+            lock.acquire(wait=False)
+            results.append("acquired")
+            time.sleep(0.3)
+            lock.release()
+        except BuildLockHeldError:
+            results.append("blocked")
+
+    t1 = threading.Thread(target=_worker)
+    t2 = threading.Thread(target=_worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert results.count("acquired") == 1, f"恰好一个 writer，got {results}"
+    assert results.count("blocked") == 1, f"另一个被阻止，got {results}"
+
+
+def test_concurrent_processes_one_writer(tmp_path):
+    """barrier 控制的两个独立进程同时竞争同一项目：恰好一个 writer。"""
+    idx = _index(tmp_path)
+    go = tmp_path / "go"
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    scripts_dir = REPO_ROOT / "scripts"
+    code = (
+        "import sys, time, os\n"
+        f"sys.path.insert(0, {json.dumps(str(scripts_dir))})\n"
+        "from pathlib import Path\n"
+        "from obsidian_wiki.application.build_lock import BuildLock, BuildLockHeldError\n"
+        f"idx = Path({json.dumps(str(idx))})\n"
+        f"go = Path({json.dumps(str(go))})\n"
+        f"results = Path({json.dumps(str(results_dir))})\n"
+        "for _ in range(200):\n"
+        "    if go.exists(): break\n"
+        "    time.sleep(0.05)\n"
+        "pid = os.getpid()\n"
+        "try:\n"
+        "    lock = BuildLock(idx, build_id='proc')\n"
+        "    lock.acquire(wait=False)\n"
+        "    (results / f'acquired_{pid}').write_text('ok', encoding='utf-8')\n"
+        "    time.sleep(1.0)\n"
+        "    lock.release()\n"
+        "except BuildLockHeldError:\n"
+        "    (results / f'blocked_{pid}').write_text('blocked', encoding='utf-8')\n"
     )
-    lock = BuildLock(idx)
-    lock.acquire()
-    data = json.loads((idx / LOCK_NAME).read_text(encoding="utf-8"))
-    assert data["pid"] == os.getpid()
-    lock.release()
+    p1 = subprocess.Popen([sys.executable, "-c", code], cwd=REPO_ROOT)
+    p2 = subprocess.Popen([sys.executable, "-c", code], cwd=REPO_ROOT)
+    try:
+        time.sleep(0.6)  # 等两个进程都就绪
+        go.write_text("go", encoding="utf-8")
+        p1.wait(timeout=20)
+        p2.wait(timeout=20)
+    finally:
+        for p in (p1, p2):
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=5)
+    acquired = list(results_dir.glob("acquired_*"))
+    blocked = list(results_dir.glob("blocked_*"))
+    assert len(acquired) == 1, f"恰好一个进程获取锁，got acquired={len(acquired)} blocked={len(blocked)}"
+    assert len(blocked) == 1, f"另一个被阻止，got acquired={len(acquired)} blocked={len(blocked)}"
 
 
-def test_concurrent_process_excluded_by_lock(tmp_path):
-    """跨进程实测：两个构建进程同时启动，后到者得到明确 BuildLockHeldError。"""
+def test_os_lock_held_blocks_reclaim_even_with_corrupt_metadata(tmp_path):
+    """OS lock 持有期间，即使 metadata 损坏，其它进程也不得 reclaim。"""
     idx = _index(tmp_path)
     ready = tmp_path / "ready"
     scripts_dir = REPO_ROOT / "scripts"
@@ -117,29 +194,87 @@ def test_concurrent_process_excluded_by_lock(tmp_path):
         f"sys.path.insert(0, {json.dumps(str(scripts_dir))})\n"
         "from pathlib import Path\n"
         "from obsidian_wiki.application.build_lock import BuildLock\n"
-        f"lock = BuildLock(Path({json.dumps(str(idx))}))\n"
+        f"lock = BuildLock(Path({json.dumps(str(idx))}), build_id='holder')\n"
         "lock.acquire()\n"
         f"Path({json.dumps(str(ready))}).write_text('ready', encoding='utf-8')\n"
-        "time.sleep(30)\n"
+        "time.sleep(15)\n"
     )
     proc = subprocess.Popen([sys.executable, "-c", code], cwd=REPO_ROOT)
     try:
         deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if ready.exists():
-                break
+        while time.monotonic() < deadline and not ready.exists():
             time.sleep(0.1)
         else:
-            raise AssertionError("子进程未能在 15s 内取得锁")
+            if not ready.exists():
+                raise AssertionError("子进程未能在 15s 内取得锁")
+        # 损坏 metadata（但 OS lock 仍被子进程持有）
+        (idx / LOCK_NAME).write_bytes(b"corrupt-metadata")
+        # 主进程尝试 acquire → 必须失败（OS lock 持有，不看 metadata）
         with pytest.raises(BuildLockHeldError):
-            BuildLock(idx).acquire()
+            BuildLock(idx).acquire(wait=False)
     finally:
         proc.kill()
         proc.wait(timeout=10)
 
 
+def test_foreign_host_metadata_reclaimable_when_os_unlocked(tmp_path):
+    """foreign-host metadata 但 OS lock 未持有 → 可获取（不因 PID 不存在而抢占）。"""
+    idx = _index(tmp_path)
+    (idx / LOCK_NAME).write_text(
+        json.dumps({
+            "pid": 2 ** 31 - 1, "hostname": "other-host",
+            "started_at": "x", "build_id": "foreign",
+        }),
+        encoding="utf-8",
+    )
+    # OS lock 未被持有 → 新进程应成功获取（metadata foreign-host 不阻止）
+    lock = BuildLock(idx, build_id="mine")
+    lock.acquire()  # 不抛异常
+    data = json.loads((idx / LOCK_NAME).read_text(encoding="utf-8"))
+    assert data["build_id"] == "mine"
+    assert data["hostname"] == socket.gethostname()
+    lock.release()
+
+
+def test_release_rename_failure_does_not_block_new_build(tmp_path, monkeypatch):
+    """release 时 rename tombstone 失败不应抛异常，且不卡住新构建。"""
+    idx = _index(tmp_path)
+    lock = BuildLock(idx, build_id="first")
+    lock.acquire()
+    real_replace = os.replace
+
+    def _fail_replace(*_args, **_kwargs):
+        raise PermissionError("simulated rename failure")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+    lock.release()  # 不应抛异常
+    monkeypatch.setattr(os, "replace", real_replace)
+    # OS lock 已释放（fd closed）→ 新构建应能获取
+    lock2 = BuildLock(idx, build_id="second")
+    lock2.acquire()
+    lock2.release()
+
+
+def test_build_id_concurrent_uniqueness():
+    """并发生成 build_id 全部唯一（UTC microseconds + UUID）。"""
+    ids: set[str] = set()
+    barrier = threading.Barrier(8)
+
+    def _gen():
+        barrier.wait()
+        for _ in range(100):
+            ids.add(new_build_id())
+
+    threads = [threading.Thread(target=_gen) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(ids) == 800, f"800 个并发 build_id 应全部唯一，got {len(ids)}"
+
+
 # ---------------------------------------------------------------------------
-# 2) ACTIVE_INDEX 指针契约
+# 2) ACTIVE_INDEX 指针契约（PR2 将重写为严格 generation/schema 测试）
 # ---------------------------------------------------------------------------
 def test_publish_includes_checksum_and_resolves(tmp_path):
     idx = _index(tmp_path)
