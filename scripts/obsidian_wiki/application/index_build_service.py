@@ -55,11 +55,7 @@ class IndexBuildService:
         page_metadata: list[dict] | None = None,
         image_metadata: list[dict] | None = None,
     ) -> StorageArtifact:
-        """#21 单写者构建：先取 BUILD.lock（进程内可重入），再委托 _build 执行。
-
-        page_metadata / image_metadata 在 publish 前注入 manifest，确保单次发布
-        （review #3：消除 facade 二次 publish_pointer）。
-        """
+        """#21 单写者构建：先取 BUILD.lock（进程内可重入），再委托 _build 执行。"""
         build_id = new_build_id()
         lock = BuildLock(index_dir, build_id=build_id)
         lock.acquire()

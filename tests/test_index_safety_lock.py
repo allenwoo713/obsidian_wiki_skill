@@ -276,6 +276,64 @@ def test_build_id_concurrent_uniqueness():
 
 
 # ---------------------------------------------------------------------------
+# 2) ACTIVE_INDEX 指针契约（PR2 将重写为严格 generation/schema 测试）
+# ---------------------------------------------------------------------------
+def test_publish_includes_checksum_and_resolves(tmp_path):
+    idx = _index(tmp_path)
+    (idx / LOCK_NAME).write_text(
+        json.dumps({
+            "pid": 2 ** 31 - 1, "hostname": "other-host",
+            "started_at": "x", "build_id": "foreign",
+        }),
+        encoding="utf-8",
+    )
+    # OS lock 未被持有 → 新进程应成功获取（metadata foreign-host 不阻止）
+    lock = BuildLock(idx, build_id="mine")
+    lock.acquire()  # 不抛异常
+    data = json.loads((idx / LOCK_NAME).read_text(encoding="utf-8"))
+    assert data["build_id"] == "mine"
+    assert data["hostname"] == socket.gethostname()
+    lock.release()
+
+
+def test_release_rename_failure_does_not_block_new_build(tmp_path, monkeypatch):
+    """release 时 rename tombstone 失败不应抛异常，且不卡住新构建。"""
+    idx = _index(tmp_path)
+    lock = BuildLock(idx, build_id="first")
+    lock.acquire()
+    real_replace = os.replace
+
+    def _fail_replace(*_args, **_kwargs):
+        raise PermissionError("simulated rename failure")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+    lock.release()  # 不应抛异常
+    monkeypatch.setattr(os, "replace", real_replace)
+    # OS lock 已释放（fd closed）→ 新构建应能获取
+    lock2 = BuildLock(idx, build_id="second")
+    lock2.acquire()
+    lock2.release()
+
+
+def test_build_id_concurrent_uniqueness():
+    """并发生成 build_id 全部唯一（UTC microseconds + UUID）。"""
+    ids: set[str] = set()
+    barrier = threading.Barrier(8)
+
+    def _gen():
+        barrier.wait()
+        for _ in range(100):
+            ids.add(new_build_id())
+
+    threads = [threading.Thread(target=_gen) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(ids) == 800, f"800 个并发 build_id 应全部唯一，got {len(ids)}"
+
+
+# ---------------------------------------------------------------------------
 # 2) ACTIVE_INDEX 严格指针契约（PR2：generation/schema/path/durability）
 # ---------------------------------------------------------------------------
 def test_publish_includes_strict_schema(tmp_path):
