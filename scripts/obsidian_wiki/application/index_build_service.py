@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, List, Sequence
 
 from obsidian_wiki.application.active_index_pointer import publish_pointer
-from obsidian_wiki.application.build_lock import BuildLock
+from obsidian_wiki.application.build_lock import BuildLock, new_build_id
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
     DenseChunk,
@@ -53,7 +53,7 @@ class IndexBuildService:
         sparse_chunks: Sequence[SparseChunk] | None = None,
     ) -> StorageArtifact:
         """#21 单写者构建：先取 BUILD.lock（进程内可重入），再委托 _build 执行。"""
-        build_id = f"build_{time.time_ns()}_{uuid.uuid4().hex}"
+        build_id = new_build_id()
         lock = BuildLock(index_dir, build_id=build_id)
         lock.acquire()
         try:
