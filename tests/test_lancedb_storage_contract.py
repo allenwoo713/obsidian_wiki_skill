@@ -54,7 +54,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
         embed=lambda texts: [[float(len(text)), 1.0] for text in texts],
     )
 
-    db = lancedb.connect(str(artifact.lance_dir))
+    db = lancedb.connect(str(artifact.artifact.lance_dir))
     assert set(db.table_names()) == {"sparse_chunks", "dense_chunks"}
     sparse = db.open_table("sparse_chunks")
     dense = db.open_table("dense_chunks")
@@ -64,7 +64,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     assert dense.count_rows() > 0
     assert "fts_text_idx" in {index.name for index in sparse.list_indices()}
 
-    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
     assert manifest["fts_config"] == {
         "column": "fts_text",
@@ -75,7 +75,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
         "ascii_folding": False,
         "max_token_length": 256,
     }
-    assert LanceDbIndexRepository(artifact.lance_dir).search_sparse(long_term)
+    assert LanceDbIndexRepository(artifact.artifact.lance_dir).search_sparse(long_term)
 
 
 def test_legacy_manifest_requires_rebuild(tmp_path: Path) -> None:
@@ -320,7 +320,7 @@ def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path)
         wiki, index_dir, embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
     )
 
-    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
     assert (index_dir / "ACTIVE_INDEX").exists()
     assert manifest["format_version"] >= 4
     assert manifest["validation"]["schema_counts"] == {"sparse_chunks_count": 1, "dense_chunks_count": 1}

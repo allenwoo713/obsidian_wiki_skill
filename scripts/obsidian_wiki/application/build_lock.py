@@ -11,10 +11,10 @@
   unreadable/fresh/foreign-host metadata 一律视为"可能被占用"，但**不据此抢占**——
   抢占决策只看 OS lock 真实状态（获取成功即持有，失败即被占用）。因此不会因本机
   PID 不存在而抢占其它 hostname 的锁。
-- build_id：UTC microseconds + UUID，最外层生成一次。
-- release：close fd（解除 OS lock）→ 原子 rename BUILD.lock → tombstone（释放
-  canonical path）→ best-effort 删 tombstone；cleanup 故障仅记日志，不覆盖已成功
-  发布结果或永久卡住新构建。
+- build_id：UTC microseconds + 完整 UUID，最外层生成一次（#34 完整 UUID 约定）。
+- release：最后一层只 close fd（解除 OS lock）→ RLock.release()。BUILD.lock 是
+  稳定 pathname/inode，绝不在 release 时 rename/unlink（#34：避免 unlock→删除
+  窗口内第三进程抢锁与并发写入）。
 - 生命周期映射：building（持锁）→ validated（manifest 落盘）→ published（指针翻转）
   → superseded（下一代发布）。
 """
@@ -29,6 +29,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from obsidian_wiki.domain.index_models import BuildContext
 
 log = logging.getLogger(__name__)
 
@@ -73,10 +75,16 @@ def _holder_for(key: str) -> _LockHolder:
         return holder
 
 
-def new_build_id() -> str:
-    """UTC microseconds + UUID suffix，全局唯一（review 要求格式）。"""
+def new_build_context() -> BuildContext:
+    """创建不可变构建上下文：#34 要求 build_id = UTC 微秒 + 完整随机 UUID。"""
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
-    return f"build_{ts}_{uuid.uuid4().hex[:8]}"
+    return BuildContext(
+        build_id=f"build_{ts}_{uuid.uuid4().hex}",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        owner_nonce=(
+            f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+        ),
+    )
 
 
 def _try_os_lock(fd: int) -> None:
@@ -120,9 +128,9 @@ class BuildLock:
     OS lock 是最可靠的 stale 指示：进程活着则锁持有，进程死了则锁自动释放。
     """
 
-    def __init__(self, index_dir: Path, build_id: str = ""):
+    def __init__(self, index_dir: Path, ctx: BuildContext):
         self.path = Path(index_dir) / _LOCK_NAME
-        self.build_id = build_id or new_build_id()
+        self.ctx = ctx
 
     def acquire(self, wait: bool = False, timeout: float = 300.0) -> None:
         key = os.fspath(self.path)
@@ -164,12 +172,9 @@ class BuildLock:
                     {
                         "pid": os.getpid(),
                         "hostname": socket.gethostname(),
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        "build_id": self.build_id,
-                        "owner_nonce": (
-                            f"{socket.gethostname()}:{os.getpid()}:"
-                            f"{threading.get_ident()}:{uuid.uuid4().hex[:8]}"
-                        ),
+                        "started_at": self.ctx.started_at,
+                        "build_id": self.ctx.build_id,
+                        "owner_nonce": self.ctx.owner_nonce,
                         "tool": "build_index",
                     },
                     sort_keys=True,
@@ -193,7 +198,9 @@ class BuildLock:
         if holder.depth > 0:
             holder.rlock.release()  # 内层重入释放
             return
-        # depth == 0：释放 OS lock + rename tombstone 释放 canonical path
+        # depth == 0（#34）：仅释放自己持有的 descriptor + RLock。BUILD.lock 是
+        # 稳定 pathname/inode，绝不在 release 时 rename/unlink——否则会在
+        # unlock 与删除之间的窗口让第三进程抢到原 pathname 并与新 owner 并发写入。
         fd = holder.fd
         holder.fd = None
         if fd is not None:
@@ -202,15 +209,4 @@ class BuildLock:
                 os.close(fd)
             except OSError:
                 pass
-        try:
-            tombstone = self.path.with_name(
-                f"{_LOCK_NAME}.{uuid.uuid4().hex[:8]}.tombstone"
-            )
-            os.replace(self.path, tombstone)
-            try:
-                os.unlink(tombstone)
-            except OSError:
-                pass  # best-effort（沙箱 safe-delete 可能拦截，tombstone 残留无害）
-        except OSError as exc:
-            log.warning("release rename tombstone 失败（不影响已发布结果）：%s", exc)
         holder.rlock.release()

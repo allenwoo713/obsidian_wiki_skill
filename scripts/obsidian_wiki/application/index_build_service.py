@@ -11,10 +11,11 @@ import uuid
 from pathlib import Path
 from typing import Callable, List, Sequence
 
-from obsidian_wiki.application.active_index_pointer import publish_pointer
-from obsidian_wiki.application.build_lock import BuildLock, new_build_id
+from obsidian_wiki.application.active_index_pointer import publish_pointer, record_validated
+from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
+    BuildContext,
     DenseChunk,
     FtsIndexConfig,
     IndexStats,
@@ -54,15 +55,18 @@ class IndexBuildService:
         sparse_chunks: Sequence[SparseChunk] | None = None,
         page_metadata: list[dict] | None = None,
         image_metadata: list[dict] | None = None,
+        ctx: BuildContext | None = None,
     ) -> StorageArtifact:
-        """#21 单写者构建：先取 BUILD.lock（进程内可重入），再委托 _build 执行。"""
-        build_id = new_build_id()
-        lock = BuildLock(index_dir, build_id=build_id)
+        """#21/#34 单写者构建：最外层传入或创建一次 BuildContext，锁 metadata、
+        build 目录、manifest、pointer 与返回 artifact 共用同一个 build_id；
+        service 不再独立生成 ID。"""
+        ctx = ctx or new_build_context()
+        lock = BuildLock(index_dir, ctx=ctx)
         lock.acquire()
         try:
             return self._build(
                 wiki_dir, index_dir, embed=embed,
-                sparse_chunks=sparse_chunks, build_id=build_id,
+                sparse_chunks=sparse_chunks, ctx=ctx,
                 page_metadata=page_metadata, image_metadata=image_metadata,
             )
         finally:
@@ -70,7 +74,7 @@ class IndexBuildService:
 
     def _build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
-        sparse_chunks: Sequence[SparseChunk] | None = None, build_id: str | None = None,
+        sparse_chunks: Sequence[SparseChunk] | None = None, ctx: BuildContext | None = None,
         page_metadata: list[dict] | None = None,
         image_metadata: list[dict] | None = None,
     ) -> StorageArtifact:
@@ -109,7 +113,7 @@ class IndexBuildService:
         if not all(chunk.vector for chunk in dense_chunks):
             raise RuntimeError("Dense chunks require non-empty vectors")
 
-        build_dir = index_dir / "builds" / (build_id or f"build_{time.time_ns()}_{uuid.uuid4().hex}")
+        build_dir = index_dir / "builds" / ctx.build_id
         lance_dir = build_dir / "lance_db"
         build_dir.mkdir(parents=True, exist_ok=False)
         try:
@@ -155,7 +159,13 @@ class IndexBuildService:
             )
             manifest_path = build_dir / "manifest.json"
             self._manifest_store.write(manifest_path, manifest)
-            publish_pointer(index_dir, build_dir, generation=generation, build_id=build_id or "")
+            # #35：manifest 完整落盘后写入 validated 生命周期记录——manifest 写后、
+            # pointer 发布前中断的 staging generation 绝不被 recovery 选中。
+            record_validated(
+                build_dir, generation=generation, build_id=ctx.build_id,
+                manifest_sha256=self._sha256_file(manifest_path),
+            )
+            publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
             return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
         except Exception as exc:
             message = str(exc).lower()
@@ -297,6 +307,10 @@ class IndexBuildService:
             "exact_result_ids": exact_ids,
             "candidate_result_ids": candidate_ids,
         }
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
     @staticmethod
     def _stable_hash(value: dict) -> str:

@@ -156,7 +156,9 @@ def test_successful_producers_invalidate_only_after_publication(tmp_path, monkey
             pass
 
         def build(self, *_args, **_kwargs):
-            return object()
+            # build_storage_contract 读 manifest_path 取 generation；mock 场景无真实
+            # manifest（FileNotFoundError → generation 0），post-commit 仍执行。
+            return type("_Artifact", (), {"manifest_path": Path("nonexistent")})()
 
     monkeypatch.setattr(index_build_service, "IndexBuildService", _SuccessfulIndexBuild)
     build_index.build_storage_contract(tmp_path / "Wiki", tmp_path / ".index", embed=lambda _texts: [])
