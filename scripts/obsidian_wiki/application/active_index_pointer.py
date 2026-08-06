@@ -66,21 +66,41 @@ def read_generation_record(build_dir: Path) -> GenerationRecord | None:
 
 def _transition(build_dir: Path, target: GenerationState, *,
                 build_id: str, generation: int, manifest_sha256: str) -> None:
-    """集中生命周期转换（#35）：仅 missing→building→validated→published→superseded。"""
+    """集中生命周期转换（#35）：仅 missing→building→validated→published→superseded。
+
+    时间戳按目标状态赋值（#35 follow-up）：BUILDING 全部为空；VALIDATED 只写
+    validated_at；PUBLISHED 保留 validated + 写 published_at；SUPERSEDED 三者齐全。
+    """
     current = read_generation_record(build_dir)
     current_state = current.state if current is not None else None
     if target not in ALLOWED_TRANSITIONS.get(current_state, frozenset()):
         raise RuntimeError(
             f"非法生命周期转换: {current_state} -> {target}（{build_dir.name}）")
     now = _now()
+    if target is GenerationState.BUILDING:
+        validated_at: str | None = None
+        published_at: str | None = None
+        superseded_at: str | None = None
+    elif target is GenerationState.VALIDATED:
+        validated_at = now
+        published_at = None
+        superseded_at = None
+    elif target is GenerationState.PUBLISHED:
+        validated_at = current.validated_at if current is not None else None
+        if validated_at is None:
+            raise RuntimeError(f"PUBLISHED 前必须有 validated_at（{build_dir.name}）")
+        published_at = now
+        superseded_at = None
+    else:  # SUPERSEDED
+        validated_at = current.validated_at if current is not None else None
+        published_at = current.published_at if current is not None else None
+        superseded_at = now
     record = GenerationRecord(
         generation=generation, build_id=build_id, state=target,
         manifest_sha256=manifest_sha256,
-        validated_at=current.validated_at if current is not None else now,
-        published_at=(now if target is GenerationState.PUBLISHED
-                      else (current.published_at if current is not None else None)),
-        superseded_at=(now if target is GenerationState.SUPERSEDED
-                       else (current.superseded_at if current is not None else None)),
+        validated_at=validated_at,
+        published_at=published_at,
+        superseded_at=superseded_at,
     )
     _write_record(build_dir, record)
 
@@ -137,20 +157,10 @@ def publish_pointer(
             json.dumps(payload, sort_keys=True).encode("utf-8"),
         )
     except CommitUncertainError:
-        # #36：replace 已成功（commit point 已过）。读回 pointer 确认内容与本 build
-        # 一致（record 尚未 transition 到 PUBLISHED，故不要求 record 状态）；一致则
-        # 继续 lifecycle 视为已发布 + reconciliation warning。
-        try:
-            data = json.loads(pointer.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            data = None
-        if not isinstance(data, dict) or data.get("build_id") != build_id \
-                or data.get("generation") != generation \
-                or data.get("manifest_sha256") != manifest_digest:
-            raise RuntimeError(
-                "ACTIVE_INDEX 发布状态不确定（replace 后耐久确认失败且新指针不可验证）；"
-                "请重新解析确认状态后重试。")
-        log.warning("ACTIVE_INDEX 已替换但目录同步确认失败（commit uncertain，已 reconciliation）")
+        # #36 follow-up：replace 已成功但耐久确认失败 → 必须返回非成功（不能凭 OS
+        # cache 读回冒充耐久证明）；record 保持 VALIDATED，由 restart-safe 的
+        # resolve reconciliation 修复为 PUBLISHED。禁止进入 pre-commit 失败路径。
+        raise
     except OSError as exc:
         raise RuntimeError(
             f"ACTIVE_INDEX 发布失败（旧活动索引保持可用）：{type(exc).__name__}: {exc}。"
@@ -158,12 +168,13 @@ def publish_pointer(
         ) from exc
     # 生命周期：validated → published；新 pointer 耐久落盘后才标旧代 superseded（#35）。
     # #37：commit 点之后的 reconciliation 失败不得伪装为 pre-commit 失败（不写 .failed）。
+    # pointer 已提交，PUBLISHED record 首写失败留给 resolve/retry 的 reconciliation 修复。
     try:
         _transition(build_dir, GenerationState.PUBLISHED, build_id=build_id,
                     generation=generation, manifest_sha256=manifest_digest)
         _mark_superseded(index_dir, build_dir, generation)
     except (OSError, RuntimeError) as exc:
-        log.warning("发布后生命周期 reconciliation 失败（索引已发布）：%s", exc)
+        log.warning("发布后生命周期 reconciliation 失败（索引已提交，resolve 将修复）：%s", exc)
 
 
 def _mark_superseded(index_dir: Path, new_build_dir: Path, new_generation: int) -> None:
@@ -211,14 +222,63 @@ def _validate_pointer(index_dir: Path, data: object) -> Path | None:
         return None
     if not isinstance(m, dict) or m.get("build_id") != ptr.build_id or m.get("generation") != ptr.generation:
         return None
-    # record：仅 PUBLISHED，且 build_id/generation/digest 全链一致
+    # record：仅 PUBLISHED 接受；#35 follow-up：pointer 已耐久提交但 PUBLISHED
+    # record 首写失败（commit window）→ record 仍 VALIDATED 且身份全链一致时，
+    # restart-safe reconciliation：durably 修复为 PUBLISHED 再接受新代，绝不静默
+    # 回退旧代。reconciliation 写失败 → 返回 None 走 recovery（安全降级）。
     record = read_generation_record(build_dir)
     if record is None or record.state is not GenerationState.PUBLISHED:
-        return None
-    if (record.build_id != ptr.build_id or record.generation != ptr.generation
+        if record is not None and record.state is GenerationState.VALIDATED \
+                and record.build_id == ptr.build_id \
+                and record.generation == ptr.generation \
+                and record.manifest_sha256 == ptr.manifest_sha256:
+            try:
+                _transition(build_dir, GenerationState.PUBLISHED, build_id=ptr.build_id,
+                            generation=ptr.generation, manifest_sha256=ptr.manifest_sha256)
+            except (OSError, RuntimeError) as exc:
+                log.warning("committed pointer reconciliation 失败：%s", exc)
+                return None
+        else:
+            return None
+    elif (record.build_id != ptr.build_id or record.generation != ptr.generation
             or record.manifest_sha256 != ptr.manifest_sha256):
         return None
     return build_dir / "lance_db"
+
+
+def reconcile_committed_record(index_dir: Path, build_dir: Path, *,
+                               build_id: str, generation: int) -> bool:
+    """#35/#37：pointer 已耐久提交（身份精确匹配 build）但 record 仍 VALIDATED 时，
+    将 record durably 修复为 PUBLISHED。成功返回 True；不匹配/修复失败返回 False。
+
+    用于 restart-safe reconciliation：绝不以「缓存可读」冒充耐久确认，也绝不
+    在 commit 之后静默回退旧代。
+    """
+    pointer = index_dir / POINTER_NAME
+    try:
+        data = json.loads(pointer.read_text(encoding="utf-8"))
+        ptr = ActiveIndexPointerV4.from_json(data)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if ptr.build_id != build_id or ptr.generation != generation:
+        return False
+    if not build_dir.is_dir():
+        return False
+    manifest = build_dir / "manifest.json"
+    if not manifest.is_file() or ptr.manifest_sha256 != _sha256(manifest):
+        return False
+    record = read_generation_record(build_dir)
+    if record is None or record.state is not GenerationState.VALIDATED:
+        return False
+    if (record.build_id != ptr.build_id or record.generation != ptr.generation
+            or record.manifest_sha256 != ptr.manifest_sha256):
+        return False
+    try:
+        _transition(build_dir, GenerationState.PUBLISHED, build_id=build_id,
+                    generation=generation, manifest_sha256=ptr.manifest_sha256)
+    except (OSError, RuntimeError):
+        return False
+    return True
 
 
 def resolve_active_lance_dir(index_dir: Path) -> Path:

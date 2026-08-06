@@ -101,17 +101,15 @@ class LanceDbIndexRepository:
 
         LanceDB 每次 persist/reopen 都使用独立 connection（无跨调用写入 handle），
         写入完成后 connection 已随 persist 返回释放；此处显式把全部文件落到磁盘。
-        任一 fsync 失败向上传播（不允许降级为 warning）。
+        任一 open/fsync 失败向上传播（不允许跳过/降级为 warning）——无法证明的
+        耐久边界必须阻止发布。
         """
         root = Path(lance_dir)
         if not root.is_dir():
             raise OSError(f"seal 失败：{root} 不存在")
         for path in sorted(root.rglob("*")):
             if path.is_file():
-                try:
-                    fd = os.open(os.fspath(path), os.O_RDWR)
-                except OSError:
-                    continue  # 只读文件未被本次写入，无需 fsync（Windows 只读句柄不能 fsync）
+                fd = os.open(os.fspath(path), os.O_RDWR)
                 try:
                     os.fsync(fd)
                 finally:

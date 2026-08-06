@@ -18,6 +18,7 @@ from obsidian_wiki.application.active_index_pointer import (
     record_validated,
 )
 from obsidian_wiki.application.build_lock import BuildLock, new_build_context
+from obsidian_wiki.application.durable_filesystem import CommitUncertainError
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
     BuildContext,
@@ -49,10 +50,13 @@ class IndexBuildService:
         *,
         reopen_storage: Callable[[Path], ChunkRepository],
         manifest_store: IndexManifestStore,
+        post_commit_journal: PostCommitJournal,
         fts_config: FtsIndexConfig | None = None,
         benchmark_observer: BenchmarkObserver | None = None,
-        post_commit_journal: PostCommitJournal | None = None,
     ):
+        """#37：``post_commit_journal`` 为必填依赖——每个发布路径都必须在 pointer
+        commit 前 durable prepare 失效 intent；不需要 invalidation 的调用方必须显式
+        注入 deliberate no-op port，遗漏绝不能静默禁用契约。"""
         self._storage = storage
         self._reopen_storage = reopen_storage
         self._manifest_store = manifest_store
@@ -131,9 +135,9 @@ class IndexBuildService:
         record_building(build_dir, build_id=ctx.build_id, generation=generation)
         try:
             self._storage.persist(lance_dir, sparse_chunks, dense_chunks, self._fts_config)
-            # #36：发布前 durability boundary——storage seal 后数据才允许被 pointer 引用。
-            self._storage.seal(lance_dir)
-            # Reopen through a new adapter instance: inputs and an open write handle are not evidence.
+            # #36 follow-up：所有 storage mutation（persist / create_vector_index）都
+            # 必须在最终 seal 之前完成——vector index 创建会改写 LanceDB，故 seal
+            # 不能放在 persist 后（当前已修复：先建索引，再最终 seal）。
             reopened = self._reopen_storage(lance_dir)
             dimension = len(dense_chunks[0].vector)
             vector_config = VectorIndexConfig(
@@ -164,6 +168,8 @@ class IndexBuildService:
                 disk_bytes=self._disk_bytes(build_dir),
             )
             policy = select_vector_policy(benchmark, vector_stats)
+            # #36 follow-up：最终 seal = 最后 storage mutation 之后的耐久边界。
+            self._storage.seal(lance_dir)
             manifest = self._manifest(
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
@@ -186,21 +192,24 @@ class IndexBuildService:
                 manifest_sha256=self._sha256_file(manifest_path),
             )
             # #37：pointer commit 前 durable prepare post-commit intent——进程在
-            # prepare 与 invalidate 之间退出也不会永久丢失任务。
-            if self._post_commit_journal is not None:
-                self._post_commit_journal.prepare(PostCommitTask(
-                    task_id=uuid.uuid4().hex,
-                    task_type="community_report_invalidation",
-                    build_id=ctx.build_id,
-                    generation=generation,
-                    state=PostCommitTaskState.PREPARED,
-                    prepared_at=datetime.now(timezone.utc).isoformat(),
-                ))
+            # prepare 与 invalidate 之间退出也不会永久丢失任务。journal 为必填依赖。
+            self._post_commit_journal.prepare(PostCommitTask(
+                task_id=uuid.uuid4().hex,
+                task_type="community_report_invalidation",
+                build_id=ctx.build_id,
+                generation=generation,
+                state=PostCommitTaskState.PREPARED,
+                prepared_at=datetime.now(timezone.utc).isoformat(),
+            ))
             publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
             return StorageArtifact(
                 lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks),
                 build_id=ctx.build_id, generation=generation,
             )
+        except CommitUncertainError:
+            # #37 follow-up：pointer 可能已替换（commit point 已过）——绝不能写
+            # .failed 伪装成从未发布；向上传播让调用方按状态不确定处理。
+            raise
         except Exception as exc:
             message = str(exc).lower()
             invariant = "manifest" if "manifest" in message else "validation"

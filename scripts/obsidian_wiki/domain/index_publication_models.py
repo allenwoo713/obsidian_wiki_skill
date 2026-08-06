@@ -97,15 +97,40 @@ class ActiveIndexPointerV4:
         )
 
 
+# 各状态允许的时间戳集合（#35 follow-up：BUILDING 不得声称已 validated）：
+#   building  → 全部为 None
+#   validated → 仅 validated_at
+#   published → validated_at + published_at
+#   superseded→ 三者齐全
+_STATE_TIMESTAMP_FIELDS: dict[GenerationState, frozenset[str]] = {
+    GenerationState.BUILDING: frozenset(),
+    GenerationState.VALIDATED: frozenset({"validated_at"}),
+    GenerationState.PUBLISHED: frozenset({"validated_at", "published_at"}),
+    GenerationState.SUPERSEDED: frozenset({"validated_at", "published_at", "superseded_at"}),
+}
+_TIMESTAMP_FIELDS = frozenset({"validated_at", "published_at", "superseded_at"})
+
+
+def _require_optional_utc(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    return require_utc(value, field)
+
+
 @dataclass(frozen=True)
 class GenerationRecord:
-    """不可变 generation 验证/发布记录（落盘于 build 目录 ``.generation.json``）。"""
+    """不可变 generation 验证/发布记录（落盘于 build 目录 ``.generation.json``）。
+
+    ``validated_at`` 可空（#35 follow-up）：BUILDING 阶段必须为 None，只有
+    BUILDING→VALIDATED 转换才赋 UTC 值。``from_json`` 强制 state-specific
+    时间戳集合，拒绝与状态不符的字段值。
+    """
 
     generation: int
     build_id: str
     state: GenerationState
     manifest_sha256: str
-    validated_at: str
+    validated_at: str | None = None
     published_at: str | None = None
     superseded_at: str | None = None
 
@@ -129,16 +154,24 @@ class GenerationRecord:
             digest = require_sha256(digest)
         elif digest != "":
             raise ValueError(f"BUILDING 记录的 manifest_sha256 必须为空: {digest!r}")
+        allowed_ts = _STATE_TIMESTAMP_FIELDS[state]
+        for field in _TIMESTAMP_FIELDS:
+            value = data.get(field)
+            if value is None:
+                if field in allowed_ts:
+                    raise ValueError(f"{state.value} 状态缺少必需时间戳 {field}")
+                continue
+            if field not in allowed_ts:
+                raise ValueError(f"{state.value} 状态不允许时间戳 {field}（got {value!r}）")
+            require_utc(value, field)
         return cls(
             generation=require_positive_int(data["generation"]),
             build_id=require_build_id(data["build_id"]),
             state=state,
             manifest_sha256=digest,
-            validated_at=require_utc(data["validated_at"], "validated_at"),
-            published_at=require_utc(data["published_at"], "published_at")
-            if data.get("published_at") is not None else None,
-            superseded_at=require_utc(data["superseded_at"], "superseded_at")
-            if data.get("superseded_at") is not None else None,
+            validated_at=_require_optional_utc(data["validated_at"], "validated_at"),
+            published_at=_require_optional_utc(data["published_at"], "published_at"),
+            superseded_at=_require_optional_utc(data["superseded_at"], "superseded_at"),
         )
 
 
