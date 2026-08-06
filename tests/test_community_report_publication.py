@@ -156,9 +156,22 @@ def test_successful_producers_invalidate_only_after_publication(tmp_path, monkey
             pass
 
         def build(self, *_args, **_kwargs):
-            # build_storage_contract 读 manifest_path 取 generation；mock 场景无真实
-            # manifest（FileNotFoundError → generation 0），post-commit 仍执行。
-            return type("_Artifact", (), {"manifest_path": Path("nonexistent")})()
+            # 模拟真实 service 的 commit 前 prepare（#37），再返回 artifact。
+            from datetime import datetime, timezone
+            import uuid as _uuid
+
+            from obsidian_wiki.domain.index_models import PostCommitTask, PostCommitTaskState
+            from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+
+            bid = "build_20260806T000000000000_" + "0" * 32
+            FilesystemPostCommitJournal(tmp_path / ".index").prepare(PostCommitTask(
+                task_id=_uuid.uuid4().hex, task_type="community_report_invalidation",
+                build_id=bid, generation=1, state=PostCommitTaskState.PREPARED,
+                prepared_at=datetime.now(timezone.utc).isoformat(),
+            ))
+            return type("_Artifact", (), {
+                "build_id": bid, "generation": 1, "manifest_path": Path("nonexistent"),
+            })()
 
     monkeypatch.setattr(index_build_service, "IndexBuildService", _SuccessfulIndexBuild)
     build_index.build_storage_contract(tmp_path / "Wiki", tmp_path / ".index", embed=lambda _texts: [])

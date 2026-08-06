@@ -8,10 +8,15 @@ import os
 import statistics
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Sequence
 
-from obsidian_wiki.application.active_index_pointer import publish_pointer, record_validated
+from obsidian_wiki.application.active_index_pointer import (
+    publish_pointer,
+    record_building,
+    record_validated,
+)
 from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
@@ -19,6 +24,8 @@ from obsidian_wiki.domain.index_models import (
     DenseChunk,
     FtsIndexConfig,
     IndexStats,
+    PostCommitTask,
+    PostCommitTaskState,
     SparseChunk,
     StorageArtifact,
     VectorIndexConfig,
@@ -26,6 +33,7 @@ from obsidian_wiki.domain.index_models import (
 from obsidian_wiki.domain.index_policy import select_vector_policy
 from obsidian_wiki.ports.chunk_repository import ChunkRepository
 from obsidian_wiki.ports.index_manifest import IndexManifestStore
+from obsidian_wiki.ports.post_commit import PostCommitJournal
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
@@ -43,12 +51,14 @@ class IndexBuildService:
         manifest_store: IndexManifestStore,
         fts_config: FtsIndexConfig | None = None,
         benchmark_observer: BenchmarkObserver | None = None,
+        post_commit_journal: PostCommitJournal | None = None,
     ):
         self._storage = storage
         self._reopen_storage = reopen_storage
         self._manifest_store = manifest_store
         self._fts_config = fts_config or FtsIndexConfig()
         self._benchmark_observer = benchmark_observer
+        self._post_commit_journal = post_commit_journal
 
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -113,11 +123,16 @@ class IndexBuildService:
         if not all(chunk.vector for chunk in dense_chunks):
             raise RuntimeError("Dense chunks require non-empty vectors")
 
+        generation = self._next_generation(index_dir)
         build_dir = index_dir / "builds" / ctx.build_id
         lance_dir = build_dir / "lance_db"
         build_dir.mkdir(parents=True, exist_ok=False)
+        # #35：build 目录创建后立即耐久写 BUILDING（missing → building）。
+        record_building(build_dir, build_id=ctx.build_id, generation=generation)
         try:
             self._storage.persist(lance_dir, sparse_chunks, dense_chunks, self._fts_config)
+            # #36：发布前 durability boundary——storage seal 后数据才允许被 pointer 引用。
+            self._storage.seal(lance_dir)
             # Reopen through a new adapter instance: inputs and an open write handle are not evidence.
             reopened = self._reopen_storage(lance_dir)
             dimension = len(dense_chunks[0].vector)
@@ -149,14 +164,19 @@ class IndexBuildService:
                 disk_bytes=self._disk_bytes(build_dir),
             )
             policy = select_vector_policy(benchmark, vector_stats)
-            generation = self._next_generation(index_dir)
             manifest = self._manifest(
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
                 benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
-                sparse_chunks=sparse_chunks, generation=generation,
+                sparse_chunks=sparse_chunks, generation=generation, build_id=ctx.build_id,
                 page_metadata=page_metadata, image_metadata=image_metadata,
             )
+            # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
+            if build_dir.name != ctx.build_id or manifest.get("build_id") != ctx.build_id:
+                raise RuntimeError(
+                    f"build 身份不一致：dir={build_dir.name} manifest="
+                    f"{manifest.get('build_id')!r} ctx={ctx.build_id}"
+                )
             manifest_path = build_dir / "manifest.json"
             self._manifest_store.write(manifest_path, manifest)
             # #35：manifest 完整落盘后写入 validated 生命周期记录——manifest 写后、
@@ -165,8 +185,22 @@ class IndexBuildService:
                 build_dir, generation=generation, build_id=ctx.build_id,
                 manifest_sha256=self._sha256_file(manifest_path),
             )
+            # #37：pointer commit 前 durable prepare post-commit intent——进程在
+            # prepare 与 invalidate 之间退出也不会永久丢失任务。
+            if self._post_commit_journal is not None:
+                self._post_commit_journal.prepare(PostCommitTask(
+                    task_id=uuid.uuid4().hex,
+                    task_type="community_report_invalidation",
+                    build_id=ctx.build_id,
+                    generation=generation,
+                    state=PostCommitTaskState.PREPARED,
+                    prepared_at=datetime.now(timezone.utc).isoformat(),
+                ))
             publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
-            return StorageArtifact(lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks))
+            return StorageArtifact(
+                lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks),
+                build_id=ctx.build_id, generation=generation,
+            )
         except Exception as exc:
             message = str(exc).lower()
             invariant = "manifest" if "manifest" in message else "validation"
@@ -179,6 +213,7 @@ class IndexBuildService:
     def _manifest(self, *, counts: dict, vector_stats: dict, fts_stats: dict,
                   vector_config: VectorIndexConfig, benchmark: dict, policy: dict,
                   sparse_chunks: Sequence[SparseChunk], generation: int = 0,
+                  build_id: str = "",
                   page_metadata: list[dict] | None = None,
                   image_metadata: list[dict] | None = None) -> dict:
         fts_config = self._fts_config.to_json()
@@ -205,6 +240,7 @@ class IndexBuildService:
             "format_version": 4,
             "layout": "sparse_chunks+dense_chunks",
             "generation": generation,
+            "build_id": build_id,
             "fts_config": fts_config,
             "vector_config": vector_config_json,
             "config_hashes": {

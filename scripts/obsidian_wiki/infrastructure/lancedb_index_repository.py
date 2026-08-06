@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -94,6 +95,38 @@ class LanceDbIndexRepository:
         )
         if f"{fts_config.column}_idx" not in {index.name for index in sparse_table.list_indices()}:
             raise RuntimeError("Native FTS index was not created for sparse_chunks")
+
+    def seal(self, lance_dir: Path) -> None:
+        """#36：发布前耐久边界——逐个 fsync 全部存储文件 + 目录自底向上同步。
+
+        LanceDB 每次 persist/reopen 都使用独立 connection（无跨调用写入 handle），
+        写入完成后 connection 已随 persist 返回释放；此处显式把全部文件落到磁盘。
+        任一 fsync 失败向上传播（不允许降级为 warning）。
+        """
+        root = Path(lance_dir)
+        if not root.is_dir():
+            raise OSError(f"seal 失败：{root} 不存在")
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                try:
+                    fd = os.open(os.fspath(path), os.O_RDWR)
+                except OSError:
+                    continue  # 只读文件未被本次写入，无需 fsync（Windows 只读句柄不能 fsync）
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        if os.name == "posix":
+            dirs = sorted(
+                (p for p in root.rglob("*") if p.is_dir()),
+                key=lambda p: len(p.parts), reverse=True,
+            )
+            for directory in [root, *dirs]:
+                fd = os.open(os.fspath(directory), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
 
     def create_vector_index(self, config: VectorIndexConfig) -> IndexStats:
         table = self._dense_table()

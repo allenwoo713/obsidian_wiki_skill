@@ -141,7 +141,8 @@ def test_storage_contract_failure_never_changes_active_pointer(tmp_path, monkeyp
 
 
 def test_post_commit_report_failure_returns_published_with_pending(tmp_path, monkeypatch):
-    """#37：pointer 发布后 report 失效失败 → build 返回 published + pending，不伪装失败。"""
+    """#37：pointer 发布后 report 失效失败 → build 返回 published + pending（journal PREPARED），不伪装失败。"""
+    from obsidian_wiki.application.post_commit_service import retry_pending
     from obsidian_wiki.infrastructure import filesystem_community_reports as cr_module
 
     wiki = tmp_path / "Wiki"
@@ -157,15 +158,28 @@ def test_post_commit_report_failure_returns_published_with_pending(tmp_path, mon
     assert outcome.published is True
     assert outcome.post_commit_status == PostCommitStatus.COMMUNITY_REPORT_INVALIDATION_PENDING
     assert outcome.warnings
-    # ACTIVE_INDEX 已推进且与 artifact 一致；pending 任务已持久化（可重试）
+    # ACTIVE_INDEX 已推进且与 artifact 一致；post-commit intent 已 durable 持久化（可重试）
     ptr = json.loads((index_dir / "ACTIVE_INDEX").read_text(encoding="utf-8"))
     assert ptr["build_id"] == outcome.build_id
-    assert (index_dir / ".post_commit_pending.json").exists()
-    # 重试路径：report 恢复后下一次 build 完成 post-commit
+    journal_dir = index_dir / "post_commit_tasks"
+    assert journal_dir.is_dir() and any(journal_dir.glob("*.json"))
+    # 重试路径：显式 retry_pending 重放（幂等），不依赖下一次 build
     monkeypatch.undo()
-    retry = build_storage_contract(wiki, index_dir, embed=embed)
-    assert retry.post_commit_status == PostCommitStatus.COMPLETE
-    assert not (index_dir / ".post_commit_pending.json").exists()
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+
+    journal = FilesystemPostCommitJournal(index_dir)
+    summary = retry_pending(
+        index_dir, journal=journal,
+        invalidator=cr_module.FilesystemCommunityReportStore(index_dir),
+    )
+    assert summary.completed == 1, f"retry 应完成 1 个任务，got {summary}"
+    assert summary.still_pending == 0
+    # 幂等：第二次为 no-op
+    summary2 = retry_pending(
+        index_dir, journal=journal,
+        invalidator=cr_module.FilesystemCommunityReportStore(index_dir),
+    )
+    assert summary2.completed == 0 and summary2.still_pending == 0
 
 
 def test_single_build_publishes_pointer_exactly_once(tmp_path, monkeypatch):

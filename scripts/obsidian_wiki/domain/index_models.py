@@ -113,10 +113,14 @@ class DenseChunk(_JsonRecord):
 
 @dataclass(frozen=True)
 class StorageArtifact(_JsonRecord):
+    """构建产物：路径 + count + 身份（#34：build_id/generation 贯穿 manifest/pointer/record）。"""
+
     lance_dir: Path
     manifest_path: Path
     sparse_count: int
     dense_count: int
+    build_id: str
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,26 @@ class PostCommitStatus(str, Enum):
 
     COMPLETE = "complete"
     COMMUNITY_REPORT_INVALIDATION_PENDING = "community_report_invalidation_pending"
+
+
+class PostCommitTaskState(str, Enum):
+    PREPARED = "prepared"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class PostCommitTask(_JsonRecord):
+    """#37 提交点之前的 durable intent：post-commit 工作必须先 prepare 再执行，
+    进程在任何一步退出都不会永久丢失任务。"""
+
+    task_id: str
+    task_type: str
+    build_id: str
+    generation: int
+    state: PostCommitTaskState
+    prepared_at: str
+    completed_at: str | None = None
 
 
 @dataclass(frozen=True)

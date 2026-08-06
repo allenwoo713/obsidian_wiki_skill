@@ -73,11 +73,16 @@ def _sha256_of(path: Path) -> str:
 
 def _fake_build(idx: Path, build_id: str, body: str = "ok", generation: int = 1,
                 state: str = "published") -> Path:
-    """构造 build 产物：manifest.json + lance_db 目录 + .generation.json 生命周期记录。"""
+    """构造 build 产物：manifest.json（含 build_id/generation）+ lance_db + .generation.json。
+
+    #35：default state=published 供 recovery 类测试；发布类测试须传 state='validated'，
+    因为 publish_pointer 只接受存在完全匹配 VALIDATED record 的 build。
+    """
     build = idx / "builds" / build_id
     (build / "lance_db").mkdir(parents=True, exist_ok=True)
     (build / "manifest.json").write_text(
-        json.dumps({"layout": "sparse_chunks+dense_chunks", "body": body, "generation": generation}),
+        json.dumps({"layout": "sparse_chunks+dense_chunks", "body": body,
+                    "generation": generation, "build_id": build_id}),
         encoding="utf-8",
     )
     if state:
@@ -294,8 +299,9 @@ def test_foreign_host_metadata_reclaimable_when_os_unlocked(tmp_path):
 def test_three_process_release_race_single_writer(tmp_path):
     """#34：三进程交错——A 释放后 B 持有期间 C 必须无法取得锁（稳定 pathname）。
 
-    旧实现 release 时 rename/unlink BUILD.lock，A 释放后 B 建新文件、C 又能建
-    另一个 → 并发写者；新实现 BUILD.lock 稳定，B 的 OS lock 阻止 C。
+    使用双端 barrier（各角色先写 ready，父进程等所有 ready 后才发 continue；
+    无时序 sleep 作为正确性前提）。逐一断言子进程 numeric exit code；
+    B 释放后 D 必须能取得同一 stable lockfile。
     """
     idx = _index(tmp_path)
     scripts_dir = REPO_ROOT / "scripts"
@@ -310,7 +316,7 @@ def test_three_process_release_race_single_writer(tmp_path):
         f"idx = Path({json.dumps(str(idx))})\n"
         f"stage = Path({json.dumps(str(stage))})\n"
         "def mark(name): (stage / name).write_text('1', encoding='utf-8')\n"
-        "def wait(name, timeout=25):\n"
+        "def wait(name, timeout=30):\n"
         "    deadline = time.monotonic() + timeout\n"
         "    while time.monotonic() < deadline:\n"
         "        if (stage / name).exists(): return\n"
@@ -319,51 +325,76 @@ def test_three_process_release_race_single_writer(tmp_path):
         "def ctx(tag):\n"
         "    return BuildContext(build_id=tag, started_at='t', owner_nonce=f'{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}')\n"
         "role = sys.argv[1]\n"
+        "mark(role + '_ready')\n"
+        "wait('continue')\n"
         "if role == 'A':\n"
         "    lock = BuildLock(idx, ctx=ctx('build_A'))\n"
         "    lock.acquire()\n"
         "    mark('A_held')\n"
-        "    wait('A_go')\n"
+        "    wait('a_go')\n"
         "    lock.release()\n"
         "    mark('A_released')\n"
         "elif role == 'B':\n"
-        "    wait('A_held')\n"
+        "    wait('a_go')\n"
         "    lock = BuildLock(idx, ctx=ctx('build_B'))\n"
-        "    lock.acquire(wait=True, timeout=25)\n"
+        "    lock.acquire(wait=True, timeout=30)\n"
         "    mark('B_held')\n"
-        "    wait('B_go')\n"
+        "    wait('b_go')\n"
         "    lock.release()\n"
         "    mark('B_released')\n"
-        "else:\n"
-        "    wait('B_held')\n"
+        "elif role == 'C':\n"
+        "    wait('B_held')       # B 明确持有后才允许 C 尝试（双端 barrier）\n"
         "    try:\n"
         "        lock = BuildLock(idx, ctx=ctx('build_C'))\n"
         "        lock.acquire(wait=False)\n"
         "        mark('C_acquired')\n"
         "    except BuildLockHeldError:\n"
         "        mark('C_blocked')\n"
+        "else:\n"
+        "    wait('B_released')\n"
+        "    lock = BuildLock(idx, ctx=ctx('build_D'))\n"
+        "    lock.acquire()\n"
+        "    mark('D_acquired')\n"
+        "    lock.release()\n"
+        "    mark('D_released')\n"
     )
-    pA = subprocess.Popen([sys.executable, "-c", child, "A"], cwd=REPO_ROOT)
-    pB = subprocess.Popen([sys.executable, "-c", child, "B"], cwd=REPO_ROOT)
-    pC = subprocess.Popen([sys.executable, "-c", child, "C"], cwd=REPO_ROOT)
+    procs = {
+        role: subprocess.Popen([sys.executable, "-c", child, role], cwd=REPO_ROOT)
+        for role in ("A", "B", "C", "D")
+    }
     try:
+        # 双端 barrier：等全部角色 ready 才 continue（无 sleep 代表 ready）
+        for role in ("A", "B", "C", "D"):
+            _wait_file(stage / f"{role}_ready")
+        (stage / "continue").write_text("1", encoding="utf-8")
         _wait_file(stage / "A_held")
-        (stage / "A_go").write_text("1", encoding="utf-8")
-        _wait_file(stage / "B_held")
-        time.sleep(0.3)  # 给 C 一个尝试窗口（协调等待，非正确性前提）
-        (stage / "B_go").write_text("1", encoding="utf-8")
-        for p in (pA, pB, pC):
-            p.wait(timeout=30)
+        (stage / "a_go").write_text("1", encoding="utf-8")   # B 开始 acquire（等待 A 释放）
+        _wait_file(stage / "B_held")                          # B 已确认持有
+        # C 等 B_held 自动尝试；必须等 C 尝试完成（blocked/acquired）后才放行 B 释放，
+        # 保证 C 的 acquire 发生在 B 持有期间（非并发竞速）。
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if (stage / "C_blocked").exists() or (stage / "C_acquired").exists():
+                break
+            time.sleep(0.02)
+        (stage / "b_go").write_text("1", encoding="utf-8")   # 现在才让 B 释放
+        for role in ("A", "B", "C", "D"):
+            procs[role].wait(timeout=40)
     finally:
-        for p in (pA, pB, pC):
+        for p in procs.values():
             if p.poll() is None:
                 p.kill()
                 p.wait(timeout=5)
+    # 逐一断言 numeric exit code（全部 0 = 无超时/未捕获异常）
+    for role, p in procs.items():
+        assert p.returncode == 0, f"{role} exit code={p.returncode}"
     assert (stage / "A_released").exists()
     assert (stage / "B_held").exists()
     assert (stage / "B_released").exists()
     assert (stage / "C_blocked").exists(), "B 持有期间 C 必须无法取得锁"
     assert not (stage / "C_acquired").exists()
+    assert (stage / "D_acquired").exists(), "B 释放后 D 必须可取得同一 stable lockfile"
+    assert (stage / "D_released").exists()
 
 
 def test_killed_holder_allows_reacquire_same_pathname(tmp_path):
@@ -420,6 +451,34 @@ def test_build_context_id_concurrent_uniqueness():
         assert _BUILD_ID_RE.fullmatch(build_id), f"build_id 必须是 UTC 微秒 + 完整 UUID: {build_id}"
 
 
+def test_build_ids_unique_when_clock_frozen(tmp_path, monkeypatch):
+    """#34：UTC 时钟固定到同一微秒时，并发生成 1000 个 build_id 仍全部唯一（UUID 保证）。"""
+    import obsidian_wiki.application.build_lock as bl
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=timezone.utc):
+            return datetime(2026, 8, 6, 0, 0, 0, 123456, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(bl, "datetime", _FixedDatetime)
+    ids: set[str] = set()
+    barrier = threading.Barrier(10)
+
+    def _gen():
+        barrier.wait()
+        for _ in range(100):
+            ids.add(new_build_context().build_id)
+
+    threads = [threading.Thread(target=_gen) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert len(ids) == 1000, f"时钟冻结时 1000 个 build_id 仍应全部唯一，got {len(ids)}"
+    for build_id in ids:
+        assert _BUILD_ID_RE.fullmatch(build_id), f"完整 UUID 后缀: {build_id}"
+
+
 def test_build_context_flows_through_service_build(tmp_path):
     """#34 端到端：单次 build 的 build_id 贯穿 lock metadata / build 目录 / manifest /
     pointer / 生命周期记录与返回 artifact，且只生成一次。"""
@@ -445,8 +504,12 @@ def test_build_context_flows_through_service_build(tmp_path):
 
     lock_data = json.loads((index_dir / LOCK_NAME).read_text(encoding="utf-8"))
     assert lock_data["build_id"] == ctx.build_id, "lock metadata build_id 必须与 ctx 一致"
+    assert artifact.build_id == ctx.build_id, "artifact.build_id 必须与 ctx 一致"
+    assert artifact.generation >= 1
     assert artifact.lance_dir.parent.name == ctx.build_id, "build 目录名必须与 ctx.build_id 一致"
     manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["build_id"] == ctx.build_id, "manifest build_id 必须与 ctx 一致"
+    assert manifest["generation"] == artifact.generation
     ptr = _pointer_data(index_dir)
     assert ptr["build_id"] == ctx.build_id
     assert ptr["active_lance"] == f"builds/{ctx.build_id}/lance_db"
@@ -464,7 +527,7 @@ def test_publish_strict_schema_and_resolves(tmp_path):
     """publish 写入严格 schema v4，且可被 resolve 校验通过。"""
     idx = _index(tmp_path)
     build_id = _valid_build_id("a")
-    build = _fake_build(idx, build_id, generation=1)
+    build = _fake_build(idx, build_id, generation=1, state="validated")
     publish_pointer(idx, build, generation=1, build_id=build_id)
     data = _pointer_data(idx)
     assert data["schema_version"] == 4
@@ -475,6 +538,16 @@ def test_publish_strict_schema_and_resolves(tmp_path):
     assert resolve_active_lance_dir(idx) == build / "lance_db"
     record = read_generation_record(build)
     assert record is not None and record.state == GenerationState.PUBLISHED
+
+
+def test_publish_requires_validated_record(tmp_path):
+    """#35：无完全匹配 VALIDATED record 的 build（含任意 manifest）不可直接 PUBLISHED。"""
+    idx = _index(tmp_path)
+    build_id = _valid_build_id("a")
+    _fake_build(idx, build_id, generation=1, state="published")  # 直接标 published 绕过 validated
+    with pytest.raises(RuntimeError, match="无 VALIDATED 生命周期记录"):
+        publish_pointer(idx, idx / "builds" / build_id, generation=1, build_id=build_id)
+    assert not (idx / POINTER_NAME).exists()
 
 
 @pytest.mark.parametrize("overrides", [
@@ -490,7 +563,10 @@ def test_publish_strict_schema_and_resolves(tmp_path):
     {"manifest_sha256": "not-hex"},
     {"manifest_sha256": "abc"},
     {"published_at": "not-a-date"},
+    {"published_at": "2026-08-06T00:00:00+08:00"},  # 非 UTC（offset +08:00）拒绝
+    {"published_at": "2026-08-06T00:00:00"},        # naive 时间拒绝
     {"active_lance": "builds/other/lance_db"},   # 与 build_id 不一致
+    {"extra_field": "x"},                        # 额外字段拒绝（字段集合精确相等）
 ])
 def test_pointer_schema_variants_rejected(tmp_path, overrides):
     """#35：任一 schema 字段非法 → 拒绝并走 recovery 回退到已验证 build。"""
@@ -573,8 +649,9 @@ def test_manifest_tamper_skips_current_falls_back(tmp_path):
     idx = _index(tmp_path)
     old_id = _valid_build_id("old")
     new_id = _valid_build_id("new")
-    old = _fake_build(idx, old_id, generation=1)
-    new = _fake_build(idx, new_id, generation=2)
+    old = _fake_build(idx, old_id, generation=1, state="validated")
+    new = _fake_build(idx, new_id, generation=2, state="validated")
+    publish_pointer(idx, old, generation=1, build_id=old_id)
     publish_pointer(idx, new, generation=2, build_id=new_id)
     (new / "manifest.json").write_text(json.dumps({"body": "tampered"}), encoding="utf-8")
     # 指针指向 new 但 checksum 与生命周期记录均失配 → recovery 跳过 new，回退 old
@@ -585,7 +662,7 @@ def test_staging_validated_not_selected_by_recovery(tmp_path):
     """#35：manifest 已写 + validated 记录但 pointer 未发布（模拟中断）→ 绝不被选中。"""
     idx = _index(tmp_path)
     good_id = _valid_build_id("good")
-    good = _fake_build(idx, good_id, generation=1)
+    good = _fake_build(idx, good_id, generation=1, state="validated")
     publish_pointer(idx, good, generation=1, build_id=good_id)
     staging = _fake_build(idx, _valid_build_id("staging"), generation=2, state="validated")
     (idx / POINTER_NAME).write_bytes(b"torn")
@@ -599,10 +676,10 @@ def test_lifecycle_supersedes_previous_published(tmp_path):
     idx = _index(tmp_path)
     id1 = _valid_build_id("g1")
     id2 = _valid_build_id("g2")
-    build1 = _fake_build(idx, id1, generation=1)
+    build1 = _fake_build(idx, id1, generation=1, state="validated")
     publish_pointer(idx, build1, generation=1, build_id=id1)
     assert read_generation_record(build1).state == GenerationState.PUBLISHED
-    build2 = _fake_build(idx, id2, generation=2)
+    build2 = _fake_build(idx, id2, generation=2, state="validated")
     publish_pointer(idx, build2, generation=2, build_id=id2)
     rec1 = read_generation_record(build1)
     rec2 = read_generation_record(build2)
@@ -621,14 +698,15 @@ def test_generation_based_fallback_not_mtime(tmp_path):
     assert resolve_active_lance_dir(idx) == high / "lance_db"
 
 
-def test_legacy_explicit_acceptance(tmp_path):
-    """#35：legacy 顶层目录经显式验证后接受。"""
+def test_legacy_rejected_requires_rebuild(tmp_path):
+    """#35：删除普通 legacy fallback——无法验证的 legacy 一律 RebuildRequiredError。"""
     idx = _index(tmp_path)
     legacy = idx / "lance_db"
     legacy.mkdir(parents=True)
     (idx / "manifest.json").write_text("{}", encoding="utf-8")
     (idx / POINTER_NAME).write_bytes(b"torn")
-    assert resolve_active_lance_dir(idx) == legacy
+    with pytest.raises(RebuildRequiredError):
+        resolve_active_lance_dir(idx)
 
 
 def test_legacy_unverifiable_raises_rebuild_required(tmp_path):
@@ -653,7 +731,7 @@ def test_publish_failure_keeps_old_pointer(tmp_path, monkeypatch):
 
     idx = _index(tmp_path)
     old_id = _valid_build_id("old")
-    old = _fake_build(idx, old_id, generation=1)
+    old = _fake_build(idx, old_id, generation=1, state="validated")
     publish_pointer(idx, old, generation=1, build_id=old_id)
     before = (idx / POINTER_NAME).read_bytes()
     new_id = _valid_build_id("new")

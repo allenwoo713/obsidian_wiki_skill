@@ -1,39 +1,42 @@
-"""#11/#21/#35/#36 ACTIVE_INDEX 指针契约：严格 schema v4 + 生命周期 + 耐久发布。
+"""#11/#21/#35/#36/#37 ACTIVE_INDEX 指针契约：严格 schema v4 + 生命周期 + 耐久发布。
 
-#35 严格化（review 复审遗留）：
-- schema_version 必须恰好为整数 4（拒绝 bool / 低版本 / 未知高版本）；
-- generation 必须为非 bool 正整数；build_id 匹配完整 build-ID 格式；
-- published_at 必须可解析为 UTC；manifest_sha256 必须是规范 SHA-256；
-- active_lance 必须精确为 ``builds/<build_id>/lance_db`` 三段相对路径，
-  拒绝绝对路径、``.``、``..``、额外组件与任意 symlink 组件。
-- 每个 generation 持久化不可变验证记录（``.generation.json``）：
-  building → validated → published → superseded；recovery 只从 published 回退；
-  manifest 摘要与记录不符的 generation 被跳过。
-- legacy 顶层目录只通过显式验证接受，否则 RebuildRequiredError。
+#35（review 复审）：
+- pointer/record 经 ``ActiveIndexPointerV4.from_json`` / ``GenerationRecord.from_json``
+  严格构造（字段集合精确相等、正整数 generation、UTC、fullmatch digest/build_id）。
+- 集中生命周期转换 missing→building→validated→published→superseded，其它拒绝；
+  build 目录创建后立即耐久写 BUILDING。
+- ``publish_pointer`` 只接受存在完全匹配 VALIDATED record 的 build（任意含 manifest
+  的目录不可直接跳 PUBLISHED）。
+- direct resolve / recovery 身份绑定：pointer.build_id == build_dir.name ==
+  record.build_id == manifest.build_id，generation/digest 全链一致。
+- 删除普通 legacy fallback：无法验证的 legacy 一律 RebuildRequiredError。
 
-#36 耐久：
-- 所有关键写入经 durable_filesystem（fsync/replace 失败向上传播，不降级 warning）。
+#36 耐久：所有关键写入经 durable_filesystem（fsync/replace 失败向上传播）。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from obsidian_wiki.domain.index_publication_models import GenerationRecord, GenerationState
-from obsidian_wiki.application.durable_filesystem import atomic_write_bytes
+from obsidian_wiki.application.durable_filesystem import (
+    CommitUncertainError,
+    atomic_write_bytes,
+)
+from obsidian_wiki.domain.index_publication_models import (
+    ALLOWED_TRANSITIONS,
+    ActiveIndexPointerV4,
+    GenerationRecord,
+    GenerationState,
+)
 
 log = logging.getLogger(__name__)
 
 POINTER_NAME = "ACTIVE_INDEX"
 GEN_RECORD_NAME = ".generation.json"
 SCHEMA_VERSION = 4
-
-_BUILD_ID_RE = re.compile(r"^build_\d{8}T\d{12}_[0-9a-f]{32}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _sha256(path: Path) -> str:
@@ -44,16 +47,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _write_generation_record(
-    build_dir: Path, *, generation: int, build_id: str, state: GenerationState,
-    manifest_sha256: str, validated_at: str,
-    published_at: str | None = None, superseded_at: str | None = None,
-) -> None:
-    record = GenerationRecord(
-        generation=generation, build_id=build_id, state=state,
-        manifest_sha256=manifest_sha256, validated_at=validated_at,
-        published_at=published_at, superseded_at=superseded_at,
-    )
+def _write_record(build_dir: Path, record: GenerationRecord) -> None:
     atomic_write_bytes(
         build_dir / GEN_RECORD_NAME,
         json.dumps(record.to_json(), sort_keys=True).encode("utf-8"),
@@ -65,26 +59,43 @@ def read_generation_record(build_dir: Path) -> GenerationRecord | None:
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        state = GenerationState(data["state"])
-        return GenerationRecord(
-            generation=int(data["generation"]), build_id=str(data["build_id"]),
-            state=state, manifest_sha256=str(data["manifest_sha256"]),
-            validated_at=str(data["validated_at"]),
-            published_at=str(data["published_at"]) if data.get("published_at") else None,
-            superseded_at=str(data["superseded_at"]) if data.get("superseded_at") else None,
-        )
-    except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return GenerationRecord.from_json(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, ValueError):
         return None
 
 
-def record_validated(build_dir: Path, *, generation: int, build_id: str, manifest_sha256: str) -> None:
-    """manifest 落盘并完整验证后写入 validated 记录（#35：staging 绝不被 recovery 选中）。"""
-    _write_generation_record(
-        build_dir, generation=generation, build_id=build_id,
-        state=GenerationState.VALIDATED, manifest_sha256=manifest_sha256,
-        validated_at=_now(),
+def _transition(build_dir: Path, target: GenerationState, *,
+                build_id: str, generation: int, manifest_sha256: str) -> None:
+    """集中生命周期转换（#35）：仅 missing→building→validated→published→superseded。"""
+    current = read_generation_record(build_dir)
+    current_state = current.state if current is not None else None
+    if target not in ALLOWED_TRANSITIONS.get(current_state, frozenset()):
+        raise RuntimeError(
+            f"非法生命周期转换: {current_state} -> {target}（{build_dir.name}）")
+    now = _now()
+    record = GenerationRecord(
+        generation=generation, build_id=build_id, state=target,
+        manifest_sha256=manifest_sha256,
+        validated_at=current.validated_at if current is not None else now,
+        published_at=(now if target is GenerationState.PUBLISHED
+                      else (current.published_at if current is not None else None)),
+        superseded_at=(now if target is GenerationState.SUPERSEDED
+                       else (current.superseded_at if current is not None else None)),
     )
+    _write_record(build_dir, record)
+
+
+def record_building(build_dir: Path, *, build_id: str, generation: int) -> None:
+    """build 目录创建后立即耐久写 BUILDING（#35：missing → building）。"""
+    _transition(build_dir, GenerationState.BUILDING, build_id=build_id,
+                generation=generation, manifest_sha256="")
+
+
+def record_validated(build_dir: Path, *, build_id: str, generation: int,
+                     manifest_sha256: str) -> None:
+    """manifest 落盘并完整验证后 building → validated（#35：staging 绝不被 recovery 选中）。"""
+    _transition(build_dir, GenerationState.VALIDATED, build_id=build_id,
+                generation=generation, manifest_sha256=manifest_sha256)
 
 
 def publish_pointer(
@@ -92,19 +103,25 @@ def publish_pointer(
 ) -> None:
     """原子翻转 ACTIVE_INDEX 指向 ``build_dir``；失败时旧指针保持可用。
 
-    严格校验 generation/build_id/目录名一致性与 manifest 存在；经 durable 写入后
-    把本 generation 标为 published，并把其它 published 标 superseded。
+    前置条件（#35）：存在完全匹配的 VALIDATED record（build_id/generation/digest 一致），
+    任意仅含 manifest 的目录不可直接跳到 PUBLISHED。
     """
     if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
         raise RuntimeError(f"拒绝发布：generation={generation!r} 必须为正整数")
-    if not isinstance(build_id, str) or not _BUILD_ID_RE.match(build_id):
-        raise RuntimeError(f"拒绝发布：build_id={build_id!r} 不符合 build_ID 格式")
-    if build_dir.name != build_id:
+    if not isinstance(build_id, str) or build_dir.name != build_id:
         raise RuntimeError(f"拒绝发布：build_dir={build_dir.name} 与 build_id={build_id} 不一致")
     manifest = build_dir / "manifest.json"
     if not manifest.is_file():
-        raise RuntimeError(f"拒绝发布：{manifest} 不存在（未 validated 的构建不可被引用）")
+        raise RuntimeError(f"拒绝发布：{manifest} 不存在")
     manifest_digest = _sha256(manifest)
+    record = read_generation_record(build_dir)
+    if record is None or record.state is not GenerationState.VALIDATED:
+        raise RuntimeError(
+            f"拒绝发布：{build_dir.name} 无 VALIDATED 生命周期记录"
+            f"（state={record.state if record is not None else None}）")
+    if (record.build_id != build_id or record.generation != generation
+            or record.manifest_sha256 != manifest_digest):
+        raise RuntimeError("拒绝发布：VALIDATED 记录身份与 build 不一致")
     payload = {
         "schema_version": SCHEMA_VERSION,
         "generation": generation,
@@ -119,20 +136,34 @@ def publish_pointer(
             pointer,
             json.dumps(payload, sort_keys=True).encode("utf-8"),
         )
+    except CommitUncertainError:
+        # #36：replace 已成功（commit point 已过）。读回 pointer 确认内容与本 build
+        # 一致（record 尚未 transition 到 PUBLISHED，故不要求 record 状态）；一致则
+        # 继续 lifecycle 视为已发布 + reconciliation warning。
+        try:
+            data = json.loads(pointer.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if not isinstance(data, dict) or data.get("build_id") != build_id \
+                or data.get("generation") != generation \
+                or data.get("manifest_sha256") != manifest_digest:
+            raise RuntimeError(
+                "ACTIVE_INDEX 发布状态不确定（replace 后耐久确认失败且新指针不可验证）；"
+                "请重新解析确认状态后重试。")
+        log.warning("ACTIVE_INDEX 已替换但目录同步确认失败（commit uncertain，已 reconciliation）")
     except OSError as exc:
         raise RuntimeError(
             f"ACTIVE_INDEX 发布失败（旧活动索引保持可用）：{type(exc).__name__}: {exc}。"
             f"请确认 {pointer} 未被 Obsidian/杀软独占后重试。"
         ) from exc
     # 生命周期：validated → published；新 pointer 耐久落盘后才标旧代 superseded（#35）。
-    previous = read_generation_record(build_dir)
-    _write_generation_record(
-        build_dir, generation=generation, build_id=build_id,
-        state=GenerationState.PUBLISHED, manifest_sha256=manifest_digest,
-        validated_at=previous.validated_at if previous else _now(),
-        published_at=_now(),
-    )
-    _mark_superseded(index_dir, build_dir, generation)
+    # #37：commit 点之后的 reconciliation 失败不得伪装为 pre-commit 失败（不写 .failed）。
+    try:
+        _transition(build_dir, GenerationState.PUBLISHED, build_id=build_id,
+                    generation=generation, manifest_sha256=manifest_digest)
+        _mark_superseded(index_dir, build_dir, generation)
+    except (OSError, RuntimeError) as exc:
+        log.warning("发布后生命周期 reconciliation 失败（索引已发布）：%s", exc)
 
 
 def _mark_superseded(index_dir: Path, new_build_dir: Path, new_generation: int) -> None:
@@ -145,79 +176,49 @@ def _mark_superseded(index_dir: Path, new_build_dir: Path, new_generation: int) 
         if entry.name.startswith(".") or entry.name.startswith("_old"):
             continue
         record = read_generation_record(entry)
-        if record is None or record.state != GenerationState.PUBLISHED:
+        if record is None or record.state is not GenerationState.PUBLISHED:
             continue
-        _write_generation_record(
-            entry, generation=record.generation, build_id=record.build_id,
-            state=GenerationState.SUPERSEDED, manifest_sha256=record.manifest_sha256,
-            validated_at=record.validated_at, published_at=record.published_at,
-            superseded_at=_now(),
-        )
+        try:
+            _transition(entry, GenerationState.SUPERSEDED,
+                        build_id=record.build_id, generation=record.generation,
+                        manifest_sha256=record.manifest_sha256)
+        except RuntimeError as exc:
+            log.warning("标记 superseded 失败（不影响新发布）：%s", exc)
 
 
 def _validate_pointer(index_dir: Path, data: object) -> Path | None:
-    """严格校验 schema v4 pointer（#35）；返回 resolved lance_dir 或 None（进 recovery）。"""
-    if not isinstance(data, dict):
-        log.warning("ACTIVE_INDEX payload 非 dict（%s），进入 recovery", type(data).__name__)
-        return None
-    sv = data.get("schema_version")
-    if not isinstance(sv, int) or isinstance(sv, bool) or sv != SCHEMA_VERSION:
-        log.warning("ACTIVE_INDEX schema_version=%r 必须为整数 %d，拒绝", sv, SCHEMA_VERSION)
-        return None
-    generation = data.get("generation")
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
-        log.warning("ACTIVE_INDEX generation=%r 非法，拒绝", generation)
-        return None
-    build_id = data.get("build_id")
-    if not isinstance(build_id, str) or not _BUILD_ID_RE.match(build_id):
-        log.warning("ACTIVE_INDEX build_id=%r 非法，拒绝", build_id)
-        return None
-    published_at = data.get("published_at")
-    if not isinstance(published_at, str):
-        log.warning("ACTIVE_INDEX published_at 缺失/非字符串，拒绝")
-        return None
+    """严格校验 schema v4 pointer 并绑定身份（#35）；返回 lance_dir 或 None（进 recovery）。"""
     try:
-        datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        ptr = ActiveIndexPointerV4.from_json(data)
     except ValueError:
-        log.warning("ACTIVE_INDEX published_at=%r 不可解析，拒绝", published_at)
         return None
-    digest = data.get("manifest_sha256")
-    if not isinstance(digest, str) or not _SHA256_RE.match(digest):
-        log.warning("ACTIVE_INDEX manifest_sha256=%r 非法，拒绝", digest)
-        return None
-    rel = data.get("active_lance")
-    expected = f"builds/{build_id}/lance_db"
-    if not isinstance(rel, str) or rel != expected:
-        log.warning("ACTIVE_INDEX active_lance=%r != %r，拒绝", rel, expected)
-        return None
-    # 逐组件校验拒绝 symlink；resolve 后必须仍在 builds root 内
+    # 拒绝任意 symlink 组件（builds / <build_id> / lance_db）
     probe = index_dir
-    for part in Path(rel).parts:
+    for part in Path(ptr.active_lance).parts:
         probe = probe / part
         if probe.is_symlink():
-            log.warning("ACTIVE_INDEX target 含 symlink 组件，拒绝")
             return None
-    cand = (index_dir / rel).resolve()
+    build_dir = index_dir / "builds" / ptr.build_id
+    if not build_dir.is_dir():
+        return None
+    manifest = build_dir / "manifest.json"
+    if not manifest.is_file() or ptr.manifest_sha256 != _sha256(manifest):
+        return None
+    # manifest 身份一致（build_id / generation）
     try:
-        cand.relative_to((index_dir / "builds").resolve())
-    except ValueError:
-        log.warning("ACTIVE_INDEX target 逃逸 builds root，拒绝")
+        m = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return None
-    if not cand.is_dir():
-        log.warning("ACTIVE_INDEX target 目录不存在，拒绝")
+    if not isinstance(m, dict) or m.get("build_id") != ptr.build_id or m.get("generation") != ptr.generation:
         return None
-    manifest = cand.parent / "manifest.json"
-    if not manifest.is_file():
-        log.warning("ACTIVE_INDEX 指向的构建缺 manifest，拒绝")
+    # record：仅 PUBLISHED，且 build_id/generation/digest 全链一致
+    record = read_generation_record(build_dir)
+    if record is None or record.state is not GenerationState.PUBLISHED:
         return None
-    if digest != _sha256(manifest):
-        log.warning("ACTIVE_INDEX checksum 不匹配，拒绝 %s", cand)
+    if (record.build_id != ptr.build_id or record.generation != ptr.generation
+            or record.manifest_sha256 != ptr.manifest_sha256):
         return None
-    record = read_generation_record(cand.parent)
-    if record is None or record.state != GenerationState.PUBLISHED:
-        log.warning("ACTIVE_INDEX 指向的 build 无 published 生命周期记录，拒绝")
-        return None
-    return cand
+    return build_dir / "lance_db"
 
 
 def resolve_active_lance_dir(index_dir: Path) -> Path:
@@ -233,9 +234,7 @@ def resolve_active_lance_dir(index_dir: Path) -> Path:
         if cand is not None:
             return cand
 
-    # Recovery：只从「有可验证 published 记录」的 generation 回退——published 或
-    # superseded 都曾耐久发布（记录含 published_at）；staging（validated）与
-    # 仅文件存在的 build 一律不选；manifest 摘要与记录不符的 generation 被跳过。
+    # Recovery：只从有 published/superseded 生命周期记录且完整身份一致的 generation 回退
     builds_dir = index_dir / "builds"
     candidates: list[tuple[int, Path]] = []
     if builds_dir.is_dir():
@@ -247,13 +246,22 @@ def resolve_active_lance_dir(index_dir: Path) -> Path:
                 GenerationState.PUBLISHED, GenerationState.SUPERSEDED,
             ):
                 continue
+            if entry.name != record.build_id:
+                continue  # 目录名必须等于 record.build_id（#35）
             if not ((entry / "lance_db").is_dir() and (entry / "manifest.json").is_file()):
                 continue
             try:
-                if _sha256(entry / "manifest.json") != record.manifest_sha256:
-                    log.warning("build %s manifest 与验证记录摘要不符，跳过", entry.name)
-                    continue
+                manifest_digest = _sha256(entry / "manifest.json")
             except OSError:
+                continue
+            if manifest_digest != record.manifest_sha256:
+                continue
+            try:
+                m = json.loads((entry / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(m, dict) or m.get("build_id") != record.build_id \
+                    or m.get("generation") != record.generation:
                 continue
             candidates.append((record.generation, entry))
     if candidates:
@@ -262,12 +270,7 @@ def resolve_active_lance_dir(index_dir: Path) -> Path:
         log.info("回退到最近已验证 published 构建（generation=%d）：%s", candidates[0][0], best.name)
         return best / "lance_db"
 
-    # Legacy 顶层：只在显式验证通过后接受（#35：不静默回退）
-    legacy = index_dir / "lance_db"
-    if legacy.is_dir() and (index_dir / "manifest.json").is_file():
-        log.warning("回退到 legacy 顶层 lance_db（显式验证通过；建议 rebuild 迁移）")
-        return legacy
-
+    # #35：删除普通 legacy fallback——无法验证的 legacy 一律要求 rebuild。
     raise RebuildRequiredError(
         f"无可用活动索引：{pointer} 损坏/失配，且 builds/ 下无已验证 published 构建。"
         f"请执行 rebuild 重建索引。"
