@@ -14,6 +14,7 @@ sys = __import__("sys")
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import WikiIndex  # noqa: E402
 from build_index import build_storage_contract  # noqa: E402
+from obsidian_wiki.domain.index_models import PostCommitStatus  # noqa: E402
 from obsidian_wiki.infrastructure import filesystem_index_manifest as manifest_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
@@ -137,3 +138,68 @@ def test_storage_contract_failure_never_changes_active_pointer(tmp_path, monkeyp
     failed_markers = list((index_dir / "builds").glob("*/.failed"))
     assert failed_markers
     assert boundary in failed_markers[-1].read_text(encoding="utf-8")
+
+
+def test_post_commit_report_failure_returns_published_with_pending(tmp_path, monkeypatch):
+    """#37：pointer 发布后 report 失效失败 → build 返回 published + pending（journal PREPARED），不伪装失败。"""
+    from obsidian_wiki.application.post_commit_service import retry_pending
+    from obsidian_wiki.infrastructure import filesystem_community_reports as cr_module
+
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "post.md", "Post", "stable token post commit", ["raw/post.docx"])
+    embed = lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)]  # noqa: E731
+
+    def _boom(*_a, **_k):
+        raise OSError("report store unavailable")
+
+    monkeypatch.setattr(cr_module.FilesystemCommunityReportStore, "mark_stale", _boom)
+    outcome = build_storage_contract(wiki, index_dir, embed=embed)
+    assert outcome.published is True
+    assert outcome.post_commit_status == PostCommitStatus.COMMUNITY_REPORT_INVALIDATION_PENDING
+    assert outcome.warnings
+    # ACTIVE_INDEX 已推进且与 artifact 一致；post-commit intent 已 durable 持久化（可重试）
+    ptr = json.loads((index_dir / "ACTIVE_INDEX").read_text(encoding="utf-8"))
+    assert ptr["build_id"] == outcome.build_id
+    journal_dir = index_dir / "post_commit_tasks"
+    assert journal_dir.is_dir() and any(journal_dir.glob("*.json"))
+    # 重试路径：显式 retry_pending 重放（幂等），不依赖下一次 build
+    monkeypatch.undo()
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+
+    journal = FilesystemPostCommitJournal(index_dir)
+    summary = retry_pending(
+        index_dir, journal=journal,
+        invalidator=cr_module.FilesystemCommunityReportStore(index_dir),
+    )
+    assert summary.completed == 1, f"retry 应完成 1 个任务，got {summary}"
+    assert summary.still_pending == 0
+    # 幂等：第二次为 no-op
+    summary2 = retry_pending(
+        index_dir, journal=journal,
+        invalidator=cr_module.FilesystemCommunityReportStore(index_dir),
+    )
+    assert summary2.completed == 0 and summary2.still_pending == 0
+
+
+def test_single_build_publishes_pointer_exactly_once(tmp_path, monkeypatch):
+    """#37：单次成功 build 恰好一次最终 pointer 发布，且调用时 manifest 已完整验证。"""
+    import obsidian_wiki.application.index_build_service as svc_module
+
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "once.md", "Once", "stable token single publish", ["raw/once.docx"])
+    embed = lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)]  # noqa: E731
+    real_publish = svc_module.publish_pointer
+    calls: list[dict] = []
+
+    def _counting(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return real_publish(*args, **kwargs)
+
+    monkeypatch.setattr(svc_module, "publish_pointer", _counting)
+    outcome = build_storage_contract(wiki, index_dir, embed=embed)
+    assert len(calls) == 1, f"单次 build 应恰好一次 publish_pointer，got {len(calls)}"
+    assert calls[0]["kwargs"]["build_id"] == outcome.build_id
+    assert outcome.published is True
+    assert outcome.post_commit_status == PostCommitStatus.COMPLETE

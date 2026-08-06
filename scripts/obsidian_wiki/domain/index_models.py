@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Tuple
 
@@ -112,10 +113,70 @@ class DenseChunk(_JsonRecord):
 
 @dataclass(frozen=True)
 class StorageArtifact(_JsonRecord):
+    """构建产物：路径 + count + 身份（#34：build_id/generation 贯穿 manifest/pointer/record）。"""
+
     lance_dir: Path
     manifest_path: Path
     sparse_count: int
     dense_count: int
+    build_id: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class BuildContext:
+    """不可变构建身份（#34）：最外层 facade 创建一次，贯穿 lock metadata、
+    build 目录、manifest、ACTIVE_INDEX pointer、日志与返回 artifact。
+    build_id 必须是 UTC 微秒时间戳 + 完整随机 UUID（原 #21 约定）。
+    """
+
+    build_id: str
+    started_at: str
+    owner_nonce: str
+
+
+class PostCommitStatus(str, Enum):
+    """#37 提交点之后的衍生工作状态：report 失效是可观察、可重试的 post-commit 任务。"""
+
+    COMPLETE = "complete"
+    COMMUNITY_REPORT_INVALIDATION_PENDING = "community_report_invalidation_pending"
+
+
+class PostCommitTaskState(str, Enum):
+    PREPARED = "prepared"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class PostCommitTask(_JsonRecord):
+    """#37 提交点之前的 durable intent：post-commit 工作必须先 prepare 再执行，
+    进程在任何一步退出都不会永久丢失任务。"""
+
+    task_id: str
+    task_type: str
+    build_id: str
+    generation: int
+    state: PostCommitTaskState
+    prepared_at: str
+    completed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class IndexBuildOutcome:
+    """#37 构建对外结果：区分「索引提交结果」与「提交后任务状态」。
+
+    ``published=True`` 表示 ACTIVE_INDEX 已耐久推进（commit point）；
+    其后的 report 失效失败只体现在 ``post_commit_status`` 与 ``warnings``，
+    绝不把已发布的 build 伪装成失败。
+    """
+
+    artifact: StorageArtifact
+    build_id: str
+    generation: int
+    published: bool
+    post_commit_status: PostCommitStatus
+    warnings: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

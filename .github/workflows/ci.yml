@@ -115,12 +115,19 @@ jobs:
       # #17 API coverage: adapter call shapes, persisted real artifacts, exact-bypass
       # and ANN policy, SDK-free import boundaries, and installed-version reporting.
       # D-03 timing and resource values are recorded observations, never timing gates.
-      # #21 index safety: single-writer lock + pointer contract (model-free, Windows+Linux).
-      - name: Run #17 LanceDB storage-contract and ANN-policy suites
+      # #21/#34-#37 publication safety: real storage ordering, durable pointer primitives,
+      # lifecycle/post-commit crash windows, deterministic process tests, and test integrity.
+      # All named suites are model-free and must pass on Windows + Linux.
+      - name: Run storage and publication acceptance gates
         run: >
           python -m pytest -p no:cacheprovider
           --basetemp=.review-tmp/phase01-contract
-          tests/test_lancedb_storage_contract.py tests/test_ann_policy.py tests/test_index_safety_lock.py -q
+          tests/test_lancedb_storage_contract.py
+          tests/test_ann_policy.py
+          tests/test_index_safety_lock.py
+          tests/test_index_durability.py
+          tests/test_index_post_commit.py
+          tests/test_test_suite_integrity.py -q
 
       - name: Enforce package import contracts
         working-directory: scripts

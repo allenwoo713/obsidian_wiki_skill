@@ -42,3 +42,7 @@ class ChunkRepository(Protocol):
     def vector_index_stats(self, index_name: str) -> IndexStats: ...
 
     def fts_index_stats(self, index_name: str = "fts_text_idx") -> FtsIndexStats: ...
+
+    def seal(self, lance_dir: Path) -> None:
+        """#36：建立「数据已可耐久读取」的发布前边界——关闭写入 connection、
+        逐个 fsync 存储文件、自底向上同步目录。无法证明关闭/提交边界时必须失败。"""

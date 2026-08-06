@@ -65,7 +65,7 @@ from vector_scoring import apply_vector_metric, normalize_vector_score
 
 
 def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
-                           page_metadata=None, image_metadata=None):
+                           page_metadata=None, image_metadata=None, ctx=None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -73,29 +73,70 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
     tracer can exercise real LanceDB without loading a model in its tiny test.
     page_metadata / image_metadata are injected into the manifest before the
     single publish_pointer call (review #3: no second publish from facade).
+    ``ctx`` 是最外层生成的 BuildContext（#34）；未传时自行生成一次。
+
+    返回 ``IndexBuildOutcome``（#37）：pointer 发布即 commit point，其后的
+    community report 失效是 post-commit 工作，失败只体现为 pending/warning，
+    不会把已发布的 build 伪装成失败。
     """
+    from obsidian_wiki.application.build_lock import new_build_context
     from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.domain.index_models import IndexBuildOutcome
     from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
     from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
+    # #34：ctx 贯穿 lock metadata、build 目录、manifest、ACTIVE_INDEX pointer 与
+    # 返回 artifact；service 不再独立生成 ID。
+    ctx = ctx or new_build_context()
+    journal = FilesystemPostCommitJournal(Path(index_dir))
     artifact = IndexBuildService(
         LanceDbIndexRepository(index_dir),
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
+        post_commit_journal=journal,
     ).build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
-        page_metadata=page_metadata, image_metadata=image_metadata)
-    _mark_community_reports_stale(Path(index_dir))
-    return artifact
+        page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx)
+    # #37：pointer commit 之后执行 post-commit（可观察、可重试；失败保留 PREPARED）。
+    post_commit_status, warnings = _run_post_commit(Path(index_dir), journal, artifact)
+    # #34：outcome 的 build_id/generation 必须来自 artifact（单一事实来源），
+    # 不再从 manifest 二次解析。
+    return IndexBuildOutcome(
+        artifact=artifact,
+        build_id=artifact.build_id,
+        generation=artifact.generation,
+        published=True,
+        post_commit_status=post_commit_status,
+        warnings=warnings,
+    )
 
 
-def _mark_community_reports_stale(index_dir: Path) -> None:
-    """Mark reports stale after a successful ACTIVE_INDEX publication."""
+def _run_post_commit(index_dir: Path, journal, artifact):
+    """执行 journal 中本 build 的 PREPARED 任务（#37）；失败保留 pending 供 retry_pending 重放。"""
+    from obsidian_wiki.domain.index_models import PostCommitStatus
     from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
 
-    FilesystemCommunityReportStore(index_dir).mark_stale(
-        producer="build_index", reason="index_published"
-    )
+    tasks = [
+        t for t in journal.pending()
+        if t.build_id == artifact.build_id and t.task_type == "community_report_invalidation"
+    ]
+    if not tasks:
+        return PostCommitStatus.COMPLETE, ()
+    try:
+        FilesystemCommunityReportStore(index_dir).mark_stale(
+            producer="build_index", reason="index_published"
+        )
+        for task in tasks:
+            journal.complete(task.task_id)
+        return PostCommitStatus.COMPLETE, ()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "community report 失效失败（post-commit pending，可重试，不影响已发布索引）：%s", exc
+        )
+        return PostCommitStatus.COMMUNITY_REPORT_INVALIDATION_PENDING, (
+            "community report 失效未完成（post-commit pending，可重试）；索引已发布。",
+        )
 
 
 # 仅固定「pyarrow 先于 torch」的导入顺序（ISSUE-16）；torch 已于上方最顶部加载完毕。
@@ -290,20 +331,23 @@ class WikiIndex:
         降级为 warning，禁止用于生产发布。
 
         #21 单写者：整个构建（含 embed 阶段）持有 .index/BUILD.lock，并发构建只有一个写者。
+        #34：最外层 facade 生成一次不可变 BuildContext，贯穿两层锁 metadata、build
+        目录、manifest、ACTIVE_INDEX pointer 与返回 artifact；内层不再独立生成 ID。
         """
-        from obsidian_wiki.application.build_lock import BuildLock
+        from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 
-        lock = BuildLock(self.index_dir)
+        ctx = new_build_context()
+        lock = BuildLock(self.index_dir, ctx=ctx)
         lock.acquire()
         try:
-            self._build(wiki_dir, full_rebuild=full_rebuild,
-                        vector_index_mode=vector_index_mode,
-                        allow_partial_index=allow_partial_index)
+            return self._build(wiki_dir, full_rebuild=full_rebuild,
+                               vector_index_mode=vector_index_mode,
+                               allow_partial_index=allow_partial_index, ctx=ctx)
         finally:
             lock.release()
 
     def _build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
-               allow_partial_index: bool = False):
+               allow_partial_index: bool = False, ctx=None):
         """build() 的锁内主体。"""
         # Keep the long-standing public call signature, but route every actual
         # build through the D-01 service.  #22 incremental/publisher work and
@@ -390,17 +434,19 @@ class WikiIndex:
             for page in self.pages
         ] if self.pages else None
 
-        build_storage_contract(
+        # #34：facade 返回 IndexBuildOutcome（不再是 None），真实 CLI/facade 契约可测。
+        outcome = build_storage_contract(
             Path(wiki_dir), self.index_dir, embed=embed_cached,
             sparse_chunks=canonical_chunks,
             page_metadata=page_metadata,
             image_metadata=source_images if source_images else None,
+            ctx=ctx,
         )
         # #21 review #3: single publication — service publishes once with
         # complete manifest (pages/images injected before publish_pointer).
         self._repository = None
         self._lance_table = None
-        return
+        return outcome
 
     def _mark_preflight_failure(self, exc: Exception) -> None:
         """Keep the fail-fast forensic marker even when chunking fails pre-stage."""
@@ -1268,25 +1314,56 @@ def main():
                    help="向量索引类型（默认 auto：依数据量自适应；评测可强制 exact/ivf-hnsw-flat/sq）")
     p.add_argument("--allow-partial-index", action="store_true",
                    help="实验用：容忍缺页/0-chunk（降级为 warning）。默认关闭 fail-fast，禁止用于生产发布")
+    p.add_argument("--retry-pending", action="store_true",
+                   help="重放 post-commit 任务（#37）：只处理已发布 generation 的 PREPARED intent")
     args = p.parse_args()
     proj = Path(args.project_root)
     wiki = proj / "Wiki"
     idx_dir = proj / ".index"
+
+    if args.retry_pending:
+        from obsidian_wiki.application.post_commit_service import retry_pending
+        from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
+        from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+
+        summary = retry_pending(
+            idx_dir,
+            journal=FilesystemPostCommitJournal(idx_dir),
+            invalidator=FilesystemCommunityReportStore(idx_dir),
+        )
+        print(
+            f"post-commit retry: completed={summary.completed}, "
+            f"still_pending={summary.still_pending}"
+        )
+        return
+
     from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
     model_path = Path(os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or SKILL_EMBEDDER_DIR)
     embedder = SentenceTransformerEmbedder(model_path)
     from obsidian_wiki.application.build_lock import BuildLockHeldError
+    from obsidian_wiki.domain.index_models import PostCommitStatus
     try:
-        artifact = build_storage_contract(wiki, idx_dir, embed=embedder.embed)
+        outcome = build_storage_contract(wiki, idx_dir, embed=embedder.embed)
     except BuildLockHeldError as exc:
         print(f"索引构建被拒：{exc}", file=sys.stderr)
         sys.exit(1)
+    artifact = outcome.artifact
     mode = "全量重建" if args.full_rebuild else "增量"
     print(
         f"索引构建完成（{mode}）: sparse={artifact.sparse_count}, "
         f"dense={artifact.dense_count} → {artifact.lance_dir}"
     )
+    # #37：pending outcome 的 CLI exit code 必须为 0；stderr 输出明确 warning 与 retry action。
+    if outcome.post_commit_status != PostCommitStatus.COMPLETE:
+        print(
+            f"警告：{outcome.warnings[0] if outcome.warnings else 'post-commit 任务待重试'}",
+            file=sys.stderr,
+        )
+        print(
+            "修复：运行 `python build_index.py <project_root> --retry-pending` 重试。",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

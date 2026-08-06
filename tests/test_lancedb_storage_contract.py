@@ -24,6 +24,9 @@ from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E40
     LanceDbIndexRepository,
 )
 from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest  # noqa: E402
+from obsidian_wiki.infrastructure.filesystem_post_commit_journal import (  # noqa: E402
+    FilesystemPostCommitJournal,
+)
 
 
 def _write_page(wiki: Path, body: str) -> None:
@@ -54,7 +57,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
         embed=lambda texts: [[float(len(text)), 1.0] for text in texts],
     )
 
-    db = lancedb.connect(str(artifact.lance_dir))
+    db = lancedb.connect(str(artifact.artifact.lance_dir))
     assert set(db.table_names()) == {"sparse_chunks", "dense_chunks"}
     sparse = db.open_table("sparse_chunks")
     dense = db.open_table("dense_chunks")
@@ -64,7 +67,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     assert dense.count_rows() > 0
     assert "fts_text_idx" in {index.name for index in sparse.list_indices()}
 
-    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
     assert manifest["fts_config"] == {
         "column": "fts_text",
@@ -75,7 +78,50 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
         "ascii_folding": False,
         "max_token_length": 256,
     }
-    assert LanceDbIndexRepository(artifact.lance_dir).search_sparse(long_term)
+    assert LanceDbIndexRepository(artifact.artifact.lance_dir).search_sparse(long_term)
+
+
+def test_real_lancedb_has_no_storage_mutation_after_final_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#36：真实 LanceDB 的 persist + vector-index 写入必须都早于最终 seal。"""
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "# Contract\n\nThe standalone exact token is SEALORDERTERM\n")
+    events: list[str] = []
+    real_persist = LanceDbIndexRepository.persist
+    real_create = LanceDbIndexRepository.create_vector_index
+    real_seal = LanceDbIndexRepository.seal
+
+    def _persist(self, *args, **kwargs):
+        events.append("persist")
+        return real_persist(self, *args, **kwargs)
+
+    def _create(self, *args, **kwargs):
+        events.append("create_vector_index")
+        return real_create(self, *args, **kwargs)
+
+    def _seal(self, *args, **kwargs):
+        events.append("seal")
+        return real_seal(self, *args, **kwargs)
+
+    monkeypatch.setattr(LanceDbIndexRepository, "persist", _persist)
+    monkeypatch.setattr(LanceDbIndexRepository, "create_vector_index", _create)
+    monkeypatch.setattr(LanceDbIndexRepository, "seal", _seal)
+
+    build_storage_contract(
+        wiki,
+        index_dir,
+        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
+    )
+
+    assert "seal" in events
+    final_seal = max(index for index, event in enumerate(events) if event == "seal")
+    final_mutation = max(
+        index for index, event in enumerate(events)
+        if event in {"persist", "create_vector_index"}
+    )
+    assert final_mutation < final_seal, f"storage 在最终 seal 后仍被修改: {events}"
 
 
 def test_legacy_manifest_requires_rebuild(tmp_path: Path) -> None:
@@ -320,7 +366,7 @@ def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path)
         wiki, index_dir, embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
     )
 
-    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
     assert (index_dir / "ACTIVE_INDEX").exists()
     assert manifest["format_version"] >= 4
     assert manifest["validation"]["schema_counts"] == {"sparse_chunks_count": 1, "dense_chunks_count": 1}
@@ -338,6 +384,7 @@ def test_complete_non_promoting_candidate_publishes_exact_policy(tmp_path: Path)
         LanceDbIndexRepository(index_dir),
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
+        post_commit_journal=FilesystemPostCommitJournal(index_dir),
         benchmark_observer=lambda _stats: BenchmarkObservation(
             recall_at_10=0.9, recall_at_20=1.0, latency_p50_ms=1.0,
             latency_p95_ms=2.0, build_time_ms=3.0, disk_bytes=4,
