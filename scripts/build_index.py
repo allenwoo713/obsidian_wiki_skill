@@ -60,12 +60,35 @@ from models import (
 import chunking
 from chunking import (chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer,
                       ChunkBuildError, count_token_ids)
+from chunk_plan import chunk_records_to_sparse, plan_sparse_chunks
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
 
 def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
-                           page_metadata=None, image_metadata=None, ctx=None):
+                           page_metadata=None, image_metadata=None, ctx=None,
+                           tokenizer=None, lexicon=None):
+    """Direct-script facade for the D-01/D-04 storage-contract build path.
+
+    The public script remains the entry point while orchestration and storage are
+    delegated to their package tiers.  ``embed`` is injected so the persisted
+    tracer can exercise real LanceDB without loading a model in its tiny test.
+    page_metadata / image_metadata are injected into the manifest before the
+    single publish_pointer call (review #3: no second publish from facade).
+    ``ctx`` is the outermost BuildContext (#34); generated once if omitted.
+
+    Issue #39: when ``tokenizer`` (a ``callable[[str], int]``) is supplied, the
+    chunk plan is produced with the tokenizer-aware ``plan_sparse_chunks`` so
+    large pages are split into token-bounded dense leaves instead of stored as
+    one whole-page dense chunk. ``sparse_chunks`` passed by the caller wins;
+    otherwise the plan is computed here (the ``main()`` production path). The
+    tokenizer-less ``sparse_chunks=None`` path keeps the legacy whole-page plan
+    for callers/tests that do not inject a tokenizer.
+
+    Returns ``IndexBuildOutcome`` (#37): the pointer publish is the commit point;
+    subsequent community-report invalidation is post-commit work whose failure
+    only surfaces as pending/warning and never masks an already-published build.
+    """
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -89,6 +112,15 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
     # #34：ctx 贯穿 lock metadata、build 目录、manifest、ACTIVE_INDEX pointer 与
     # 返回 artifact；service 不再独立生成 ID。
     ctx = ctx or new_build_context()
+    # Issue #39：tokenizer 注入时在此预计算 token 有界 chunk 计划（large doc 不再
+    # 整页存为单个 dense 块）。sparse_chunks 调用方显式传入时优先。
+    if sparse_chunks is None and tokenizer is not None:
+        project_root = Path(wiki_dir).parent
+        sparse_chunks = plan_sparse_chunks(
+            Path(wiki_dir), project_root,
+            tokenizer=tokenizer,
+            lexicon=lexicon if lexicon is not None else load_lexicon(project_root),
+        )
     journal = FilesystemPostCommitJournal(Path(index_dir))
     artifact = IndexBuildService(
         LanceDbIndexRepository(index_dir),
@@ -401,19 +433,8 @@ class WikiIndex:
                     continue
                 self._mark_preflight_failure(RuntimeError(message))
                 raise ChunkBuildError(message)
-            for record in records:
-                canonical_chunks.append(SparseChunk(
-                    chunk_id=record.chunk_id, page_id=record.page_id, path=str(record.path),
-                    title=record.title, text=record.text,
-                    fts_text=" ".join(fts_terms(record.text, self._lexicon) + extract_exact_terms(record.text)),
-                    page_type=record.page_type,
-                    section_path=json.dumps(record.section_path, ensure_ascii=False),
-                    heading=record.heading, chunk_kind=record.chunk_kind,
-                    chunk_index=record.chunk_index, parent_section_id=record.parent_section_id or "",
-                    token_count=record.token_count, content_hash=record.content_hash,
-                    forced_split=record.forced_split, continuation_index=record.continuation_index,
-                    start_char=record.start_char, end_char=record.end_char,
-                ))
+            # issue #39：复用共享映射，避免与 build_storage_contract 路径重复分块逻辑。
+            canonical_chunks.extend(chunk_records_to_sparse(records, self._lexicon))
         dense_sources = [chunk for chunk in canonical_chunks if chunk.chunk_kind == "dense"]
         vectors_by_position = self._cached_dense_vectors(
             dense_sources, embedder, full_rebuild=full_rebuild
@@ -1343,8 +1364,14 @@ def main():
     embedder = SentenceTransformerEmbedder(model_path)
     from obsidian_wiki.application.build_lock import BuildLockHeldError
     from obsidian_wiki.domain.index_models import PostCommitStatus
+    # issue #39：注入真实 embedding tokenizer + lexicon，使 build_storage_contract
+    # 走 token 有界分块（大文档切片而非整页被模型 128-token 截断）。
+    tokenizer = EmbeddingTokenizer(getattr(embedder, "tokenizer", None)).count
+    lexicon = load_lexicon(proj)
     try:
-        outcome = build_storage_contract(wiki, idx_dir, embed=embedder.embed)
+        outcome = build_storage_contract(
+            wiki, idx_dir, embed=embedder.embed, tokenizer=tokenizer, lexicon=lexicon,
+        )
     except BuildLockHeldError as exc:
         print(f"索引构建被拒：{exc}", file=sys.stderr)
         sys.exit(1)

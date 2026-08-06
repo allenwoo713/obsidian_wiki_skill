@@ -71,7 +71,8 @@ jobs:
           tests/test_index_durability.py
           tests/test_index_post_commit.py
           tests/test_test_suite_integrity.py
-          tests/test_community_report_publication.py -q
+          tests/test_community_report_publication.py
+          tests/test_index_chunking_contract.py -q
       - name: Unit tests
         run: |
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider --basetemp=.review-tmp/pytest
