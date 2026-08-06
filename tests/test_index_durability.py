@@ -2,7 +2,9 @@
 
 - 短写：``os.write`` 每次只写部分字节，最终文件必须逐字节等于完整 payload。
 - pre-replace 失败：tmp 写入/fsync 失败 → target 保持原字节（旧指针保留）。
-- CommitUncertain：replace 成功但目录同步失败 → publish 读回验证新 pointer 后视为已发布。
+- CommitUncertain：replace 成功但目录同步失败 → 必须返回非成功，禁止用缓存读回冒充耐久确认。
+- storage seal：任一存储文件无法打开/fsync 都必须使发布失败。
+- Windows：MoveFileExW 必须使用 REPLACE_EXISTING | WRITE_THROUGH 并传播失败。
 """
 import hashlib
 import json
@@ -23,6 +25,7 @@ from obsidian_wiki.application.active_index_pointer import (  # noqa: E402
 )
 from obsidian_wiki.application.durable_filesystem import (  # noqa: E402
     CommitUncertainError,
+    _replace_win,
     atomic_write_bytes,
 )
 from obsidian_wiki.domain.index_publication_models import (  # noqa: E402
@@ -108,8 +111,8 @@ def test_atomic_write_short_write_failure_propagates(tmp_path, monkeypatch):
     assert not target.exists()
 
 
-def test_publish_commit_uncertain_reconciles_new_pointer(tmp_path, monkeypatch):
-    """#36：replace 成功但目录同步失败（CommitUncertain）→ publish 读回验证后视为已发布。"""
+def test_publish_directory_fsync_failure_is_not_success(tmp_path, monkeypatch):
+    """#36：replace 后目录 fsync 失败必须是非成功，缓存读回不是耐久证据。"""
     import obsidian_wiki.application.durable_filesystem as df
 
     idx = tmp_path / ".index"
@@ -123,10 +126,54 @@ def test_publish_commit_uncertain_reconciles_new_pointer(tmp_path, monkeypatch):
         raise OSError("dir fsync failed")
 
     monkeypatch.setattr(df, "_fsync_dir", _boom_fsync_dir)
-    # 发布不应抛错：CommitUncertain 后读回验证新 pointer 有效 → 视为已发布（reconciliation）
-    publish_pointer(idx, build, generation=1, build_id=build_id)
+    with pytest.raises(CommitUncertainError, match="目录同步失败|dir fsync failed"):
+        publish_pointer(idx, build, generation=1, build_id=build_id)
     assert calls, "目录 fsync 应被调用（并失败）"
-    assert (idx / POINTER_NAME).is_file()
-    assert resolve_active_lance_dir(idx) == build / "lance_db"
+    # replace 可能已发生，但调用方绝不能收到成功；生命周期也不能伪装成 PUBLISHED。
+    assert (idx / POINTER_NAME).is_file(), "commit-uncertain 允许新 pointer 已可见"
     record = read_generation_record(build)
-    assert record is not None and record.state == GenerationState.PUBLISHED
+    assert record is not None and record.state == GenerationState.VALIDATED
+
+
+def test_storage_seal_propagates_file_open_failure(tmp_path, monkeypatch):
+    """#36：seal 不能跳过打不开的存储文件，否则发布物不在已证明的耐久边界内。"""
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    lance_dir = tmp_path / "lance_db"
+    lance_dir.mkdir()
+    data_file = lance_dir / "data.lance"
+    data_file.write_bytes(b"storage")
+    real_open = os.open
+
+    def _open(path, flags, *args):
+        if Path(path) == data_file:
+            raise PermissionError("simulated sharing violation")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", _open)
+    with pytest.raises(PermissionError, match="sharing violation"):
+        LanceDbIndexRepository(lance_dir).seal(lance_dir)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MoveFileExW contract")
+def test_windows_replace_uses_write_through_and_propagates_failure(tmp_path, monkeypatch):
+    """#36：Windows 原子替换必须携带 WRITE_THROUGH，系统调用失败必须上抛。"""
+    import ctypes
+    from types import SimpleNamespace
+
+    observed: dict[str, object] = {}
+
+    def _move_file(source, target, flags):
+        observed.update(source=source, target=target, flags=flags)
+        return 0
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(MoveFileExW=_move_file)),
+    )
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+
+    with pytest.raises(OSError, match="MoveFileExW failed"):
+        _replace_win(tmp_path / "source", tmp_path / "target")
+    assert observed["flags"] == 0x1 | 0x8

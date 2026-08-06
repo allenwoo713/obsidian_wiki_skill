@@ -126,6 +126,18 @@ def _wait_file(path: Path, timeout: float = 25.0) -> None:
     raise AssertionError(f"timeout waiting {path}")
 
 
+def _wait_glob_count(directory: Path, pattern: str, count: int, timeout: float = 25.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(list(directory.glob(pattern))) >= count:
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        f"timeout waiting for {count} files matching {directory / pattern}; "
+        f"found {sorted(path.name for path in directory.glob(pattern))}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1) #34 owner-scoped 单写者构建锁（BUILD.lock 稳定 pathname）
 # ---------------------------------------------------------------------------
@@ -209,6 +221,9 @@ def test_concurrent_processes_one_writer(tmp_path):
     """barrier 控制的两个独立进程同时竞争同一项目：恰好一个 writer。"""
     idx = _index(tmp_path)
     go = tmp_path / "go"
+    release = tmp_path / "release"
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
     results_dir = tmp_path / "results"
     results_dir.mkdir()
     scripts_dir = REPO_ROOT / "scripts"
@@ -220,17 +235,22 @@ def test_concurrent_processes_one_writer(tmp_path):
         "from obsidian_wiki.domain.index_models import BuildContext\n"
         f"idx = Path({json.dumps(str(idx))})\n"
         f"go = Path({json.dumps(str(go))})\n"
+        f"release = Path({json.dumps(str(release))})\n"
+        f"ready = Path({json.dumps(str(ready_dir))})\n"
         f"results = Path({json.dumps(str(results_dir))})\n"
+        "pid = os.getpid()\n"
+        "(ready / f'ready_{pid}').write_text('ready', encoding='utf-8')\n"
         "for _ in range(200):\n"
         "    if go.exists(): break\n"
         "    time.sleep(0.05)\n"
-        "pid = os.getpid()\n"
         "ctx = BuildContext(build_id='proc', started_at='t', owner_nonce=f'{socket.gethostname()}:{pid}:{threading.get_ident()}:{uuid.uuid4().hex}')\n"
         "try:\n"
         "    lock = BuildLock(idx, ctx=ctx)\n"
         "    lock.acquire(wait=False)\n"
         "    (results / f'acquired_{pid}').write_text('ok', encoding='utf-8')\n"
-        "    time.sleep(1.0)\n"
+        "    for _ in range(400):\n"
+        "        if release.exists(): break\n"
+        "        time.sleep(0.05)\n"
         "    lock.release()\n"
         "except BuildLockHeldError:\n"
         "    (results / f'blocked_{pid}').write_text('blocked', encoding='utf-8')\n"
@@ -238,8 +258,10 @@ def test_concurrent_processes_one_writer(tmp_path):
     p1 = subprocess.Popen([sys.executable, "-c", code], cwd=REPO_ROOT)
     p2 = subprocess.Popen([sys.executable, "-c", code], cwd=REPO_ROOT)
     try:
-        time.sleep(0.6)  # 等两个进程就绪
+        _wait_glob_count(ready_dir, "ready_*", 2)
         go.write_text("go", encoding="utf-8")
+        _wait_glob_count(results_dir, "*", 2)
+        release.write_text("release", encoding="utf-8")
         p1.wait(timeout=20)
         p2.wait(timeout=20)
     finally:
@@ -247,6 +269,8 @@ def test_concurrent_processes_one_writer(tmp_path):
             if p.poll() is None:
                 p.kill()
                 p.wait(timeout=5)
+    assert p1.returncode == 0, f"p1 exit code={p1.returncode}"
+    assert p2.returncode == 0, f"p2 exit code={p2.returncode}"
     acquired = list(results_dir.glob("acquired_*"))
     blocked = list(results_dir.glob("blocked_*"))
     assert len(acquired) == 1, f"恰好一个进程获取锁，got acquired={len(acquired)} blocked={len(blocked)}"
@@ -259,7 +283,7 @@ def test_os_lock_held_blocks_reclaim_even_with_corrupt_metadata(tmp_path):
     ready = tmp_path / "ready"
     scripts_dir = REPO_ROOT / "scripts"
     code = (
-        "import sys, time, threading, socket, uuid\n"
+        "import sys, time, threading, socket, uuid, os\n"
         f"sys.path.insert(0, {json.dumps(str(scripts_dir))})\n"
         "from pathlib import Path\n"
         "from obsidian_wiki.application.build_lock import BuildLock\n"
@@ -278,6 +302,7 @@ def test_os_lock_held_blocks_reclaim_even_with_corrupt_metadata(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=10)
+    assert proc.returncode is not None and proc.returncode != 0
 
 
 def test_foreign_host_metadata_reclaimable_when_os_unlocked(tmp_path):
@@ -424,6 +449,7 @@ def test_killed_holder_allows_reacquire_same_pathname(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+    assert proc.returncode is not None and proc.returncode != 0
     # OS lock 随进程终止自动释放；同一稳定 pathname 可重新获取
     lock = BuildLock(idx, ctx=_ctx("after-kill"))
     lock.acquire()
@@ -485,6 +511,7 @@ def test_build_context_flows_through_service_build(tmp_path):
     lancedb = pytest.importorskip("lancedb")  # CI architecture job 已安装
     from obsidian_wiki.application.index_build_service import IndexBuildService
     from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
     from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
     wiki = tmp_path / "Wiki"
@@ -500,6 +527,7 @@ def test_build_context_flows_through_service_build(tmp_path):
         LanceDbIndexRepository(index_dir),
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
+        post_commit_journal=FilesystemPostCommitJournal(index_dir),
     ).build(wiki, index_dir, embed=embed, ctx=ctx)
 
     lock_data = json.loads((index_dir / LOCK_NAME).read_text(encoding="utf-8"))
