@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from obsidian_wiki.domain.index_publication_models import GenerationRecord, GenerationState
-from obsidian_wiki.infrastructure.durable_filesystem import atomic_write_bytes
+from obsidian_wiki.application.durable_filesystem import atomic_write_bytes
 
 log = logging.getLogger(__name__)
 

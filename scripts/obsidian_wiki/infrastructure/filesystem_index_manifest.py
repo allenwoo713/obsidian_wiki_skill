@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Mapping
 
-from obsidian_wiki.infrastructure.durable_filesystem import atomic_write_bytes
+from obsidian_wiki.application.durable_filesystem import atomic_write_bytes
 
 
 class FilesystemIndexManifest:
