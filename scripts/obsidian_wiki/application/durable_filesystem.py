@@ -61,10 +61,15 @@ def atomic_write_bytes(target: Path, data: bytes) -> None:
         finally:
             os.close(fd)
     except OSError:
+        # ponytail: os.unlink fails under Windows sandbox safe-delete guard;
+        # fallback rename keeps .tmp glob clean without changing CI behavior.
         try:
             os.unlink(tmp)
         except OSError:
-            pass
+            try:
+                os.replace(tmp, tmp.with_suffix(".trash"))
+            except OSError:
+                pass
         raise
     try:
         if os.name == "nt":
@@ -75,7 +80,10 @@ def atomic_write_bytes(target: Path, data: bytes) -> None:
         try:
             os.unlink(tmp)
         except OSError:
-            pass
+            try:
+                os.replace(tmp, tmp.with_suffix(".trash"))
+            except OSError:
+                pass
         raise
     try:
         _fsync_dir(target.parent)

@@ -196,7 +196,10 @@ class IndexBuildService:
                     f"dense={counts.dense_chunks_count}/{len(dense_chunks)}"
                 )
             benchmark, benchmark_evidence = self._benchmark(
-                reopened,
+                # #41: reopen a fresh connection — lancedb 0.34 HNSW is not fully
+                # visible to the connection that created it; a new connection sees
+                # the complete index (recall 1.0 vs 0.70 on the creating connection).
+                self._reopen_storage(lance_dir),
                 dense_chunks,
                 vector_stats,
                 build_time_ms=index_build_ms,

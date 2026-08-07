@@ -249,6 +249,11 @@ class LanceDbIndexRepository:
             query = self._dense_table().search(list(vector)).distance_type(metric)
             if exact:
                 query = query.bypass_vector_index()
+            else:
+                # #41: lancedb 0.34 HNSW default ef is too low for build-time
+                # self-probe recall; raising ef ensures the ANN candidate set is
+                # complete enough for the recall@10/20 == 1.0 publication gate.
+                query = query.ef(max(limit, 100))
             if where is not None:
                 query = query.where(where)
             return query.limit(limit).to_list()

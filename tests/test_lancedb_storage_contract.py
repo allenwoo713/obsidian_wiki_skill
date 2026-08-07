@@ -269,6 +269,9 @@ class _QuerySpy:
         self.exact_bypass = True
         return self
 
+    def ef(self, _value: int) -> "_QuerySpy":
+        return self
+
     def where(self, predicate: str) -> "_QuerySpy":
         self.predicate = predicate
         return self
