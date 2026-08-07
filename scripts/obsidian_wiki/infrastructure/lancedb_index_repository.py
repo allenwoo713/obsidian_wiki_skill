@@ -250,10 +250,12 @@ class LanceDbIndexRepository:
             if exact:
                 query = query.bypass_vector_index()
             else:
-                # #41: lancedb 0.34 HNSW default ef is too low for build-time
-                # self-probe recall; raising ef ensures the ANN candidate set is
-                # complete enough for the recall@10/20 == 1.0 publication gate.
-                query = query.ef(max(limit, 100))
+                # #41: lancedb 0.34 HNSW default ef (=1.5*limit) is too low for
+                # build-time self-probe recall (recall@10/20 == 1.0 gate). Floor
+                # ef at 100; but never go BELOW lancedb's own default (1.5*limit),
+                # since large-k production queries (e.g. limit=80) would otherwise
+                # regress from ef=120 to 100. Floor = max(100, ceil(1.5*limit)).
+                query = query.ef(max(100, (limit * 3 + 1) // 2))
             if where is not None:
                 query = query.where(where)
             return query.limit(limit).to_list()

@@ -260,6 +260,7 @@ class _QuerySpy:
         self.metric = None
         self.predicate = None
         self.result_limit = None
+        self.ef_value = None
 
     def distance_type(self, metric: str) -> "_QuerySpy":
         self.metric = metric
@@ -269,7 +270,8 @@ class _QuerySpy:
         self.exact_bypass = True
         return self
 
-    def ef(self, _value: int) -> "_QuerySpy":
+    def ef(self, value: int) -> "_QuerySpy":
+        self.ef_value = value
         return self
 
     def where(self, predicate: str) -> "_QuerySpy":
@@ -341,6 +343,41 @@ def test_candidate_hnsw_and_exact_bypass_stay_in_adapter(monkeypatch: pytest.Mon
     assert table.queries[0].metric == table.queries[1].metric == "cosine"
     assert table.queries[0].predicate == table.queries[1].predicate == "page_id = 'safe'"
     assert table.queries[0].result_limit == table.queries[1].result_limit == 20
+    # #41: ef value must be set explicitly (was never below lancedb default 1.5*limit,
+    # and floored at 100 for small k). limit=20 -> max(100, ceil(1.5*20)=30) = 100.
+    assert table.queries[0].ef_value == 100
+    assert table.queries[1].ef_value is None  # exact path bypasses ef
+
+
+def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Large-k production queries (e.g. limit=80) must keep ef == lancedb default.
+
+    lancedb 0.34 uses ef = 1.5*limit by default (=120 for limit=80). A naive
+    `.ef(max(limit, 100))` would have LOWERED this to 100, silently regressing
+    recall on the daily search path. The floor must be max(100, ceil(1.5*limit)).
+    """
+    table = _DenseTableSpy()
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+    config = VectorIndexConfig(
+        index_type="hnsw_flat", metric="cosine", num_partitions=2,
+        m=16, ef_construction=300, dense_chunks_count=20,
+    )
+    repository.create_vector_index(config)
+
+    # limit=80 -> max(100, ceil(1.5*80)=120) = 120 (matches lancedb default)
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=80)
+    assert table.queries[-1].ef_value == 120
+
+    # limit=20 -> max(100, ceil(1.5*20)=30) = 100 (floored, above default)
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
+    assert table.queries[-1].ef_value == 100
+
+    # limit=200 -> max(100, ceil(1.5*200)=300) = 300 (follows default, above floor)
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=200)
+    assert table.queries[-1].ef_value == 300
 
 
 def test_adapter_rejects_duplicate_or_nonfinite_dense_vectors(tmp_path: Path) -> None:
