@@ -60,7 +60,11 @@ from models import (
 import chunking
 from chunking import (chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer,
                       ChunkBuildError, count_token_ids)
-from chunk_plan import chunk_records_to_sparse, plan_sparse_chunks
+from chunk_plan import (
+    chunk_records_to_sparse,
+    page_metadata_from_pages,
+    plan_sparse_chunks,
+)
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 
@@ -112,15 +116,26 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
     # #34：ctx 贯穿 lock metadata、build 目录、manifest、ACTIVE_INDEX pointer 与
     # 返回 artifact；service 不再独立生成 ID。
     ctx = ctx or new_build_context()
-    # Issue #39：tokenizer 注入时在此预计算 token 有界 chunk 计划（large doc 不再
-    # 整页存为单个 dense 块）。sparse_chunks 调用方显式传入时优先。
+    # Issue #39 (review)：tokenizer 注入时不再在此预计算 chunk 计划。分块必须在
+    # BUILD.lock 持锁后、针对已加锁的 Wiki 快照执行（防止对并发写入中的快照分块），
+    # 因此把 planner 作为回调下沉到 service._build（持锁区）内运行。planner 同时
+    # 返回 canonical pages，用于生成「每源文件一逻辑页 + 全文件 SHA-256」的 manifest
+    # 元数据（不再每 chunk 一行）。sparse_chunks 调用方显式传入时优先。
+    plan_provider = None
     if sparse_chunks is None and tokenizer is not None:
         project_root = Path(wiki_dir).parent
-        sparse_chunks = plan_sparse_chunks(
-            Path(wiki_dir), project_root,
-            tokenizer=tokenizer,
-            lexicon=lexicon if lexicon is not None else load_lexicon(project_root),
-        )
+        resolved_lexicon = lexicon if lexicon is not None else load_lexicon(project_root)
+
+        def plan_provider(wiki_snapshot: Path):
+            import build_index as _self  # 模块级符号，供测试 monkeypatch plan_sparse_chunks
+            chunks = _self.plan_sparse_chunks(
+                Path(wiki_snapshot), project_root,
+                tokenizer=tokenizer, lexicon=resolved_lexicon,
+            )
+            # manifest：每 canonical 源文件一逻辑页（全文件 SHA-256），与 chunks 同一快照。
+            pages = _self.scan_wiki(Path(wiki_snapshot), project_root)
+            return chunks, page_metadata_from_pages(pages)
+
     journal = FilesystemPostCommitJournal(Path(index_dir))
     artifact = IndexBuildService(
         LanceDbIndexRepository(index_dir),
@@ -129,7 +144,8 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
         post_commit_journal=journal,
     ).build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
-        page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx)
+        page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx,
+        plan_provider=plan_provider)
     # #37：pointer commit 之后执行 post-commit（可观察、可重试；失败保留 PREPARED）。
     post_commit_status, warnings = _run_post_commit(Path(index_dir), journal, artifact)
     # #34：outcome 的 build_id/generation 必须来自 artifact（单一事实来源），
@@ -220,7 +236,10 @@ def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
     fm = yaml.safe_load(fm_text) or {}
     links = [l.strip() for l in _LINK_RE.findall(body)]
     import hashlib
-    sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    # #39 (review)：page 身份哈希必须锚定磁盘原始字节，而非 read_text 归一化后的
+    # 文本（Windows 上 read_text 会把 CRLF 折成 LF，再 encode 会丢 \r，导致同一
+    # 文件产生与 sha256(read_bytes()) 不一致的指纹）。用原始字节保证可复现、跨平台。
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
     sources = fm.get("sources", []) or []
     if isinstance(sources, str):
         sources = [sources]

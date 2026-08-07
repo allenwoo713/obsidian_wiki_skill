@@ -6,17 +6,27 @@ tokenizer-aware ``chunk_page`` from ``chunking`` plus the ``fts_text``
 assembly from ``lexical_tokenizer`` so the two build paths stop diverging
 (the divergence stored every page as one whole-page dense chunk, truncating
 large docs at the embedding model's 128-token window).
+
+Issue #39 review findings:
+
+* Planning MUST accept/reject pages exactly like ``WikiIndex`` — i.e. through
+  the canonical ``scan_wiki`` / ``parse_wiki_page`` front-matter parser — so a
+  file without valid front matter is skipped, not turned into a hard error.
+* The manifest must carry one logical page per canonical source (with the
+  full-file SHA-256), not one row per chunk. ``plan_pages_and_chunks`` returns
+  the canonical ``WikiPage`` list alongside the chunks so the orchestration
+  layer can build page metadata from the same snapshot it chunked.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Sequence, Tuple
 
 import chunking
 from chunking import ChunkBuildError, chunk_page
-from lexical_tokenizer import extract_exact_terms, fts_terms, load_lexicon
+from lexical_tokenizer import extract_exact_terms, fts_terms
+from models import WikiPage
 from obsidian_wiki.domain.index_models import SparseChunk
 
 
@@ -39,44 +49,84 @@ def chunk_records_to_sparse(records: Sequence[chunking.ChunkRecord], lexicon) ->
     return chunks
 
 
-def plan_sparse_chunks(wiki_dir: Path, project_root: Path, *, tokenizer, lexicon) -> tuple[SparseChunk, ...]:
-    """Token-bounded sparse+dense plan for every canonical .md under ``wiki_dir``.
+def _chunks_for_page(page: WikiPage, *, tokenizer, lexicon) -> List[SparseChunk]:
+    """Token-bounded sparse+dense chunks for a single canonical page."""
+    page_id = str(Path(page.path).resolve())
+    body = (page.content or "").strip()
+    if not body:
+        return []
+    try:
+        records = list(chunk_page(
+            page_id=page_id, path=Path(page.path), title=page.title,
+            page_type=page.page_type, content=body, tokenizer=tokenizer,
+        ))
+    except Exception as exc:  # pragma: no cover - defensive wrap
+        raise ChunkBuildError(
+            f"chunk_page 失败: page_id={page_id}, path={page.path}"
+        ) from exc
+    kinds = {r.chunk_kind for r in records}
+    if not records or kinds != {"dense", "sparse"}:
+        raise ChunkBuildError(
+            f"索引完整性校验失败：非空页面 {page_id} 的 retrieval kinds="
+            f"{sorted(kinds)}，期望 ['dense', 'sparse']"
+        )
+    return chunk_records_to_sparse(records, lexicon)
+
+
+def plan_pages_and_chunks(
+    wiki_dir: Path, project_root: Path, *, tokenizer, lexicon
+) -> Tuple[Tuple[WikiPage, ...], Tuple[SparseChunk, ...]]:
+    """Canonical pages + token-bounded plan from the *same* Wiki snapshot.
+
+    Pages are parsed through ``scan_wiki`` (the canonical ``parse_wiki_page``
+    front-matter contract) so acceptance/rejection and title/type/body
+    semantics match ``WikiIndex`` exactly. Files without valid front matter are
+    skipped, not treated as hard chunking errors.
+
+    Returns ``(pages, chunks)`` where ``pages`` has one entry per canonical
+    source file (each carries the full-file ``sha256``) and ``chunks`` is the
+    flattened token-bounded sparse+dense plan for those pages.
+    """
+    # Imported lazily to avoid a build_index <-> chunk_plan import cycle.
+    from build_index import scan_wiki
+
+    pages = tuple(scan_wiki(Path(wiki_dir), Path(project_root)))
+    chunks: List[SparseChunk] = []
+    for page in pages:
+        chunks.extend(_chunks_for_page(page, tokenizer=tokenizer, lexicon=lexicon))
+    return pages, tuple(chunks)
+
+
+def plan_sparse_chunks(wiki_dir: Path, project_root: Path, *, tokenizer, lexicon) -> Tuple[SparseChunk, ...]:
+    """Token-bounded sparse+dense plan for every canonical page under ``wiki_dir``.
 
     ``tokenizer`` is ``callable[[str], int]`` (e.g. ``EmbeddingTokenizer(...).count``).
     Dense leaves are bounded by ``chunking.DENSE_HARD_MAX_TOKENS`` in tokenizer
-    units, so large docs are split instead of embedded only at their head.
+    units, so large docs are split instead of embedded only at their head. Pages
+    are accepted/rejected through the canonical ``scan_wiki`` parser.
     """
-    chunks: List[SparseChunk] = []
-    for path in sorted(Path(wiki_dir).rglob("*.md")):
-        if ".graph" in path.parts:
-            continue
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        front_matter, body = ("", raw.strip())
-        if raw.startswith("---"):
-            parts = raw.split("---", 2)
-            front_matter, body = parts[1], parts[-1].strip()
-        if not body:
-            continue
-        title = path.stem
-        page_type = "concept"
-        for line in front_matter.splitlines():
-            if line.startswith("title:"):
-                title = line.partition(":")[2].strip().strip("\"'") or title
-            elif line.startswith("type:"):
-                page_type = line.partition(":")[2].strip().strip("\"'") or "concept"
-        page_id = str(path.resolve())
-        try:
-            records = list(chunk_page(
-                page_id=page_id, path=path, title=title, page_type=page_type,
-                content=body, tokenizer=tokenizer,
-            ))
-        except Exception as exc:
-            raise ChunkBuildError(f"chunk_page 失败: page_id={page_id}, path={path}") from exc
-        kinds = {r.chunk_kind for r in records}
-        if body.strip() and (not records or kinds != {"dense", "sparse"}):
-            raise ChunkBuildError(
-                f"索引完整性校验失败：非空页面 {page_id} 的 retrieval kinds="
-                f"{sorted(kinds)}，期望 ['dense', 'sparse']"
-            )
-        chunks.extend(chunk_records_to_sparse(records, lexicon))
-    return tuple(chunks)
+    _pages, chunks = plan_pages_and_chunks(
+        wiki_dir, project_root, tokenizer=tokenizer, lexicon=lexicon
+    )
+    return chunks
+
+
+def page_metadata_from_pages(pages: Sequence[WikiPage]) -> List[dict]:
+    """One manifest page entry per canonical source (full-file SHA-256).
+
+    Mirrors the ``WikiIndex`` page metadata contract so both build paths write
+    identical logical-page manifests (one row per source, not per chunk).
+    """
+    return [
+        {
+            "page_id": str(Path(page.path).resolve()),
+            "path": str(page.path),
+            "title": page.title,
+            "page_type": page.page_type,
+            "sources": list(page.sources),
+            "links": list(page.links),
+            "aliases": list(page.aliases),
+            "sha256": page.sha256,
+        }
+        for page in pages
+    ]
