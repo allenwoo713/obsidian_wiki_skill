@@ -62,7 +62,12 @@ jobs:
       - name: Bootstrap local embedding model
         run: |
           python scripts/download_embedding_model.py
-      - name: Run publication safety acceptance gates
+      - name: Run #39 production CLI real-model tail-recall gate
+        run: >
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/chunking-real-model
+          tests/test_index_chunking_eval_contract.py -q
+      - name: Run publication and model-free chunking acceptance gates
         run: >
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
           --basetemp=.review-tmp/publication-acceptance
