@@ -237,6 +237,11 @@ class VectorPolicyDecision(_JsonRecord):
     reason: str
     benchmark: BenchmarkObservation
     index_stats: IndexStats
+    # #41：policy 必须复述 benchmark evidence 的采样口径，禁止 v4-shaped record
+    # 静默携带 sampled 语义。evidence 缺失的调用方（旧两参签名）保持空默认。
+    benchmark_scope: str = ""
+    benchmark_probe_count: int = 0
+    benchmark_probe_total: int = 0
 
 
 @dataclass(frozen=True)
