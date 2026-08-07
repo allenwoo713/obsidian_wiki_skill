@@ -121,7 +121,7 @@ jobs:
             eval/detail.jsonl
 
   issue41-scale-benchmark:
-    name: Issue #41 scale benchmark (77,348 x 384)
+    name: "Issue #41 scale benchmark (77,348 x 384)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
