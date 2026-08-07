@@ -39,6 +39,10 @@ from obsidian_wiki.ports.post_commit import PostCommitJournal
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 BenchmarkObserver = Callable[[IndexStats], BenchmarkObservation]
+# #39 (review)：持锁后运行的分块回调，返回 (sparse_chunks, page_metadata)。
+PlanProvider = Callable[
+    [Path], tuple[Sequence["SparseChunk"], "list[dict] | None"]
+]
 
 
 class IndexBuildService:
@@ -70,10 +74,16 @@ class IndexBuildService:
         page_metadata: list[dict] | None = None,
         image_metadata: list[dict] | None = None,
         ctx: BuildContext | None = None,
+        plan_provider: PlanProvider | None = None,
     ) -> StorageArtifact:
         """#21/#34 单写者构建：最外层传入或创建一次 BuildContext，锁 metadata、
         build 目录、manifest、pointer 与返回 artifact 共用同一个 build_id；
-        service 不再独立生成 ID。"""
+        service 不再独立生成 ID。
+
+        #39 (review)：``plan_provider`` 是持锁后运行的分块回调
+        ``(wiki_dir) -> (sparse_chunks, page_metadata)``。分块必须在 BUILD.lock
+        获取之后、针对已加锁的 Wiki 快照执行；调用方传入的 ``sparse_chunks``
+        （显式计划）仍然优先。"""
         ctx = ctx or new_build_context()
         lock = BuildLock(index_dir, ctx=ctx)
         lock.acquire()
@@ -82,6 +92,7 @@ class IndexBuildService:
                 wiki_dir, index_dir, embed=embed,
                 sparse_chunks=sparse_chunks, ctx=ctx,
                 page_metadata=page_metadata, image_metadata=image_metadata,
+                plan_provider=plan_provider,
             )
         finally:
             lock.release()
@@ -91,7 +102,14 @@ class IndexBuildService:
         sparse_chunks: Sequence[SparseChunk] | None = None, ctx: BuildContext | None = None,
         page_metadata: list[dict] | None = None,
         image_metadata: list[dict] | None = None,
+        plan_provider: PlanProvider | None = None,
     ) -> StorageArtifact:
+        # #39 (review)：持锁后再分块。显式 sparse_chunks > plan_provider > 回退整页 plan。
+        if sparse_chunks is None and plan_provider is not None:
+            planned_chunks, planned_pages = plan_provider(wiki_dir)
+            sparse_chunks = planned_chunks
+            if page_metadata is None and planned_pages is not None:
+                page_metadata = planned_pages
         sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
             raise RuntimeError("No canonical Wiki Markdown pages were available to index")
