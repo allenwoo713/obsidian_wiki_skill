@@ -43,6 +43,9 @@ BenchmarkObserver = Callable[[IndexStats], BenchmarkObservation]
 PlanProvider = Callable[
     [Path], tuple[Sequence["SparseChunk"], "list[dict] | None"]
 ]
+# #41：构建期 ANN 自检的最大 probe 数。recall 语义从「全量最小」变为
+# 「bottom-k SHA-256 样本最小」；evidence 与 policy 必须自证该口径。
+BENCHMARK_MAX_PROBES = 256
 
 
 class IndexBuildService:
@@ -57,16 +60,30 @@ class IndexBuildService:
         post_commit_journal: PostCommitJournal,
         fts_config: FtsIndexConfig | None = None,
         benchmark_observer: BenchmarkObserver | None = None,
+        benchmark_max_probes: int = BENCHMARK_MAX_PROBES,
     ):
         """#37：``post_commit_journal`` 为必填依赖——每个发布路径都必须在 pointer
         commit 前 durable prepare 失效 intent；不需要 invalidation 的调用方必须显式
-        注入 deliberate no-op port，遗漏绝不能静默禁用契约。"""
+        注入 deliberate no-op port，遗漏绝不能静默禁用契约。
+
+        #41：``benchmark_max_probes`` 在 storage mutation 之前验证（构造时即拒绝
+        非法值）；bool 是 int 子类，须显式拒绝。
+        """
+        if (
+            isinstance(benchmark_max_probes, bool)
+            or not isinstance(benchmark_max_probes, int)
+            or benchmark_max_probes <= 0
+        ):
+            raise ValueError(
+                f"benchmark_max_probes must be a positive integer, got {benchmark_max_probes!r}"
+            )
         self._storage = storage
         self._reopen_storage = reopen_storage
         self._manifest_store = manifest_store
         self._fts_config = fts_config or FtsIndexConfig()
         self._benchmark_observer = benchmark_observer
         self._post_commit_journal = post_commit_journal
+        self._benchmark_max_probes = benchmark_max_probes
 
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -179,13 +196,17 @@ class IndexBuildService:
                     f"dense={counts.dense_chunks_count}/{len(dense_chunks)}"
                 )
             benchmark, benchmark_evidence = self._benchmark(
-                reopened,
+                # #41: reopen a fresh connection — lancedb 0.34 HNSW is not fully
+                # visible to the connection that created it; a new connection sees
+                # the complete index (recall 1.0 vs 0.70 on the creating connection).
+                self._reopen_storage(lance_dir),
                 dense_chunks,
                 vector_stats,
                 build_time_ms=index_build_ms,
                 disk_bytes=self._disk_bytes(build_dir),
+                wiki_dir=wiki_dir,
             )
-            policy = select_vector_policy(benchmark, vector_stats)
+            policy = select_vector_policy(benchmark, vector_stats, evidence=benchmark_evidence)
             # #36 follow-up：最终 seal = 最后 storage mutation 之后的耐久边界。
             self._storage.seal(lance_dir)
             manifest = self._manifest(
@@ -264,7 +285,9 @@ class IndexBuildService:
                 for chunk in sparse_chunks
             ]
         manifest = {
-            "format_version": 4,
+            # #41：v4 → v5——recall 语义从「全量最小」变为「样本最小」（或显式
+            # synthetic observer），v4-shaped record 不得静默携带 sampled 语义。
+            "format_version": 5,
             "layout": "sparse_chunks+dense_chunks",
             "generation": generation,
             "build_id": build_id,
@@ -312,6 +335,34 @@ class IndexBuildService:
                 continue
         return max_gen + 1
 
+    @staticmethod
+    def _benchmark_probe_keys(
+        dense_chunks: Sequence[DenseChunk], wiki_dir: Path
+    ) -> tuple[str, ...]:
+        """#41 portable probe keys：与 checkout root / 平台无关。
+
+        chunk_id 含绝对 page_id（换根目录或 Windows runner 会选出不同 probe），
+        因此 key 只用 wiki-relative POSIX path + chunk-id content suffix +
+        chunk_kind + chunk_index 构造，跨机器可复现。``_make_chunk_id`` 的
+        chunk_id 形如 ``{absolute_page_id}::{16位hash}``，取 ``::`` 后片段即可。
+        """
+        resolved_wiki = Path(wiki_dir).resolve()
+        keys: list[str] = []
+        for chunk in dense_chunks:
+            chunk_path = Path(chunk.path).resolve()
+            try:
+                relative = os.path.relpath(chunk_path, resolved_wiki)
+            except ValueError:  # 不同盘符（Windows）无公共根
+                relative = str(chunk_path)
+            relative = relative.replace(os.sep, "/")
+            suffix = (
+                chunk.chunk_id.rsplit("::", 1)[-1]
+                if "::" in chunk.chunk_id
+                else chunk.content_hash
+            )
+            keys.append(f"{relative}::{suffix}::{chunk.chunk_kind}::{chunk.chunk_index}")
+        return tuple(keys)
+
     def _benchmark(
         self,
         repository: ChunkRepository,
@@ -320,21 +371,62 @@ class IndexBuildService:
         *,
         build_time_ms: float,
         disk_bytes: int,
+        wiki_dir: Path,
     ) -> tuple[BenchmarkObservation, dict]:
         """Measure the candidate against exact bypass with the same query contract.
 
         Latency is evidence only.  The policy consumes only deterministic recall
         and coverage observations, so runner variance cannot change publication.
+
+        #41：probe 数受 ``benchmark_max_probes`` 上限约束——total ≤ cap 走全量
+        （scope=full，顺序不变），超过则按 (sha256(key), key) 排序取 bottom-k
+        （scope=sampled，确定性、与输入顺序无关）。evidence 显式记录采样口径，
+        observer 分支输出 synthetic evidence 且不查询 repository。
         """
+        benchmark_started = time.perf_counter()
         if self._benchmark_observer is not None:
             observation = self._benchmark_observer(stats)
-            return observation, {"exact_result_ids": [], "candidate_result_ids": []}
+            return observation, {
+                "evidence_schema_version": 1,
+                "evidence_source": "observer",
+                "probe_scope": "synthetic",
+                "sampling_method": "synthetic",
+                "sampling_key_schema": "wiki_relative_path+chunk_suffix+kind+chunk_index:v1",
+                "probe_keys": [],
+                "probe_selection_sha256": hashlib.sha256(b"").hexdigest(),
+                "probe_count": 0,
+                "probe_total": len(dense_chunks),
+                "probe_coverage": 0.0,
+                "result_limit": 20,
+                "recall_aggregation": "minimum",
+                "benchmark_duration_ms": 0.0,
+                "exact_result_ids": [],
+                "candidate_result_ids": [],
+            }
+
+        keys = self._benchmark_probe_keys(dense_chunks, wiki_dir)
+        total = len(dense_chunks)
+        if total <= self._benchmark_max_probes:
+            probe_indices = list(range(total))
+            probe_keys = list(keys)
+            scope = "full"
+            sampling_method = "full"
+        else:
+            ranked = sorted(
+                (hashlib.sha256(key.encode("utf-8")).hexdigest(), key, index)
+                for index, key in enumerate(keys)
+            )[: self._benchmark_max_probes]
+            probe_indices = [index for _digest, _key, index in ranked]
+            probe_keys = [key for _digest, key, _index in ranked]
+            scope = "sampled"
+            sampling_method = "bottom_k_sha256_v1"
 
         exact_ids: list[list[str]] = []
         candidate_ids: list[list[str]] = []
         candidate_durations: list[float] = []
         recalls: dict[int, list[float]] = {10: [], 20: []}
-        for chunk in dense_chunks:
+        for index in probe_indices:
+            chunk = dense_chunks[index]
             exact = repository.search_dense_exact(
                 chunk.vector, metric="cosine", limit=20, where=None
             )
@@ -366,10 +458,27 @@ class IndexBuildService:
             build_time_ms=build_time_ms,
             disk_bytes=disk_bytes,
         )
-        return observation, {
+        probe_count = len(probe_indices)
+        evidence = {
+            "evidence_schema_version": 1,
+            "evidence_source": "measured",
+            "probe_scope": scope,
+            "sampling_method": sampling_method,
+            "sampling_key_schema": "wiki_relative_path+chunk_suffix+kind+chunk_index:v1",
+            "probe_keys": probe_keys,
+            "probe_selection_sha256": hashlib.sha256(
+                "\n".join(probe_keys).encode("utf-8")
+            ).hexdigest(),
+            "probe_count": probe_count,
+            "probe_total": total,
+            "probe_coverage": probe_count / total,
+            "result_limit": 20,
+            "recall_aggregation": "minimum",
+            "benchmark_duration_ms": (time.perf_counter() - benchmark_started) * 1000,
             "exact_result_ids": exact_ids,
             "candidate_result_ids": candidate_ids,
         }
+        return observation, evidence
 
     @staticmethod
     def _sha256_file(path: Path) -> str:

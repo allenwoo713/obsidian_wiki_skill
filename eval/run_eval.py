@@ -24,7 +24,9 @@ Overflow 判定口径：以 ``bundle.effective_budget_tokens``（hybrid_search �
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import shutil
 import statistics
 import sys
@@ -45,6 +47,113 @@ from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
 from chunking import CHUNK_SCHEMA_VERSION  # noqa: E402
+
+
+BENCHMARK_EVIDENCE_FIELDS = frozenset({
+    "evidence_schema_version",
+    "evidence_source",
+    "probe_scope",
+    "sampling_method",
+    "sampling_key_schema",
+    "probe_keys",
+    "probe_selection_sha256",
+    "probe_count",
+    "probe_total",
+    "probe_coverage",
+    "result_limit",
+    "recall_aggregation",
+    "benchmark_duration_ms",
+    "exact_result_ids",
+    "candidate_result_ids",
+})
+
+
+def validate_benchmark_contract(manifest: dict) -> dict:
+    """Fail closed when build-time ANN evidence cannot support its policy claim.
+
+    Issue #41 changes recall from a full-corpus minimum to a bounded sampled
+    minimum.  Eval must therefore validate the evidence schema and ensure the
+    policy repeats the same scope/counts instead of silently interpreting a
+    sampled 1.0 as a corpus-wide proof.
+    """
+    if manifest.get("format_version") != 5:
+        raise ValueError("ANN benchmark evidence requires manifest format_version=5")
+    benchmark = manifest.get("benchmark")
+    policy = manifest.get("policy")
+    if not isinstance(benchmark, dict) or not isinstance(policy, dict):
+        raise ValueError("manifest benchmark and policy must be objects")
+    missing = sorted(BENCHMARK_EVIDENCE_FIELDS - set(benchmark))
+    if missing:
+        raise ValueError(f"benchmark evidence fields missing: {missing}")
+
+    source = benchmark["evidence_source"]
+    scope = benchmark["probe_scope"]
+    count = benchmark["probe_count"]
+    total = benchmark["probe_total"]
+    coverage = benchmark["probe_coverage"]
+    probe_keys = benchmark["probe_keys"]
+    exact_ids = benchmark["exact_result_ids"]
+    candidate_ids = benchmark["candidate_result_ids"]
+    if benchmark["evidence_schema_version"] != 1:
+        raise ValueError("unsupported benchmark evidence_schema_version")
+    if source not in {"measured", "observer"}:
+        raise ValueError("benchmark evidence_source must be measured or observer")
+    if scope not in {"full", "sampled", "synthetic"}:
+        raise ValueError("benchmark probe_scope must be full, sampled, or synthetic")
+    if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
+        raise ValueError("benchmark probe_total must be a positive integer")
+    if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= total:
+        raise ValueError("benchmark probe_count must be an integer within probe_total")
+    if not isinstance(coverage, (int, float)) or not math.isclose(coverage, count / total):
+        raise ValueError("benchmark probe_coverage is inconsistent with count/total")
+    if not isinstance(probe_keys, list) or len(probe_keys) != count:
+        raise ValueError("benchmark probe_keys length must equal probe_count")
+    if len(set(probe_keys)) != len(probe_keys):
+        raise ValueError("benchmark probe_keys must be unique")
+    selection_digest = hashlib.sha256("\n".join(probe_keys).encode()).hexdigest()
+    if benchmark["probe_selection_sha256"] != selection_digest:
+        raise ValueError("benchmark probe_selection_sha256 does not match probe_keys")
+    if benchmark["result_limit"] != 20 or benchmark["recall_aggregation"] != "minimum":
+        raise ValueError("benchmark result_limit/recall_aggregation contract changed")
+    if not isinstance(benchmark["benchmark_duration_ms"], (int, float)) \
+            or benchmark["benchmark_duration_ms"] < 0:
+        raise ValueError("benchmark_duration_ms must be non-negative")
+
+    if scope == "full":
+        if count != total or coverage != 1.0 or benchmark["sampling_method"] != "full":
+            raise ValueError("full benchmark scope must cover every probe")
+    elif scope == "sampled":
+        if not 0 < count < total or benchmark["sampling_method"] != "bottom_k_sha256_v1":
+            raise ValueError("sampled benchmark scope must be bounded bottom-k SHA-256")
+    else:
+        if source != "observer" or count != 0 or coverage != 0.0:
+            raise ValueError("synthetic benchmark evidence must be an explicit zero-probe observer")
+
+    expected_rows = count if source == "measured" else 0
+    if not isinstance(exact_ids, list) or not isinstance(candidate_ids, list) \
+            or len(exact_ids) != expected_rows or len(candidate_ids) != expected_rows:
+        raise ValueError("benchmark result evidence lengths do not match measured probe_count")
+
+    if policy.get("benchmark_scope") != scope \
+            or policy.get("benchmark_probe_count") != count \
+            or policy.get("benchmark_probe_total") != total:
+        raise ValueError("policy benchmark scope/counts are inconsistent with benchmark evidence")
+    if policy.get("selected_mode") not in {"ann", "exact"}:
+        raise ValueError("policy selected_mode must be ann or exact")
+    return {
+        "selected_mode": policy["selected_mode"],
+        "probe_scope": scope,
+        "probe_count": count,
+        "probe_total": total,
+        "probe_coverage": coverage,
+        "probe_selection_sha256": benchmark["probe_selection_sha256"],
+        "benchmark_duration_ms": benchmark["benchmark_duration_ms"],
+    }
+
+
+def _active_benchmark_contract(wi: WikiIndex) -> dict:
+    manifest = json.loads(wi._resolve_active_manifest().read_text(encoding="utf-8"))
+    return validate_benchmark_contract(manifest)
 
 
 def _page_hit(candidate, gold_pages):
@@ -116,14 +225,17 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     # 1) 主索引（exact，小库等价精确）
     main_root = work_dir / "main"
     main_wi, main_wiki, build_time = _build(main_root, wiki_src, "exact", full_rebuild=True)
+    main_benchmark = _active_benchmark_contract(main_wi)
     planner = DefaultQueryPlanner(project_root=main_root)
 
     # 2) ANN 索引（独立 project，复用语义内容；向量层走 IVF_HNSW_FLAT）
     ann_wi = None
     ann_build_time = None
+    ann_benchmark = None
     if build_ann:
         ann_root = work_dir / "ann"
         ann_wi, _, ann_build_time = _build(ann_root, wiki_src, "ivf-hnsw-flat", full_rebuild=True)
+        ann_benchmark = _active_benchmark_contract(ann_wi)
 
     # 3) 逐查询评测
     page_recalls, evid_recalls, mrrs, exact_hits, ann_recalls = [], [], [], [], []
@@ -284,6 +396,10 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "mean_contextbundle_tokens": round(statistics.mean(bundle_tokens), 1),
             "ann_build_time_s": round(ann_build_time, 2) if ann_build_time else None,
         },
+        "index_benchmark": {
+            "main": main_benchmark,
+            "ann": ann_benchmark,
+        },
     }
     return metrics, detail
 
@@ -395,6 +511,14 @@ def main():
         failures.append("graph trigger fixture did not produce a validated graph result")
     if mq["ann_recall_at_10"] is not None and mq["ann_recall_at_10"] < 0.98:
         failures.append(f"ann_recall_at_10={mq['ann_recall_at_10']:.4f} < 0.98")
+    ann_benchmark = metrics.get("index_benchmark", {}).get("ann")
+    if ann_benchmark is not None and ann_benchmark.get("selected_mode") != "ann":
+        failures.append(
+            "ANN evaluation build was not promoted: "
+            f"selected_mode={ann_benchmark.get('selected_mode')} "
+            f"scope={ann_benchmark.get('probe_scope')} "
+            f"probes={ann_benchmark.get('probe_count')}/{ann_benchmark.get('probe_total')}"
+        )
 
     if failures:
         print("\n[FAIL] 评测未通过：", file=sys.stderr)
