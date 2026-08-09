@@ -217,6 +217,22 @@ class BenchmarkObservation(_JsonRecord):
 
 
 @dataclass(frozen=True)
+class ExactBatchResult(_JsonRecord):
+    """Ground truth from one streamed cosine top-k scan over the dense table.
+
+    #41: replaces the 256 independent scalar ``bypass_vector_index`` full scans
+    that dominated the build-time benchmark. The application layer consumes only
+    IDs plus instrumentation; NumPy/Arrow objects never cross the storage port.
+    """
+
+    result_ids: Tuple[Tuple[str, ...], ...]
+    elapsed_ms: float
+    scan_rows: int
+    scan_batches: int
+    method: str
+
+
+@dataclass(frozen=True)
 class ValidationObservation(_JsonRecord):
     schema_counts: IndexSchemaCounts
     vector_index: IndexStats

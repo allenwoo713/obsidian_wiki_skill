@@ -1,9 +1,14 @@
-"""Reproducible issue #41 build-time ANN benchmark.
+"""Reproducible issue #41 build-time ANN benchmark (performance-only gate).
 
 The script generates vectors at runtime, creates a real LanceDB HNSW index, and
 executes the production IndexBuildService benchmark path.  No large fixture is
 stored in git.  A non-zero exit means the bounded-probe performance/evidence
 contract is not satisfied.
+
+This is a PERFORMANCE-ONLY gate: it asserts the benchmark scans the dense corpus
+exactly once (streamed batch exact) and stays within wall-clock/evidence budgets.
+ANN publication quality (recall, promote-to-ann) is validated separately by
+eval/run_eval.py against a real-model fixture, not by this random-vector scale.
 """
 from __future__ import annotations
 
@@ -11,6 +16,8 @@ import argparse
 import inspect
 import json
 import math
+import os
+import platform
 import sys
 import tempfile
 import time
@@ -168,22 +175,39 @@ def run(args: argparse.Namespace) -> dict:
             build_time_ms=index_build_ms,
             disk_bytes=sum(path.stat().st_size for path in lance_dir.rglob("*") if path.is_file()),
             wiki_dir=wiki_dir,
+            row_batch_size=args.row_batch_size,
+            query_batch_size=args.query_batch_size,
         )
         measured_seconds = time.perf_counter() - benchmark_started
         decision = select_vector_policy(observation, stats, evidence=evidence)
         payload = {
+            "benchmark_intent": "performance_only",
+            "quality_gate": "eval/run_eval.py",
             "configuration": {
                 "rows": args.rows,
                 "dimensions": args.dimensions,
                 "max_probes": args.max_probes,
                 "seed": args.seed,
                 "max_seconds": args.max_seconds,
+                "max_exact_seconds": args.max_exact_seconds,
+                "row_batch_size": args.row_batch_size,
+                "query_batch_size": args.query_batch_size,
                 "max_evidence_bytes": args.max_evidence_bytes,
             },
             "index_build_ms": round(index_build_ms, 3),
             "benchmark_wall_seconds": round(measured_seconds, 6),
             "benchmark": {**observation.to_json(), **evidence},
             "policy": decision.to_json(),
+            "diagnostics": {
+                "cpu_count": os.cpu_count(),
+                "python_version": platform.python_version(),
+                "numpy_version": np.__version__,
+                "lancedb_version": lancedb.__version__,
+                "pyarrow_version": pa.__version__,
+                "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+                "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"),
+                "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+            },
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
         payload["benchmark_payload_bytes"] = len(encoded)
@@ -202,6 +226,31 @@ def run(args: argparse.Namespace) -> dict:
         failures.append("exact_result_ids is not bounded by max_probes")
     if len(benchmark.get("candidate_result_ids", [])) != args.max_probes:
         failures.append("candidate_result_ids is not bounded by max_probes")
+
+    # #41 batch-exact structure gates. Performance-only: ANN promotion quality is
+    # validated by eval/run_eval.py, not by this random-vector scale fixture.
+    if benchmark.get("evidence_schema_version") != 2:
+        failures.append("expected benchmark evidence schema v2")
+    if benchmark.get("exact_method") != "streamed_numpy_cosine_v1":
+        failures.append(f"unexpected exact_method={benchmark.get('exact_method')!r}")
+    if benchmark.get("exact_scan_rows") != args.rows:
+        failures.append(
+            f"exact_scan_rows={benchmark.get('exact_scan_rows')!r}, expected {args.rows}"
+        )
+    if not isinstance(benchmark.get("exact_scan_batches"), int) \
+            or benchmark["exact_scan_batches"] <= 0:
+        failures.append("exact_scan_batches must be positive")
+    if benchmark.get("ann_query_count") != args.max_probes:
+        failures.append(
+            f"ann_query_count={benchmark.get('ann_query_count')!r}, expected {args.max_probes}"
+        )
+    exact_seconds = float(benchmark.get("exact_verification_ms", float("inf"))) / 1000
+    if exact_seconds > args.max_exact_seconds:
+        failures.append(
+            f"exact_verification_seconds={exact_seconds:.3f} > "
+            f"SLO {args.max_exact_seconds:.3f}"
+        )
+
     if measured_seconds > args.max_seconds:
         failures.append(
             f"benchmark_wall_seconds={measured_seconds:.3f} > SLO {args.max_seconds:.3f}"
@@ -228,6 +277,9 @@ def main() -> int:
     parser.add_argument("--max-probes", type=int, default=256)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--max-seconds", type=float, default=30.0)
+    parser.add_argument("--max-exact-seconds", type=float, default=10.0)
+    parser.add_argument("--row-batch-size", type=int, default=8192)
+    parser.add_argument("--query-batch-size", type=int, default=32)
     parser.add_argument("--max-evidence-bytes", type=int, default=10 * 1024 * 1024)
     parser.add_argument("--work-dir", type=Path, default=SKILL_ROOT / ".review-tmp" / "issue41-scale")
     parser.add_argument("--output", type=Path, default=HERE / "index-benchmark.json")

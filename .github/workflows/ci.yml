@@ -133,7 +133,8 @@ jobs:
           tests/test_index_post_commit.py
           tests/test_test_suite_integrity.py
           tests/test_index_chunking_contract.py
-          tests/test_benchmark_sampling.py -q
+          tests/test_benchmark_sampling.py
+          tests/test_benchmark_batch_exact.py -q
 
       - name: Enforce package import contracts
         working-directory: scripts

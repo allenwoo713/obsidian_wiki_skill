@@ -5,15 +5,18 @@ import json
 import logging
 import math
 import os
+import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import lancedb
+import numpy as np
 import pyarrow as pa
 from lancedb.index import HnswFlat
 
 from obsidian_wiki.domain.index_models import (
     DenseChunk,
+    ExactBatchResult,
     FtsIndexConfig,
     FtsIndexStats,
     IndexSchemaCounts,
@@ -227,6 +230,115 @@ class LanceDbIndexRepository:
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
     ) -> list[Mapping[str, object]]:
         return self._search_dense(vector, metric=metric, limit=limit, where=where, exact=True)
+
+    def search_dense_exact_batch(
+        self,
+        vectors: Sequence[Sequence[float]],
+        *,
+        metric: str,
+        limit: int = 20,
+        row_batch_size: int = 8192,
+        query_batch_size: int = 32,
+    ) -> ExactBatchResult:
+        """#41: one streamed cosine top-k scan over the dense table for many probes.
+
+        Replaces the 256 independent scalar ``bypass_vector_index`` full scans that
+        dominated the build-time benchmark. The dense table is read exactly once via
+        ``to_arrow`` (``to_lance`` needs the external ``lance`` package, absent from CI
+        deps); rows stream in ``row_batch_size`` batches and scores are materialized
+        only as ``query_batch_size x row_batch_size`` blocks so memory stays bounded
+        regardless of corpus size. Ground-truth failures propagate and never silently
+        fall back to a slower scalar path.
+        """
+        if metric != "cosine":
+            raise ValueError("Batch exact verification currently supports cosine only")
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        if row_batch_size <= 0 or query_batch_size <= 0:
+            raise ValueError("batch sizes must be positive")
+        if not vectors:
+            raise ValueError("Batch exact verification requires at least one query")
+
+        queries = np.asarray(
+            [tuple(float(value) for value in vector) for vector in vectors],
+            dtype=np.float32,
+        )
+        if queries.ndim != 2 or queries.shape[1] == 0:
+            raise ValueError("Batch exact queries must share one non-zero dimension")
+        if not np.isfinite(queries).all():
+            raise ValueError("Batch exact queries must contain only finite values")
+        eps = np.finfo(np.float32).eps
+        query_norms = np.linalg.norm(queries, axis=1, keepdims=True)
+        if np.any(query_norms <= eps):
+            raise ValueError("Cosine exact verification rejects zero-norm queries")
+        queries = queries / query_norms
+
+        # ponytail: read the dense table once; process it in row-batch slices so the
+        # score block stays bounded at query_batch_size x row_batch_size. (RecordBatch
+        # column .values returns the whole underlying buffer, not the batch's logical
+        # rows, so we slice the materialized matrix by index instead of streaming.)
+        table = self._dense_table()
+        arrow = table.to_arrow().select(["chunk_id", "vector"])
+        if arrow.num_rows <= 0:
+            raise RuntimeError("Batch exact verification scanned no dense rows")
+        vector_column = arrow.column("vector")
+        if hasattr(vector_column, "combine_chunks"):
+            vector_column = vector_column.combine_chunks()
+        rows = np.asarray(
+            vector_column.values.to_numpy(zero_copy_only=False),
+            dtype=np.float32,
+        ).reshape(arrow.num_rows, -1)
+        if rows.shape[1] != queries.shape[1]:
+            raise RuntimeError("Dense table/query dimensions do not match")
+        if not np.isfinite(rows).all():
+            raise RuntimeError("Dense table contains non-finite vectors")
+        row_norms = np.linalg.norm(rows, axis=1, keepdims=True)
+        if np.any(row_norms <= eps):
+            raise RuntimeError("Cosine exact verification rejects zero-norm stored vectors")
+        rows = rows / row_norms
+        row_ids = np.asarray(arrow.column("chunk_id").to_pylist(), dtype=object)
+
+        best_ids: list[np.ndarray] = [np.empty(0, dtype=object) for _ in range(len(queries))]
+        best_scores: list[np.ndarray] = [np.empty(0, dtype=np.float32) for _ in range(len(queries))]
+
+        started = time.perf_counter()
+        scan_rows = arrow.num_rows
+        scan_batches = 0
+        for start in range(0, arrow.num_rows, row_batch_size):
+            end = min(start + row_batch_size, arrow.num_rows)
+            batch_rows = rows[start:end]
+            batch_ids = row_ids[start:end]
+            scan_batches += 1
+            for q0 in range(0, len(queries), query_batch_size):
+                q1 = min(q0 + query_batch_size, len(queries))
+                scores = queries[q0:q1] @ batch_rows.T
+                for offset in range(q1 - q0):
+                    query_index = q0 + offset
+                    scores_row = scores[offset]
+                    local_k = min(limit, scores_row.shape[0])
+                    kth = scores_row.shape[0] - local_k
+                    positions = np.argpartition(scores_row, kth)[kth:]
+                    local_scores = scores_row[positions]
+                    candidate_scores = np.concatenate((best_scores[query_index], local_scores))
+                    candidate_ids = np.concatenate((best_ids[query_index], batch_ids[positions]))
+                    order = np.lexsort((candidate_ids.astype(str), -candidate_scores))[:limit]
+                    best_scores[query_index] = candidate_scores[order]
+                    best_ids[query_index] = candidate_ids[order]
+
+        if scan_rows <= 0:
+            raise RuntimeError("Batch exact verification scanned no dense rows")
+        elapsed_ms = (time.perf_counter() - started) * 1000
+
+        return ExactBatchResult(
+            result_ids=tuple(
+                tuple(str(chunk_id) for chunk_id in query_ids)
+                for query_ids in best_ids
+            ),
+            elapsed_ms=elapsed_ms,
+            scan_rows=scan_rows,
+            scan_batches=scan_batches,
+            method="streamed_numpy_cosine_v1",
+        )
 
     def search_sparse_for_page(self, query: str, page_id: str, *, limit: int = 10) -> list[Mapping[str, object]]:
         return self._sparse_table().search(query, query_type="fts").where(

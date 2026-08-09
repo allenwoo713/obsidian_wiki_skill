@@ -16,7 +16,13 @@ from typing import Mapping, Sequence
 import pytest
 
 from obsidian_wiki.application.index_build_service import IndexBuildService
-from obsidian_wiki.domain.index_models import BenchmarkObservation, DenseChunk, IndexStats, SparseChunk
+from obsidian_wiki.domain.index_models import (
+    BenchmarkObservation,
+    DenseChunk,
+    ExactBatchResult,
+    IndexStats,
+    SparseChunk,
+)
 from obsidian_wiki.domain.index_policy import select_vector_policy
 from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
@@ -37,6 +43,14 @@ REQUIRED_EVIDENCE_FIELDS = {
     "result_limit",
     "recall_aggregation",
     "benchmark_duration_ms",
+    "probe_selection_ms",
+    "exact_verification_ms",
+    "ann_verification_ms",
+    "recall_assembly_ms",
+    "exact_method",
+    "exact_scan_rows",
+    "exact_scan_batches",
+    "ann_query_count",
     "exact_result_ids",
     "candidate_result_ids",
 }
@@ -87,16 +101,35 @@ class _NoopDependency:
 
 class _CountingRepository:
     def __init__(self, chunk_ids: Sequence[str], *, miss_at_20: bool = False) -> None:
-        self._truth = [{"chunk_id": chunk_id} for chunk_id in chunk_ids[:20]]
+        self._chunk_ids = list(chunk_ids)
+        self._truth = [{"chunk_id": chunk_id} for chunk_id in self._chunk_ids[:20]]
         self._miss_at_20 = miss_at_20
-        self.exact_calls = 0
+        self.exact_batch_calls = 0
+        self.exact_scalar_calls = 0
         self.ann_calls = 0
 
-    def search_dense_exact(
-        self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
-    ) -> list[Mapping[str, object]]:
-        self.exact_calls += 1
-        return self._truth[:limit]
+    def search_dense_exact(self, *args, **kwargs):
+        self.exact_scalar_calls += 1
+        raise AssertionError("#41 benchmark must not use scalar exact queries")
+
+    def search_dense_exact_batch(
+        self,
+        vectors,
+        *,
+        metric,
+        limit=20,
+        row_batch_size=8192,
+        query_batch_size=32,
+    ) -> ExactBatchResult:
+        self.exact_batch_calls += 1
+        ids = tuple(str(row["chunk_id"]) for row in self._truth[:limit])
+        return ExactBatchResult(
+            result_ids=tuple(ids for _ in vectors),
+            elapsed_ms=0.1,
+            scan_rows=len(self._chunk_ids),
+            scan_batches=1,
+            method="streamed_numpy_cosine_v1",
+        )
 
     def search_dense(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
@@ -155,13 +188,19 @@ def test_small_corpus_uses_full_probe_scope(tmp_path: Path) -> None:
     observation, evidence, repository = _run_benchmark(tmp_path, chunks, max_probes=8)
 
     assert observation.recall_at_10 == observation.recall_at_20 == 1.0
-    assert repository.exact_calls == repository.ann_calls == 8
+    assert repository.exact_batch_calls == 1
+    assert repository.exact_scalar_calls == 0
+    assert repository.ann_calls == 8
     assert REQUIRED_EVIDENCE_FIELDS <= set(evidence)
+    assert evidence["evidence_schema_version"] == 2
     assert evidence["evidence_source"] == "measured"
     assert evidence["probe_scope"] == "full"
     assert evidence["probe_count"] == evidence["probe_total"] == 8
     assert evidence["probe_coverage"] == 1.0
     assert evidence["sampling_method"] == "full"
+    assert evidence["exact_method"] == "streamed_numpy_cosine_v1"
+    assert evidence["exact_scan_rows"] == 8
+    assert evidence["ann_query_count"] == 8
 
 
 def test_large_corpus_caps_calls_and_emits_auditable_sample(tmp_path: Path) -> None:
@@ -169,9 +208,11 @@ def test_large_corpus_caps_calls_and_emits_auditable_sample(tmp_path: Path) -> N
     observation, evidence, repository = _run_benchmark(tmp_path, chunks, max_probes=32)
 
     assert observation.recall_at_10 == observation.recall_at_20 == 1.0
-    assert repository.exact_calls == repository.ann_calls == 32
+    assert repository.exact_batch_calls == 1
+    assert repository.exact_scalar_calls == 0
+    assert repository.ann_calls == 32
     assert REQUIRED_EVIDENCE_FIELDS <= set(evidence)
-    assert evidence["evidence_schema_version"] == 1
+    assert evidence["evidence_schema_version"] == 2
     assert evidence["evidence_source"] == "measured"
     assert evidence["probe_scope"] == "sampled"
     assert evidence["sampling_method"] == "bottom_k_sha256_v1"
@@ -181,6 +222,9 @@ def test_large_corpus_caps_calls_and_emits_auditable_sample(tmp_path: Path) -> N
     assert evidence["probe_coverage"] == pytest.approx(32 / 500)
     assert evidence["result_limit"] == 20
     assert evidence["recall_aggregation"] == "minimum"
+    assert evidence["exact_method"] == "streamed_numpy_cosine_v1"
+    assert evidence["exact_scan_rows"] == 500
+    assert evidence["ann_query_count"] == 32
     assert len(evidence["probe_keys"]) == 32
     assert len(set(evidence["probe_keys"])) == 32
     assert len(evidence["exact_result_ids"]) == 32
@@ -225,6 +269,10 @@ def test_observer_emits_complete_explicit_synthetic_evidence(tmp_path: Path) -> 
     assert evidence["probe_count"] == 0
     assert evidence["probe_total"] == 32
     assert evidence["probe_coverage"] == 0.0
+    assert evidence["exact_method"] == "observer"
+    assert evidence["exact_scan_rows"] == 0
+    assert evidence["exact_scan_batches"] == 0
+    assert evidence["ann_query_count"] == 0
     assert evidence["probe_keys"] == []
     assert evidence["exact_result_ids"] == []
     assert evidence["candidate_result_ids"] == []
@@ -254,7 +302,7 @@ def test_eval_manifest_contract_rejects_unversioned_or_inconsistent_evidence() -
         "format_version": 5,
         "benchmark": {
             **{field: None for field in REQUIRED_EVIDENCE_FIELDS},
-            "evidence_schema_version": 1,
+            "evidence_schema_version": 2,
             "evidence_source": "measured",
             "probe_scope": "sampled",
             "sampling_method": "bottom_k_sha256_v1",
@@ -269,6 +317,14 @@ def test_eval_manifest_contract_rejects_unversioned_or_inconsistent_evidence() -
             "result_limit": 20,
             "recall_aggregation": "minimum",
             "benchmark_duration_ms": 1.0,
+            "probe_selection_ms": 1.0,
+            "exact_verification_ms": 1.0,
+            "ann_verification_ms": 1.0,
+            "recall_assembly_ms": 1.0,
+            "exact_method": "streamed_numpy_cosine_v1",
+            "exact_scan_rows": 2,
+            "exact_scan_batches": 1,
+            "ann_query_count": 1,
             "exact_result_ids": [["a"]],
             "candidate_result_ids": [["a"]],
         },

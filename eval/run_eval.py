@@ -63,6 +63,14 @@ BENCHMARK_EVIDENCE_FIELDS = frozenset({
     "result_limit",
     "recall_aggregation",
     "benchmark_duration_ms",
+    "probe_selection_ms",
+    "exact_verification_ms",
+    "ann_verification_ms",
+    "recall_assembly_ms",
+    "exact_method",
+    "exact_scan_rows",
+    "exact_scan_batches",
+    "ann_query_count",
     "exact_result_ids",
     "candidate_result_ids",
 })
@@ -94,7 +102,7 @@ def validate_benchmark_contract(manifest: dict) -> dict:
     probe_keys = benchmark["probe_keys"]
     exact_ids = benchmark["exact_result_ids"]
     candidate_ids = benchmark["candidate_result_ids"]
-    if benchmark["evidence_schema_version"] != 1:
+    if benchmark["evidence_schema_version"] != 2:
         raise ValueError("unsupported benchmark evidence_schema_version")
     if source not in {"measured", "observer"}:
         raise ValueError("benchmark evidence_source must be measured or observer")
@@ -133,6 +141,36 @@ def validate_benchmark_contract(manifest: dict) -> dict:
     if not isinstance(exact_ids, list) or not isinstance(candidate_ids, list) \
             or len(exact_ids) != expected_rows or len(candidate_ids) != expected_rows:
         raise ValueError("benchmark result evidence lengths do not match measured probe_count")
+
+    if source == "measured":
+        if benchmark["exact_method"] != "streamed_numpy_cosine_v1":
+            raise ValueError("measured benchmark must use streamed batch exact verification")
+        if benchmark["exact_scan_rows"] != total:
+            raise ValueError("exact batch verification must scan the dense corpus exactly once")
+        if not isinstance(benchmark["exact_scan_batches"], int) \
+                or benchmark["exact_scan_batches"] <= 0:
+            raise ValueError("exact_scan_batches must be positive")
+        if benchmark["ann_query_count"] != count:
+            raise ValueError("ann_query_count must equal measured probe_count")
+
+    for field in (
+        "benchmark_duration_ms",
+        "probe_selection_ms",
+        "exact_verification_ms",
+        "ann_verification_ms",
+        "recall_assembly_ms",
+    ):
+        value = benchmark[field]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{field} must be a finite non-negative number")
+
+    if source == "observer":
+        if benchmark["exact_method"] != "observer":
+            raise ValueError("observer evidence must identify exact_method=observer")
+        if any(benchmark[field] != 0 for field in (
+            "exact_scan_rows", "exact_scan_batches", "ann_query_count"
+        )):
+            raise ValueError("observer evidence cannot report measured scan/query counters")
 
     if policy.get("benchmark_scope") != scope \
             or policy.get("benchmark_probe_count") != count \

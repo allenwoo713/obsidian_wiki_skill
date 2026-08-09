@@ -6,6 +6,7 @@ from typing import Mapping, Protocol, Sequence
 
 from obsidian_wiki.domain.index_models import (
     DenseChunk,
+    ExactBatchResult,
     FtsIndexConfig,
     FtsIndexStats,
     IndexStats,
@@ -36,6 +37,16 @@ class ChunkRepository(Protocol):
     def search_dense_exact(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
     ) -> list[Mapping[str, object]]: ...
+
+    def search_dense_exact_batch(
+        self,
+        vectors: Sequence[Sequence[float]],
+        *,
+        metric: str,
+        limit: int = 20,
+        row_batch_size: int = 8192,
+        query_batch_size: int = 32,
+    ) -> ExactBatchResult: ...
 
     def create_vector_index(self, config: VectorIndexConfig) -> IndexStats: ...
 

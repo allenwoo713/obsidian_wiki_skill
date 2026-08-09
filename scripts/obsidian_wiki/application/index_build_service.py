@@ -372,6 +372,8 @@ class IndexBuildService:
         build_time_ms: float,
         disk_bytes: int,
         wiki_dir: Path,
+        row_batch_size: int = 8192,
+        query_batch_size: int = 32,
     ) -> tuple[BenchmarkObservation, dict]:
         """Measure the candidate against exact bypass with the same query contract.
 
@@ -387,7 +389,7 @@ class IndexBuildService:
         if self._benchmark_observer is not None:
             observation = self._benchmark_observer(stats)
             return observation, {
-                "evidence_schema_version": 1,
+                "evidence_schema_version": 2,
                 "evidence_source": "observer",
                 "probe_scope": "synthetic",
                 "sampling_method": "synthetic",
@@ -400,10 +402,19 @@ class IndexBuildService:
                 "result_limit": 20,
                 "recall_aggregation": "minimum",
                 "benchmark_duration_ms": 0.0,
+                "probe_selection_ms": 0.0,
+                "exact_verification_ms": 0.0,
+                "ann_verification_ms": 0.0,
+                "recall_assembly_ms": 0.0,
+                "exact_method": "observer",
+                "exact_scan_rows": 0,
+                "exact_scan_batches": 0,
+                "ann_query_count": 0,
                 "exact_result_ids": [],
                 "candidate_result_ids": [],
             }
 
+        selection_started = time.perf_counter()
         keys = self._benchmark_probe_keys(dense_chunks, wiki_dir)
         total = len(dense_chunks)
         if total <= self._benchmark_max_probes:
@@ -420,31 +431,45 @@ class IndexBuildService:
             probe_keys = [key for _digest, key, _index in ranked]
             scope = "sampled"
             sampling_method = "bottom_k_sha256_v1"
+        probe_selection_ms = (time.perf_counter() - selection_started) * 1000
 
-        exact_ids: list[list[str]] = []
+        # #41: one streamed batch exact scan replaces the 256 independent scalar
+        # bypass_vector_index full scans that dominated build-time cost.
+        probe_vectors = [dense_chunks[index].vector for index in probe_indices]
+        exact_batch = repository.search_dense_exact_batch(
+            probe_vectors,
+            metric="cosine",
+            limit=20,
+            row_batch_size=row_batch_size,
+            query_batch_size=query_batch_size,
+        )
+        exact_ids = [list(ids) for ids in exact_batch.result_ids]
+        if len(exact_ids) != len(probe_indices):
+            raise RuntimeError("Batch exact result count does not match probe count")
+
+        ann_started = time.perf_counter()
         candidate_ids: list[list[str]] = []
         candidate_durations: list[float] = []
-        recalls: dict[int, list[float]] = {10: [], 20: []}
         for index in probe_indices:
             chunk = dense_chunks[index]
-            exact = repository.search_dense_exact(
-                chunk.vector, metric="cosine", limit=20, where=None
-            )
             started = time.perf_counter()
             candidate = repository.search_dense(
                 chunk.vector, metric="cosine", limit=20, where=None
             )
             candidate_durations.append((time.perf_counter() - started) * 1000)
-            exact_row_ids = [str(row["chunk_id"]) for row in exact]
-            candidate_row_ids = [str(row["chunk_id"]) for row in candidate]
+            candidate_ids.append([str(row["chunk_id"]) for row in candidate])
+        ann_verification_ms = (time.perf_counter() - ann_started) * 1000
+
+        recall_started = time.perf_counter()
+        recalls: dict[int, list[float]] = {10: [], 20: []}
+        for exact_row_ids, candidate_row_ids in zip(exact_ids, candidate_ids, strict=True):
             if not exact_row_ids:
-                raise RuntimeError("Exact benchmark query returned no dense rows")
-            exact_ids.append(exact_row_ids)
-            candidate_ids.append(candidate_row_ids)
-            for limit in recalls:
-                truth = set(exact_row_ids[:limit])
-                observed = set(candidate_row_ids[:limit])
-                recalls[limit].append(len(truth & observed) / len(truth))
+                raise RuntimeError("Batch exact benchmark returned no dense rows")
+            for recall_limit in recalls:
+                truth = set(exact_row_ids[:recall_limit])
+                observed = set(candidate_row_ids[:recall_limit])
+                recalls[recall_limit].append(len(truth & observed) / len(truth))
+        recall_assembly_ms = (time.perf_counter() - recall_started) * 1000
 
         def percentile_95(samples: Sequence[float]) -> float:
             ordered = sorted(samples)
@@ -460,7 +485,7 @@ class IndexBuildService:
         )
         probe_count = len(probe_indices)
         evidence = {
-            "evidence_schema_version": 1,
+            "evidence_schema_version": 2,
             "evidence_source": "measured",
             "probe_scope": scope,
             "sampling_method": sampling_method,
@@ -475,6 +500,14 @@ class IndexBuildService:
             "result_limit": 20,
             "recall_aggregation": "minimum",
             "benchmark_duration_ms": (time.perf_counter() - benchmark_started) * 1000,
+            "probe_selection_ms": probe_selection_ms,
+            "exact_verification_ms": exact_batch.elapsed_ms,
+            "ann_verification_ms": ann_verification_ms,
+            "recall_assembly_ms": recall_assembly_ms,
+            "exact_method": exact_batch.method,
+            "exact_scan_rows": exact_batch.scan_rows,
+            "exact_scan_batches": exact_batch.scan_batches,
+            "ann_query_count": len(probe_indices),
             "exact_result_ids": exact_ids,
             "candidate_result_ids": candidate_ids,
         }
