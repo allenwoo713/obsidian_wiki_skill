@@ -15,6 +15,7 @@ from typing import Mapping, Sequence
 
 import pytest
 
+from eval import benchmark_ann_build
 from obsidian_wiki.application.index_build_service import IndexBuildService
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
@@ -54,6 +55,19 @@ REQUIRED_EVIDENCE_FIELDS = {
     "exact_result_ids",
     "candidate_result_ids",
 }
+
+
+def test_issue41_scale_gate_separates_exact_slo_from_coarse_wall_ceiling() -> None:
+    """Runner-sensitive ANN latency must not crowd the exact-path regression gate."""
+    assert benchmark_ann_build.DEFAULT_MAX_EXACT_SECONDS == 10.0
+    assert benchmark_ann_build.DEFAULT_MAX_WALL_SECONDS == 60.0
+
+    workflow = (Path(__file__).parents[1] / ".github/workflows/eval.yml").read_text(
+        encoding="utf-8"
+    )
+    scale_job = workflow.split("issue41-scale-benchmark:", 1)[1]
+    assert "--max-exact-seconds 10" in scale_job
+    assert "--max-seconds 60" in scale_job
 
 
 def _stats(total: int) -> IndexStats:

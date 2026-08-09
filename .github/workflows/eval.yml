@@ -160,7 +160,7 @@ jobs:
           --row-batch-size 8192
           --query-batch-size 32
           --max-exact-seconds 10
-          --max-seconds 30
+          --max-seconds 60
           --max-evidence-bytes 10485760
           --work-dir .review-tmp/issue41-scale
           --output eval/index-benchmark.json

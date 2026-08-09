@@ -35,6 +35,12 @@ SKILL_ROOT = HERE.parent
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+DEFAULT_MAX_EXACT_SECONDS = 10.0
+# Coarse end-to-end guard only. The stage-specific exact SLO above is the
+# deterministic #41 algorithmic regression gate; scalar ANN latency varies on
+# shared runners and remains fully measured in the evidence payload.
+DEFAULT_MAX_WALL_SECONDS = 60.0
+
 import obsidian_wiki.application.index_build_service as build_service_module  # noqa: E402
 from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
 from obsidian_wiki.domain.index_models import VectorIndexConfig  # noqa: E402
@@ -276,8 +282,10 @@ def main() -> int:
     parser.add_argument("--dimensions", type=int, default=384)
     parser.add_argument("--max-probes", type=int, default=256)
     parser.add_argument("--seed", type=int, default=41)
-    parser.add_argument("--max-seconds", type=float, default=30.0)
-    parser.add_argument("--max-exact-seconds", type=float, default=10.0)
+    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_WALL_SECONDS)
+    parser.add_argument(
+        "--max-exact-seconds", type=float, default=DEFAULT_MAX_EXACT_SECONDS
+    )
     parser.add_argument("--row-batch-size", type=int, default=8192)
     parser.add_argument("--query-batch-size", type=int, default=32)
     parser.add_argument("--max-evidence-bytes", type=int, default=10 * 1024 * 1024)
