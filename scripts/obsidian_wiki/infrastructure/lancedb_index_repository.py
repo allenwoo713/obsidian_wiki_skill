@@ -321,6 +321,13 @@ class LanceDbIndexRepository:
                     local_scores = scores_row[positions]
                     candidate_scores = np.concatenate((best_scores[query_index], local_scores))
                     candidate_ids = np.concatenate((best_ids[query_index], batch_ids[positions]))
+                    # ponytail: ties are broken by chunk_id, which is deterministic and
+                    # reproducible across runners but NOT the order lancedb's own scan
+                    # returns. Ceiling: on a corpus with exact score ties straddling the
+                    # k-th rank, recall@k is computed on ordered prefixes and will
+                    # under-report (fail-safe: ANN promotion is refused, never granted).
+                    # Real float32 embeddings do not tie; upgrade path if they ever do is
+                    # score-aware recall (count a hit when score >= the k-th exact score).
                     order = np.lexsort((candidate_ids.astype(str), -candidate_scores))[:limit]
                     best_scores[query_index] = candidate_scores[order]
                     best_ids[query_index] = candidate_ids[order]
