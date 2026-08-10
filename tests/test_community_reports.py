@@ -281,9 +281,9 @@ def test_query_preserves_fresh_no_fit_budget_diagnostic(monkeypatch, tmp_path):
 
 
 def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatch, tmp_path):
-    """The query wrapper exposes fresh report evidence through its normal JSON shape."""
+    """Fresh Global Search keeps reports title-cited, never page-path-cited."""
     from obsidian_wiki.application.community_report_service import CommunityReportService
-    from query import hybrid_search, result_to_json
+    from query import format_for_agent, hybrid_search, result_to_json
     from query_planner import DefaultQueryPlanner
     import query
 
@@ -306,6 +306,12 @@ def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatc
     # and expose no citation, instead of being forced into a Wiki/... shape.
     assert payload["text"][0]["path"] == str(result.bundle.items[0].page_id)
     assert payload["text"][0]["citation"] is None
+    # Exercise the production CLI/agent renderer too: community IDs are not
+    # resolvable Wiki paths and must never appear in a fake citation token.
+    rendered = format_for_agent(result)
+    assert result.bundle.items[0].title in rendered
+    assert "[来源: community-" not in rendered
+    assert "- 路径: community-" not in rendered
     assert result.bundle.budget_contract_violations() == []
 
 

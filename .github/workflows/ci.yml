@@ -122,7 +122,8 @@ jobs:
       # #41 bounded ANN benchmark: deterministic portable probes, versioned evidence,
       # explicit policy scope, observer parity, and a real >256-row publication path.
       # #43 citation contract: ContextItem.path must be Wiki-relative posix on every
-      # platform — this suite is the OS-sensitive gate (Windows separators/abs paths).
+      # platform — this suite is the OS-sensitive gate (Windows separators/abs paths),
+      # canonical spelling, and Global Search's text/JSON report renderers.
       # All named suites are model-free and must pass on Windows + Linux.
       - name: Run storage, publication, chunking, and ANN benchmark acceptance gates
         run: >
@@ -138,6 +139,7 @@ jobs:
           tests/test_benchmark_sampling.py
           tests/test_benchmark_batch_exact.py
           tests/test_issue14_context_contract.py
+          tests/test_community_reports.py
           tests/test_eval_workflow.py -q
 
       - name: Enforce package import contracts

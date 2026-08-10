@@ -68,7 +68,8 @@ jobs:
           --basetemp=.review-tmp/chunking-real-model
           tests/test_index_chunking_eval_contract.py -q
       # #43 citation contract is part of publication acceptance: a bundle that
-      # cites an absolute or backslash path is not publishable evidence.
+      # cites a noncanonical path or gives a community report a fake page citation
+      # is not publishable evidence.
       - name: Run publication, chunking, and bounded ANN benchmark acceptance gates
         run: >
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider

@@ -379,8 +379,14 @@ def render_context_markdown(bundle: ContextBundle) -> str:
     lines = [f"## 检索结果（hybrid FTS+RAG，{label}模式，{bundle.token_count}/{bundle.max_context_tokens} tokens）\n"]
     for i, item in enumerate(bundle.items, 1):
         lines.append(f"### [{i}] {item.title}")
-        lines.append(f"- 路径: {item.path}")
-        lines.append(f"- 引用: [来源: {item.path}]")
+        # Community reports deliberately have no Wiki-page path.  Rendering
+        # their internal community id as a ``[来源: ...]`` token would forge a
+        # citation that JSON correctly represents as ``null`` (issue #43).
+        if item.inclusion_reason == "global_community_report":
+            lines.append("- 类型: 社区报告（无页面路径引用）")
+        else:
+            lines.append(f"- 路径: {item.path}")
+            lines.append(f"- 引用: [来源: {item.path}]")
         lines.append(f"- 纳入原因: {item.inclusion_reason} | 范围: {item.scope} | tokens: {item.token_count}")
         lines.append(f"- 页面 ID: {item.page_id}")
         lines.append(f"- 来源: {', '.join(item.sources) if item.sources else '无'}")

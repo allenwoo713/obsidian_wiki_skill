@@ -64,15 +64,41 @@ def _citation_violations(bundle):
         reasons = []
         if "\\" in path:
             reasons.append("backslash_separator")
-        if PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute():
+        posix_path = PurePosixPath(path)
+        if posix_path.is_absolute() or PureWindowsPath(path).is_absolute():
             reasons.append("absolute_path")
         if not path.startswith("Wiki/"):
             reasons.append("not_wiki_rooted")
+        # ``PurePosixPath`` normalizes duplicate separators and ``.``; reject
+        # every input whose literal spelling is not its canonical serialized
+        # form, and reject traversal segments explicitly.  A valid citation is
+        # both Wiki-rooted *and* a stable, publishable identity.
+        if any(part in {".", ".."} for part in path.split("/")):
+            reasons.append("dot_or_traversal_segment")
+        if path != posix_path.as_posix():
+            reasons.append("noncanonical_posix_path")
         if f"[来源: {path}]" not in (getattr(bundle, "context_text", "") or ""):
             reasons.append("citation_token_missing_from_context_text")
         if reasons:
             found.append({"path": path, "page_id": item.page_id, "reasons": reasons})
     return found
+
+
+def _citation_contract_failures(metrics: dict) -> list[str]:
+    """Return baseline-independent citation failures for every eval mode.
+
+    Citation paths are publication safety data rather than a relative quality
+    metric.  Consequently an invalid run must not be accepted merely because
+    it initializes, lacks, or cannot compare a historical baseline.
+    """
+    count = metrics.get("quality", {}).get("citation_path_contract_violation_count", 0)
+    if count > 0:
+        return [
+            f"citation_path_contract_violation_count={count} > 0"
+            "（判定口径：ContextItem.path 必须为 Wiki/ 起始的规范相对 posix 路径，"
+            "且 context_text 内含 [来源: <path>] 字面；样本见 metrics.citation_paths）"
+        ]
+    return []
 
 
 BENCHMARK_EVIDENCE_FIELDS = frozenset({
@@ -527,6 +553,15 @@ def main():
         "\n".join(json.dumps(d, ensure_ascii=False) for d in detail), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
+    # This is a publication contract, not a baseline-relative quality metric:
+    # enforce it before all baseline setup/absence/schema early-return paths.
+    citation_failures = _citation_contract_failures(metrics)
+    if citation_failures:
+        print("\n[FAIL] citation 路径契约未通过：", file=sys.stderr)
+        for failure in citation_failures:
+            print("  - " + failure, file=sys.stderr)
+        return 1
+
     if args.init_baseline:
         baseline_obj = dict(metrics)
         baseline_obj["meta"] = {
@@ -580,11 +615,6 @@ def main():
         failures.append(
             f"context_overflow_count={mq['context_overflow_count']} > 0"
             f"（判定口径：token_count > bundle.effective_budget_tokens）")
-    if mq.get("citation_path_contract_violation_count", 0) > 0:
-        failures.append(
-            f"citation_path_contract_violation_count={mq['citation_path_contract_violation_count']} > 0"
-            f"（判定口径：ContextItem.path 必须为 Wiki/ 起始的相对 posix 路径，"
-            f"且 context_text 内含 [来源: <path>] 字面；样本见 metrics.citation_paths）")
     if mq.get("budget_contract_violation_count", 0) > 0:
         failures.append(
             f"budget_contract_violation_count={mq['budget_contract_violation_count']} > 0"
