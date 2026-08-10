@@ -559,6 +559,10 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/audit_images.py <pro
 4. **出处标注**：
    - text: `[来源: Wiki/xxx.md]`
    - image: `[来源: Wiki/assets/xxx.png, 源文档: Raw/.../xxx.<ext>]`
+   - JSON 输出的每条 `text`/`images` 记录都带一个 `citation` 字段，直接原样使用即可，
+     不要自己从 `path` 拼装、也不要改写它。`path` 已经是 `Wiki/` 起始的相对 posix 路径
+     （不含盘符、不含反斜杠）；社区报告（`method=global_community_report`）不是 Wiki 页面，
+     其 `citation` 为 `null`，应引用报告标题而非路径。
 
 ## 开发与维护规则（从实战教训沉淀）
 

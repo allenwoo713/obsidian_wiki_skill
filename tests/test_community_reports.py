@@ -302,6 +302,10 @@ def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatc
     assert payload["status"] == "community_reports_fresh"
     assert payload["mode"] == "summary"
     assert payload["text"] and payload["text"][0]["method"] == "global_community_report"
+    # issue #43: reports are not Wiki pages — they keep the community id as path
+    # and expose no citation, instead of being forced into a Wiki/... shape.
+    assert payload["text"][0]["path"] == str(result.bundle.items[0].page_id)
+    assert payload["text"][0]["citation"] is None
     assert result.bundle.budget_contract_violations() == []
 
 

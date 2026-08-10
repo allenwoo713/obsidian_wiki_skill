@@ -7,7 +7,7 @@ from fusion import assemble_context, render_context_markdown
 
 def _cand(page_id, title, score=1.0, evidence_text="关键证据文本", graph_paths=None):
     return PageCandidate(
-        page_id=page_id, path=Path(page_id), title=title, rrf_score=score,
+        page_id=page_id, path=Path(f"Wiki/{page_id}.md"), title=title, rrf_score=score,
         sparse_rank=1, dense_rank=1,
         dense_evidence=[EvidenceHit("c1", "dense", 1, 1.0, evidence_text, [])],
         sparse_evidence=[], graph_paths=graph_paths or [],
@@ -38,7 +38,7 @@ def test_assemble_per_type_budget_isolated(tiny_kb):
     from models import PageCandidate, EvidenceHit
     dense = [_cand(f"d{i}", f"D{i}", evidence_text="密集文本 " * 10) for i in range(20)]
     img = PageCandidate(
-        page_id="img1", path=Path("assets/img1.png"), title="图1", rrf_score=1.0,
+        page_id="img1", path=Path("Wiki/assets/img1.png"), title="图1", rrf_score=1.0,
         sparse_rank=1, dense_rank=1,
         dense_evidence=[EvidenceHit("ic", "dense", 1, 1.0, "图片说明文字", [])],
         sparse_evidence=[], graph_paths=[],
