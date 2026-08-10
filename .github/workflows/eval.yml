@@ -67,6 +67,9 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
           --basetemp=.review-tmp/chunking-real-model
           tests/test_index_chunking_eval_contract.py -q
+      # #43 citation contract is part of publication acceptance: a bundle that
+      # cites a noncanonical path or gives a community report a fake page citation
+      # is not publishable evidence.
       - name: Run publication, chunking, and bounded ANN benchmark acceptance gates
         run: >
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
@@ -79,7 +82,10 @@ jobs:
           tests/test_community_report_publication.py
           tests/test_index_chunking_contract.py
           tests/test_benchmark_sampling.py
-          tests/test_benchmark_batch_exact.py -q
+          tests/test_benchmark_batch_exact.py
+          tests/test_issue14_context_contract.py
+          tests/test_community_reports.py
+          tests/test_eval_workflow.py -q
       - name: Unit tests
         run: |
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider --basetemp=.review-tmp/pytest

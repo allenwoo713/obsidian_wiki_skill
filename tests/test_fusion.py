@@ -53,7 +53,8 @@ def test_assemble_context_budget_splits_text_and_images():
         rrf_score=0.5, sparse_rank=2, dense_rank=None,
         dense_evidence=[EvidenceHit("ci", "dense", 2, 0.5, "方框图示意雷达前端", [])],
     )
-    bundle = assemble_context([tc, ic], wi=None, mode="snippet", max_tokens=500)
+    bundle = assemble_context([tc, ic], wi=None, mode="snippet", max_tokens=500,
+                              citation_root=Path("/wiki"))
     kinds = {i.inclusion_reason for i in bundle.items}
     assert "image" in kinds
     assert bundle.token_count <= 500
@@ -72,7 +73,8 @@ def test_assemble_context_full_mode_reads_page():
         sparse_rank=1, dense_rank=1,
         dense_evidence=[EvidenceHit("c", "dense", 1, 1.0, "short", [])],
     )
-    bundle = assemble_context([tc], wi=None, mode="full", max_tokens=2000)
+    bundle = assemble_context([tc], wi=None, mode="full", max_tokens=2000,
+                              citation_root=Path(d))
     assert "完整内容" in bundle.items[0].text
     import shutil
     shutil.rmtree(d, ignore_errors=True)
@@ -96,7 +98,8 @@ def test_assemble_context_per_type_budget_enforced():
         rrf_score=0.1, sparse_rank=None, dense_rank=None,
         dense_evidence=[EvidenceHit("ci", "dense", 1, 0.5, "图注内容", [])],
     )
-    bundle = assemble_context(dense + [img], wi=None, mode="snippet", max_tokens=2000)
+    bundle = assemble_context(dense + [img], wi=None, mode="snippet", max_tokens=2000,
+                              citation_root=Path("/wiki"))
     dense_items = [i for i in bundle.items if i.inclusion_reason == "rrf"]
     image_items = [i for i in bundle.items if i.inclusion_reason == "image"]
     # Dense cannot displace the image minimum, but may use the shared remainder.

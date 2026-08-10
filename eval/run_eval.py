@@ -33,7 +33,7 @@ import sys
 import tempfile
 import time
 import tracemalloc
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
@@ -47,6 +47,58 @@ from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
 from chunking import CHUNK_SCHEMA_VERSION  # noqa: E402
+
+
+def _citation_violations(bundle):
+    """Zero-tolerance check of the ``[来源: Wiki/xxx.md]`` citation contract.
+
+    Community-report rows never map to a Wiki page and are exempt; every other
+    ContextItem must expose a forward-slash, non-absolute ``Wiki/``-rooted path
+    that literally appears as a citation token inside ``context_text``.
+    """
+    found = []
+    for item in getattr(bundle, "items", ()) or ():
+        if item.inclusion_reason == "global_community_report":
+            continue
+        path = str(item.path)
+        reasons = []
+        if "\\" in path:
+            reasons.append("backslash_separator")
+        posix_path = PurePosixPath(path)
+        if posix_path.is_absolute() or PureWindowsPath(path).is_absolute():
+            reasons.append("absolute_path")
+        if not path.startswith("Wiki/"):
+            reasons.append("not_wiki_rooted")
+        # ``PurePosixPath`` normalizes duplicate separators and ``.``; reject
+        # every input whose literal spelling is not its canonical serialized
+        # form, and reject traversal segments explicitly.  A valid citation is
+        # both Wiki-rooted *and* a stable, publishable identity.
+        if any(part in {".", ".."} for part in path.split("/")):
+            reasons.append("dot_or_traversal_segment")
+        if path != posix_path.as_posix():
+            reasons.append("noncanonical_posix_path")
+        if f"[来源: {path}]" not in (getattr(bundle, "context_text", "") or ""):
+            reasons.append("citation_token_missing_from_context_text")
+        if reasons:
+            found.append({"path": path, "page_id": item.page_id, "reasons": reasons})
+    return found
+
+
+def _citation_contract_failures(metrics: dict) -> list[str]:
+    """Return baseline-independent citation failures for every eval mode.
+
+    Citation paths are publication safety data rather than a relative quality
+    metric.  Consequently an invalid run must not be accepted merely because
+    it initializes, lacks, or cannot compare a historical baseline.
+    """
+    count = metrics.get("quality", {}).get("citation_path_contract_violation_count", 0)
+    if count > 0:
+        return [
+            f"citation_path_contract_violation_count={count} > 0"
+            "（判定口径：ContextItem.path 必须为 Wiki/ 起始的规范相对 posix 路径，"
+            "且 context_text 内含 [来源: <path>] 字面；样本见 metrics.citation_paths）"
+        ]
+    return []
 
 
 BENCHMARK_EVIDENCE_FIELDS = frozenset({
@@ -281,6 +333,8 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     context_overflow = 0
     budget_violations = 0
     budget_violation_samples = []
+    citation_path_violations = 0
+    citation_path_violation_samples = []
     budget_by_intent = {}          # intent → {"base": Counter, "effective": Counter}
     expanded_queries = 0           # effective > base（意图倍率生效）
     max_effective_budget = 0
@@ -335,6 +389,14 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         bundle = res.bundle
         if bundle.token_count > bundle.effective_budget_tokens:
             context_overflow += 1
+        # Citation contract (issue #43): every cited page must be Wiki-relative
+        # posix. Zero tolerance — one violation fails publication.
+        cite_bad = _citation_violations(bundle)
+        if cite_bad:
+            citation_path_violations += len(cite_bad)
+            if len(citation_path_violation_samples) < 5:
+                citation_path_violation_samples.append(
+                    {"query": q["query"], "violations": cite_bad[:3]})
         # 防契约漂移：max_context_tokens 必须等于 effective；hard cap 必须被尊重
         violations = bundle.budget_contract_violations()
         if violations:
@@ -409,6 +471,7 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "ann_recall_at_10": round(statistics.mean(ann_recalls), 4) if ann_recalls else None,
             "context_overflow_count": context_overflow,
             "budget_contract_violation_count": budget_violations,
+            "citation_path_contract_violation_count": citation_path_violations,
             "graph_only_unsupported_count": graph_only_unsupported,
             "graph_trigger_query_count": graph_trigger_queries,
             "graph_trigger_validated_count": graph_trigger_validated,
@@ -421,6 +484,10 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "max_effective_budget_tokens": max_effective_budget,
             "by_intent": budget_by_intent,
             "violation_samples": budget_violation_samples,
+        },
+        "citation_paths": {
+            "contract": "Wiki/<relative>.md (posix, non-absolute)",
+            "violation_samples": citation_path_violation_samples,
         },
         "performance": {
             "full_build_time_s": round(build_time, 2),
@@ -485,6 +552,15 @@ def main():
     (HERE / "detail.jsonl").write_text(
         "\n".join(json.dumps(d, ensure_ascii=False) for d in detail), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
+
+    # This is a publication contract, not a baseline-relative quality metric:
+    # enforce it before all baseline setup/absence/schema early-return paths.
+    citation_failures = _citation_contract_failures(metrics)
+    if citation_failures:
+        print("\n[FAIL] citation 路径契约未通过：", file=sys.stderr)
+        for failure in citation_failures:
+            print("  - " + failure, file=sys.stderr)
+        return 1
 
     if args.init_baseline:
         baseline_obj = dict(metrics)

@@ -453,9 +453,16 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
     # 7) 按 token 预算装配 ContextBundle（预算策略：context_mode → mode/倍率 + 硬上限）
     mode, mult, _planned, eff_tokens = resolve_budget(
         plan.context_mode, max_tokens, mode_override, hard_max_tokens)
+    # Citations must resolve against the *authoritative* vault root, never a
+    # rightmost-"Wiki" guess (issue #43). Fall back to the index sibling only
+    # when the caller supplied no wiki_dir.
+    effective_wiki_dir = wiki_dir
+    if effective_wiki_dir is None and getattr(wi, "index_dir", None) is not None:
+        effective_wiki_dir = Path(wi.index_dir).parent / "Wiki"
     bundle = assemble_context(merged, repository=wi, mode=mode,
                               scope=("full_page" if mode == "full" else plan.context_mode), max_tokens=eff_tokens,
-                              token_counter=wi.count_tokens)
+                              token_counter=wi.count_tokens,
+                              citation_root=effective_wiki_dir)
     bundle.apply_budget(base_tokens=max_tokens, multiplier=mult,
                         effective_tokens=eff_tokens, hard_max_tokens=hard_max_tokens,
                         policy=BUDGET_POLICY)
@@ -507,9 +514,13 @@ def result_to_json(result: HybridResult) -> dict:
 
     def item_entry(it: ContextItem):
         ps = str(it.path).replace("\\", "/")
+        # Community reports are not Wiki pages; they carry no resolvable
+        # citation path (issue #43).
+        is_report = it.inclusion_reason == "global_community_report"
         return {
             "page_id": it.page_id,
             "path": str(it.path),
+            "citation": None if is_report else f"[来源: {it.path}]",
             "title": it.title,
             "score": round(rrf.get(it.page_id, 0.0), 6),
             "snippet": it.text,

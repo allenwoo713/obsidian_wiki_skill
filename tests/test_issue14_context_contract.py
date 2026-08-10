@@ -47,9 +47,9 @@ class _Repository:
         return "# Install\n\n" + ("complete repository page " * 20)
 
 
-def _candidate():
+def _candidate(path=Path("Wiki/page-a.md")):
     return PageCandidate(
-        page_id="page-a", path=Path("Wiki/page-a.md"), title="Page A", rrf_score=1.0,
+        page_id="page-a", path=Path(path), title="Page A", rrf_score=1.0,
         sparse_rank=1, dense_rank=1,
         sparse_evidence=[EvidenceHit("sparse-1", "sparse", 1, 2.0, "same evidence", ["Install"])],
         dense_evidence=[EvidenceHit("dense-1", "dense", 1, 3.0, "same evidence", ["Install"])],
@@ -257,6 +257,80 @@ def test_wiki_index_parent_section_follows_persisted_chunk_index_with_fallback()
     assert [hit.chunk_id for hit in section] == [
         "m-before", "z-anchor", "a-after", "b-legacy"
     ]
+
+
+def test_absolute_page_path_becomes_wiki_relative_posix_citation(tmp_path):
+    """issue #43: an absolute on-disk path must never leak into the citation."""
+    wiki_root = tmp_path / "Wiki"
+    (wiki_root).mkdir()
+    absolute = wiki_root / "page-a.md"
+    absolute.write_text("# Install\n", encoding="utf-8")
+
+    repo = _Repository()
+    bundle = assemble_context([_candidate(absolute)], repository=repo, scope="chunk",
+                              max_tokens=200, token_counter=lambda text: len(text.split()),
+                              citation_root=wiki_root)
+    item = bundle.items[0]
+
+    assert item.path == "Wiki/page-a.md"
+    assert "\\" not in item.path
+    assert not Path(item.path).is_absolute()
+    assert "[来源: Wiki/page-a.md]" in bundle.context_text
+    assert str(absolute) not in bundle.context_text
+
+    payload = result_to_json(
+        HybridResult("q", bundle, SimpleNamespace(to_json=lambda: {}),
+                     [_candidate(absolute)], [item], []))
+    assert payload["text"][0]["path"] == "Wiki/page-a.md"
+    assert payload["text"][0]["citation"] == "[来源: Wiki/page-a.md]"
+
+
+def test_citation_root_not_rightmost_wiki_component(tmp_path):
+    """A nested ``Wiki`` directory must not truncate the citation prefix."""
+    wiki_root = tmp_path / "Wiki"
+    nested = wiki_root / "archive" / "Wiki"
+    nested.mkdir(parents=True)
+    absolute = nested / "page-a.md"
+    absolute.write_text("# Install\n", encoding="utf-8")
+
+    bundle = assemble_context([_candidate(absolute)], repository=_Repository(), scope="chunk",
+                              max_tokens=200, token_counter=lambda text: len(text.split()),
+                              citation_root=wiki_root)
+
+    assert bundle.items[0].path == "Wiki/archive/Wiki/page-a.md"
+    assert "[来源: Wiki/archive/Wiki/page-a.md]" in bundle.context_text
+
+
+def test_full_page_read_uses_original_path_before_presentation_normalization(tmp_path):
+    """Normalisation is presentation-only: disk reads still use the real path."""
+    wiki_root = tmp_path / "Wiki"
+    wiki_root.mkdir()
+    absolute = wiki_root / "page-a.md"
+    absolute.write_text("---\ntitle: A\n---\nreal disk content marker\n", encoding="utf-8")
+
+    candidate = _candidate(absolute)
+    bundle = assemble_context([candidate], scope="full_page", max_tokens=200,
+                              token_counter=lambda text: len(text.split()),
+                              citation_root=wiki_root)
+    item = bundle.items[0]
+
+    assert "real disk content marker" in item.text, "read must follow the original path"
+    assert candidate.path == absolute, "storage-side path must stay untouched"
+    assert candidate.page_id == "page-a"
+    assert item.path == "Wiki/page-a.md"
+
+
+def test_absolute_candidate_outside_wiki_root_is_rejected(tmp_path):
+    wiki_root = tmp_path / "Wiki"
+    wiki_root.mkdir()
+    outside = tmp_path / "elsewhere" / "page-a.md"
+    outside.parent.mkdir()
+    outside.write_text("# Install\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="outside Wiki root"):
+        assemble_context([_candidate(outside)], repository=_Repository(), scope="chunk",
+                         max_tokens=200, token_counter=lambda text: len(text.split()),
+                         citation_root=wiki_root)
 
 
 def test_rrf_collects_all_channel_evidence_for_one_page():

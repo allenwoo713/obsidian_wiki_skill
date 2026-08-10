@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional
 
 from models import (
@@ -186,6 +186,49 @@ def _truncate_to_budget(text: str, budget: int, token_counter):
     return prefix, True, [{"start_char": len(prefix), "end_char": len(text), "reason": "token_limit"}]
 
 
+def _citation_path(path, wiki_root: Optional[Path]) -> str:
+    """Canonicalise a page path into the ``Wiki/<...>.md`` citation contract.
+
+    Presentation-only boundary (issue #43): storage identity (``page_id``,
+    stored index rows, ``PageCandidate.path`` used for disk reads) is never
+    rewritten here — only what the agent finally cites.
+
+    ``wiki_root`` is the *authoritative* vault root supplied by the caller.
+    Rightmost-``Wiki``-component matching is deliberately NOT used: for a vault
+    at ``/project/Wiki`` a page at ``/project/Wiki/archive/Wiki/page.md`` must
+    cite ``Wiki/archive/Wiki/page.md``, not ``Wiki/page.md``.
+
+    Fails closed: an absolute candidate outside ``wiki_root`` — or a
+    non-canonical path when no root is known — raises ``ValueError`` rather
+    than emitting a citation the reader cannot resolve.
+    """
+    raw = str(path).replace("\\", "/")
+    pure = PurePosixPath(raw)
+    if wiki_root is None:
+        # No authoritative root: only an already-canonical citation is safe.
+        if not pure.is_absolute() and pure.parts and pure.parts[0] == "Wiki" \
+                and ".." not in pure.parts:
+            return pure.as_posix()
+        raise ValueError(
+            f"absolute/non-canonical citation path requires wiki_root: {raw}")
+
+    candidate = Path(path)
+    root = Path(wiki_root)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+        except ValueError as exc:
+            raise ValueError(f"citation path is outside Wiki root: {candidate}") from exc
+    else:
+        relative = PurePosixPath(raw)
+        if relative.parts and relative.parts[0] == "Wiki":
+            relative = PurePosixPath(*relative.parts[1:])
+    parts = tuple(relative.parts)
+    if not parts or ".." in parts:
+        raise ValueError(f"invalid Wiki-relative citation path: {relative}")
+    return PurePosixPath("Wiki", *parts).as_posix()
+
+
 def assemble_context(
     candidates: List[PageCandidate],
     wi=None,
@@ -195,6 +238,7 @@ def assemble_context(
     scope: Optional[str] = None,
     max_tokens: int = 4096,
     token_counter=None,
+    citation_root: Optional[Path] = None,
 ) -> ContextBundle:
     """把 PageCandidate 按 token 预算装配为 ContextBundle。
 
@@ -206,6 +250,9 @@ def assemble_context(
 
     Args:
         token_counter: 可选 callable(text)->int；缺省用 char//4 估计。
+        citation_root: 权威 vault 根目录（生产链路即 ``hybrid_search(wiki_dir=)``）。
+            仅用于把 ``ContextItem.path`` 规范化为 ``Wiki/xxx.md`` 引用形态；
+            读盘仍走 ``PageCandidate.path`` 原值。
     """
     bundle = ContextBundle(query="", mode=mode, max_context_tokens=max_tokens)
     if token_counter is None:
@@ -240,7 +287,7 @@ def assemble_context(
             return False
         sources = list(getattr(repository, "get_page_sources", lambda _pid: [])(c.page_id) or [])
         item = ContextItem(
-            page_id=c.page_id, path=str(c.path), title=c.title,
+            page_id=c.page_id, path=_citation_path(c.path, citation_root), title=c.title,
             inclusion_reason=("graph_expansion" if type_key == "graph"
                               else ("image" if type_key == "image" else "rrf")),
             scope=item_scope, evidence=evidence,
@@ -332,7 +379,14 @@ def render_context_markdown(bundle: ContextBundle) -> str:
     lines = [f"## 检索结果（hybrid FTS+RAG，{label}模式，{bundle.token_count}/{bundle.max_context_tokens} tokens）\n"]
     for i, item in enumerate(bundle.items, 1):
         lines.append(f"### [{i}] {item.title}")
-        lines.append(f"- 路径: {item.path}")
+        # Community reports deliberately have no Wiki-page path.  Rendering
+        # their internal community id as a ``[来源: ...]`` token would forge a
+        # citation that JSON correctly represents as ``null`` (issue #43).
+        if item.inclusion_reason == "global_community_report":
+            lines.append("- 类型: 社区报告（无页面路径引用）")
+        else:
+            lines.append(f"- 路径: {item.path}")
+            lines.append(f"- 引用: [来源: {item.path}]")
         lines.append(f"- 纳入原因: {item.inclusion_reason} | 范围: {item.scope} | tokens: {item.token_count}")
         lines.append(f"- 页面 ID: {item.page_id}")
         lines.append(f"- 来源: {', '.join(item.sources) if item.sources else '无'}")
