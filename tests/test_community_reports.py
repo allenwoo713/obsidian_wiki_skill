@@ -308,10 +308,13 @@ def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatc
     assert payload["text"][0]["citation"] is None
     # Exercise the production CLI/agent renderer too: community IDs are not
     # resolvable Wiki paths and must never appear in a fake citation token.
+    # Assert against the row's own rendered identity — community_id is an int,
+    # so matching a hardcoded "community-" prefix would be vacuously true.
     rendered = format_for_agent(result)
-    assert result.bundle.items[0].title in rendered
-    assert "[来源: community-" not in rendered
-    assert "- 路径: community-" not in rendered
+    report_item = result.bundle.items[0]
+    assert report_item.title in rendered
+    assert f"[来源: {report_item.path}]" not in rendered
+    assert f"- 路径: {report_item.path}" not in rendered
     assert result.bundle.budget_contract_violations() == []
 
 
