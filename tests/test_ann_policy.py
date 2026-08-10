@@ -131,8 +131,13 @@ def test_service_records_exact_and_candidate_id_sets_before_ann_promotion(tmp_pa
     ).build(
         wiki,
         index_dir,
+        # Tie-free by construction: a shared strictly-decreasing tail makes every
+        # non-self cosine distinct, so exact top-k has ONE valid ordering. Plain
+        # one-hot vectors leave a 19-way tie at score 0.0, and the two engines
+        # (numpy batch exact vs lancedb HNSW) break that tie differently, which
+        # made recall@10 platform-dependent noise rather than a real signal.
         embed=lambda texts: [
-            [1.0 if column == row else 0.0 for column in range(20)]
+            [1.0 if column == row else 1.0 / (2 ** (column + 2)) for column in range(20)]
             for row, _text in enumerate(texts)
         ],
     )

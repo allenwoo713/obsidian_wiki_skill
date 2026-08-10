@@ -217,6 +217,22 @@ class BenchmarkObservation(_JsonRecord):
 
 
 @dataclass(frozen=True)
+class ExactBatchResult(_JsonRecord):
+    """Ground truth from one streamed cosine top-k scan over the dense table.
+
+    #41: replaces the 256 independent scalar ``bypass_vector_index`` full scans
+    that dominated the build-time benchmark. The application layer consumes only
+    IDs plus instrumentation; NumPy/Arrow objects never cross the storage port.
+    """
+
+    result_ids: Tuple[Tuple[str, ...], ...]
+    elapsed_ms: float
+    scan_rows: int
+    scan_batches: int
+    method: str
+
+
+@dataclass(frozen=True)
 class ValidationObservation(_JsonRecord):
     schema_counts: IndexSchemaCounts
     vector_index: IndexStats
@@ -237,6 +253,11 @@ class VectorPolicyDecision(_JsonRecord):
     reason: str
     benchmark: BenchmarkObservation
     index_stats: IndexStats
+    # #41：policy 必须复述 benchmark evidence 的采样口径，禁止 v4-shaped record
+    # 静默携带 sampled 语义。evidence 缺失的调用方（旧两参签名）保持空默认。
+    benchmark_scope: str = ""
+    benchmark_probe_count: int = 0
+    benchmark_probe_total: int = 0
 
 
 @dataclass(frozen=True)

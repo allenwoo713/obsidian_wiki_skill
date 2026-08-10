@@ -119,8 +119,10 @@ jobs:
       # lifecycle/post-commit crash windows, deterministic process tests, and test integrity.
       # #39 model-free gates: planning is lock-scoped, manifest pages stay canonical,
       # parser semantics match WikiIndex, and persisted dense leaves remain token-bounded.
+      # #41 bounded ANN benchmark: deterministic portable probes, versioned evidence,
+      # explicit policy scope, observer parity, and a real >256-row publication path.
       # All named suites are model-free and must pass on Windows + Linux.
-      - name: Run storage, publication, and chunking acceptance gates
+      - name: Run storage, publication, chunking, and ANN benchmark acceptance gates
         run: >
           python -m pytest -p no:cacheprovider
           --basetemp=.review-tmp/phase01-contract
@@ -130,7 +132,9 @@ jobs:
           tests/test_index_durability.py
           tests/test_index_post_commit.py
           tests/test_test_suite_integrity.py
-          tests/test_index_chunking_contract.py -q
+          tests/test_index_chunking_contract.py
+          tests/test_benchmark_sampling.py
+          tests/test_benchmark_batch_exact.py -q
 
       - name: Enforce package import contracts
         working-directory: scripts
