@@ -140,8 +140,7 @@ jobs:
           tests/test_benchmark_batch_exact.py
           tests/test_issue14_context_contract.py
           tests/test_sparse_structure_contract.py
-          tests/test_two_table_purity.py
-          tests/test_rrf_invariance.py
+          tests/test_fusion.py
           tests/test_community_reports.py
           tests/test_eval_workflow.py -q
 

@@ -367,9 +367,13 @@ def test_real_build_over_cap_publishes_bounded_v5_evidence(tmp_path: Path) -> No
     wiki.mkdir()
     index_dir = tmp_path / ".index"
     total = 257
-    chunks = tuple(
+    # issue #47 strict two-table contract: a canonical build must carry both
+    # lexical (sparse) and vector (dense) chunks. This test only exercises the
+    # dense/vector benchmark-sampling path, but the production build invariant
+    # still applies, so we emit a matching sparse chunk per page too.
+    dense_chunks = tuple(
         SparseChunk(
-            chunk_id=f"{(wiki / f'page-{index:04d}.md').resolve()}::{index:016x}",
+            chunk_id=f"{(wiki / f'page-{index:04d}.md').resolve()}::dense::{index:016x}",
             page_id=str((wiki / f"page-{index:04d}.md").resolve()),
             path=str((wiki / f"page-{index:04d}.md").resolve()),
             title=f"Page {index}",
@@ -381,6 +385,21 @@ def test_real_build_over_cap_publishes_bounded_v5_evidence(tmp_path: Path) -> No
         )
         for index in range(total)
     )
+    sparse_chunks = tuple(
+        SparseChunk(
+            chunk_id=f"{(wiki / f'page-{index:04d}.md').resolve()}::sparse::{index:016x}",
+            page_id=str((wiki / f"page-{index:04d}.md").resolve()),
+            path=str((wiki / f"page-{index:04d}.md").resolve()),
+            title=f"Page {index}",
+            text=f"sparse text {index}",
+            fts_text=f"SPARSETERM{index}",
+            chunk_kind="sparse",
+            chunk_index=index,
+            content_hash=hashlib.sha256(f"sparse text {index}".encode()).hexdigest(),
+        )
+        for index in range(total)
+    )
+    chunks = dense_chunks + sparse_chunks
 
     service = IndexBuildService(
         LanceDbIndexRepository(index_dir),

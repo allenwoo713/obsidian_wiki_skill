@@ -189,7 +189,10 @@ class IndexBuildService:
             index_started = time.perf_counter()
             reopened.create_vector_index(vector_config)
             index_build_ms = (time.perf_counter() - index_started) * 1000
-            exact_term = self._exact_term(sparse_chunks)
+            # issue #47: the exact-term validation probes the FTS (sparse) table,
+            # so the sampled term must come from the lexical corpus that is
+            # actually indexed there — not from a dense chunk that never enters FTS.
+            exact_term = self._exact_term(lexical_chunks)
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term
             )
