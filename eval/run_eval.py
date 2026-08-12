@@ -626,6 +626,17 @@ def main():
     metrics, detail = run_evaluation(args.wiki, queries, work_dir, args.max_tokens,
                              build_ann=not args.no_ann, regression_pp=args.regression_pp,
                              hard_max_tokens=args.hard_max_tokens)
+
+    # This is a publication contract, not a baseline-relative quality metric.
+    # Enforce it at the primary evaluation boundary: unsafe evidence must not
+    # trigger unrelated graph/model work or reach any baseline write path.
+    citation_failures = _citation_contract_failures(metrics)
+    if citation_failures:
+        print("\n[FAIL] citation 路径契约未通过：", file=sys.stderr)
+        for failure in citation_failures:
+            print("  - " + failure, file=sys.stderr)
+        return 1
+
     graph_metrics, graph_detail = run_graph_contract_evaluation(
         args.graph_wiki, graph_queries, work_dir, args.max_tokens,
         hard_max_tokens=args.hard_max_tokens)
@@ -638,15 +649,6 @@ def main():
     (HERE / "graph_detail.jsonl").write_text(
         "\n".join(json.dumps(d, ensure_ascii=False) for d in graph_detail), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
-
-    # This is a publication contract, not a baseline-relative quality metric:
-    # enforce it before all baseline setup/absence/schema early-return paths.
-    citation_failures = _citation_contract_failures(metrics)
-    if citation_failures:
-        print("\n[FAIL] citation 路径契约未通过：", file=sys.stderr)
-        for failure in citation_failures:
-            print("  - " + failure, file=sys.stderr)
-        return 1
 
     if args.init_baseline:
         baseline_obj = dict(metrics)

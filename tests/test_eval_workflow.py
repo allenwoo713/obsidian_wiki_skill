@@ -79,6 +79,12 @@ def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tm
     }
     monkeypatch.setattr(run_eval, "HERE", output_dir)
     monkeypatch.setattr(run_eval, "run_evaluation", lambda *args, **kwargs: (metrics, []))
+    monkeypatch.setattr(
+        run_eval,
+        "run_graph_contract_evaluation",
+        lambda *args, **kwargs: pytest.fail(
+            "graph evaluation must not run after a primary citation failure"),
+    )
     argv = [
         "run_eval.py", "--wiki", str(wiki), "--queries", str(queries),
         "--baselines", str(baseline), "--work-dir", str(tmp_path / "work"),
@@ -89,3 +95,37 @@ def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tm
 
     assert run_eval.main() == 1
     assert not baseline.exists()
+
+
+def test_eval_valid_primary_output_runs_graph_contract(monkeypatch, tmp_path):
+    """Valid primary evidence must continue through the production graph gate."""
+    wiki = tmp_path / "Wiki"
+    wiki.mkdir()
+    queries = tmp_path / "queries.jsonl"
+    queries.write_text("", encoding="utf-8")
+    baseline = tmp_path / "missing-baseline.json"
+    output_dir = tmp_path / "eval-output"
+    output_dir.mkdir()
+    graph_calls = []
+    metrics = {
+        "quality": {
+            "citation_path_contract_violation_count": 0,
+            "citation_paths": [],
+        },
+    }
+
+    def graph_evaluation(*args, **kwargs):
+        graph_calls.append((args, kwargs))
+        return ({"failures": []}, [])
+
+    monkeypatch.setattr(run_eval, "HERE", output_dir)
+    monkeypatch.setattr(run_eval, "run_evaluation", lambda *args, **kwargs: (metrics, []))
+    monkeypatch.setattr(run_eval, "run_graph_contract_evaluation", graph_evaluation)
+    monkeypatch.setattr(sys, "argv", [
+        "run_eval.py", "--wiki", str(wiki), "--queries", str(queries),
+        "--baselines", str(baseline), "--work-dir", str(tmp_path / "work"),
+    ])
+
+    assert run_eval.main() == 0
+    assert len(graph_calls) == 1
+    assert metrics["graph_contract"] == {"failures": []}
