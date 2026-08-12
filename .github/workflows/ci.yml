@@ -139,6 +139,9 @@ jobs:
           tests/test_benchmark_sampling.py
           tests/test_benchmark_batch_exact.py
           tests/test_issue14_context_contract.py
+          tests/test_sparse_structure_contract.py
+          tests/test_issue47_two_table_purity.py
+          tests/test_issue47_rrf_invariance.py
           tests/test_community_reports.py
           tests/test_eval_workflow.py -q
 
