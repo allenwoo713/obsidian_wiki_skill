@@ -31,6 +31,8 @@ from obsidian_wiki.domain.index_models import (
 class LanceDbIndexRepository:
     """The sole location where #17 domain values become LanceDB calls."""
 
+    _FULL_EVIDENCE_MAX_ROWS = 256
+
     def __init__(self, lance_dir: Path):
         self._lance_dir = Path(lance_dir)
 
@@ -399,7 +401,17 @@ class LanceDbIndexRepository:
                 # ef at 100; but never go BELOW lancedb's own default (1.5*limit),
                 # since large-k production queries (e.g. limit=80) would otherwise
                 # regress from ef=120 to 100. Floor = max(100, ceil(1.5*limit)).
-                query = query.ef(max(100, (limit * 3 + 1) // 2))
+                default_ef = max(100, (limit * 3 + 1) // 2)
+                dense_rows = self._dense_table().count_rows()
+                # Build-time policy fully probes corpora up to 256 rows. Make
+                # those candidate queries exhaustive so HNSW construction order
+                # cannot randomly flip a strict 1.00 recall promotion decision.
+                # Larger production indexes retain the bounded/default policy.
+                query = query.ef(
+                    max(default_ef, dense_rows)
+                    if dense_rows <= self._FULL_EVIDENCE_MAX_ROWS
+                    else default_ef
+                )
             if where is not None:
                 query = query.where(where)
             return query.limit(limit).to_list()

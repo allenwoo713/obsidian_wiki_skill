@@ -291,9 +291,10 @@ class _QuerySpy:
 
 
 class _DenseTableSpy:
-    def __init__(self) -> None:
+    def __init__(self, row_count: int = 20) -> None:
         self.index_call = None
         self.queries: list[_QuerySpy] = []
+        self.row_count = row_count
 
     def create_index(self, column: str, **kwargs: object) -> None:
         self.index_call = (column, kwargs)
@@ -304,7 +305,7 @@ class _DenseTableSpy:
         return query
 
     def count_rows(self) -> int:
-        return 20
+        return self.row_count
 
     def index_stats(self, index_name: str):
         return type("Stats", (), {"num_indexed_rows": 20, "num_unindexed_rows": 0})()
@@ -382,6 +383,31 @@ def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(
     # limit=200 -> max(100, ceil(1.5*200)=300) = 300 (follows default, above floor)
     repository.search_dense([1.0, 0.0], metric="cosine", limit=200)
     assert table.queries[-1].ef_value == 300
+
+
+def test_small_full_evidence_corpus_uses_exhaustive_ann_ef(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The 157-probe Eval build cannot depend on HNSW construction order."""
+    table = _DenseTableSpy(row_count=157)
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
+
+    assert table.queries[-1].ef_value == 157
+
+
+def test_large_corpus_keeps_bounded_ann_ef(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    table = _DenseTableSpy(row_count=257)
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
+
+    assert table.queries[-1].ef_value == 100
 
 
 def test_adapter_rejects_duplicate_or_nonfinite_dense_vectors(tmp_path: Path) -> None:
