@@ -363,10 +363,14 @@ class WikiIndex:
         return self._resolve_active_lance_dir().parent / "manifest.json"
 
     def _content_hashes(self):
-        """#11 内容签名：tokenizer / 分块配置哈希；变化时作废旧向量、强制全量重 encode。"""
+        """#11 内容签名：tokenizer / 分块配置哈希；变化时作废旧向量、强制全量重 encode。
+
+        issue #47：sparse / dense schema 版本独立，sparse-only 改动（如 block-first
+        重构）不使未变的 dense 向量缓存失效 → 第二元组仍用 DENSE_CHUNK_SCHEMA_VERSION。
+        """
         return (
-            "whitespace+" + ("jieba" if _jieba_available() else "bigram"),
-            f"v{CHUNK_SCHEMA_VERSION}:{chunking.DENSE_TARGET_TOKENS}:{chunking.DENSE_OVERLAP_TOKENS}",
+            "whitespace+" + ("jieba" if _jieba_available() else "bigram") + f":v{chunking.SPARSE_CHUNK_SCHEMA_VERSION}",
+            f"v{chunking.DENSE_CHUNK_SCHEMA_VERSION}:{chunking.DENSE_TARGET_TOKENS}:{chunking.DENSE_OVERLAP_TOKENS}",
         )
 
     # ---- build ----

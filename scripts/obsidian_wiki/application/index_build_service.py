@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Sequence
 
+import chunking  # 叶子模块（仅 stdlib），提供 SPARSE/DENSE_CHUNK_SCHEMA_VERSION
+
 from obsidian_wiki.application.active_index_pointer import (
     publish_pointer,
     record_building,
@@ -24,6 +26,7 @@ from obsidian_wiki.domain.index_models import (
     BuildContext,
     DenseChunk,
     FtsIndexConfig,
+    INDEX_LAYOUT_VERSION,
     IndexStats,
     PostCommitTask,
     PostCommitTaskState,
@@ -130,7 +133,11 @@ class IndexBuildService:
         sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
             raise RuntimeError("No canonical Wiki Markdown pages were available to index")
+        # issue #47：canonical 计划同时含 sparse+dense 两种 kind；严格分离后再落两表。
+        lexical_chunks = tuple(chunk for chunk in sparse_chunks if chunk.chunk_kind == "sparse")
         dense_sources = tuple(chunk for chunk in sparse_chunks if chunk.chunk_kind == "dense")
+        if not lexical_chunks:
+            raise RuntimeError("Canonical chunk plan contains no sparse (lexical) retrieval chunks")
         if not dense_sources:
             raise RuntimeError("Canonical chunk plan contains no dense retrieval chunks")
         vectors = embed([chunk.text for chunk in dense_sources])
@@ -169,7 +176,7 @@ class IndexBuildService:
         # #35：build 目录创建后立即耐久写 BUILDING（missing → building）。
         record_building(build_dir, build_id=ctx.build_id, generation=generation)
         try:
-            self._storage.persist(lance_dir, sparse_chunks, dense_chunks, self._fts_config)
+            self._storage.persist(lance_dir, lexical_chunks, dense_chunks, self._fts_config)
             # #36 follow-up：所有 storage mutation（persist / create_vector_index）都
             # 必须在最终 seal 之前完成——vector index 创建会改写 LanceDB，故 seal
             # 不能放在 persist 后（当前已修复：先建索引，再最终 seal）。
@@ -187,12 +194,12 @@ class IndexBuildService:
                 dimension=dimension, exact_term=exact_term
             )
             if (
-                counts.sparse_chunks_count != len(sparse_chunks)
+                counts.sparse_chunks_count != len(lexical_chunks)
                 or counts.dense_chunks_count != len(dense_chunks)
             ):
                 raise RuntimeError(
                     "staging 持久化完整性校验失败："
-                    f"sparse={counts.sparse_chunks_count}/{len(sparse_chunks)} "
+                    f"sparse={counts.sparse_chunks_count}/{len(lexical_chunks)} "
                     f"dense={counts.dense_chunks_count}/{len(dense_chunks)}"
                 )
             benchmark, benchmark_evidence = self._benchmark(
@@ -242,7 +249,7 @@ class IndexBuildService:
             ))
             publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
             return StorageArtifact(
-                lance_dir, manifest_path, len(sparse_chunks), len(dense_chunks),
+                lance_dir, manifest_path, len(lexical_chunks), len(dense_chunks),
                 build_id=ctx.build_id, generation=generation,
             )
         except CommitUncertainError:
@@ -291,6 +298,12 @@ class IndexBuildService:
             "layout": "sparse_chunks+dense_chunks",
             "generation": generation,
             "build_id": build_id,
+            # issue #47 F：布局/版本元信息，供 require_current_layout 拒绝旧构建。
+            "index_layout_version": INDEX_LAYOUT_VERSION,
+            "sparse_chunk_schema_version": chunking.SPARSE_CHUNK_SCHEMA_VERSION,
+            "dense_chunk_schema_version": chunking.DENSE_CHUNK_SCHEMA_VERSION,
+            "canonical_chunks_count": len(sparse_chunks),
+            "fts_rows_count": sum(1 for c in sparse_chunks if c.chunk_kind == "sparse"),
             "fts_config": fts_config,
             "vector_config": vector_config_json,
             "config_hashes": {
@@ -556,6 +569,15 @@ class IndexBuildService:
             page_id = str(path.resolve())
             chunks.append(SparseChunk(
                 chunk_id=f"sparse:{digest}", page_id=page_id, path=str(path),
-                title=title, text=body, fts_text=body, end_char=len(body),
+                title=title, text=body, fts_text=body, chunk_kind="sparse",
+                end_char=len(body),
+            ))
+            # issue #47：legacy 无 tokenizer 路径（build_storage_contract 不带 tokenizer）
+            # 仍需产出 dense chunk，否则 _build 的「两种 kind 都必须存在」守卫会拒绝。
+            # 该 dense 是整页 chunk（仅用于 legacy fallback；生产路径走 tokenizer 计划）。
+            chunks.append(SparseChunk(
+                chunk_id=f"dense:{digest}", page_id=page_id, path=str(path),
+                title=title, text=body, fts_text=body, chunk_kind="dense",
+                end_char=len(body),
             ))
         return tuple(chunks)

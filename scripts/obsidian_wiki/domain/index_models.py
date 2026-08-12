@@ -13,6 +13,11 @@ class RebuildRequiredError(RuntimeError):
     """Raised when a persisted index belongs to the retired ``chunks`` layout."""
 
 
+# issue #47 F：index 布局版本。旧构建（被污染的两表 / 旧 schema）缺少该字段，
+# ``require_current_layout`` 据此拒绝并要求重建。
+INDEX_LAYOUT_VERSION = 6
+
+
 class _JsonRecord:
     """Provide a stable, JSON-safe representation for persisted domain records."""
 
@@ -87,6 +92,11 @@ class SparseChunk(_JsonRecord):
     continuation_index: int = -1
     start_char: int = 0
     end_char: int = 0
+    # issue #47：结构感知 provenance（原样保留真实 source span，不伪造连续切片）。
+    structure_kind: str = "paragraph"   # paragraph|quote|list|code|table
+    table_header_text: str = ""         # 大表窗口重复 header 的真实文本
+    table_header_start_char: int = -1   # header 真实起始 offset
+    table_header_end_char: int = -1     # header 真实结束 offset
 
 
 @dataclass(frozen=True)

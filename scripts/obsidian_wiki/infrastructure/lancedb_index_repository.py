@@ -19,6 +19,7 @@ from obsidian_wiki.domain.index_models import (
     ExactBatchResult,
     FtsIndexConfig,
     FtsIndexStats,
+    INDEX_LAYOUT_VERSION,
     IndexSchemaCounts,
     IndexStats,
     RebuildRequiredError,
@@ -61,6 +62,11 @@ class LanceDbIndexRepository:
         dimensions = self.validate_dense_chunks(dense_chunks)
         if len({chunk.chunk_id for chunk in sparse_chunks}) != len(sparse_chunks):
             raise ValueError("Sparse persistence rejects duplicate chunk IDs")
+        # issue #47：两表严格语义分离，写入前 fail-closed 拒绝混入的另一种 kind。
+        if any(c.chunk_kind != "sparse" for c in sparse_chunks):
+            raise ValueError("sparse_chunks accepts only chunk_kind='sparse' (issue #47)")
+        if any(c.chunk_kind != "dense" for c in dense_chunks):
+            raise ValueError("dense_chunks accepts only chunk_kind='dense' (issue #47)")
         db = lancedb.connect(str(lance_dir))
         sparse_schema = pa.schema([
             pa.field("chunk_id", pa.string()), pa.field("page_id", pa.string()),
@@ -72,6 +78,10 @@ class LanceDbIndexRepository:
             pa.field("token_count", pa.int64()), pa.field("content_hash", pa.string()),
             pa.field("forced_split", pa.bool_()), pa.field("continuation_index", pa.int64()),
             pa.field("start_char", pa.int64()), pa.field("end_char", pa.int64()),
+            pa.field("structure_kind", pa.string()),
+            pa.field("table_header_text", pa.string()),
+            pa.field("table_header_start_char", pa.int64()),
+            pa.field("table_header_end_char", pa.int64()),
         ])
         dense_schema = pa.schema([
             pa.field("chunk_id", pa.string()), pa.field("page_id", pa.string()),
@@ -172,12 +182,19 @@ class LanceDbIndexRepository:
             raise RuntimeError("Persisted artifact must contain exactly sparse_chunks and dense_chunks")
         sparse = db.open_table("sparse_chunks")
         dense = db.open_table("dense_chunks")
+        # 两表共享的上下文列；structure_kind/table_header_* 为 sparse 表独有
+        # （dense 表 schema 不含），仅计入 required_sparse 校验（issue #47）。
         context_columns = {
             "page_type", "section_path", "heading", "chunk_kind", "chunk_index",
             "parent_section_id", "token_count", "content_hash", "forced_split",
             "continuation_index", "start_char", "end_char",
         }
-        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text", *context_columns}
+        sparse_only = {
+            "structure_kind", "table_header_text",
+            "table_header_start_char", "table_header_end_char",
+        }
+        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text",
+                          *context_columns, *sparse_only}
         required_dense = {"chunk_id", "page_id", "path", "title", "text", "vector", *context_columns}
         if set(sparse.schema.names) != required_sparse or set(dense.schema.names) != required_dense:
             raise RuntimeError("Persisted table schemas do not satisfy the two-table contract")
@@ -213,13 +230,21 @@ class LanceDbIndexRepository:
         return self._sparse_table().search(query, query_type="fts").limit(limit).to_list()
 
     def context_rows(self, predicate: str) -> list[Mapping[str, object]]:
-        """Read canonical chunk text/metadata from sparse_chunks for context assembly.
+        """Union sparse + dense retrieval rows for context assembly (issue #47).
 
-        This deliberately never opens the retired ``chunks`` table.  Sparse rows
-        retain every ChunkRecord (including dense leaf metadata), whereas the
-        dense table is intentionally limited to vector-bearing leaves.
+        The two physical tables are strictly separated; context assembly reads
+        both and deduplicates by ``chunk_id`` (dense wins on collision, since it
+        carries the vector-bearing leaf).  Sorted by
+        (page_id, chunk_index, chunk_id) for deterministic ordering.
         """
-        return self._sparse_table().search().where(predicate).to_list()
+        def _normalize(row: Mapping[str, object]) -> dict:
+            return {**row}
+
+        sparse = self._sparse_table().search().where(predicate).to_list()
+        dense = self._dense_table().search().where(predicate).to_list()
+        rows = {row["chunk_id"]: _normalize(row) for row in sparse}
+        rows.update({row["chunk_id"]: _normalize(row) for row in dense})
+        return sorted(rows.values(), key=lambda r: (r["page_id"], r["chunk_index"], r["chunk_id"]))
 
     def search_dense(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
@@ -396,3 +421,7 @@ class LanceDbIndexRepository:
             raise RebuildRequiredError("Index manifest cannot be interpreted; rebuild required") from exc
         if manifest.get("layout") != "sparse_chunks+dense_chunks":
             raise RebuildRequiredError("Legacy index layout detected; rebuild required")
+        # issue #47：旧构建（被污染的两表 / 旧 schema）缺少 index_layout_version，
+        # 据此明确要求重建，而非在污染的稀疏表上继续服务。
+        if manifest.get("index_layout_version") != INDEX_LAYOUT_VERSION:
+            raise RebuildRequiredError("Index layout version mismatch; rebuild required")
