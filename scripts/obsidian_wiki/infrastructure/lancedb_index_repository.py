@@ -12,7 +12,7 @@ from typing import Mapping, Sequence
 import lancedb
 import numpy as np
 import pyarrow as pa
-from lancedb.index import HnswFlat, IvfFlat
+from lancedb.index import HnswFlat, HnswSq, IvfFlat
 
 from obsidian_wiki.domain.index_models import (
     DenseChunk,
@@ -143,19 +143,25 @@ class LanceDbIndexRepository:
         table = self._dense_table()
         if table.count_rows() != config.dense_chunks_count:
             raise ValueError("Vector index config dense_chunks_count does not match dense table")
-        index_config = (
-            IvfFlat(
+        if config.index_type == "ivf_flat":
+            index_config = IvfFlat(
                 distance_type=config.metric,
                 num_partitions=config.num_partitions,
             )
-            if config.index_type == "ivf_flat"
-            else HnswFlat(
+        elif config.index_type == "hnsw_sq":
+            index_config = HnswSq(
                 distance_type=config.metric,
                 num_partitions=config.num_partitions,
                 m=config.m,
                 ef_construction=config.ef_construction,
             )
-        )
+        else:
+            index_config = HnswFlat(
+                distance_type=config.metric,
+                num_partitions=config.num_partitions,
+                m=config.m,
+                ef_construction=config.ef_construction,
+            )
         table.create_index(
             "vector",
             config=index_config,

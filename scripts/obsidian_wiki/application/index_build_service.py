@@ -192,13 +192,23 @@ class IndexBuildService:
             # 不能放在 persist 后（当前已修复：先建索引，再最终 seal）。
             reopened = self._reopen_storage(lance_dir)
             dimension = len(dense_chunks[0].vector)
+            forced_index_types = {
+                "ivf-hnsw-flat": "hnsw_flat",
+                "ivf-hnsw-sq": "hnsw_sq",
+            }
+            candidate_index_type = forced_index_types.get(self._vector_index_mode)
+            if candidate_index_type is None:
+                # Only auto may substitute deterministic one-partition IVF-FLAT
+                # for a small corpus whose policy evidence covers every row.
+                # Exact creates no candidate; its placeholder config remains HNSW.
+                candidate_index_type = (
+                    "ivf_flat"
+                    if self._vector_index_mode == "auto"
+                    and len(dense_chunks) <= self._benchmark_max_probes
+                    else "hnsw_flat"
+                )
             vector_config = VectorIndexConfig(
-                # One-partition IVF-FLAT is deterministic and lossless for the
-                # small corpora whose policy evidence covers every row. Larger
-                # sampled corpora retain the scalable HNSW candidate.
-                index_type=("ivf_flat"
-                            if len(dense_chunks) <= self._benchmark_max_probes
-                            else "hnsw_flat"),
+                index_type=candidate_index_type,
                 metric="cosine", num_partitions=1,
                 m=16, ef_construction=300,
                 dense_chunks_count=len(dense_chunks),

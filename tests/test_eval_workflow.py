@@ -61,6 +61,46 @@ def test_eval_exempts_community_report_rows():
     assert _citation_violations(bundle) == []
 
 
+def test_eval_builds_ann_candidate_through_auto_policy(monkeypatch, tmp_path):
+    """Dedicated Eval must opt into internal policy, not misuse a public force flag."""
+    requested_modes = []
+
+    class Planner:
+        def plan(self, _query):
+            return None
+
+    class FakeIndex:
+        def build(self, *_args, **_kwargs):
+            return None
+
+    def fake_build(root, _wiki, mode, full_rebuild):
+        requested_modes.append((root.name, mode, full_rebuild))
+        staged_wiki = root / "Wiki"
+        staged_wiki.mkdir(parents=True, exist_ok=True)
+        (staged_wiki / "page.md").write_text("fixture", encoding="utf-8")
+        return FakeIndex(), staged_wiki, 0.01
+
+    monkeypatch.setattr(run_eval, "_build", fake_build)
+    monkeypatch.setattr(run_eval, "_active_benchmark_contract", lambda _wi: {})
+    monkeypatch.setattr(run_eval, "DefaultQueryPlanner", lambda project_root: Planner())
+    monkeypatch.setattr(run_eval.tracemalloc, "start", lambda: None)
+    monkeypatch.setattr(run_eval.tracemalloc, "stop", lambda: None)
+    monkeypatch.setattr(run_eval.tracemalloc, "get_traced_memory", lambda: (0, 0))
+    monkeypatch.setattr(run_eval.statistics, "mean", lambda _values: 0.0)
+
+    metrics, detail = run_eval.run_evaluation(
+        tmp_path / "fixture-wiki", [], tmp_path / "work", 4096,
+        build_ann=True, regression_pp=2.0,
+    )
+
+    assert requested_modes[:2] == [
+        ("main", "exact", True),
+        ("ann", "auto", True),
+    ]
+    assert metrics["index_benchmark"] == {"main": {}, "ann": {}}
+    assert detail == []
+
+
 @pytest.mark.parametrize("init_baseline", [False, True])
 def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tmp_path, init_baseline):
     """Unsafe evidence cannot become a new baseline or pass without one."""

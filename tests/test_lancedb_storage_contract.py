@@ -110,6 +110,41 @@ def test_exact_build_mode_bypasses_candidate_index(
     assert "dense_hnsw" not in {index.name for index in dense.list_indices()}
 
 
+@pytest.mark.parametrize(
+    ("requested_mode", "expected_index_type"),
+    [
+        ("ivf-hnsw-flat", "hnsw_flat"),
+        ("ivf-hnsw-sq", "hnsw_sq"),
+    ],
+)
+def test_explicit_hnsw_mode_is_not_rewritten_for_small_corpus(
+    requested_mode: str, expected_index_type: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public force flag must beat the internal small-auto IVF policy."""
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Forced HNSW\n\nEXPLICITHNSWTERM\n")
+    observed_configs: list[VectorIndexConfig] = []
+    real_create = LanceDbIndexRepository.create_vector_index
+
+    def capture_create(self, config):
+        observed_configs.append(config)
+        return real_create(self, config)
+
+    monkeypatch.setattr(LanceDbIndexRepository, "create_vector_index", capture_create)
+    outcome = build_storage_contract(
+        wiki,
+        tmp_path / ".index",
+        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
+        vector_index_mode=requested_mode,
+    )
+    manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
+
+    assert [config.index_type for config in observed_configs] == [expected_index_type]
+    assert manifest["requested_vector_index_mode"] == requested_mode
+    assert manifest["vector_config"]["index_type"] == expected_index_type
+
+
 def test_real_lancedb_has_no_storage_mutation_after_final_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -398,6 +433,29 @@ def test_small_full_evidence_candidate_uses_single_partition_ivf_flat(
     assert type(ivf).__name__ == "IvfFlat"
     assert ivf.distance_type == "cosine"
     assert ivf.num_partitions == 1
+
+
+def test_explicit_hnsw_sq_config_stays_in_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The second public forced HNSW mode must not collapse to FLAT or IVF-FLAT."""
+    table = _DenseTableSpy()
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+    config = VectorIndexConfig(
+        index_type="hnsw_sq", metric="cosine", num_partitions=2,
+        m=16, ef_construction=300, dense_chunks_count=20,
+    )
+
+    repository.create_vector_index(config)
+
+    _, kwargs = table.index_call
+    sq = kwargs["config"]
+    assert type(sq).__name__ == "HnswSq"
+    assert sq.distance_type == "cosine"
+    assert sq.num_partitions == 2
+    assert sq.m == 16
+    assert sq.ef_construction == 300
 
 
 def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(

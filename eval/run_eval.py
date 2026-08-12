@@ -320,13 +320,13 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     main_benchmark = _active_benchmark_contract(main_wi)
     planner = DefaultQueryPlanner(project_root=main_root)
 
-    # 2) ANN 索引（独立 project，复用语义内容；向量层走 IVF_HNSW_FLAT）
+    # 2) ANN candidate（独立 project，复用语义内容；auto 选择受自检的索引策略）
     ann_wi = None
     ann_build_time = None
     ann_benchmark = None
     if build_ann:
         ann_root = work_dir / "ann"
-        ann_wi, _, ann_build_time = _build(ann_root, wiki_src, "ivf-hnsw-flat", full_rebuild=True)
+        ann_wi, _, ann_build_time = _build(ann_root, wiki_src, "auto", full_rebuild=True)
         ann_benchmark = _active_benchmark_contract(ann_wi)
 
     # 3) 逐查询评测
