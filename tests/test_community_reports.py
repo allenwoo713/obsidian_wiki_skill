@@ -336,7 +336,9 @@ def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, t
     calls = []
     monkeypatch.setattr(query, "compose_global_report_service", lambda root: MissingService())
     candidate = SimpleNamespace(page_id="local", rrf_score=1.0)
-    monkeypatch.setattr(query, "_retrieve_for_plan", lambda *args: calls.append(args) or ([object()], [], [candidate], [candidate], 0))
+    monkeypatch.setattr(query, "_retrieve_for_plan",
+                        lambda *args, **kwargs: calls.append((args, kwargs)) or
+                        ([object()], [], [candidate], [candidate], 0))
     monkeypatch.setattr(
         query,
         "assemble_context",

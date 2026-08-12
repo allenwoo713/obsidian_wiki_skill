@@ -39,6 +39,8 @@ HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
 SCRIPTS = SKILL_ROOT / "scripts"
 FIXTURES_WIKI = SKILL_ROOT / "tests" / "fixtures" / "wiki"
+GRAPH_CONTRACT_WIKI = SKILL_ROOT / "tests" / "fixtures" / "graph_contract" / "wiki"
+GRAPH_CONTRACT_QUERIES = HERE / "graph_queries.jsonl"
 
 sys.path.insert(0, str(SCRIPTS))
 
@@ -339,8 +341,6 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     expanded_queries = 0           # effective > base（意图倍率生效）
     max_effective_budget = 0
     graph_only_unsupported = 0
-    graph_trigger_queries = 0
-    graph_trigger_validated = 0
     bundle_tokens = []
     detail = []
 
@@ -348,12 +348,10 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         gold = q["relevant_pages"]
         plan = planner.plan(q["query"])
         t0 = time.perf_counter()
-        # The marked fixture deliberately leaves expansion room after the
-        # direct seed so this evaluation exercises restricted graph validation.
-        search_k = 1 if q.get("graph_trigger") else 10
-        res = hybrid_search(main_wi, q["query"], planner, k=search_k,
+        res = hybrid_search(main_wi, q["query"], planner, k=10,
                             max_tokens=max_tokens, hard_max_tokens=hard_max_tokens,
-                            wiki_dir=main_wiki, intent_override="auto")
+                            wiki_dir=main_wiki, intent_override="auto",
+                            allow_local_fallback=True)
         latencies.append(time.perf_counter() - t0)
 
         cands = res.candidates
@@ -411,9 +409,6 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         if bundle.effective_budget_tokens > bundle.requested_base_budget_tokens:
             expanded_queries += 1
         max_effective_budget = max(max_effective_budget, bundle.effective_budget_tokens)
-        if q.get("graph_trigger"):
-            graph_trigger_queries += 1
-            graph_trigger_validated += res.graph_validated_count
         for it in res.bundle.items:
             if it.inclusion_reason == "graph_expansion" and not it.evidence:
                 graph_only_unsupported += 1
@@ -473,8 +468,6 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "budget_contract_violation_count": budget_violations,
             "citation_path_contract_violation_count": citation_path_violations,
             "graph_only_unsupported_count": graph_only_unsupported,
-            "graph_trigger_query_count": graph_trigger_queries,
-            "graph_trigger_validated_count": graph_trigger_validated,
         },
         "budget": {
             "policy": _BUDGET_POLICY,
@@ -509,6 +502,87 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     return metrics, detail
 
 
+def _recall_at_5(candidates, gold_pages):
+    hits = sum(1 for candidate in candidates[:5] if _page_hit(candidate, gold_pages))
+    return min(1.0, hits / max(1, len(gold_pages)))
+
+
+def _evidence_recall(bundle, required_facts):
+    if not required_facts:
+        return 1.0
+    context = bundle.context_text or ""
+    return sum(fact in context for fact in required_facts) / len(required_facts)
+
+
+def run_graph_contract_evaluation(wiki_src: Path, queries: list, work_dir: Path,
+                                  max_tokens: int, hard_max_tokens: int | None = None):
+    """Measure graph lift with paired production retrieval on an explicit-link corpus."""
+    root = work_dir / "graph-contract"
+    wi, wiki, _ = _build(root, wiki_src, "exact", full_rebuild=True)
+    planner = DefaultQueryPlanner(project_root=root)
+    failures, detail = [], []
+    validated_count = unsupported_count = incremental_gold_pages = 0
+    off_recalls, on_recalls = [], []
+
+    for query in queries:
+        k = int(query.get("k", 5))
+        common = {"k": k, "max_tokens": max_tokens,
+                  "hard_max_tokens": hard_max_tokens, "wiki_dir": wiki}
+        without_graph = hybrid_search(wi, query["query"], planner,
+                                      enable_graph=False, **common)
+        with_graph = hybrid_search(wi, query["query"], planner,
+                                   enable_graph=True, **common)
+        gold = query["relevant_pages"]
+        off_recall = _recall_at_5(without_graph.candidates, gold)
+        on_recall = _recall_at_5(with_graph.candidates, gold)
+        off_recalls.append(off_recall)
+        on_recalls.append(on_recall)
+        off_gold = {c.page_id for c in without_graph.candidates[:5] if _page_hit(c, gold)}
+        on_gold = {c.page_id for c in with_graph.candidates[:5] if _page_hit(c, gold)}
+        added = len(on_gold - off_gold)
+        incremental_gold_pages += added
+        validated_count += with_graph.graph_validated_count
+        graph_items = [item for item in with_graph.bundle.items
+                       if item.inclusion_reason == "graph_expansion"]
+        unsupported_count += sum(1 for item in graph_items if not item.evidence)
+        required_gain = int(query.get("min_incremental_gold_pages", 0))
+        if added < required_gain:
+            failures.append(f"{query['query']}: incremental_gold_pages={added} < required {required_gain}")
+        if on_recall < off_recall:
+            failures.append(f"{query['query']}: graph recall regressed {off_recall:.4f}->{on_recall:.4f}")
+        detail.append({
+            "query": query["query"], "k": k,
+            "page_recall_without_graph": off_recall,
+            "page_recall_with_graph": on_recall,
+            "evidence_recall_without_graph": _evidence_recall(without_graph.bundle, query.get("required_facts", [])),
+            "evidence_recall_with_graph": _evidence_recall(with_graph.bundle, query.get("required_facts", [])),
+            "incremental_gold_pages": added,
+            "graph_validated_count": with_graph.graph_validated_count,
+            "direct_top5": [Path(c.page_id).name for c in without_graph.candidates[:5]],
+            "graph_top5": [Path(c.page_id).name for c in with_graph.candidates[:5]],
+            "graph_evidence": [{"page": Path(item.page_id).name,
+                                "evidence_chunks": [ev.chunk_id for ev in item.evidence],
+                                "paths": [{"source": Path(path.source_id).name,
+                                           "target": Path(path.target_id).name,
+                                           "signals": path.edge_signals}
+                                          for path in item.graph_paths]}
+                               for item in graph_items],
+        })
+    if unsupported_count:
+        failures.append(f"graph_only_unsupported_count={unsupported_count} > 0")
+    if validated_count <= 0:
+        failures.append("graph contract fixture did not produce a validated graph result")
+    return {
+        "n_queries": len(queries),
+        "page_recall_at_5_without_graph": round(statistics.mean(off_recalls), 4),
+        "page_recall_at_5_with_graph": round(statistics.mean(on_recalls), 4),
+        "incremental_gold_pages": incremental_gold_pages,
+        "graph_validated_count": validated_count,
+        "graph_only_unsupported_count": unsupported_count,
+        "failures": failures,
+    }, detail
+
+
 def load_queries(path: Path):
     out = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -522,6 +596,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wiki", type=Path, default=FIXTURES_WIKI)
     ap.add_argument("--queries", type=Path, default=HERE / "queries.jsonl")
+    ap.add_argument("--graph-wiki", type=Path, default=GRAPH_CONTRACT_WIKI)
+    ap.add_argument("--graph-queries", type=Path, default=GRAPH_CONTRACT_QUERIES)
     ap.add_argument("--baselines", type=Path, default=HERE / "baselines.json")
     ap.add_argument("--work-dir", type=Path, default=None,
                     help="构建临时目录（默认系统临时目录；本地建议 D: 盘避免 C: 虚拟化）")
@@ -539,18 +615,28 @@ def main():
     if not args.wiki.exists():
         print(f"[ERROR] fixture wiki 不存在: {args.wiki}", file=sys.stderr)
         return 2
+    if not args.graph_wiki.exists() or not args.graph_queries.exists():
+        print("[ERROR] graph contract fixture or queries missing", file=sys.stderr)
+        return 2
     queries = load_queries(args.queries)
+    graph_queries = load_queries(args.graph_queries)
     work_dir = args.work_dir or Path(tempfile.mkdtemp(prefix="obs_wiki_eval_"))
     print(f"[info] work-dir = {work_dir}", file=sys.stderr)
 
     metrics, detail = run_evaluation(args.wiki, queries, work_dir, args.max_tokens,
                              build_ann=not args.no_ann, regression_pp=args.regression_pp,
                              hard_max_tokens=args.hard_max_tokens)
+    graph_metrics, graph_detail = run_graph_contract_evaluation(
+        args.graph_wiki, graph_queries, work_dir, args.max_tokens,
+        hard_max_tokens=args.hard_max_tokens)
+    metrics["graph_contract"] = graph_metrics
 
     (HERE / "results.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2),
                                        encoding="utf-8")
     (HERE / "detail.jsonl").write_text(
         "\n".join(json.dumps(d, ensure_ascii=False) for d in detail), encoding="utf-8")
+    (HERE / "graph_detail.jsonl").write_text(
+        "\n".join(json.dumps(d, ensure_ascii=False) for d in graph_detail), encoding="utf-8")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
     # This is a publication contract, not a baseline-relative quality metric:
@@ -621,8 +707,8 @@ def main():
             f"：{metrics['budget']['violation_samples']}")
     if mq["graph_only_unsupported_count"] > 0:
         failures.append(f"graph_only_unsupported_count={mq['graph_only_unsupported_count']} > 0")
-    if mq.get("graph_trigger_query_count", 0) <= 0 or mq.get("graph_trigger_validated_count", 0) <= 0:
-        failures.append("graph trigger fixture did not produce a validated graph result")
+    failures.extend("graph contract: " + failure
+                    for failure in metrics["graph_contract"]["failures"])
     if mq["ann_recall_at_10"] is not None and mq["ann_recall_at_10"] < 0.98:
         failures.append(f"ann_recall_at_10={mq['ann_recall_at_10']:.4f} < 0.98")
     ann_benchmark = metrics.get("index_benchmark", {}).get("ann")

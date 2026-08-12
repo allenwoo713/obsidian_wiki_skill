@@ -20,6 +20,21 @@ from models import (
 )
 
 _FM_RE = re.compile(r"^---\n.*?\n---\n(.*)$", re.DOTALL)
+_EVIDENCE_RANK_CAP = 5
+
+
+def page_ranking_score(candidate: PageCandidate, k_rrf: int = 60) -> float:
+    """Order pages by bounded fragment-rank corroboration.
+
+    The public ``rrf_score`` still contributes exactly once per page/channel.
+    Ordering may use up to five returned fragment ranks per channel as bounded
+    corroboration; additional fragmentation cannot increase this signal.
+    """
+    score = 0.0
+    for evidence in (candidate.sparse_evidence, candidate.dense_evidence):
+        for hit in sorted(evidence, key=lambda item: item.rank)[:_EVIDENCE_RANK_CAP]:
+            score += 1.0 / (k_rrf + hit.rank)
+    return score
 
 
 def _read_full_content(path: Path, max_chars: Optional[int] = None) -> str:
@@ -50,13 +65,8 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
     """
     # 归并：保留每一路的所有命中证据；呈现文本随后去重，provenance 不去重。
     pages: dict = {}
-    # issue #47 E：限制「同页多 fragment 叠加曝光偏置」——每页每路最多取
-    # _RRF_PER_PAGE_CAP 个最佳（rank 最小）fragment 计入 RRF，避免单页被切碎成
-    # 几十条命中而垄断排序；但仍保留「多 fragment 命中 = 更相关」的判别信号，
-    # 而非像早期实现那样每页每路只计一次（会抹掉正确页面的排序优势，导致
-    # page_recall/mrr 退化）。
-    _RRF_PER_PAGE_CAP = 5
-    contrib_count: dict = {"fts": {}, "vector": {}}
+    # issue #47 E：每页每路只贡献一次 RRF（同页多 fragment 不再叠加曝光偏置）。
+    scored_pages: dict = {"fts": set(), "vector": set()}
     for channel, channel_hits in (("fts", fts_hits), ("vector", vector_hits)):
         for rank, h in enumerate(channel_hits, 1):
             pid = h.page_id
@@ -68,9 +78,9 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
                     "fts_hits": [], "vec_hits": [], "rrf": 0.0,
                 }
                 pages[pid] = entry
-            if contrib_count[channel].get(pid, 0) < _RRF_PER_PAGE_CAP:
+            if pid not in scored_pages[channel]:
                 entry["rrf"] += 1.0 / (k_rrf + rank)
-                contrib_count[channel][pid] = contrib_count[channel].get(pid, 0) + 1
+                scored_pages[channel].add(pid)
             if channel == "fts":
                 entry["fts_hits"].append((rank, h))
                 if entry["fts_rank"] is None or rank < entry["fts_rank"]:
@@ -97,7 +107,7 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
             rrf_score=e["rrf"], sparse_rank=e["fts_rank"], dense_rank=e["vec_rank"],
             sparse_evidence=sparse_ev, dense_evidence=dense_ev,
         ))
-    candidates.sort(key=lambda c: -c.rrf_score)
+    candidates.sort(key=lambda c: (-page_ranking_score(c, k_rrf), -c.rrf_score, c.page_id))
     return candidates[:k]
 
 

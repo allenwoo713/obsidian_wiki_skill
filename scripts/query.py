@@ -33,7 +33,7 @@ torch.set_grad_enabled(False)
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 
 from models import PageCandidate, ContextBundle, ContextItem, EvidenceHit, GraphPath, ChunkHit
-from fusion import page_level_rrf, assemble_context, render_context_markdown
+from fusion import page_level_rrf, page_ranking_score, assemble_context, render_context_markdown
 from query_planner import DefaultQueryPlanner, InMemoryEntityCatalog, ResolvedEntity
 from query_plan_models import (
     QueryPlan, PlannerContext, RetrievalFeedback, QueryIntent,
@@ -296,7 +296,8 @@ def _merge_graph_candidates(direct_candidates: List[PageCandidate],
     return merged
 
 
-def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
+def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path],
+                       *, enable_graph: bool = True):
     """One complete retrieval/graph-validation pass, reusable for retries."""
     fts_hits = wi.search_fts_terms(plan.lexical_terms, plan.exact_terms, k=20)
     vec_hits: List[ChunkHit] = []
@@ -309,7 +310,7 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
     candidates = direct_candidates[:k]
 
     graph_candidates: List[PageCandidate] = []
-    if wiki_dir:
+    if enable_graph and wiki_dir:
         try:
             graph_file = wiki_dir.parent / ".index" / "graph.json"
             graph_data = json.loads(graph_file.read_text(encoding="utf-8"))
@@ -323,7 +324,12 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path]):
             logger.warning("图谱扩展/验证失败: %s", exc)
 
     merged = _merge_graph_candidates(candidates, graph_candidates)
-    merged.sort(key=lambda candidate: (candidate.rrf_score <= 0, -candidate.rrf_score))
+    merged.sort(key=lambda candidate: (
+        candidate.rrf_score <= 0,
+        -page_ranking_score(candidate),
+        -candidate.rrf_score,
+        candidate.page_id,
+    ))
     return fts_hits, vec_hits, candidates, merged, len(graph_candidates)
 
 
@@ -405,7 +411,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                   intent_override: str = "auto", rewrite_override: str = "auto",
                   mode_override: Optional[str] = None,
                   hard_max_tokens: Optional[int] = None,
-                  allow_local_fallback: bool = False) -> HybridResult:
+                  allow_local_fallback: bool = False,
+                  enable_graph: bool = True) -> HybridResult:
     """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。"""
     ctx = context or PlannerContext()
     # The planner stays free of index implementations; query.py injects the
@@ -437,7 +444,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         if not allow_local_fallback:
             return gr
 
-    fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan, k, wiki_dir)
+    fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(
+        wi, plan, k, wiki_dir, enable_graph=enable_graph)
 
     # 6) 低召回重试（最多 1 次，issue #6）
     sparse_n, dense_n, ev_n = len(fts_hits), len(vec_hits), len(candidates)
@@ -447,7 +455,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                                      failure_reason="low_recall")
         plan2 = planner.plan_retry(plan, feedback, ctx)
         if plan2 is not None:
-            fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(wi, plan2, k, wiki_dir)
+            fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(
+                wi, plan2, k, wiki_dir, enable_graph=enable_graph)
             plan = plan2
 
     # 7) 按 token 预算装配 ContextBundle（预算策略：context_mode → mode/倍率 + 硬上限）
