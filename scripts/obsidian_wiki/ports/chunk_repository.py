@@ -31,7 +31,8 @@ class ChunkRepository(Protocol):
     def context_rows(self, predicate: str) -> list[Mapping[str, object]]: ...
 
     def search_dense(
-        self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
+        self, vector: Sequence[float], *, metric: str, limit: int = 10,
+        where: str | None = None, ef: int | None = None,
     ) -> list[Mapping[str, object]]: ...
 
     def search_dense_exact(

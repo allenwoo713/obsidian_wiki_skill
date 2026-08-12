@@ -10,6 +10,44 @@ from build_index import WikiIndex
 from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
 
+def test_wikiindex_propagates_requested_vector_mode(monkeypatch, tmp_path):
+    """Eval's exact control must cross the production facade unchanged."""
+    import build_index as build_module
+
+    requested = []
+
+    class FakeEmbedder:
+        tokenizer = object()
+
+        def get_embedding_dimension(self):
+            return 2
+
+        def encode(self, texts, **kwargs):
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(build_module, "scan_wiki", lambda *_args: [])
+    monkeypatch.setattr(build_module, "EmbeddingTokenizer", lambda _tokenizer: types.SimpleNamespace(count=len))
+
+    def fake_build(*_args, **kwargs):
+        mode = kwargs["vector_index_mode"]
+        requested.append(mode)
+        manifest = tmp_path / f"{mode}.json"
+        manifest.write_text(
+            json.dumps({"policy": {"selected_mode": "exact" if mode == "exact" else "ann"}}),
+            encoding="utf-8",
+        )
+        return types.SimpleNamespace(artifact=types.SimpleNamespace(manifest_path=manifest))
+
+    monkeypatch.setattr(build_module, "build_storage_contract", fake_build)
+    index = WikiIndex(tmp_path / ".index")
+    index._embedder = FakeEmbedder()
+
+    index._build(tmp_path / "Wiki", vector_index_mode="exact")
+    index._build(tmp_path / "Wiki", vector_index_mode="ivf-hnsw-flat")
+
+    assert requested == ["exact", "ivf-hnsw-flat"]
+
+
 def _write_page(wiki: Path, name: str, title: str, body: str, sources=None):
     d = wiki / "concepts"
     d.mkdir(parents=True, exist_ok=True)

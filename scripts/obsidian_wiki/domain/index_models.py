@@ -57,8 +57,8 @@ class VectorIndexConfig(_JsonRecord):
     index_name: str = "dense_hnsw"
 
     def __post_init__(self) -> None:
-        if self.index_type != "hnsw_flat":
-            raise ValueError("Only the hnsw_flat candidate index type is supported")
+        if self.index_type not in {"hnsw_flat", "ivf_flat"}:
+            raise ValueError("Only hnsw_flat and ivf_flat candidate index types are supported")
         if self.metric not in {"cosine", "l2", "dot"}:
             raise ValueError("Vector metric must be cosine, l2, or dot")
         for field_name in ("num_partitions", "m", "ef_construction", "dense_chunks_count"):

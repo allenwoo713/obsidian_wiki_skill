@@ -146,7 +146,8 @@ class _CountingRepository:
         )
 
     def search_dense(
-        self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
+        self, vector: Sequence[float], *, metric: str, limit: int = 10,
+        where: str | None = None, ef: int | None = None,
     ) -> list[Mapping[str, object]]:
         self.ann_calls += 1
         rows = list(self._truth[:limit])

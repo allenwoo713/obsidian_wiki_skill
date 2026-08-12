@@ -85,6 +85,31 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     assert LanceDbIndexRepository(artifact.artifact.lance_dir).search_sparse(long_term)
 
 
+def test_exact_build_mode_bypasses_candidate_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eval's exact control must not silently become another randomized HNSW build."""
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Exact control\n\nEXACTMODETERM\n")
+
+    def unexpected_index(*_args, **_kwargs):
+        pytest.fail("exact vector mode must not create a candidate ANN index")
+
+    monkeypatch.setattr(LanceDbIndexRepository, "create_vector_index", unexpected_index)
+    outcome = build_storage_contract(
+        wiki,
+        tmp_path / ".index",
+        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
+        vector_index_mode="exact",
+    )
+    manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
+    dense = lancedb.connect(str(outcome.artifact.lance_dir)).open_table("dense_chunks")
+
+    assert manifest["requested_vector_index_mode"] == "exact"
+    assert manifest["policy"]["selected_mode"] == "exact"
+    assert "dense_hnsw" not in {index.name for index in dense.list_indices()}
+
+
 def test_real_lancedb_has_no_storage_mutation_after_final_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -354,6 +379,27 @@ def test_candidate_hnsw_and_exact_bypass_stay_in_adapter(monkeypatch: pytest.Mon
     assert table.queries[1].ef_value is None  # exact path bypasses ef
 
 
+def test_small_full_evidence_candidate_uses_single_partition_ivf_flat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Small full-probe builds use an indexed candidate without HNSW randomness."""
+    table = _DenseTableSpy()
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(tmp_path / "lance")
+    config = VectorIndexConfig(
+        index_type="ivf_flat", metric="cosine", num_partitions=1,
+        m=16, ef_construction=300, dense_chunks_count=20,
+    )
+
+    repository.create_vector_index(config)
+
+    _, kwargs = table.index_call
+    ivf = kwargs["config"]
+    assert type(ivf).__name__ == "IvfFlat"
+    assert ivf.distance_type == "cosine"
+    assert ivf.num_partitions == 1
+
+
 def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -384,29 +430,11 @@ def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(
     repository.search_dense([1.0, 0.0], metric="cosine", limit=200)
     assert table.queries[-1].ef_value == 300
 
-
-def test_small_full_evidence_corpus_uses_exhaustive_ann_ef(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The 157-probe Eval build cannot depend on HNSW construction order."""
-    table = _DenseTableSpy(row_count=157)
-    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
-    repository = LanceDbIndexRepository(tmp_path / "lance")
-
-    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
-
+    # Build-time evidence may explicitly request exhaustive breadth without
+    # changing the online default for ordinary retrieval calls.
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=20, ef=157)
     assert table.queries[-1].ef_value == 157
-
-
-def test_large_corpus_keeps_bounded_ann_ef(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    table = _DenseTableSpy(row_count=257)
-    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
-    repository = LanceDbIndexRepository(tmp_path / "lance")
-
     repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
-
     assert table.queries[-1].ef_value == 100
 
 

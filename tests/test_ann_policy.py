@@ -148,4 +148,6 @@ def test_service_records_exact_and_candidate_id_sets_before_ann_promotion(tmp_pa
     assert benchmark["recall_at_20"] == 1.0
     assert benchmark["exact_result_ids"]
     assert benchmark["candidate_result_ids"]
+    assert manifest["vector_config"]["index_type"] == "ivf_flat"
+    assert manifest["vector_config"]["num_partitions"] == 1
     assert manifest["policy"]["selected_mode"] == "ann"

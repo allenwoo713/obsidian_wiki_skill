@@ -33,6 +33,7 @@ from obsidian_wiki.domain.index_models import (
     SparseChunk,
     StorageArtifact,
     VectorIndexConfig,
+    VectorPolicyDecision,
 )
 from obsidian_wiki.domain.index_policy import select_vector_policy
 from obsidian_wiki.ports.chunk_repository import ChunkRepository
@@ -64,6 +65,7 @@ class IndexBuildService:
         fts_config: FtsIndexConfig | None = None,
         benchmark_observer: BenchmarkObserver | None = None,
         benchmark_max_probes: int = BENCHMARK_MAX_PROBES,
+        vector_index_mode: str = "auto",
     ):
         """#37：``post_commit_journal`` 为必填依赖——每个发布路径都必须在 pointer
         commit 前 durable prepare 失效 intent；不需要 invalidation 的调用方必须显式
@@ -80,6 +82,13 @@ class IndexBuildService:
             raise ValueError(
                 f"benchmark_max_probes must be a positive integer, got {benchmark_max_probes!r}"
             )
+        if vector_index_mode not in {
+            "auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"
+        }:
+            raise ValueError(
+                "vector_index_mode must be auto, exact, ivf-hnsw-flat, or ivf-hnsw-sq, "
+                f"got {vector_index_mode!r}"
+            )
         self._storage = storage
         self._reopen_storage = reopen_storage
         self._manifest_store = manifest_store
@@ -87,6 +96,7 @@ class IndexBuildService:
         self._benchmark_observer = benchmark_observer
         self._post_commit_journal = post_commit_journal
         self._benchmark_max_probes = benchmark_max_probes
+        self._vector_index_mode = vector_index_mode
 
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -183,18 +193,29 @@ class IndexBuildService:
             reopened = self._reopen_storage(lance_dir)
             dimension = len(dense_chunks[0].vector)
             vector_config = VectorIndexConfig(
-                index_type="hnsw_flat", metric="cosine", num_partitions=1,
-                m=16, ef_construction=300, dense_chunks_count=len(dense_chunks),
+                # One-partition IVF-FLAT is deterministic and lossless for the
+                # small corpora whose policy evidence covers every row. Larger
+                # sampled corpora retain the scalable HNSW candidate.
+                index_type=("ivf_flat"
+                            if len(dense_chunks) <= self._benchmark_max_probes
+                            else "hnsw_flat"),
+                metric="cosine", num_partitions=1,
+                m=16, ef_construction=300,
+                dense_chunks_count=len(dense_chunks),
             )
             index_started = time.perf_counter()
-            reopened.create_vector_index(vector_config)
+            if self._vector_index_mode != "exact":
+                reopened.create_vector_index(vector_config)
             index_build_ms = (time.perf_counter() - index_started) * 1000
             # issue #47: the exact-term validation probes the FTS (sparse) table,
             # so the sampled term must come from the lexical corpus that is
             # actually indexed there — not from a dense chunk that never enters FTS.
             exact_term = self._exact_term(lexical_chunks)
             counts, vector_stats, fts_stats = reopened.validate_reopened(
-                dimension=dimension, exact_term=exact_term
+                dimension=dimension, exact_term=exact_term,
+                vector_index_name=(
+                    None if self._vector_index_mode == "exact" else vector_config.index_name
+                ),
             )
             if (
                 counts.sparse_chunks_count != len(lexical_chunks)
@@ -217,6 +238,16 @@ class IndexBuildService:
                 wiki_dir=wiki_dir,
             )
             policy = select_vector_policy(benchmark, vector_stats, evidence=benchmark_evidence)
+            if self._vector_index_mode == "exact":
+                policy = VectorPolicyDecision(
+                    selected_mode="exact",
+                    reason="exact vector mode explicitly requested",
+                    benchmark=benchmark,
+                    index_stats=vector_stats,
+                    benchmark_scope=benchmark_evidence["probe_scope"],
+                    benchmark_probe_count=benchmark_evidence["probe_count"],
+                    benchmark_probe_total=benchmark_evidence["probe_total"],
+                )
             # #36 follow-up：最终 seal = 最后 storage mutation 之后的耐久边界。
             self._storage.seal(lance_dir)
             manifest = self._manifest(
@@ -225,6 +256,7 @@ class IndexBuildService:
                 benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
                 sparse_chunks=sparse_chunks, generation=generation, build_id=ctx.build_id,
                 page_metadata=page_metadata, image_metadata=image_metadata,
+                requested_vector_index_mode=self._vector_index_mode,
             )
             # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
             if build_dir.name != ctx.build_id or manifest.get("build_id") != ctx.build_id:
@@ -273,7 +305,8 @@ class IndexBuildService:
                   sparse_chunks: Sequence[SparseChunk], generation: int = 0,
                   build_id: str = "",
                   page_metadata: list[dict] | None = None,
-                  image_metadata: list[dict] | None = None) -> dict:
+                  image_metadata: list[dict] | None = None,
+                  requested_vector_index_mode: str = "auto") -> dict:
         fts_config = self._fts_config.to_json()
         vector_config_json = vector_config.to_json()
         # facade 提供的 page_metadata 含完整 page_type/sources/links/aliases/sha256；
@@ -309,6 +342,7 @@ class IndexBuildService:
             "fts_rows_count": sum(1 for c in sparse_chunks if c.chunk_kind == "sparse"),
             "fts_config": fts_config,
             "vector_config": vector_config_json,
+            "requested_vector_index_mode": requested_vector_index_mode,
             "config_hashes": {
                 "fts_config": self._stable_hash(fts_config),
                 "vector_config": self._stable_hash(vector_config_json),
@@ -470,7 +504,10 @@ class IndexBuildService:
             chunk = dense_chunks[index]
             started = time.perf_counter()
             candidate = repository.search_dense(
-                chunk.vector, metric="cosine", limit=20, where=None
+                chunk.vector, metric="cosine", limit=20, where=None,
+                # Benchmark-only exhaustive breadth. Online calls retain the
+                # stable max(100, ceil(1.5*limit)) adapter policy.
+                ef=total if scope == "full" else None,
             )
             candidate_durations.append((time.perf_counter() - started) * 1000)
             candidate_ids.append([str(row["chunk_id"]) for row in candidate])

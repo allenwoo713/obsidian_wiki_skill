@@ -12,7 +12,7 @@ from typing import Mapping, Sequence
 import lancedb
 import numpy as np
 import pyarrow as pa
-from lancedb.index import HnswFlat
+from lancedb.index import HnswFlat, IvfFlat
 
 from obsidian_wiki.domain.index_models import (
     DenseChunk,
@@ -30,8 +30,6 @@ from obsidian_wiki.domain.index_models import (
 
 class LanceDbIndexRepository:
     """The sole location where #17 domain values become LanceDB calls."""
-
-    _FULL_EVIDENCE_MAX_ROWS = 256
 
     def __init__(self, lance_dir: Path):
         self._lance_dir = Path(lance_dir)
@@ -145,15 +143,22 @@ class LanceDbIndexRepository:
         table = self._dense_table()
         if table.count_rows() != config.dense_chunks_count:
             raise ValueError("Vector index config dense_chunks_count does not match dense table")
-        # `VectorIndexConfig` permits only hnsw_flat; keep current SDK objects adapter-local.
-        table.create_index(
-            "vector",
-            config=HnswFlat(
+        index_config = (
+            IvfFlat(
+                distance_type=config.metric,
+                num_partitions=config.num_partitions,
+            )
+            if config.index_type == "ivf_flat"
+            else HnswFlat(
                 distance_type=config.metric,
                 num_partitions=config.num_partitions,
                 m=config.m,
                 ef_construction=config.ef_construction,
-            ),
+            )
+        )
+        table.create_index(
+            "vector",
+            config=index_config,
             replace=True,
             name=config.index_name,
         )
@@ -175,7 +180,9 @@ class LanceDbIndexRepository:
             raise RuntimeError(f"FTS index statistics unavailable for {index_name}")
         return FtsIndexStats(index_name=index_name, indexed_rows=stats.num_indexed_rows)
 
-    def validate_reopened(self, *, dimension: int, exact_term: str) -> tuple[IndexSchemaCounts, IndexStats, FtsIndexStats]:
+    def validate_reopened(
+        self, *, dimension: int, exact_term: str, vector_index_name: str | None = "dense_hnsw"
+    ) -> tuple[IndexSchemaCounts, IndexStats, FtsIndexStats]:
         """Inspect persisted data through a new connection, never cached input rows."""
         if not exact_term or not exact_term.strip() or any(char.isspace() for char in exact_term.strip()):
             raise ValueError("Exact-term validation requires one non-empty token")
@@ -220,7 +227,15 @@ class LanceDbIndexRepository:
             raise RuntimeError("Native FTS statistics show unindexed sparse rows")
         if not self.search_sparse(exact_term, limit=1):
             raise RuntimeError("Native FTS exact-term validation failed")
-        vector_stats = self.vector_index_stats("dense_hnsw")
+        vector_stats = (
+            self.vector_index_stats(vector_index_name)
+            if vector_index_name is not None
+            else IndexStats(
+                index_name="exact_scan",
+                indexed_rows=len(dense_rows),
+                unindexed_dense_rows=0,
+            )
+        )
         return (
             IndexSchemaCounts(len(sparse_rows), len(dense_rows)),
             vector_stats,
@@ -249,14 +264,19 @@ class LanceDbIndexRepository:
         return sorted(rows.values(), key=lambda r: (r["page_id"], r["chunk_index"], r["chunk_id"]))
 
     def search_dense(
-        self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
+        self, vector: Sequence[float], *, metric: str, limit: int = 10,
+        where: str | None = None, ef: int | None = None,
     ) -> list[Mapping[str, object]]:
-        return self._search_dense(vector, metric=metric, limit=limit, where=where, exact=False)
+        return self._search_dense(
+            vector, metric=metric, limit=limit, where=where, exact=False, ef=ef
+        )
 
     def search_dense_exact(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
     ) -> list[Mapping[str, object]]:
-        return self._search_dense(vector, metric=metric, limit=limit, where=where, exact=True)
+        return self._search_dense(
+            vector, metric=metric, limit=limit, where=where, exact=True, ef=None
+        )
 
     def search_dense_exact_batch(
         self,
@@ -385,7 +405,8 @@ class LanceDbIndexRepository:
         return "page_id = '{}'".format(page_id.replace("'", "''"))
 
     def _search_dense(
-        self, vector: Sequence[float], *, metric: str, limit: int, where: str | None, exact: bool
+        self, vector: Sequence[float], *, metric: str, limit: int,
+        where: str | None, exact: bool, ef: int | None,
     ) -> list[Mapping[str, object]]:
         if metric not in {"cosine", "l2", "dot"}:
             raise ValueError("Vector metric must be cosine, l2, or dot")
@@ -401,17 +422,7 @@ class LanceDbIndexRepository:
                 # ef at 100; but never go BELOW lancedb's own default (1.5*limit),
                 # since large-k production queries (e.g. limit=80) would otherwise
                 # regress from ef=120 to 100. Floor = max(100, ceil(1.5*limit)).
-                default_ef = max(100, (limit * 3 + 1) // 2)
-                dense_rows = self._dense_table().count_rows()
-                # Build-time policy fully probes corpora up to 256 rows. Make
-                # those candidate queries exhaustive so HNSW construction order
-                # cannot randomly flip a strict 1.00 recall promotion decision.
-                # Larger production indexes retain the bounded/default policy.
-                query = query.ef(
-                    max(default_ef, dense_rows)
-                    if dense_rows <= self._FULL_EVIDENCE_MAX_ROWS
-                    else default_ef
-                )
+                query = query.ef(ef if ef is not None else max(100, (limit * 3 + 1) // 2))
             if where is not None:
                 query = query.where(where)
             return query.limit(limit).to_list()
