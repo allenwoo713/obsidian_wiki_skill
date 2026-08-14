@@ -10,6 +10,8 @@ import hashlib
 import inspect
 import json
 import math
+from argparse import Namespace
+from copy import deepcopy
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -459,3 +461,81 @@ def test_real_build_over_cap_publishes_bounded_v5_evidence(tmp_path: Path) -> No
     assert policy["benchmark_probe_total"] == total
     assert len(manifest_bytes) <= 10 * 1024 * 1024
     assert (index_dir / "ACTIVE_INDEX").is_file()
+
+
+def _reduced_comparator_args(tmp_path: Path) -> Namespace:
+    return Namespace(
+        rows=257,
+        dimensions=8,
+        max_probes=256,
+        ef_grid=benchmark_ann_build.DECISION_EF_GRID,
+        candidates=benchmark_ann_build.CANDIDATES,
+        max_seconds=60.0,
+        max_exact_seconds=10.0,
+        row_batch_size=64,
+        query_batch_size=32,
+        max_evidence_bytes=10 * 1024 * 1024,
+        work_dir=tmp_path / "work",
+        output=tmp_path / "index-benchmark.json",
+    )
+
+
+def test_reduced_real_matrix_uses_one_cached_table_per_candidate_and_complete_normal_queries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The performance seam must retain every real normal ANN request."""
+    monkeypatch.setattr(
+        benchmark_ann_build,
+        "_runtime_identity",
+        lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+    )
+
+    payload = benchmark_ann_build.run(_reduced_comparator_args(tmp_path))
+
+    assert len(payload["candidate_runs"]) == 2
+    assert len(payload["records"]) == 2 * 6
+    assert payload["exact"]["method"] == "streamed_numpy_cosine_v1"
+    assert payload["queries"]["zero_overlap_count"] == 0
+    assert all(len(record["queries"]) == 256 for record in payload["records"])
+    assert all(record["candidate_run_id"] for record in payload["records"])
+    assert all(record["query_group_wall_ms"] >= 0 for record in payload["records"])
+    assert {run["dense_table_open_count"] for run in payload["candidate_runs"]} == {1}
+    assert {run["normal_ann_request_count"] for run in payload["candidate_runs"]} == {6 * 256}
+    assert payload["matrix_timing"]["end_monotonic"] - payload["matrix_timing"]["start_monotonic"] \
+        == pytest.approx(payload["benchmark_wall_seconds"], abs=0.01)
+
+
+def test_complete_matrix_timer_and_candidate_run_references_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        benchmark_ann_build,
+        "_runtime_identity",
+        lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+    )
+    payload = benchmark_ann_build.run(_reduced_comparator_args(tmp_path))
+    assert benchmark_ann_build.validate_evidence(payload) is payload
+
+    for mutation in (
+        lambda value: value.pop("candidate_runs"),
+        lambda value: value["candidate_runs"].pop(),
+        lambda value: value["records"].pop(),
+        lambda value: value["records"][0].pop("candidate_run_id"),
+        lambda value: value["matrix_timing"].update(start_monotonic=value["records"][0]["query_group_end_monotonic"]),
+        lambda value: value["candidate_runs"][0].update(index_build_end_monotonic=float("nan")),
+    ):
+        broken = deepcopy(payload)
+        mutation(broken)
+        with pytest.raises(ValueError):
+            benchmark_ann_build.validate_evidence(broken)
+
+    boundary = deepcopy(payload)
+    boundary["benchmark_wall_seconds"] = 60.0
+    boundary["matrix_timing"]["end_monotonic"] = (
+        boundary["matrix_timing"]["start_monotonic"] + 60.0
+    )
+    assert benchmark_ann_build.validate_evidence(boundary) is boundary
+    boundary["benchmark_wall_seconds"] = 60.000001
+    boundary["matrix_timing"]["end_monotonic"] += 0.000001
+    with pytest.raises(ValueError, match="wall-time cap"):
+        benchmark_ann_build.validate_evidence(boundary)
