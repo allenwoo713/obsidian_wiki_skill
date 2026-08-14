@@ -41,6 +41,9 @@ CANDIDATES = ("ivf-hnsw-flat", "ivf-hnsw-sq")
 _REPOSITORY_TYPES = {"ivf-hnsw-flat": "hnsw_flat", "ivf-hnsw-sq": "hnsw_sq"}
 DEFAULT_MAX_EXACT_SECONDS = 10.0
 DEFAULT_MAX_WALL_SECONDS = 60.0
+# The default remains a strict 60-second gate. A committed, root/user-approved
+# calibration may select a larger static cap, but never an unbounded one.
+MAX_APPROVED_STATIC_CAP_SECONDS = 180.0
 CORPUS_SEED = 41001
 QUERY_SEED = 41002
 _LOCKED_PACKAGES = {"lancedb", "numpy", "pyarrow"}
@@ -104,6 +107,10 @@ def _finite(value: Any) -> bool:
     if isinstance(value, list):
         return all(_finite(item) for item in value)
     return True
+
+
+def _valid_approved_static_cap(value: float) -> bool:
+    return 0 < value <= MAX_APPROVED_STATIC_CAP_SECONDS
 
 
 def _locked_runtime_identity() -> dict[str, str]:
@@ -796,8 +803,7 @@ def main() -> int:
         if args.calibrate or any(value is None for value in approval_values):
             parser.error("approved static acceptance inputs must be complete and cannot calibrate")
         if (
-            args.approved_static_cap <= 0
-            or args.approved_static_cap > DEFAULT_MAX_WALL_SECONDS
+            not _valid_approved_static_cap(args.approved_static_cap)
             or len(args.approved_calibration_sha256) != 64
         ):
             parser.error("approved static acceptance inputs")

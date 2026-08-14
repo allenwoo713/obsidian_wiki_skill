@@ -84,6 +84,9 @@ def test_issue41_scale_gate_separates_exact_slo_from_coarse_wall_ceiling() -> No
     """Runner-sensitive ANN latency must not crowd the exact-path regression gate."""
     assert benchmark_ann_build.DEFAULT_MAX_EXACT_SECONDS == 10.0
     assert benchmark_ann_build.DEFAULT_MAX_WALL_SECONDS == 60.0
+    assert benchmark_ann_build.MAX_APPROVED_STATIC_CAP_SECONDS == 180.0
+    assert benchmark_ann_build._valid_approved_static_cap(129.0)
+    assert not benchmark_ann_build._valid_approved_static_cap(180.1)
 
     workflow = (Path(__file__).parents[1] / ".github/workflows/eval.yml").read_text(
         encoding="utf-8"
