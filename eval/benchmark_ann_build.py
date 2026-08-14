@@ -289,7 +289,9 @@ def _write_rejected_error(
             "message": str(exc),
             "traceback": traceback.format_exc(),
         },
-        "failed_at": dt.datetime.now(dt.UTC).isoformat(),
+        # ``datetime.UTC`` arrived in Python 3.11; the CI compatibility
+        # matrix still validates the failure path on Python 3.10.
+        "failed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
