@@ -477,6 +477,7 @@ def _reduced_comparator_args(tmp_path: Path) -> Namespace:
         max_evidence_bytes=10 * 1024 * 1024,
         work_dir=tmp_path / "work",
         output=tmp_path / "index-benchmark.json",
+        error_output=tmp_path / "index-benchmark-error.json",
     )
 
 
@@ -490,8 +491,9 @@ class _InlineFuture:
 
 class _InlineTwoWorkerSchedule:
     """Exercise real LanceDB records where the sandbox disallows semaphores."""
-    def __init__(self, *, max_workers: int):
+    def __init__(self, *, max_workers: int, mp_context):
         assert max_workers == 2
+        assert mp_context.get_start_method() == "spawn"
 
     def __enter__(self):
         return self
@@ -501,6 +503,21 @@ class _InlineTwoWorkerSchedule:
 
     def submit(self, function, *args):
         return _InlineFuture(function(*args))
+
+
+class _WorkerStartupFailure:
+    def __init__(self, *, max_workers: int, mp_context):
+        assert max_workers == 2
+        assert mp_context.get_start_method() == "spawn"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def submit(self, *_args):
+        raise RuntimeError("simulated spawn worker startup failure")
 
 
 def test_reduced_real_matrix_uses_one_cached_table_per_candidate_and_complete_normal_queries(
@@ -525,6 +542,10 @@ def test_reduced_real_matrix_uses_one_cached_table_per_candidate_and_complete_no
     assert all(record["query_group_wall_ms"] >= 0 for record in payload["records"])
     assert {run["dense_table_open_count"] for run in payload["candidate_runs"]} == {1}
     assert {run["normal_ann_request_count"] for run in payload["candidate_runs"]} == {6 * 256}
+    assert payload["environment"]["worker_schedule"]["start_method"] == "spawn"
+    assert payload["environment"]["worker_schedule"]["configured_workers"] == 2
+    assert payload["environment"]["worker_schedule"]["effective_workers"] == 2
+    assert {run["worker"]["start_method"] for run in payload["candidate_runs"]} == {"spawn"}
     assert payload["matrix_timing"]["end_monotonic"] - payload["matrix_timing"]["start_monotonic"] \
         == pytest.approx(payload["benchmark_wall_seconds"], abs=0.01)
 
@@ -564,3 +585,25 @@ def test_complete_matrix_timer_and_candidate_run_references_fail_closed(
     boundary["matrix_timing"]["end_monotonic"] += 0.000001
     with pytest.raises(ValueError, match="wall-time cap"):
         benchmark_ann_build.validate_evidence(boundary)
+
+
+def test_spawn_worker_failure_writes_rejected_error_evidence_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = _reduced_comparator_args(tmp_path)
+    monkeypatch.setattr(benchmark_ann_build, "ProcessPoolExecutor", _WorkerStartupFailure)
+
+    with pytest.raises(RuntimeError, match="simulated spawn worker startup failure"):
+        benchmark_ann_build.run(args)
+
+    assert not args.output.exists()
+    error = json.loads(args.error_output.read_text(encoding="utf-8"))
+    assert error["status"] == "reject-evidence"
+    assert error["worker_schedule"]["start_method"] == "spawn"
+    assert error["worker_schedule"]["configured_workers"] == 2
+    assert set(error["candidate_assignment"]) == set(benchmark_ann_build.CANDIDATES)
+    assert error["error"]["class"] == "RuntimeError"
+    assert "simulated spawn worker startup failure" in error["error"]["message"]
+    assert error["error"]["traceback"]
+    with pytest.raises(ValueError):
+        benchmark_ann_build.validate_evidence(error)
