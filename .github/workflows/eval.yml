@@ -178,6 +178,15 @@ jobs:
           --work-dir .review-tmp/issue41-scale
           --output eval/index-benchmark.json
           --error-output .review-tmp/issue41-scale/index-benchmark-error.json
+          --calibrate
+          --calibration-output .review-tmp/issue41-scale/ann-calibration.json
+      - name: Upload non-accepting OMP calibration diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue41-ann-calibration
+          path: .review-tmp/issue41-scale/ann-calibration.json
+          if-no-files-found: ignore
       - name: Upload issue #41 held-out scale evidence
         if: success()
         uses: actions/upload-artifact@v4
