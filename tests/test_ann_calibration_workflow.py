@@ -28,3 +28,17 @@ def test_manual_calibration_persists_actual_observational_batch_artifact() -> No
     assert "--calibration-batch-output" in calibration
     assert "issue41-ann-calibration-batch-spike" in calibration
     assert "eval/index-benchmark.json" not in calibration
+
+
+def test_manual_calibration_has_ten_run_timeout_without_relaxing_pr_acceptance() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    calibration = workflow.split("issue41-manual-calibration:", 1)[1].split(
+        "issue41-scale-benchmark:", 1
+    )[0]
+    acceptance = workflow.split("issue41-scale-benchmark:", 1)[1].split(
+        "model-backed-ann-decision:", 1
+    )[0]
+
+    assert "timeout-minutes: 30" in calibration
+    assert "timeout-minutes: 15" in acceptance
+    assert "--max-seconds 60" in acceptance
