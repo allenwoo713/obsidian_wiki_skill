@@ -116,6 +116,39 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
     assert "--init-baseline" not in workflow.split("model-backed-ann-decision:", 1)[1]
 
 
+def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> None:
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    scale = workflow.split("issue41-scale-benchmark:", 1)[1].split("model-backed-ann-decision:", 1)[0]
+    assert 'runs-on: [self-hosted, "${{ vars.ANN_SCALE_RUNNER_LABEL }}"]' in scale
+    assert "python -m pip install -r requirements.txt pytest" in scale
+    assert '"numpy>=1.26"' not in scale
+    assert "LanceDB 0.34.0 / NumPy 2.2.6 / PyArrow 25.0.0" in scale
+    assert "--rows 77348" in scale
+    assert "--dimensions 384" in scale
+    assert "--max-probes 256" in scale
+    assert "--ef-grid 30,50,75,100,150,200" in scale
+    assert "--max-seconds 60" in scale
+    assert "if: always()" in scale
+
+    reconciliation = workflow.split("reconcile-ann-decision:", 1)[1]
+    assert "if: ${{ always() }}" in reconciliation
+    assert "test-and-eval" in reconciliation
+    assert "issue41-scale-benchmark" in reconciliation
+    assert "model-backed-ann-decision" in reconciliation
+    assert "eval/reconcile_ann_gate.py" in reconciliation
+    assert "Architecture (ubuntu-latest, Python 3.10)" in reconciliation
+    assert "Architecture (windows-latest, Python 3.13)" in reconciliation
+
+
+def test_reconciliation_cli_is_fail_closed_for_missing_jobs_and_artifacts() -> None:
+    reconciliation = SKILL_ROOT / "eval" / "reconcile_ann_gate.py"
+    source = reconciliation.read_text(encoding="utf-8")
+    assert "validate_evidence" in source
+    assert "validate_candidate_decision_records" in source
+    assert "all_required_jobs_numeric_success" in source
+    assert "!= \"success\"" in source
+
+
 @pytest.mark.parametrize("init_baseline", [False, True])
 def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tmp_path, init_baseline):
     """Unsafe evidence cannot become a new baseline or pass without one."""
