@@ -101,6 +101,21 @@ def test_eval_builds_ann_candidate_through_auto_policy(monkeypatch, tmp_path):
     assert detail == []
 
 
+def test_small_fixture_metric_and_decision_records_are_separate() -> None:
+    """A 157-row functional observation cannot masquerade as scale evidence."""
+    assert run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC == "functional_final_retrieval_ann_overlap_at_10"
+    with pytest.raises(ValueError, match="candidate records"):
+        run_eval.validate_candidate_decision_records(
+            {"schema_version": 1, "records": []},
+            {"evidence_schema_version": 3},
+        )
+
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    assert "model-backed-ann-decision" in workflow
+    assert "--decision-evidence" in workflow
+    assert "--init-baseline" not in workflow.split("model-backed-ann-decision:", 1)[1]
+
+
 @pytest.mark.parametrize("init_baseline", [False, True])
 def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tmp_path, init_baseline):
     """Unsafe evidence cannot become a new baseline or pass without one."""
