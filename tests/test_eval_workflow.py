@@ -134,6 +134,9 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--calibrate" not in scale
     assert "--approved-static-cap" in scale
     assert "approved_ann_calibration.json" in scale
+    assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale
+    assert "OPENBLAS_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale
+    assert "MKL_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale
     assert "--calibrate" in calibration
     assert "--calibration-output .review-tmp/issue41-scale/ann-calibration.json" in calibration
     assert "--calibration-batch-output .review-tmp/issue41-scale/ann-calibration-batch-spike.json" in calibration

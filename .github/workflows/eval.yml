@@ -247,6 +247,12 @@ jobs:
           env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
           [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
       - name: Run static-cap held-out FLAT/SQ ANN acceptance comparator
+        env:
+          # Bind native thread pools to the approved calibration setting so the
+          # held-out run uses the same normal per-query ANN execution regime.
+          OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
+          OPENBLAS_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
+          MKL_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
         run: >
           python eval/benchmark_ann_build.py
           --rows 77348
