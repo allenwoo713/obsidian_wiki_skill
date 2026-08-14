@@ -178,3 +178,44 @@ jobs:
         with:
           name: issue41-index-benchmark
           path: eval/index-benchmark.json
+
+  model-backed-ann-decision:
+    name: "Model-backed final-retrieval decision records"
+    needs: issue41-scale-benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install locked evaluation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: embed-model-${{ hashFiles('scripts/download_embedding_model.py') }}
+      - name: Bootstrap local embedding model
+        run: python scripts/download_embedding_model.py
+      - name: Download complete held-out comparator evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: issue41-index-benchmark
+          path: .review-tmp/held-out-evidence
+      - name: Run model-backed candidate decision records without baseline refresh
+        run: >
+          python eval/run_eval.py
+          --work-dir .review-tmp/model-backed-ann
+          --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
+          --decision-output eval/model-ann-decision.json
+      - name: Upload model-backed candidate decision records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-backed-ann-decision
+          path: |
+            eval/model-ann-decision.json
+            eval/results.json
+            eval/detail.jsonl
