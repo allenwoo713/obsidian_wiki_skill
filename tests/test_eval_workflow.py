@@ -119,6 +119,7 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
 def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> None:
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
     scale = workflow.split("issue41-scale-benchmark:", 1)[1].split("model-backed-ann-decision:", 1)[0]
+    calibration = workflow.split("issue41-manual-calibration:", 1)[1].split("issue41-scale-benchmark:", 1)[0]
     assert "runs-on: ubuntu-latest" in scale
     assert "self-hosted" not in scale
     assert "ANN_SCALE_RUNNER_LABEL" not in scale
@@ -130,10 +131,15 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--max-probes 256" in scale
     assert "--ef-grid 30,50,75,100,150,200" in scale
     assert "--max-seconds 60" in scale
-    assert "--calibrate" in scale
-    assert "--calibration-output .review-tmp/issue41-scale/ann-calibration.json" in scale
-    assert "ann-calibration.json" in scale
-    assert "issue41-ann-calibration" in scale
+    assert "--calibrate" not in scale
+    assert "--approved-static-cap" in scale
+    assert "approved_ann_calibration.json" in scale
+    assert "--calibrate" in calibration
+    assert "--calibration-output .review-tmp/issue41-scale/ann-calibration.json" in calibration
+    assert "--calibration-batch-output .review-tmp/issue41-scale/ann-calibration-batch-spike.json" in calibration
+    assert "ann-calibration.json" in calibration
+    assert "issue41-ann-calibration" in calibration
+    assert "issue41-ann-calibration-batch-spike" in calibration
     assert "if: ${{ always() }}" in scale
     assert "--error-output .review-tmp/issue41-scale/index-benchmark-error.json" in scale
     assert "if: success()" in scale

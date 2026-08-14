@@ -127,8 +127,9 @@ jobs:
             eval/results.json
             eval/detail.jsonl
 
-  issue41-scale-benchmark:
-    name: "Issue #41 held-out ANN comparator (77,348 x 384)"
+  issue41-manual-calibration:
+    name: "Issue #41 manual ANN calibration (non-authorizing)"
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -162,7 +163,90 @@ jobs:
           actual={'lancedb':metadata.version('lancedb'), 'numpy':numpy.__version__,
           'pyarrow':metadata.version('pyarrow')}; print(actual);
           assert actual == expected, f'expected LanceDB 0.34.0 / NumPy 2.2.6 / PyArrow 25.0.0, got {actual}'"
-      - name: Run held-out FLAT/SQ ANN quality and performance comparator
+      - name: Run manual non-authorizing OMP calibration and batch observation
+        run: >
+          python eval/benchmark_ann_build.py
+          --rows 77348
+          --dimensions 384
+          --max-probes 256
+          --ef-grid 30,50,75,100,150,200
+          --candidates ivf-hnsw-flat,ivf-hnsw-sq
+          --row-batch-size 8192
+          --query-batch-size 32
+          --max-exact-seconds 10
+          --max-seconds 60
+          --max-evidence-bytes 10485760
+          --work-dir .review-tmp/issue41-scale
+          --output .review-tmp/issue41-scale/calibration-never-accepting.json
+          --error-output .review-tmp/issue41-scale/index-benchmark-error.json
+          --calibrate
+          --calibration-output .review-tmp/issue41-scale/ann-calibration.json
+          --calibration-batch-output .review-tmp/issue41-scale/ann-calibration-batch-spike.json
+      - name: Upload non-accepting OMP calibration diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue41-ann-calibration
+          path: .review-tmp/issue41-scale/ann-calibration.json
+          if-no-files-found: ignore
+      - name: Upload observational ANN calibration batch spike
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue41-ann-calibration-batch-spike
+          path: .review-tmp/issue41-scale/ann-calibration-batch-spike.json
+          if-no-files-found: ignore
+      - name: Upload rejected issue #41 comparator error evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue41-index-benchmark-error
+          path: .review-tmp/issue41-scale/index-benchmark-error.json
+          if-no-files-found: ignore
+
+  issue41-scale-benchmark:
+    name: "Issue #41 held-out ANN acceptance comparator (77,348 x 384)"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+      UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+      PYTHONDONTWRITEBYTECODE: "1"
+      TMPDIR: ${{ github.workspace }}/.review-tmp/issue41-scale
+      TEMP: ${{ github.workspace }}/.review-tmp/issue41-scale
+      TMP: ${{ github.workspace }}/.review-tmp/issue41-scale
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.0"
+      - name: Create repository-local cache and temporary roots
+        run: mkdir -p .cache/pip .cache/uv .review-tmp/issue41-scale
+      - name: Verify dependency lock is current
+        run: python scripts/compile_requirements.py --check
+      - name: Install scale-benchmark dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Assert locked LanceDB, NumPy, and PyArrow runtime identity
+        run: >
+          python -c "import importlib.metadata as metadata, numpy;
+          expected={'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'lancedb':metadata.version('lancedb'), 'numpy':numpy.__version__,
+          'pyarrow':metadata.version('pyarrow')}; print(actual);
+          assert actual == expected, f'expected LanceDB 0.34.0 / NumPy 2.2.6 / PyArrow 25.0.0, got {actual}'"
+      - name: Require committed root/user-approved static calibration reference
+        run: >
+          python -c "import json, os, pathlib; path=pathlib.Path('eval/approved_ann_calibration.json');
+          assert path.is_file(), 'missing committed root/user-approved calibration reference';
+          value=json.loads(path.read_text()); required=('static_cap_seconds','calibration_sha256','calibration_rule_version','omp_threads');
+          assert all(value.get(key) is not None for key in required), 'incomplete committed calibration reference';
+          assert len(value['calibration_sha256']) == 64, 'invalid committed calibration digest';
+          env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
+          [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
+      - name: Run static-cap held-out FLAT/SQ ANN acceptance comparator
         run: >
           python eval/benchmark_ann_build.py
           --rows 77348
@@ -178,15 +262,10 @@ jobs:
           --work-dir .review-tmp/issue41-scale
           --output eval/index-benchmark.json
           --error-output .review-tmp/issue41-scale/index-benchmark-error.json
-          --calibrate
-          --calibration-output .review-tmp/issue41-scale/ann-calibration.json
-      - name: Upload non-accepting OMP calibration diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: issue41-ann-calibration
-          path: .review-tmp/issue41-scale/ann-calibration.json
-          if-no-files-found: ignore
+          --approved-static-cap "${{ env.ANN_APPROVED_STATIC_CAP_SECONDS }}"
+          --approved-calibration-sha256 "${{ env.ANN_APPROVED_CALIBRATION_SHA256 }}"
+          --approved-calibration-rule-version "${{ env.ANN_APPROVED_CALIBRATION_RULE_VERSION }}"
+          --approved-omp-threads "${{ env.ANN_APPROVED_OMP_THREADS }}"
       - name: Upload issue #41 held-out scale evidence
         if: success()
         uses: actions/upload-artifact@v4
@@ -203,6 +282,7 @@ jobs:
 
   model-backed-ann-decision:
     name: "Model-backed final-retrieval decision records"
+    if: github.event_name == 'pull_request'
     needs: issue41-scale-benchmark
     runs-on: ubuntu-latest
     steps:
@@ -244,7 +324,7 @@ jobs:
 
   reconcile-ann-decision:
     name: "Eval ANN decision reconciliation"
-    if: ${{ always() }}
+    if: ${{ github.event_name == 'pull_request' && always() }}
     needs: [test-and-eval, issue41-scale-benchmark, model-backed-ann-decision]
     runs-on: ubuntu-latest
     steps:

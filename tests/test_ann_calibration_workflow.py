@@ -13,15 +13,18 @@ def test_manual_calibration_isolated_from_pull_request_acceptance() -> None:
     assert "workflow_dispatch:" in workflow
     assert "github.event_name == 'workflow_dispatch'" in workflow
     assert "github.event_name == 'pull_request'" in workflow
-    assert "--approved-static-cap" in workflow
-    assert "--approved-calibration-sha256" in workflow
+    acceptance = workflow.split("issue41-scale-benchmark:", 1)[1].split("model-backed-ann-decision:", 1)[0]
+    assert "--approved-static-cap" in acceptance
+    assert "--approved-calibration-sha256" in acceptance
+    assert "--calibrate" not in acceptance
 
 
 def test_manual_calibration_persists_actual_observational_batch_artifact() -> None:
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "--calibration-batch-output" in workflow
-    assert "issue41-ann-calibration-batch-spike" in workflow
-    assert "index-benchmark.json" not in workflow.split("workflow_dispatch", 1)[1].split(
-        "pull_request", 1
+    calibration = workflow.split("issue41-manual-calibration:", 1)[1].split(
+        "issue41-scale-benchmark:", 1
     )[0]
+    assert "--calibration-batch-output" in calibration
+    assert "issue41-ann-calibration-batch-spike" in calibration
+    assert "eval/index-benchmark.json" not in calibration

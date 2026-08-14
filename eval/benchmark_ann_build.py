@@ -624,13 +624,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise
 
 
-def _run_with_omp(args: argparse.Namespace, omp_threads: int) -> dict[str, Any]:
+def _with_omp(args: argparse.Namespace, omp_threads: int, operation: Any) -> Any:
     names = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
     original = {name: os.environ.get(name) for name in names}
     try:
         for name in names:
             os.environ[name] = str(omp_threads)
-        return run(args)
+        return operation(args)
     finally:
         for name, value in original.items():
             if value is None:
@@ -639,52 +639,103 @@ def _run_with_omp(args: argparse.Namespace, omp_threads: int) -> dict[str, Any]:
                 os.environ[name] = value
 
 
-def run_calibration_and_acceptance(args: argparse.Namespace) -> dict[str, Any]:
-    """Run the prescribed ten diagnostics, then one separately capped acceptance."""
-    if args.calibration_output is None:
-        raise ValueError("calibration output")
+def _run_with_omp(args: argparse.Namespace, omp_threads: int) -> dict[str, Any]:
+    return _with_omp(args, omp_threads, run)
+
+
+def _run_actual_batch_spike(args: argparse.Namespace, omp_threads: int) -> dict[str, Any]:
+    """Persist one real batch observation without changing per-query evidence.
+
+    This intentionally creates its own diagnostic-only table.  It is neither a
+    candidate-matrix record nor an acceptance shortcut: the individual requests
+    are retained solely as the comparison reference for the batch output.
+    """
+    corpus = _vectors(args.rows, args.dimensions, CORPUS_SEED)
+    queries = _vectors(args.max_probes, args.dimensions, QUERY_SEED)
+    chunk_ids = [f"synthetic::{index:016x}" for index in range(args.rows)]
+    with tempfile.TemporaryDirectory(prefix=f"ann-batch-omp-{omp_threads}-", dir=args.work_dir) as directory:
+        lance_dir = Path(directory) / "diagnostic"
+        lancedb.connect(str(lance_dir)).create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
+        repository = LanceDbIndexRepository(lance_dir)
+        candidate = CANDIDATES[0]
+        repository.create_vector_index(VectorIndexConfig(
+            index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
+            m=16, ef_construction=300, dense_chunks_count=args.rows,
+        ))
+        ef, limit = DECISION_EF_GRID[0], 20
+        individual_result_ids = [
+            [str(row.get("chunk_id", "")) for row in repository.search_dense(vector.tolist(), metric="cosine", limit=limit, ef=ef)]
+            for vector in queries
+        ]
+        spike = run_multivector_batch_spike(
+            repository._dense_table(), queries.tolist(), metric="cosine", ef=ef, limit=limit,
+            individual_result_ids=individual_result_ids,
+        )
+    spike.update({
+        "omp_threads": omp_threads,
+        "candidate": candidate,
+        "individual_query_count": args.max_probes,
+        "query_count": args.max_probes,
+        "normal_per_query_contract_preserved": True,
+    })
+    return spike
+
+
+def run_manual_calibration(args: argparse.Namespace) -> dict[str, Any]:
+    """Run only non-authorizing diagnostics; never run an acceptance matrix."""
+    if args.calibration_output is None or args.calibration_batch_output is None:
+        raise ValueError("calibration output and batch output")
     trials: dict[int, list[float]] = {1: [], 2: []}
     trial_records: dict[str, list[dict[str, Any]]] = {"1": [], "2": []}
-    for omp_threads in (1, 2):
-        for repetition in range(5):
-            trial = argparse.Namespace(**vars(args))
-            trial.calibration_mode = True
-            trial.max_seconds = float("inf")
-            trial.output = Path(args.work_dir) / "calibration" / f"omp-{omp_threads}-{repetition}.json"
-            trial.error_output = Path(args.work_dir) / "index-benchmark-error.json"
-            payload = _run_with_omp(trial, omp_threads)
-            trials[omp_threads].append(float(payload["benchmark_wall_seconds"]))
-            trial_records[str(omp_threads)].append({
-                "repetition": repetition,
-                "wall_seconds": payload["benchmark_wall_seconds"],
-                "exact_time_ms": payload["exact"]["time_ms"],
-                "path": str(trial.output),
-                "sha256": hashlib.sha256(trial.output.read_bytes()).hexdigest(),
-            })
-    calibration = build_calibration_record(
-        head_sha=_head_sha(), lock_identity=_locked_runtime_identity(),
-        configuration={
-            "cpu_count": os.cpu_count() or 1,
-            "worker_schedule": _spawn_worker_schedule(),
-            "candidates": list(CANDIDATES), "ef_grid": list(DECISION_EF_GRID),
-            "probes": args.max_probes,
-        },
-        repetitions=trials,
-    )
-    calibration["trial_records"] = trial_records
-    args.calibration_output.parent.mkdir(parents=True, exist_ok=True)
-    args.calibration_output.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
-    calibration_digest = hashlib.sha256(args.calibration_output.read_bytes()).hexdigest()
-
-    acceptance = argparse.Namespace(**vars(args))
-    acceptance.calibration_mode = False
-    acceptance.max_seconds = calibration["calculated_cap_seconds"]
-    acceptance.calibration_reference = {
-        "calibration_sha256": calibration_digest,
-        "calibration_rule_version": CALIBRATION_RULE_VERSION,
-        "selected_omp_threads": calibration["selected_omp_threads"],
-    }
-    return _run_with_omp(acceptance, calibration["selected_omp_threads"])
+    batch_spikes: list[dict[str, Any]] = []
+    try:
+        for omp_threads in (1, 2):
+            for repetition in range(5):
+                trial = argparse.Namespace(**vars(args))
+                trial.calibration_mode = True
+                trial.max_seconds = float("inf")
+                trial.output = Path(args.work_dir) / "calibration" / f"omp-{omp_threads}-{repetition}.json"
+                trial.error_output = Path(args.work_dir) / "index-benchmark-error.json"
+                payload = _run_with_omp(trial, omp_threads)
+                trials[omp_threads].append(float(payload["benchmark_wall_seconds"]))
+                trial_records[str(omp_threads)].append({
+                    "repetition": repetition,
+                    "wall_seconds": payload["benchmark_wall_seconds"],
+                    "exact_time_ms": payload["exact"]["time_ms"],
+                    "path": str(trial.output),
+                    "sha256": hashlib.sha256(trial.output.read_bytes()).hexdigest(),
+                })
+            batch_spikes.append(
+                _with_omp(args, omp_threads, lambda _: _run_actual_batch_spike(args, omp_threads))
+            )
+        calibration = build_calibration_record(
+            head_sha=_head_sha(), lock_identity=_locked_runtime_identity(),
+            configuration={
+                "cpu_count": os.cpu_count() or 1,
+                "worker_schedule": _spawn_worker_schedule(),
+                "candidates": list(CANDIDATES), "ef_grid": list(DECISION_EF_GRID),
+                "probes": args.max_probes,
+            },
+            repetitions=trials,
+        )
+        calibration["trial_records"] = trial_records
+        calibration["batch_spike_path"] = str(args.calibration_batch_output)
+        args.calibration_output.parent.mkdir(parents=True, exist_ok=True)
+        args.calibration_output.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
+        batch_payload = {
+            "status": "observational_only",
+            "head_sha": _head_sha(),
+            "lock_identity": _locked_runtime_identity(),
+            "spikes": batch_spikes,
+            "can_authorize_acceptance": False,
+        }
+        batch_payload["sha256"] = hashlib.sha256(json.dumps(batch_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        args.calibration_batch_output.parent.mkdir(parents=True, exist_ok=True)
+        args.calibration_batch_output.write_text(json.dumps(batch_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return calibration
+    except Exception as exc:
+        _write_rejected_error(args, exc, failure_phase="manual_calibration", matrix_started=None)
+        raise
 
 
 def main() -> int:
@@ -702,8 +753,13 @@ def main() -> int:
     parser.add_argument("--work-dir", type=Path, default=SKILL_ROOT / ".review-tmp" / "held-out-ann")
     parser.add_argument("--output", type=Path, default=HERE / "index-benchmark.json")
     parser.add_argument("--error-output", type=Path, help="Rejected worker/pool diagnostics path")
-    parser.add_argument("--calibrate", action="store_true", help="Run five OMP 1/2 diagnostics then acceptance")
+    parser.add_argument("--calibrate", action="store_true", help="Run five OMP 1/2 diagnostics only; never acceptance")
     parser.add_argument("--calibration-output", type=Path, help="Non-accepting calibration artifact")
+    parser.add_argument("--calibration-batch-output", type=Path, help="Observational-only multi-vector batch artifact")
+    parser.add_argument("--approved-static-cap", type=float, help="Root/user-approved committed PR acceptance cap")
+    parser.add_argument("--approved-calibration-sha256", help="Root/user-approved committed calibration digest")
+    parser.add_argument("--approved-calibration-rule-version", help="Rule version bound to the approved digest")
+    parser.add_argument("--approved-omp-threads", type=int, choices=(1, 2), help="OMP setting bound to the approved digest")
     parser.add_argument(
         "--validate-evidence", type=Path,
         help="Validate an existing comparator artifact without running a benchmark.",
@@ -719,9 +775,28 @@ def main() -> int:
         return 0
     args.ef_grid = tuple(int(value) for value in args.ef_grid.split(",") if value)
     args.candidates = tuple(value for value in args.candidates.split(",") if value)
+    approval_values = (
+        args.approved_static_cap, args.approved_calibration_sha256,
+        args.approved_calibration_rule_version, args.approved_omp_threads,
+    )
+    if any(value is not None for value in approval_values):
+        if args.calibrate or any(value is None for value in approval_values):
+            parser.error("approved static acceptance inputs must be complete and cannot calibrate")
+        if (
+            args.approved_static_cap <= 0
+            or args.approved_static_cap > DEFAULT_MAX_WALL_SECONDS
+            or len(args.approved_calibration_sha256) != 64
+        ):
+            parser.error("approved static acceptance inputs")
+        args.max_seconds = args.approved_static_cap
+        args.calibration_reference = {
+            "calibration_sha256": args.approved_calibration_sha256,
+            "calibration_rule_version": args.approved_calibration_rule_version,
+            "selected_omp_threads": args.approved_omp_threads,
+        }
     args.work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        runner = run_calibration_and_acceptance if args.calibrate else run
+        runner = run_manual_calibration if args.calibrate else run
         print(json.dumps(runner(args), ensure_ascii=False, indent=2))
     except Exception as exc:
         print(f"[FAIL] held-out ANN comparator: {type(exc).__name__}: {exc}", file=sys.stderr)
