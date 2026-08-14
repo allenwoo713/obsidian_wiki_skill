@@ -70,8 +70,8 @@ def test_decision_comparator_contract_is_held_out_and_fail_closed() -> None:
             "ef_grid": list(benchmark_ann_build.DECISION_EF_GRID),
             "candidates": ["ivf-hnsw-flat", "ivf-hnsw-sq"],
         },
-        "corpus": {"sha256": "a" * 64, "seed": "corpus-v1"},
-        "queries": {"sha256": "b" * 64, "seed": "queries-v1", "zero_overlap_count": 0},
+        "corpus": {"count": 513, "dimensions": 32, "sha256": "a" * 64, "seed": "corpus-v1"},
+        "queries": {"count": 256, "dimensions": 32, "sha256": "b" * 64, "seed": "queries-v1", "zero_overlap_count": 0},
         "records": [],
     }
     with pytest.raises(ValueError, match="records"):

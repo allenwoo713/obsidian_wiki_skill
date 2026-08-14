@@ -1,19 +1,8 @@
-"""Reproducible issue #41 build-time ANN benchmark (performance-only gate).
-
-The script generates vectors at runtime, creates a real LanceDB HNSW index, and
-executes the production IndexBuildService benchmark path.  No large fixture is
-stored in git.  A non-zero exit means the bounded-probe performance/evidence
-contract is not satisfied.
-
-This is a PERFORMANCE-ONLY gate: it asserts the benchmark scans the dense corpus
-exactly once (streamed batch exact) and stays within wall-clock/evidence budgets.
-ANN publication quality (recall, promote-to-ann) is validated separately by
-eval/run_eval.py against a real-model fixture, not by this random-vector scale.
-"""
+"""Fail-closed held-out FLAT/SQ ANN comparison used only by evaluation jobs."""
 from __future__ import annotations
 
 import argparse
-import inspect
+import hashlib
 import json
 import math
 import os
@@ -21,9 +10,8 @@ import platform
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Any
 
 import lancedb
 import numpy as np
@@ -35,240 +23,212 @@ SKILL_ROOT = HERE.parent
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-DEFAULT_MAX_EXACT_SECONDS = 10.0
-# Coarse end-to-end guard only. The stage-specific exact SLO above is the
-# deterministic #41 algorithmic regression gate; scalar ANN latency varies on
-# shared runners and remains fully measured in the evidence payload.
-DEFAULT_MAX_WALL_SECONDS = 60.0
-
-import obsidian_wiki.application.index_build_service as build_service_module  # noqa: E402
-from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
+from obsidian_wiki.application.index_build_service import BENCHMARK_MAX_PROBES  # noqa: E402
 from obsidian_wiki.domain.index_models import VectorIndexConfig  # noqa: E402
-from obsidian_wiki.domain.index_policy import select_vector_policy  # noqa: E402
-from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
-    LanceDbIndexRepository,
-)
+from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
 
-class _VectorView(Sequence[float]):
-    """List-compatible view without duplicating the full vector matrix in Python."""
-
-    __slots__ = ("_matrix", "_index")
-
-    def __init__(self, matrix: np.ndarray, index: int) -> None:
-        self._matrix = matrix
-        self._index = index
-
-    def __len__(self) -> int:
-        return int(self._matrix.shape[1])
-
-    def __bool__(self) -> bool:
-        return True
-
-    def __getitem__(self, index):
-        return self._matrix[self._index][index]
-
-    def __iter__(self) -> Iterator[float]:
-        return (float(value) for value in self._matrix[self._index])
-
-
-@dataclass(slots=True)
-class _DenseProbe:
-    chunk_id: str
-    page_id: str
-    path: str
-    chunk_kind: str
-    chunk_index: int
-    continuation_index: int
-    content_hash: str
-    vector: Sequence[float]
-
-
-class _NoopDependency:
-    pass
-
-
-def _require_issue41_api() -> int:
-    if not hasattr(build_service_module, "BENCHMARK_MAX_PROBES"):
-        raise RuntimeError("Issue #41 contract missing: BENCHMARK_MAX_PROBES")
-    signature = inspect.signature(IndexBuildService)
-    if "benchmark_max_probes" not in signature.parameters:
-        raise RuntimeError("Issue #41 contract missing: benchmark_max_probes constructor input")
-    benchmark_signature = inspect.signature(IndexBuildService._benchmark)
-    if "wiki_dir" not in benchmark_signature.parameters:
-        raise RuntimeError("Issue #41 contract missing: _benchmark(..., wiki_dir=...) portable sampling root")
-    return int(build_service_module.BENCHMARK_MAX_PROBES)
+EVIDENCE_SCHEMA_VERSION = 3
+DECISION_EF_GRID = (30, 50, 75, 100, 150, 200)
+CANDIDATES = ("ivf-hnsw-flat", "ivf-hnsw-sq")
+_REPOSITORY_TYPES = {"ivf-hnsw-flat": "hnsw_flat", "ivf-hnsw-sq": "hnsw_sq"}
+DEFAULT_MAX_EXACT_SECONDS = 10.0
+DEFAULT_MAX_WALL_SECONDS = 60.0
+CORPUS_SEED = 41001
+QUERY_SEED = 41002
 
 
 def _vectors(rows: int, dimensions: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    vectors = rng.standard_normal((rows, dimensions), dtype=np.float32)
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    vectors /= np.maximum(norms, np.finfo(np.float32).eps)
-    return vectors
+    values = rng.standard_normal((rows, dimensions), dtype=np.float32)
+    values /= np.maximum(np.linalg.norm(values, axis=1, keepdims=True), np.finfo(np.float32).eps)
+    return values.astype("<f4", copy=False)
+
+
+def _matrix_digest(values: np.ndarray) -> str:
+    canonical = np.asarray(values, dtype="<f4", order="C")
+    return hashlib.sha256(canonical.tobytes(order="C")).hexdigest()
+
+
+def _row_hashes(values: np.ndarray) -> set[str]:
+    return {hashlib.sha256(np.asarray(row, dtype="<f4").tobytes()).hexdigest() for row in values}
 
 
 def _arrow_table(vectors: np.ndarray, chunk_ids: list[str]) -> pa.Table:
-    dimensions = int(vectors.shape[1])
-    vector_column = pa.FixedSizeListArray.from_arrays(
-        pa.array(vectors.reshape(-1), type=pa.float32()), dimensions
+    column = pa.FixedSizeListArray.from_arrays(
+        pa.array(vectors.reshape(-1), type=pa.float32()), int(vectors.shape[1])
     )
-    return pa.table({"chunk_id": pa.array(chunk_ids), "vector": vector_column})
+    return pa.table({"chunk_id": pa.array(chunk_ids), "vector": column})
 
 
-def run(args: argparse.Namespace) -> dict:
-    default_cap = _require_issue41_api()
-    if args.max_probes != default_cap:
-        raise ValueError(
-            f"scale gate must exercise production cap {default_cap}, got {args.max_probes}"
-        )
-    if args.rows <= args.max_probes or args.dimensions <= 0:
-        raise ValueError("rows must exceed max_probes and dimensions must be positive")
+def _directory_bytes(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
-    vectors = _vectors(args.rows, args.dimensions, args.seed)
-    with tempfile.TemporaryDirectory(prefix="issue41-scale-", dir=args.work_dir) as temp_dir:
-        root = Path(temp_dir)
-        wiki_dir = root / "Wiki"
-        wiki_dir.mkdir()
-        lance_dir = root / "lance_db"
-        chunk_ids = [
-            f"{(wiki_dir / 'synthetic' / f'page-{index // 4:06d}.md').resolve()}::"
-            f"{index:016x}"
-            for index in range(args.rows)
-        ]
-        db = lancedb.connect(str(lance_dir))
-        db.create_table("dense_chunks", data=_arrow_table(vectors, chunk_ids))
-        repository = LanceDbIndexRepository(lance_dir)
 
-        index_started = time.perf_counter()
-        stats = repository.create_vector_index(
-            VectorIndexConfig(
-                index_type="hnsw_flat",
-                metric="cosine",
-                num_partitions=1,
-                m=16,
-                ef_construction=300,
-                dense_chunks_count=args.rows,
-            )
-        )
-        index_build_ms = (time.perf_counter() - index_started) * 1000
-        probes = tuple(
-            _DenseProbe(
-                chunk_id=chunk_ids[index],
-                page_id=chunk_ids[index].rsplit("::", 1)[0],
-                path=chunk_ids[index].rsplit("::", 1)[0],
-                chunk_kind="dense",
-                chunk_index=index,
-                continuation_index=-1,
-                content_hash=f"{index:064x}",
-                vector=_VectorView(vectors, index),
-            )
-            for index in range(args.rows)
-        )
-        service = IndexBuildService(
-            _NoopDependency(),
-            reopen_storage=lambda _path: _NoopDependency(),
-            manifest_store=_NoopDependency(),
-            post_commit_journal=_NoopDependency(),
-            benchmark_max_probes=args.max_probes,
-        )
+def _percentile(samples: list[float], percentile: int) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    return float(ordered[round((len(ordered) - 1) * percentile / 100)])
 
-        benchmark_started = time.perf_counter()
-        observation, evidence = service._benchmark(
-            repository,
-            probes,
-            stats,
-            build_time_ms=index_build_ms,
-            disk_bytes=sum(path.stat().st_size for path in lance_dir.rglob("*") if path.is_file()),
-            wiki_dir=wiki_dir,
-            row_batch_size=args.row_batch_size,
-            query_batch_size=args.query_batch_size,
-        )
-        measured_seconds = time.perf_counter() - benchmark_started
-        decision = select_vector_policy(observation, stats, evidence=evidence)
-        payload = {
-            "benchmark_intent": "performance_only",
-            "quality_gate": "eval/run_eval.py",
-            "configuration": {
-                "rows": args.rows,
-                "dimensions": args.dimensions,
-                "max_probes": args.max_probes,
-                "seed": args.seed,
-                "max_seconds": args.max_seconds,
-                "max_exact_seconds": args.max_exact_seconds,
-                "row_batch_size": args.row_batch_size,
-                "query_batch_size": args.query_batch_size,
-                "max_evidence_bytes": args.max_evidence_bytes,
-            },
-            "index_build_ms": round(index_build_ms, 3),
-            "benchmark_wall_seconds": round(measured_seconds, 6),
-            "benchmark": {**observation.to_json(), **evidence},
-            "policy": decision.to_json(),
-            "diagnostics": {
-                "cpu_count": os.cpu_count(),
-                "python_version": platform.python_version(),
-                "numpy_version": np.__version__,
-                "lancedb_version": lancedb.__version__,
-                "pyarrow_version": pa.__version__,
-                "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
-                "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"),
-                "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
-            },
-        }
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
-        payload["benchmark_payload_bytes"] = len(encoded)
 
-    benchmark = payload["benchmark"]
-    failures = []
-    if benchmark.get("probe_scope") != "sampled":
-        failures.append(f"probe_scope={benchmark.get('probe_scope')!r}, expected sampled")
-    if benchmark.get("probe_count") != args.max_probes:
-        failures.append(
-            f"probe_count={benchmark.get('probe_count')!r}, expected {args.max_probes}"
-        )
-    if benchmark.get("probe_total") != args.rows:
-        failures.append(f"probe_total={benchmark.get('probe_total')!r}, expected {args.rows}")
-    if len(benchmark.get("exact_result_ids", [])) != args.max_probes:
-        failures.append("exact_result_ids is not bounded by max_probes")
-    if len(benchmark.get("candidate_result_ids", [])) != args.max_probes:
-        failures.append("candidate_result_ids is not bounded by max_probes")
+def _config_digest(candidate: str, *, rows: int, dimensions: int) -> str:
+    value = {
+        "candidate": candidate,
+        "metric": "cosine",
+        "rows": rows,
+        "dimensions": dimensions,
+        "m": 16,
+        "ef_construction": 300,
+        "num_partitions": 1,
+    }
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
-    # #41 batch-exact structure gates. Performance-only: ANN promotion quality is
-    # validated by eval/run_eval.py, not by this random-vector scale fixture.
-    if benchmark.get("evidence_schema_version") != 2:
-        failures.append("expected benchmark evidence schema v2")
-    if benchmark.get("exact_method") != "streamed_numpy_cosine_v1":
-        failures.append(f"unexpected exact_method={benchmark.get('exact_method')!r}")
-    if benchmark.get("exact_scan_rows") != args.rows:
-        failures.append(
-            f"exact_scan_rows={benchmark.get('exact_scan_rows')!r}, expected {args.rows}"
-        )
-    if not isinstance(benchmark.get("exact_scan_batches"), int) \
-            or benchmark["exact_scan_batches"] <= 0:
-        failures.append("exact_scan_batches must be positive")
-    if benchmark.get("ann_query_count") != args.max_probes:
-        failures.append(
-            f"ann_query_count={benchmark.get('ann_query_count')!r}, expected {args.max_probes}"
-        )
-    exact_seconds = float(benchmark.get("exact_verification_ms", float("inf"))) / 1000
-    if exact_seconds > args.max_exact_seconds:
-        failures.append(
-            f"exact_verification_seconds={exact_seconds:.3f} > "
-            f"SLO {args.max_exact_seconds:.3f}"
-        )
 
-    if measured_seconds > args.max_seconds:
-        failures.append(
-            f"benchmark_wall_seconds={measured_seconds:.3f} > SLO {args.max_seconds:.3f}"
-        )
+def _finite(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value))
+    if isinstance(value, dict):
+        return all(_finite(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_finite(item) for item in value)
+    return True
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reject partial, mixed, self-query, or policy-bearing decision evidence."""
+    _require(payload.get("evidence_schema_version") == EVIDENCE_SCHEMA_VERSION, "schema version")
+    _require(payload.get("benchmark_intent") == "held_out_ann_comparator", "benchmark intent")
+    config = payload.get("configuration")
+    _require(isinstance(config, dict), "configuration")
+    rows, dimensions, probes = config.get("rows"), config.get("dimensions"), config.get("max_probes")
+    _require(isinstance(rows, int) and rows > 0 and isinstance(dimensions, int) and dimensions > 0, "dimensions")
+    _require(isinstance(probes, int) and 0 < probes <= BENCHMARK_MAX_PROBES, "max probes")
+    _require(config.get("ef_grid") == list(DECISION_EF_GRID), "ef grid")
+    _require(config.get("candidates") == list(CANDIDATES), "candidate identity")
+    corpus, queries = payload.get("corpus"), payload.get("queries")
+    _require(isinstance(corpus, dict) and isinstance(queries, dict), "corpus/query metadata")
+    for name, item, count in (("corpus", corpus, rows), ("queries", queries, probes)):
+        _require(item.get("count") == count and item.get("dimensions") == dimensions, f"{name} dimensions/counts")
+        _require(isinstance(item.get("sha256"), str) and len(item["sha256"]) == 64, f"{name} digest")
+        _require(isinstance(item.get("seed"), str) and item["seed"], f"{name} seed")
+    _require(queries.get("zero_overlap_count") == 0, "self-query overlap")
+    records = payload.get("records")
+    _require(isinstance(records, list) and len(records) == len(CANDIDATES) * len(DECISION_EF_GRID), "records")
+    expected = {(candidate, ef) for candidate in CANDIDATES for ef in DECISION_EF_GRID}
+    seen: set[tuple[str, int]] = set()
+    for record in records:
+        _require(isinstance(record, dict), "record type")
+        candidate, ef = record.get("candidate"), record.get("query_ef")
+        _require((candidate, ef) in expected and (candidate, ef) not in seen, "candidate/grid binding")
+        seen.add((candidate, ef))
+        _require(record.get("config_sha256") == _config_digest(candidate, rows=rows, dimensions=dimensions), "config digest")
+        _require(record.get("unindexed_dense_rows") == 0, "unindexed rows")
+        for key in ("build_time_ms", "exact_time_ms", "total_bytes", "index_delta_bytes", "latency_p50_ms", "latency_p95_ms", "recall_at_10", "recall_at_20"):
+            _require(key in record and _finite(record[key]), f"non-finite {key}")
+        samples = record.get("queries")
+        _require(isinstance(samples, list) and len(samples) == probes, "query evidence")
+        for sample in samples:
+            _require(isinstance(sample, dict), "query record")
+            for key, count in (("exact_top_10", 10), ("exact_top_20", 20), ("candidate_top_10", 10), ("candidate_top_20", 20)):
+                values = sample.get(key)
+                _require(isinstance(values, list) and len(values) == count and all(isinstance(v, str) and v for v in values), f"incomplete {key}")
+            _require(_finite(sample.get("recall_at_10")) and _finite(sample.get("recall_at_20")), "non-finite recall")
+    _require(seen == expected and _finite(payload), "incomplete evidence")
+    _require("selected_candidate" not in payload and "recall_floor" not in payload, "policy decision")
+    return payload
+
+
+def _candidate_record(
+    *, candidate: str, root: Path, corpus: np.ndarray, queries: np.ndarray, chunk_ids: list[str], args: argparse.Namespace, exact_ids: tuple[tuple[str, ...], ...], exact_time_ms: float,
+) -> list[dict[str, Any]]:
+    lance_dir = root / candidate
+    db = lancedb.connect(str(lance_dir))
+    db.create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
+    pre_index_bytes = _directory_bytes(lance_dir)
+    repository = LanceDbIndexRepository(lance_dir)
+    started = time.perf_counter()
+    stats = repository.create_vector_index(VectorIndexConfig(index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1, m=16, ef_construction=300, dense_chunks_count=args.rows))
+    build_time_ms = (time.perf_counter() - started) * 1000
+    total_bytes = _directory_bytes(lance_dir)
+    records: list[dict[str, Any]] = []
+    for ef in args.ef_grid:
+        samples, latencies = [], []
+        for index, vector in enumerate(queries):
+            started = time.perf_counter()
+            result = repository.search_dense(vector.tolist(), metric="cosine", limit=20, ef=ef)
+            latencies.append((time.perf_counter() - started) * 1000)
+            candidate_20 = [str(row.get("chunk_id", "")) for row in result]
+            candidate_10, truth_20 = candidate_20[:10], list(exact_ids[index])
+            truth_10 = truth_20[:10]
+            samples.append({
+                "query_index": index, "exact_top_10": truth_10, "exact_top_20": truth_20,
+                "candidate_top_10": candidate_10, "candidate_top_20": candidate_20,
+                "recall_at_10": len(set(truth_10) & set(candidate_10)) / 10,
+                "recall_at_20": len(set(truth_20) & set(candidate_20)) / 20,
+            })
+        records.append({
+            "candidate": candidate, "query_ef": ef, "config_sha256": _config_digest(candidate, rows=args.rows, dimensions=args.dimensions),
+            "build_time_ms": round(build_time_ms, 3), "exact_time_ms": round(exact_time_ms, 3),
+            "total_bytes": total_bytes, "index_delta_bytes": total_bytes - pre_index_bytes,
+            "unindexed_dense_rows": stats.unindexed_dense_rows,
+            "latency_p50_ms": round(_percentile(latencies, 50), 3), "latency_p95_ms": round(_percentile(latencies, 95), 3),
+            "recall_at_10": sum(s["recall_at_10"] for s in samples) / len(samples),
+            "recall_at_20": sum(s["recall_at_20"] for s in samples) / len(samples), "queries": samples,
+        })
+    return records
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.rows <= args.max_probes or args.dimensions <= 0 or not 0 < args.max_probes <= BENCHMARK_MAX_PROBES:
+        raise ValueError("rows must exceed probes, dimensions must be positive, and probes must be bounded")
+    if tuple(args.ef_grid) != DECISION_EF_GRID or tuple(args.candidates) != CANDIDATES:
+        raise ValueError("the decision comparator has a fixed candidate grid")
+    corpus, queries = _vectors(args.rows, args.dimensions, CORPUS_SEED), _vectors(args.max_probes, args.dimensions, QUERY_SEED)
+    overlap = len(_row_hashes(corpus) & _row_hashes(queries))
+    with tempfile.TemporaryDirectory(prefix="held-out-ann-", dir=args.work_dir) as directory:
+        root = Path(directory)
+        chunk_ids = [f"synthetic::{index:016x}" for index in range(args.rows)]
+        truth_repo_dir = root / "truth"
+        truth_db = lancedb.connect(str(truth_repo_dir))
+        truth_db.create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
+        truth_repository = LanceDbIndexRepository(truth_repo_dir)
+        exact_started = time.perf_counter()
+        exact = truth_repository.search_dense_exact_batch(queries.tolist(), metric="cosine", limit=20, row_batch_size=args.row_batch_size, query_batch_size=args.query_batch_size)
+        exact_time_ms = (time.perf_counter() - exact_started) * 1000
+        wall_started = time.perf_counter()
+        records = []
+        for candidate in args.candidates:
+            records.extend(_candidate_record(candidate=candidate, root=root, corpus=corpus, queries=queries, chunk_ids=chunk_ids, args=args, exact_ids=exact.result_ids, exact_time_ms=exact_time_ms))
+        wall_seconds = time.perf_counter() - wall_started
+    payload: dict[str, Any] = {
+        "evidence_schema_version": EVIDENCE_SCHEMA_VERSION, "benchmark_intent": "held_out_ann_comparator",
+        "configuration": {"rows": args.rows, "dimensions": args.dimensions, "max_probes": args.max_probes, "ef_grid": list(args.ef_grid), "candidates": list(args.candidates), "row_batch_size": args.row_batch_size, "query_batch_size": args.query_batch_size},
+        "corpus": {"count": args.rows, "dimensions": args.dimensions, "seed": "corpus-v1", "sha256": _matrix_digest(corpus)},
+        "queries": {"count": args.max_probes, "dimensions": args.dimensions, "seed": "queries-v1", "sha256": _matrix_digest(queries), "zero_overlap_count": overlap},
+        "exact": {"method": exact.method, "scan_rows": exact.scan_rows, "scan_batches": exact.scan_batches, "time_ms": round(exact_time_ms, 3)},
+        "environment": {"python": platform.python_version(), "os": platform.platform(), "numpy": np.__version__, "lancedb": lancedb.__version__, "pyarrow": pa.__version__, "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS")},
+        "records": records, "benchmark_wall_seconds": round(wall_seconds, 6),
+    }
+    payload["benchmark_payload_bytes"] = len(json.dumps(payload, sort_keys=True).encode())
+    failures: list[str] = []
+    try:
+        validate_evidence(payload)
+    except ValueError as exc:
+        failures.append(str(exc))
+    if exact_time_ms / 1000 > args.max_exact_seconds:
+        failures.append("exact-time cap")
+    if wall_seconds > args.max_seconds:
+        failures.append("wall-time cap")
     if payload["benchmark_payload_bytes"] > args.max_evidence_bytes:
-        failures.append(
-            f"benchmark_payload_bytes={payload['benchmark_payload_bytes']} > "
-            f"budget {args.max_evidence_bytes}"
-        )
-    if not math.isfinite(float(benchmark.get("benchmark_duration_ms", float("nan")))):
-        failures.append("benchmark_duration_ms is absent or non-finite")
-
+        failures.append("evidence-size cap")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     if failures:
@@ -280,26 +240,38 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=77_348)
     parser.add_argument("--dimensions", type=int, default=384)
-    parser.add_argument("--max-probes", type=int, default=256)
-    parser.add_argument("--seed", type=int, default=41)
+    parser.add_argument("--max-probes", type=int, default=BENCHMARK_MAX_PROBES)
+    parser.add_argument("--ef-grid", default=",".join(map(str, DECISION_EF_GRID)))
+    parser.add_argument("--candidates", default=",".join(CANDIDATES))
     parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_WALL_SECONDS)
-    parser.add_argument(
-        "--max-exact-seconds", type=float, default=DEFAULT_MAX_EXACT_SECONDS
-    )
+    parser.add_argument("--max-exact-seconds", type=float, default=DEFAULT_MAX_EXACT_SECONDS)
     parser.add_argument("--row-batch-size", type=int, default=8192)
     parser.add_argument("--query-batch-size", type=int, default=32)
     parser.add_argument("--max-evidence-bytes", type=int, default=10 * 1024 * 1024)
-    parser.add_argument("--work-dir", type=Path, default=SKILL_ROOT / ".review-tmp" / "issue41-scale")
+    parser.add_argument("--work-dir", type=Path, default=SKILL_ROOT / ".review-tmp" / "held-out-ann")
     parser.add_argument("--output", type=Path, default=HERE / "index-benchmark.json")
+    parser.add_argument(
+        "--validate-evidence", type=Path,
+        help="Validate an existing comparator artifact without running a benchmark.",
+    )
     args = parser.parse_args()
+    if args.validate_evidence is not None:
+        try:
+            validate_evidence(json.loads(args.validate_evidence.read_text(encoding="utf-8")))
+        except Exception as exc:
+            print(f"[FAIL] held-out ANN evidence: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print("[PASS] held-out ANN evidence", file=sys.stderr)
+        return 0
+    args.ef_grid = tuple(int(value) for value in args.ef_grid.split(",") if value)
+    args.candidates = tuple(value for value in args.candidates.split(",") if value)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        payload = run(args)
+        print(json.dumps(run(args), ensure_ascii=False, indent=2))
     except Exception as exc:
-        print(f"[FAIL] issue #41 ANN build benchmark: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"[FAIL] held-out ANN comparator: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    print("[PASS] issue #41 bounded ANN benchmark", file=sys.stderr)
+    print("[PASS] held-out ANN comparator", file=sys.stderr)
     return 0
 
 
