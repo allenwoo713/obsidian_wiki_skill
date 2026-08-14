@@ -130,6 +130,10 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--max-probes 256" in scale
     assert "--ef-grid 30,50,75,100,150,200" in scale
     assert "--max-seconds 60" in scale
+    assert "--calibrate" in scale
+    assert "--calibration-output .review-tmp/issue41-scale/ann-calibration.json" in scale
+    assert "ann-calibration.json" in scale
+    assert "issue41-ann-calibration" in scale
     assert "if: ${{ always() }}" in scale
     assert "--error-output .review-tmp/issue41-scale/index-benchmark-error.json" in scale
     assert "if: success()" in scale
