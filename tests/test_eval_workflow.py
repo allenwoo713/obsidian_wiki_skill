@@ -1,15 +1,28 @@
 """Static safety assertions for the fail-closed PR baseline workflow guard."""
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+APPROVED_CALIBRATION = SKILL_ROOT / "eval" / "approved_ann_calibration.json"
 sys.path.insert(0, str(SKILL_ROOT / "eval"))
 
 from models import ContextBundle, ContextItem  # noqa: E402
 import run_eval  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
+
+
+def test_committed_ann_calibration_reference_is_a_complete_approved_static_binding():
+    approval = json.loads(APPROVED_CALIBRATION.read_text(encoding="utf-8"))
+
+    assert approval["schema_version"] == 1
+    assert approval["static_cap_seconds"] == 180
+    assert approval["omp_threads"] == 2
+    assert approval["calibration_rule_version"] == "omp-median-mad-v1"
+    assert approval["calibration_sha256"] == "ddf6741749623400db007b2b0f1480e6378df332b52138bb00a3258b10465034"
+    assert approval["calibration_source_head_sha"] == "e872969f8a138e539ab88374703247ec01bc48f6"
 
 
 def test_baseline_pr_guard_fetches_history_and_fails_closed():

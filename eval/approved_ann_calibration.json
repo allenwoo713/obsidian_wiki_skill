@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "static_cap_seconds": 180,
+  "calibration_sha256": "ddf6741749623400db007b2b0f1480e6378df332b52138bb00a3258b10465034",
+  "calibration_rule_version": "omp-median-mad-v1",
+  "omp_threads": 2,
+  "calibration_source_head_sha": "e872969f8a138e539ab88374703247ec01bc48f6",
+  "approval_basis": "root/user-approved static 180-second cap after locked ubuntu-latest OMP calibration"
+}
