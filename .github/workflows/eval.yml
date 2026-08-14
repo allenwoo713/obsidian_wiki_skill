@@ -177,12 +177,20 @@ jobs:
           --max-evidence-bytes 10485760
           --work-dir .review-tmp/issue41-scale
           --output eval/index-benchmark.json
+          --error-output .review-tmp/issue41-scale/index-benchmark-error.json
       - name: Upload issue #41 held-out scale evidence
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: issue41-index-benchmark
           path: eval/index-benchmark.json
+      - name: Upload rejected issue #41 comparator error evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue41-index-benchmark-error
+          path: .review-tmp/issue41-scale/index-benchmark-error.json
+          if-no-files-found: ignore
 
   model-backed-ann-decision:
     name: "Model-backed final-retrieval decision records"
