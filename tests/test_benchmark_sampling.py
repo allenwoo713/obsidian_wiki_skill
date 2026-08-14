@@ -57,6 +57,27 @@ REQUIRED_EVIDENCE_FIELDS = {
 }
 
 
+def test_decision_comparator_contract_is_held_out_and_fail_closed() -> None:
+    """The scale gate must not accept self-query or partial A/B evidence."""
+    assert benchmark_ann_build.DECISION_EF_GRID == (30, 50, 75, 100, 150, 200)
+    payload = {
+        "evidence_schema_version": benchmark_ann_build.EVIDENCE_SCHEMA_VERSION,
+        "benchmark_intent": "held_out_ann_comparator",
+        "configuration": {
+            "rows": 513,
+            "dimensions": 32,
+            "max_probes": 256,
+            "ef_grid": list(benchmark_ann_build.DECISION_EF_GRID),
+            "candidates": ["ivf-hnsw-flat", "ivf-hnsw-sq"],
+        },
+        "corpus": {"sha256": "a" * 64, "seed": "corpus-v1"},
+        "queries": {"sha256": "b" * 64, "seed": "queries-v1", "zero_overlap_count": 0},
+        "records": [],
+    }
+    with pytest.raises(ValueError, match="records"):
+        benchmark_ann_build.validate_evidence(payload)
+
+
 def test_issue41_scale_gate_separates_exact_slo_from_coarse_wall_ceiling() -> None:
     """Runner-sensitive ANN latency must not crowd the exact-path regression gate."""
     assert benchmark_ann_build.DEFAULT_MAX_EXACT_SECONDS == 10.0
