@@ -33,6 +33,16 @@ class LanceDbIndexRepository:
 
     def __init__(self, lance_dir: Path):
         self._lance_dir = Path(lance_dir)
+        # A repository instance owns one normal dense-table handle.  This keeps
+        # LanceDB's ordinary ANN builder path intact while avoiding a reconnect
+        # for every request in a bounded validation matrix.
+        self._dense_table_handle = None
+        self._dense_table_open_count = 0
+
+    @property
+    def dense_table_open_count(self) -> int:
+        """Number of physical dense-table opens performed by this instance."""
+        return self._dense_table_open_count
 
     @staticmethod
     def validate_dense_chunks(dense_chunks: Sequence[DenseChunk]) -> int:
@@ -57,6 +67,10 @@ class LanceDbIndexRepository:
         dense_chunks: Sequence[DenseChunk],
         fts_config: FtsIndexConfig,
     ) -> None:
+        # Persistence can replace the table underneath a previously opened
+        # handle.  Invalidate before the first mutating SDK operation so a later
+        # normal query cannot observe a stale dense table.
+        self._dense_table_handle = None
         if not sparse_chunks:
             raise ValueError("Sparse persistence requires at least one row")
         dimensions = self.validate_dense_chunks(dense_chunks)
@@ -440,7 +454,10 @@ class LanceDbIndexRepository:
         return lancedb.connect(str(self._lance_dir)).open_table("sparse_chunks")
 
     def _dense_table(self):
-        return lancedb.connect(str(self._lance_dir)).open_table("dense_chunks")
+        if self._dense_table_handle is None:
+            self._dense_table_handle = lancedb.connect(str(self._lance_dir)).open_table("dense_chunks")
+            self._dense_table_open_count += 1
+        return self._dense_table_handle
 
     @staticmethod
     def require_current_layout(manifest_path: Path) -> None:

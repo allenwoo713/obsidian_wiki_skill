@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -36,6 +38,7 @@ DEFAULT_MAX_EXACT_SECONDS = 10.0
 DEFAULT_MAX_WALL_SECONDS = 60.0
 CORPUS_SEED = 41001
 QUERY_SEED = 41002
+_LOCKED_PACKAGES = {"lancedb", "numpy", "pyarrow"}
 
 
 def _vectors(rows: int, dimensions: int, seed: int) -> np.ndarray:
@@ -97,6 +100,26 @@ def _finite(value: Any) -> bool:
     return True
 
 
+def _locked_runtime_identity() -> dict[str, str]:
+    """Read the three approval-critical versions from the checked-in lock."""
+    versions: dict[str, str] = {}
+    for line in (SKILL_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        name, separator, version = line.partition("==")
+        if separator and name in _LOCKED_PACKAGES:
+            versions[name] = version.strip()
+    if set(versions) != _LOCKED_PACKAGES:
+        raise ValueError("locked runtime identity")
+    return versions
+
+
+def _runtime_identity() -> dict[str, str]:
+    return {
+        "lancedb": importlib.metadata.version("lancedb"),
+        "numpy": np.__version__,
+        "pyarrow": pa.__version__,
+    }
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
@@ -122,6 +145,57 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     _require(queries.get("zero_overlap_count") == 0, "self-query overlap")
     records = payload.get("records")
     _require(isinstance(records, list) and len(records) == len(CANDIDATES) * len(DECISION_EF_GRID), "records")
+    environment = payload.get("environment")
+    _require(isinstance(environment, dict), "environment")
+    _require(environment.get("runtime") == _locked_runtime_identity(), "runtime identity")
+    _require(isinstance(environment.get("cpu_count"), int) and environment["cpu_count"] > 0, "cpu count")
+    _require(isinstance(environment.get("worker_schedule"), dict), "worker schedule")
+    schedule = environment["worker_schedule"]
+    _require(schedule.get("kind") == "bounded_process_pool" and schedule.get("max_workers") == 2, "worker schedule")
+
+    matrix_timing = payload.get("matrix_timing")
+    _require(isinstance(matrix_timing, dict), "matrix timing")
+    matrix_start, matrix_end = matrix_timing.get("start_monotonic"), matrix_timing.get("end_monotonic")
+    _require(_finite(matrix_start) and _finite(matrix_end) and matrix_end >= matrix_start, "matrix timing")
+    wall_seconds = payload.get("benchmark_wall_seconds")
+    _require(_finite(wall_seconds) and wall_seconds >= 0, "wall-time cap")
+    _require(math.isclose(matrix_end - matrix_start, float(wall_seconds), abs_tol=0.01), "matrix timing")
+    _require(float(wall_seconds) <= DEFAULT_MAX_WALL_SECONDS, "wall-time cap")
+    accounting = payload.get("matrix_accounting")
+    _require(isinstance(accounting, dict), "matrix accounting")
+    accounting_start, accounting_end = accounting.get("start_monotonic"), accounting.get("end_monotonic")
+    _require(
+        _finite(accounting_start) and _finite(accounting_end)
+        and matrix_start <= accounting_start <= accounting_end <= matrix_end,
+        "matrix accounting",
+    )
+    candidate_runs = payload.get("candidate_runs")
+    _require(isinstance(candidate_runs, list) and len(candidate_runs) == len(CANDIDATES), "candidate runs")
+    runs_by_id: dict[str, dict[str, Any]] = {}
+    for run in candidate_runs:
+        _require(isinstance(run, dict), "candidate run")
+        candidate, run_id = run.get("candidate"), run.get("candidate_run_id")
+        _require(candidate in CANDIDATES and isinstance(run_id, str) and run_id and run_id not in runs_by_id, "candidate run")
+        _require(run.get("normal_ann_request_count") == len(DECISION_EF_GRID) * probes, "normal ANN request count")
+        _require(run.get("dense_table_open_count") == 1, "dense table reuse")
+        worker = run.get("worker")
+        _require(isinstance(worker, dict) and isinstance(worker.get("pid"), int), "worker identity")
+        for key in (
+            "candidate_start_monotonic", "table_create_start_monotonic", "table_create_end_monotonic",
+            "index_build_start_monotonic", "index_build_end_monotonic", "candidate_query_start_monotonic",
+            "candidate_query_end_monotonic", "candidate_end_monotonic", "table_create_ms", "index_build_ms",
+            "candidate_query_wall_ms", "candidate_wall_ms", "total_bytes", "index_delta_bytes",
+        ):
+            _require(key in run and _finite(run[key]), f"candidate run {key}")
+        _require(
+            matrix_start <= run["candidate_start_monotonic"] <= run["table_create_start_monotonic"]
+            <= run["table_create_end_monotonic"] <= run["index_build_start_monotonic"]
+            <= run["index_build_end_monotonic"] <= run["candidate_query_start_monotonic"]
+            <= run["candidate_query_end_monotonic"] <= run["candidate_end_monotonic"] <= matrix_end,
+            "candidate interval containment",
+        )
+        runs_by_id[run_id] = run
+    _require({run["candidate"] for run in candidate_runs} == set(CANDIDATES), "candidate run identity")
     expected = {(candidate, ef) for candidate in CANDIDATES for ef in DECISION_EF_GRID}
     seen: set[tuple[str, int]] = set()
     for record in records:
@@ -129,10 +203,20 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
         candidate, ef = record.get("candidate"), record.get("query_ef")
         _require((candidate, ef) in expected and (candidate, ef) not in seen, "candidate/grid binding")
         seen.add((candidate, ef))
+        candidate_run_id = record.get("candidate_run_id")
+        _require(candidate_run_id in runs_by_id and runs_by_id[candidate_run_id]["candidate"] == candidate, "candidate run reference")
         _require(record.get("config_sha256") == _config_digest(candidate, rows=rows, dimensions=dimensions), "config digest")
         _require(record.get("unindexed_dense_rows") == 0, "unindexed rows")
-        for key in ("build_time_ms", "exact_time_ms", "total_bytes", "index_delta_bytes", "latency_p50_ms", "latency_p95_ms", "recall_at_10", "recall_at_20"):
+        for key in ("build_time_ms", "exact_time_ms", "total_bytes", "index_delta_bytes", "latency_p50_ms", "latency_p95_ms", "recall_at_10", "recall_at_20", "query_group_wall_ms", "result_id_assembly_ms"):
             _require(key in record and _finite(record[key]), f"non-finite {key}")
+        group_start, group_end = record.get("query_group_start_monotonic"), record.get("query_group_end_monotonic")
+        assembly_start, assembly_end = record.get("result_id_assembly_start_monotonic"), record.get("result_id_assembly_end_monotonic")
+        run = runs_by_id[candidate_run_id]
+        _require(
+            _finite(group_start) and _finite(group_end) and _finite(assembly_start) and _finite(assembly_end)
+            and run["candidate_query_start_monotonic"] <= group_start <= assembly_start <= assembly_end <= group_end <= run["candidate_query_end_monotonic"],
+            "query group timing",
+        )
         samples = record.get("queries")
         _require(isinstance(samples, list) and len(samples) == probes, "query evidence")
         for sample in samples:
@@ -141,30 +225,60 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
                 values = sample.get(key)
                 _require(isinstance(values, list) and len(values) == count and all(isinstance(v, str) and v for v in values), f"incomplete {key}")
             _require(_finite(sample.get("recall_at_10")) and _finite(sample.get("recall_at_20")), "non-finite recall")
+    exact = payload.get("exact")
+    _require(isinstance(exact, dict) and _finite(exact.get("time_ms")), "exact evidence")
+    _require(float(exact["time_ms"]) / 1000 <= DEFAULT_MAX_EXACT_SECONDS, "exact-time cap")
     _require(seen == expected and _finite(payload), "incomplete evidence")
     _require("selected_candidate" not in payload and "recall_floor" not in payload, "policy decision")
     return payload
 
 
-def _candidate_record(
-    *, candidate: str, root: Path, corpus: np.ndarray, queries: np.ndarray, chunk_ids: list[str], args: argparse.Namespace, exact_ids: tuple[tuple[str, ...], ...], exact_time_ms: float,
-) -> list[dict[str, Any]]:
-    lance_dir = root / candidate
+def _candidate_worker(
+    candidate: str,
+    root: str,
+    rows: int,
+    dimensions: int,
+    probes: int,
+    ef_grid: tuple[int, ...],
+    exact_ids: tuple[tuple[str, ...], ...],
+    exact_time_ms: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build and query one isolated candidate in a bounded worker process.
+
+    The worker regenerates the deterministic matrices instead of receiving a
+    multi-hundred-megabyte corpus over IPC.  Its only query path is the public
+    ``search_dense`` ANN operation, whose cached table handle is shared across
+    all six groups.
+    """
+    candidate_start = time.perf_counter()
+    corpus = _vectors(rows, dimensions, CORPUS_SEED)
+    queries = _vectors(probes, dimensions, QUERY_SEED)
+    chunk_ids = [f"synthetic::{index:016x}" for index in range(rows)]
+    lance_dir = Path(root) / candidate
+    table_create_start = time.perf_counter()
     db = lancedb.connect(str(lance_dir))
     db.create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
+    table_create_end = time.perf_counter()
     pre_index_bytes = _directory_bytes(lance_dir)
     repository = LanceDbIndexRepository(lance_dir)
-    started = time.perf_counter()
-    stats = repository.create_vector_index(VectorIndexConfig(index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1, m=16, ef_construction=300, dense_chunks_count=args.rows))
-    build_time_ms = (time.perf_counter() - started) * 1000
+    index_build_start = time.perf_counter()
+    stats = repository.create_vector_index(VectorIndexConfig(
+        index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
+        m=16, ef_construction=300, dense_chunks_count=rows,
+    ))
+    index_build_end = time.perf_counter()
     total_bytes = _directory_bytes(lance_dir)
+    candidate_query_start = time.perf_counter()
     records: list[dict[str, Any]] = []
-    for ef in args.ef_grid:
+    run_id = f"candidate-run::{candidate}"
+    for ef in ef_grid:
+        group_start = time.perf_counter()
         samples, latencies = [], []
         for index, vector in enumerate(queries):
-            started = time.perf_counter()
+            request_started = time.perf_counter()
             result = repository.search_dense(vector.tolist(), metric="cosine", limit=20, ef=ef)
-            latencies.append((time.perf_counter() - started) * 1000)
+            latencies.append((time.perf_counter() - request_started) * 1000)
+            assembly_start = time.perf_counter()
             candidate_20 = [str(row.get("chunk_id", "")) for row in result]
             candidate_10, truth_20 = candidate_20[:10], list(exact_ids[index])
             truth_10 = truth_20[:10]
@@ -174,16 +288,46 @@ def _candidate_record(
                 "recall_at_10": len(set(truth_10) & set(candidate_10)) / 10,
                 "recall_at_20": len(set(truth_20) & set(candidate_20)) / 20,
             })
+            # The group-level assembly interval includes every request's ID work.
+            if index == 0:
+                result_assembly_start = assembly_start
+        result_assembly_end = time.perf_counter()
+        group_end = time.perf_counter()
         records.append({
-            "candidate": candidate, "query_ef": ef, "config_sha256": _config_digest(candidate, rows=args.rows, dimensions=args.dimensions),
-            "build_time_ms": round(build_time_ms, 3), "exact_time_ms": round(exact_time_ms, 3),
-            "total_bytes": total_bytes, "index_delta_bytes": total_bytes - pre_index_bytes,
+            "candidate": candidate, "candidate_run_id": run_id, "query_ef": ef,
+            "config_sha256": _config_digest(candidate, rows=rows, dimensions=dimensions),
+            "build_time_ms": (index_build_end - index_build_start) * 1000,
+            "exact_time_ms": exact_time_ms, "total_bytes": total_bytes,
+            "index_delta_bytes": total_bytes - pre_index_bytes,
             "unindexed_dense_rows": stats.unindexed_dense_rows,
-            "latency_p50_ms": round(_percentile(latencies, 50), 3), "latency_p95_ms": round(_percentile(latencies, 95), 3),
+            "latency_p50_ms": _percentile(latencies, 50), "latency_p95_ms": _percentile(latencies, 95),
             "recall_at_10": sum(s["recall_at_10"] for s in samples) / len(samples),
             "recall_at_20": sum(s["recall_at_20"] for s in samples) / len(samples), "queries": samples,
+            "query_group_start_monotonic": group_start, "query_group_end_monotonic": group_end,
+            "query_group_wall_ms": (group_end - group_start) * 1000,
+            "result_id_assembly_start_monotonic": result_assembly_start,
+            "result_id_assembly_end_monotonic": result_assembly_end,
+            "result_id_assembly_ms": (result_assembly_end - result_assembly_start) * 1000,
         })
-    return records
+    candidate_query_end = time.perf_counter()
+    candidate_end = time.perf_counter()
+    return {
+        "candidate": candidate, "candidate_run_id": run_id,
+        "candidate_start_monotonic": candidate_start,
+        "table_create_start_monotonic": table_create_start, "table_create_end_monotonic": table_create_end,
+        "index_build_start_monotonic": index_build_start, "index_build_end_monotonic": index_build_end,
+        "candidate_query_start_monotonic": candidate_query_start, "candidate_query_end_monotonic": candidate_query_end,
+        "candidate_end_monotonic": candidate_end,
+        "table_create_ms": (table_create_end - table_create_start) * 1000,
+        "index_build_ms": (index_build_end - index_build_start) * 1000,
+        "candidate_query_wall_ms": (candidate_query_end - candidate_query_start) * 1000,
+        "candidate_wall_ms": (candidate_end - candidate_start) * 1000,
+        "total_bytes": total_bytes, "index_delta_bytes": total_bytes - pre_index_bytes,
+        "normal_ann_request_count": len(ef_grid) * probes,
+        "dense_table_open_count": repository.dense_table_open_count,
+        "worker": {"pid": os.getpid(), "cpu_count": os.cpu_count() or 1},
+        "concurrency": {"kind": "bounded_process_pool", "max_workers": 2},
+    }, records
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -193,6 +337,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("the decision comparator has a fixed candidate grid")
     corpus, queries = _vectors(args.rows, args.dimensions, CORPUS_SEED), _vectors(args.max_probes, args.dimensions, QUERY_SEED)
     overlap = len(_row_hashes(corpus) & _row_hashes(queries))
+    args.work_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="held-out-ann-", dir=args.work_dir) as directory:
         root = Path(directory)
         chunk_ids = [f"synthetic::{index:016x}" for index in range(args.rows)]
@@ -203,19 +348,46 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         exact_started = time.perf_counter()
         exact = truth_repository.search_dense_exact_batch(queries.tolist(), metric="cosine", limit=20, row_batch_size=args.row_batch_size, query_batch_size=args.query_batch_size)
         exact_time_ms = (time.perf_counter() - exact_started) * 1000
-        wall_started = time.perf_counter()
-        records = []
-        for candidate in args.candidates:
-            records.extend(_candidate_record(candidate=candidate, root=root, corpus=corpus, queries=queries, chunk_ids=chunk_ids, args=args, exact_ids=exact.result_ids, exact_time_ms=exact_time_ms))
-        wall_seconds = time.perf_counter() - wall_started
+        matrix_started = time.perf_counter()
+        candidate_runs, records = [], []
+        # Exactly two isolated candidates are safe to schedule independently;
+        # each worker serializes its own six ef groups through one repository.
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    _candidate_worker, candidate, str(root), args.rows, args.dimensions,
+                    args.max_probes, tuple(args.ef_grid), exact.result_ids, exact_time_ms,
+                )
+                for candidate in args.candidates
+            ]
+            for future in futures:
+                candidate_run, candidate_records = future.result()
+                candidate_runs.append(candidate_run)
+                records.extend(candidate_records)
+        accounting_started = time.perf_counter()
+        candidate_runs.sort(key=lambda record: record["candidate"])
+        records.sort(key=lambda record: (record["candidate"], record["query_ef"]))
+        _require(sum(run["normal_ann_request_count"] for run in candidate_runs) == len(args.candidates) * len(args.ef_grid) * args.max_probes, "matrix accounting")
+        accounting_ended = time.perf_counter()
+        matrix_ended = time.perf_counter()
+        wall_seconds = matrix_ended - matrix_started
     payload: dict[str, Any] = {
         "evidence_schema_version": EVIDENCE_SCHEMA_VERSION, "benchmark_intent": "held_out_ann_comparator",
         "configuration": {"rows": args.rows, "dimensions": args.dimensions, "max_probes": args.max_probes, "ef_grid": list(args.ef_grid), "candidates": list(args.candidates), "row_batch_size": args.row_batch_size, "query_batch_size": args.query_batch_size},
         "corpus": {"count": args.rows, "dimensions": args.dimensions, "seed": "corpus-v1", "sha256": _matrix_digest(corpus)},
         "queries": {"count": args.max_probes, "dimensions": args.dimensions, "seed": "queries-v1", "sha256": _matrix_digest(queries), "zero_overlap_count": overlap},
         "exact": {"method": exact.method, "scan_rows": exact.scan_rows, "scan_batches": exact.scan_batches, "time_ms": round(exact_time_ms, 3)},
-        "environment": {"python": platform.python_version(), "os": platform.platform(), "numpy": np.__version__, "lancedb": lancedb.__version__, "pyarrow": pa.__version__, "omp_num_threads": os.environ.get("OMP_NUM_THREADS"), "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS")},
-        "records": records, "benchmark_wall_seconds": round(wall_seconds, 6),
+        "environment": {
+            "python": platform.python_version(), "os": platform.platform(), "runtime": _runtime_identity(),
+            "cpu_count": os.cpu_count() or 1, "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+            "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"), "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+            "runner_label": os.environ.get("ANN_SCALE_RUNNER_LABEL"),
+            "worker_schedule": {"kind": "bounded_process_pool", "max_workers": 2, "candidate_concurrency": 2},
+        },
+        "candidate_runs": candidate_runs, "records": records,
+        "matrix_timing": {"start_monotonic": matrix_started, "end_monotonic": matrix_ended},
+        "matrix_accounting": {"start_monotonic": accounting_started, "end_monotonic": accounting_ended},
+        "benchmark_wall_seconds": wall_seconds,
     }
     payload["benchmark_payload_bytes"] = len(json.dumps(payload, sort_keys=True).encode())
     failures: list[str] = []

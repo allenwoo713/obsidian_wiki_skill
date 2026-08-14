@@ -480,6 +480,29 @@ def _reduced_comparator_args(tmp_path: Path) -> Namespace:
     )
 
 
+class _InlineFuture:
+    def __init__(self, value):
+        self._value = value
+
+    def result(self):
+        return self._value
+
+
+class _InlineTwoWorkerSchedule:
+    """Exercise real LanceDB records where the sandbox disallows semaphores."""
+    def __init__(self, *, max_workers: int):
+        assert max_workers == 2
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def submit(self, function, *args):
+        return _InlineFuture(function(*args))
+
+
 def test_reduced_real_matrix_uses_one_cached_table_per_candidate_and_complete_normal_queries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -489,6 +512,7 @@ def test_reduced_real_matrix_uses_one_cached_table_per_candidate_and_complete_no
         "_runtime_identity",
         lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
     )
+    monkeypatch.setattr(benchmark_ann_build, "ProcessPoolExecutor", _InlineTwoWorkerSchedule)
 
     payload = benchmark_ann_build.run(_reduced_comparator_args(tmp_path))
 
@@ -513,6 +537,7 @@ def test_complete_matrix_timer_and_candidate_run_references_fail_closed(
         "_runtime_identity",
         lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
     )
+    monkeypatch.setattr(benchmark_ann_build, "ProcessPoolExecutor", _InlineTwoWorkerSchedule)
     payload = benchmark_ann_build.run(_reduced_comparator_args(tmp_path))
     assert benchmark_ann_build.validate_evidence(payload) is payload
 
