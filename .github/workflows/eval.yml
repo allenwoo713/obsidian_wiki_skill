@@ -131,7 +131,7 @@ jobs:
     name: "Issue #41 manual ANN calibration (non-authorizing)"
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
       UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
