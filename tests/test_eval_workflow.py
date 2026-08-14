@@ -107,7 +107,7 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
     with pytest.raises(ValueError, match="candidate records"):
         run_eval.validate_candidate_decision_records(
             {"schema_version": 1, "records": []},
-            {"evidence_schema_version": 3},
+            {"evidence_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION},
         )
 
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")

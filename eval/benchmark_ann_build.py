@@ -30,7 +30,7 @@ from obsidian_wiki.domain.index_models import VectorIndexConfig  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
 
-EVIDENCE_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 4
 DECISION_EF_GRID = (30, 50, 75, 100, 150, 200)
 CANDIDATES = ("ivf-hnsw-flat", "ivf-hnsw-sq")
 _REPOSITORY_TYPES = {"ivf-hnsw-flat": "hnsw_flat", "ivf-hnsw-sq": "hnsw_sq"}
