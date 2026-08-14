@@ -131,6 +131,11 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--ef-grid 30,50,75,100,150,200" in scale
     assert "--max-seconds 60" in scale
     assert "if: always()" in scale
+    assert "--error-output .review-tmp/issue41-scale/index-benchmark-error.json" in scale
+    assert "if: success()" in scale
+    assert "index-benchmark-error.json" in scale
+    assert "issue41-index-benchmark-error" in scale
+    assert "Upload rejected issue #41 comparator error evidence" in scale
 
     reconciliation = workflow.split("reconcile-ann-decision:", 1)[1]
     assert "if: ${{ always() }}" in reconciliation
