@@ -119,7 +119,9 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
 def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> None:
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
     scale = workflow.split("issue41-scale-benchmark:", 1)[1].split("model-backed-ann-decision:", 1)[0]
-    assert 'runs-on: [self-hosted, "${{ vars.ANN_SCALE_RUNNER_LABEL }}"]' in scale
+    assert "runs-on: ubuntu-latest" in scale
+    assert "self-hosted" not in scale
+    assert "ANN_SCALE_RUNNER_LABEL" not in scale
     assert "python -m pip install -r requirements.txt pytest" in scale
     assert '"numpy>=1.26"' not in scale
     assert "LanceDB 0.34.0 / NumPy 2.2.6 / PyArrow 25.0.0" in scale

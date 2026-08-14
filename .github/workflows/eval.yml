@@ -129,7 +129,7 @@ jobs:
 
   issue41-scale-benchmark:
     name: "Issue #41 held-out ANN comparator (77,348 x 384)"
-    runs-on: [self-hosted, "${{ vars.ANN_SCALE_RUNNER_LABEL }}"]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
@@ -141,7 +141,6 @@ jobs:
       OMP_NUM_THREADS: "2"
       OPENBLAS_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"
-      ANN_SCALE_RUNNER_LABEL: ${{ vars.ANN_SCALE_RUNNER_LABEL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
