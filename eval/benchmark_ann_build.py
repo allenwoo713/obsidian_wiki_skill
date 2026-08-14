@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+import datetime as dt
 import hashlib
 import importlib.metadata
 import json
 import math
+import multiprocessing
 import os
 import platform
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +34,7 @@ from obsidian_wiki.domain.index_models import VectorIndexConfig  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 
 
-EVIDENCE_SCHEMA_VERSION = 4
+EVIDENCE_SCHEMA_VERSION = 5
 DECISION_EF_GRID = (30, 50, 75, 100, 150, 200)
 CANDIDATES = ("ivf-hnsw-flat", "ivf-hnsw-sq")
 _REPOSITORY_TYPES = {"ivf-hnsw-flat": "hnsw_flat", "ivf-hnsw-sq": "hnsw_sq"}
@@ -135,6 +138,50 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def _spawn_worker_schedule() -> dict[str, Any]:
+    return {
+        "kind": "bounded_process_pool",
+        "max_workers": 2,
+        "configured_workers": 2,
+        "effective_workers": 2,
+        "candidate_concurrency": 2,
+        "start_method": "spawn",
+    }
+
+
+def _candidate_assignment() -> dict[str, str]:
+    return {candidate: f"candidate-run::{candidate}" for candidate in CANDIDATES}
+
+
+def _error_output_path(args: argparse.Namespace) -> Path:
+    return Path(getattr(args, "error_output", None) or Path(args.work_dir) / "index-benchmark-error.json")
+
+
+def _write_rejected_error(
+    args: argparse.Namespace, exc: Exception, *, matrix_started: float | None
+) -> Path:
+    """Persist worker/pool failure diagnostics without manufacturing evidence."""
+    output = _error_output_path(args)
+    payload = {
+        "status": "reject-evidence",
+        "error_schema_version": 1,
+        "source": {"head_sha": _head_sha(), "lock_identity": _locked_runtime_identity()},
+        "runtime": _runtime_identity(),
+        "worker_schedule": _spawn_worker_schedule(),
+        "candidate_assignment": _candidate_assignment(),
+        "matrix_started_monotonic": matrix_started,
+        "error": {
+            "class": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        },
+        "failed_at": dt.datetime.now(dt.UTC).isoformat(),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return output
+
+
 def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     """Reject partial, mixed, self-query, or policy-bearing decision evidence."""
     _require(payload.get("evidence_schema_version") == EVIDENCE_SCHEMA_VERSION, "schema version")
@@ -164,7 +211,7 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     _require(isinstance(environment.get("cpu_count"), int) and environment["cpu_count"] > 0, "cpu count")
     _require(isinstance(environment.get("worker_schedule"), dict), "worker schedule")
     schedule = environment["worker_schedule"]
-    _require(schedule.get("kind") == "bounded_process_pool" and schedule.get("max_workers") == 2, "worker schedule")
+    _require(schedule == _spawn_worker_schedule(), "worker schedule")
 
     matrix_timing = payload.get("matrix_timing")
     _require(isinstance(matrix_timing, dict), "matrix timing")
@@ -193,6 +240,7 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
         _require(run.get("dense_table_open_count") == 1, "dense table reuse")
         worker = run.get("worker")
         _require(isinstance(worker, dict) and isinstance(worker.get("pid"), int), "worker identity")
+        _require(worker.get("start_method") == "spawn" and worker.get("effective_workers") == 2, "worker identity")
         for key in (
             "candidate_start_monotonic", "table_create_start_monotonic", "table_create_end_monotonic",
             "index_build_start_monotonic", "index_build_end_monotonic", "candidate_query_start_monotonic",
@@ -338,8 +386,12 @@ def _candidate_worker(
         "total_bytes": total_bytes, "index_delta_bytes": total_bytes - pre_index_bytes,
         "normal_ann_request_count": len(ef_grid) * probes,
         "dense_table_open_count": repository.dense_table_open_count,
-        "worker": {"pid": os.getpid(), "cpu_count": os.cpu_count() or 1},
-        "concurrency": {"kind": "bounded_process_pool", "max_workers": 2},
+        "worker": {
+            "pid": os.getpid(), "cpu_count": os.cpu_count() or 1,
+            "start_method": "spawn", "effective_workers": 2,
+            "candidate_assignment": _candidate_assignment()[candidate],
+        },
+        "concurrency": _spawn_worker_schedule(),
     }, records
 
 
@@ -363,20 +415,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         exact_time_ms = (time.perf_counter() - exact_started) * 1000
         matrix_started = time.perf_counter()
         candidate_runs, records = [], []
-        # Exactly two isolated candidates are safe to schedule independently;
-        # each worker serializes its own six ef groups through one repository.
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(
-                    _candidate_worker, candidate, str(root), args.rows, args.dimensions,
-                    args.max_probes, tuple(args.ef_grid), exact.result_ids, exact_time_ms,
-                )
-                for candidate in args.candidates
-            ]
-            for future in futures:
-                candidate_run, candidate_records = future.result()
-                candidate_runs.append(candidate_run)
-                records.extend(candidate_records)
+        # Spawn is explicit: children never inherit the parent process's LanceDB
+        # runtime, connection, table handle, or Arrow state.
+        try:
+            with ProcessPoolExecutor(
+                max_workers=2, mp_context=multiprocessing.get_context("spawn")
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        _candidate_worker, candidate, str(root), args.rows, args.dimensions,
+                        args.max_probes, tuple(args.ef_grid), exact.result_ids, exact_time_ms,
+                    )
+                    for candidate in args.candidates
+                ]
+                for future in futures:
+                    candidate_run, candidate_records = future.result()
+                    candidate_runs.append(candidate_run)
+                    records.extend(candidate_records)
+        except Exception as exc:
+            _write_rejected_error(args, exc, matrix_started=matrix_started)
+            raise
         accounting_started = time.perf_counter()
         candidate_runs.sort(key=lambda record: record["candidate"])
         records.sort(key=lambda record: (record["candidate"], record["query_ef"]))
@@ -395,8 +453,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "python": platform.python_version(), "os": platform.platform(), "runtime": _runtime_identity(),
             "cpu_count": os.cpu_count() or 1, "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
             "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"), "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
-            "runner_label": os.environ.get("ANN_SCALE_RUNNER_LABEL"),
-            "worker_schedule": {"kind": "bounded_process_pool", "max_workers": 2, "candidate_concurrency": 2},
+            "runner_name": os.environ.get("RUNNER_NAME"),
+            "runner_os": os.environ.get("RUNNER_OS"),
+            "worker_schedule": _spawn_worker_schedule(),
         },
         "candidate_runs": candidate_runs, "records": records,
         "matrix_timing": {"start_monotonic": matrix_started, "end_monotonic": matrix_ended},
@@ -436,6 +495,7 @@ def main() -> int:
     parser.add_argument("--max-evidence-bytes", type=int, default=10 * 1024 * 1024)
     parser.add_argument("--work-dir", type=Path, default=SKILL_ROOT / ".review-tmp" / "held-out-ann")
     parser.add_argument("--output", type=Path, default=HERE / "index-benchmark.json")
+    parser.add_argument("--error-output", type=Path, help="Rejected worker/pool diagnostics path")
     parser.add_argument(
         "--validate-evidence", type=Path,
         help="Validate an existing comparator artifact without running a benchmark.",
