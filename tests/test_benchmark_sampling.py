@@ -636,3 +636,39 @@ def test_post_run_wall_cap_rejection_withholds_scale_evidence_and_persists_timin
     assert Path(error["raw_staging_path"]).is_file()
     with pytest.raises(ValueError):
         benchmark_ann_build.validate_evidence(error)
+
+
+def test_calibration_selects_omp_and_derives_cap_from_five_complete_runs() -> None:
+    calibration = benchmark_ann_build.build_calibration_record(
+        head_sha="a" * 40,
+        lock_identity={"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+        configuration={"cpu_count": 4, "worker_schedule": {"start_method": "spawn"}},
+        repetitions={
+            1: [101.0, 100.0, 102.0, 99.0, 100.0],
+            2: [98.0, 97.0, 99.0, 98.0, 100.0],
+        },
+    )
+
+    assert calibration["status"] == "non_accepting_calibration"
+    assert calibration["selected_omp_threads"] == 2
+    assert calibration["selection"]["median_seconds"] == 98.0
+    assert calibration["calculated_cap_seconds"] == 103
+    assert calibration["rule_version"] == benchmark_ann_build.CALIBRATION_RULE_VERSION
+    assert len(calibration["repetitions"]["1"]) == 5
+    assert len(calibration["repetitions"]["2"]) == 5
+
+    tied = benchmark_ann_build.build_calibration_record(
+        head_sha="a" * 40,
+        lock_identity={"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+        configuration={"cpu_count": 4, "worker_schedule": {"start_method": "spawn"}},
+        repetitions={1: [100.0] * 5, 2: [100.0] * 5},
+    )
+    assert tied["selected_omp_threads"] == 1
+
+    with pytest.raises(ValueError, match="five"):
+        benchmark_ann_build.build_calibration_record(
+            head_sha="a" * 40,
+            lock_identity={"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+            configuration={"cpu_count": 4, "worker_schedule": {"start_method": "spawn"}},
+            repetitions={1: [100.0] * 5, 2: [100.0] * 4},
+        )
