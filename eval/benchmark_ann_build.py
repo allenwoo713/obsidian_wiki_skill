@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import traceback
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ DEFAULT_MAX_WALL_SECONDS = 60.0
 CORPUS_SEED = 41001
 QUERY_SEED = 41002
 _LOCKED_PACKAGES = {"lancedb", "numpy", "pyarrow"}
+CALIBRATION_RULE_VERSION = "omp-median-mad-v1"
 
 
 def _vectors(rows: int, dimensions: int, seed: int) -> np.ndarray:
@@ -153,6 +155,81 @@ def _candidate_assignment() -> dict[str, str]:
     return {candidate: f"candidate-run::{candidate}" for candidate in CANDIDATES}
 
 
+def build_calibration_record(
+    *, head_sha: str, lock_identity: dict[str, str], configuration: dict[str, Any],
+    repetitions: dict[int, list[float]],
+) -> dict[str, Any]:
+    """Derive a cap solely from five complete per-query matrices per setting."""
+    expected = {1, 2}
+    if set(repetitions) != expected or any(len(repetitions[omp]) != 5 for omp in expected):
+        raise ValueError("calibration requires five complete repetitions for OMP 1 and OMP 2")
+    if any(not _finite(value) or float(value) < 0 for runs in repetitions.values() for value in runs):
+        raise ValueError("calibration timing")
+    summaries: dict[int, dict[str, float]] = {}
+    for omp, runs in repetitions.items():
+        values = [float(value) for value in runs]
+        median = float(statistics.median(values))
+        mad = float(statistics.median([abs(value - median) for value in values]))
+        summaries[omp] = {"median_seconds": median, "max_seconds": max(values), "mad_seconds": mad}
+    selected = min(expected, key=lambda omp: (summaries[omp]["median_seconds"], summaries[omp]["max_seconds"], omp))
+    summary = summaries[selected]
+    calculated_cap = math.ceil(max(
+        summary["max_seconds"], summary["median_seconds"] + 3 * 1.4826 * summary["mad_seconds"]
+    ))
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "non_accepting_calibration",
+        "rule_version": CALIBRATION_RULE_VERSION,
+        "head_sha": head_sha,
+        "lock_identity": lock_identity,
+        "configuration": configuration,
+        "repetitions": {str(omp): list(repetitions[omp]) for omp in sorted(expected)},
+        "summaries": {str(omp): summaries[omp] for omp in sorted(expected)},
+        "selected_omp_threads": selected,
+        "selection": summary,
+        "calculated_cap_seconds": calculated_cap,
+    }
+    record["sha256"] = hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return record
+
+
+def run_multivector_batch_spike(
+    table: Any, vectors: list[list[float]], *, metric: str, ef: int, limit: int,
+    individual_result_ids: list[list[str]],
+) -> dict[str, Any]:
+    """Observe LanceDB multi-vector output without changing the acceptance path.
+
+    This is deliberately not called by the per-query comparator.  Until query
+    mapping, IDs, recall, and the separate p50/p95 latency contract are proven
+    equivalent, its output is diagnostic-only.
+    """
+    started = time.perf_counter()
+    rows = table.search(vectors).distance_type(metric).ef(ef).limit(limit).to_list()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    observations = []
+    for position, row in enumerate(rows):
+        query_index = row.get("query_index") if isinstance(row, dict) else None
+        if not isinstance(query_index, int) or not 0 <= query_index < len(vectors):
+            query_index = position if position < len(vectors) else None
+        ids = [str(row.get("chunk_id", ""))] if isinstance(row, dict) else []
+        expected = individual_result_ids[query_index] if query_index is not None else []
+        observations.append({
+            "query_index": query_index, "returned_ids": ids,
+            "individual_ids": expected, "ids_identical": ids == expected,
+            "recall": len(set(ids) & set(expected)) / len(expected) if expected else 0.0,
+        })
+    return {
+        "status": "observational_only",
+        "method": "lancedb_multi_vector_search",
+        "metric": metric, "ef": ef, "limit": limit, "elapsed_ms": elapsed_ms,
+        "latency_contract_validated": False,
+        "can_substitute_per_query_acceptance": False,
+        "observations": observations,
+    }
+
+
 def _error_output_path(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "error_output", None) or Path(args.work_dir) / "index-benchmark-error.json")
 
@@ -200,7 +277,10 @@ def _write_rejected_error(
     return output
 
 
-def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+def validate_evidence(
+    payload: dict[str, Any], *, aggregate_cap_seconds: float | None = None,
+    allow_calibration: bool = False,
+) -> dict[str, Any]:
     """Reject partial, mixed, self-query, or policy-bearing decision evidence."""
     _require(payload.get("evidence_schema_version") == EVIDENCE_SCHEMA_VERSION, "schema version")
     _require(payload.get("benchmark_intent") == "held_out_ann_comparator", "benchmark intent")
@@ -238,7 +318,25 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     wall_seconds = payload.get("benchmark_wall_seconds")
     _require(_finite(wall_seconds) and wall_seconds >= 0, "wall-time cap")
     _require(math.isclose(matrix_end - matrix_start, float(wall_seconds), abs_tol=0.01), "matrix timing")
-    _require(float(wall_seconds) <= DEFAULT_MAX_WALL_SECONDS, "wall-time cap")
+    acceptance = payload.get("acceptance", {})
+    _require(isinstance(acceptance, dict), "acceptance")
+    if acceptance.get("mode") == "calibration_non_accepting":
+        _require(allow_calibration, "calibration cannot authorize evidence")
+    if acceptance.get("mode") == "calibrated_acceptance":
+        _require(
+            isinstance(acceptance.get("calibration_sha256"), str)
+            and len(acceptance["calibration_sha256"]) == 64
+            and acceptance.get("calibration_rule_version") == CALIBRATION_RULE_VERSION
+            and acceptance.get("selected_omp_threads") in {1, 2},
+            "calibration binding",
+        )
+    if acceptance.get("mode") == "calibration_non_accepting" and allow_calibration:
+        cap = None
+    else:
+        cap = aggregate_cap_seconds if aggregate_cap_seconds is not None else acceptance.get(
+            "aggregate_cap_seconds", DEFAULT_MAX_WALL_SECONDS
+        )
+        _require(_finite(cap) and float(cap) >= 0 and float(wall_seconds) <= float(cap), "wall-time cap")
     accounting = payload.get("matrix_accounting")
     _require(isinstance(accounting, dict), "matrix accounting")
     accounting_start, accounting_end = accounting.get("start_monotonic"), accounting.get("end_monotonic")
@@ -464,6 +562,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             accounting_ended = time.perf_counter()
             matrix_ended = time.perf_counter()
             wall_seconds = matrix_ended - matrix_started
+        calibration_mode = bool(getattr(args, "calibration_mode", False))
+        has_calibration_reference = bool(getattr(args, "calibration_reference", None))
+        acceptance = {
+            "mode": "calibration_non_accepting" if calibration_mode else (
+                "calibrated_acceptance" if has_calibration_reference else "acceptance"
+            ),
+            "aggregate_cap_seconds": None if calibration_mode else args.max_seconds,
+        }
+        if not calibration_mode and has_calibration_reference:
+            acceptance.update(getattr(args, "calibration_reference"))
         payload: dict[str, Any] = {
             "evidence_schema_version": EVIDENCE_SCHEMA_VERSION, "benchmark_intent": "held_out_ann_comparator",
             "configuration": {"rows": args.rows, "dimensions": args.dimensions, "max_probes": args.max_probes, "ef_grid": list(args.ef_grid), "candidates": list(args.candidates), "row_batch_size": args.row_batch_size, "query_batch_size": args.query_batch_size},
@@ -482,13 +590,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "matrix_timing": {"start_monotonic": matrix_started, "end_monotonic": matrix_ended},
             "matrix_accounting": {"start_monotonic": accounting_started, "end_monotonic": accounting_ended},
             "benchmark_wall_seconds": wall_seconds,
+            "acceptance": acceptance,
         }
         payload["benchmark_payload_bytes"] = len(json.dumps(payload, sort_keys=True).encode())
         raw_staging_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         failure_phase = "post_run_validation"
         failures: list[str] = []
         try:
-            validate_evidence(payload)
+            validate_evidence(
+                payload, aggregate_cap_seconds=args.max_seconds,
+                allow_calibration=calibration_mode,
+            )
         except ValueError as exc:
             failures.append(str(exc))
         if exact_time_ms / 1000 > args.max_exact_seconds:
@@ -512,6 +624,69 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise
 
 
+def _run_with_omp(args: argparse.Namespace, omp_threads: int) -> dict[str, Any]:
+    names = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+    original = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            os.environ[name] = str(omp_threads)
+        return run(args)
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def run_calibration_and_acceptance(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the prescribed ten diagnostics, then one separately capped acceptance."""
+    if args.calibration_output is None:
+        raise ValueError("calibration output")
+    trials: dict[int, list[float]] = {1: [], 2: []}
+    trial_records: dict[str, list[dict[str, Any]]] = {"1": [], "2": []}
+    for omp_threads in (1, 2):
+        for repetition in range(5):
+            trial = argparse.Namespace(**vars(args))
+            trial.calibration_mode = True
+            trial.max_seconds = float("inf")
+            trial.output = Path(args.work_dir) / "calibration" / f"omp-{omp_threads}-{repetition}.json"
+            trial.error_output = Path(args.work_dir) / "index-benchmark-error.json"
+            payload = _run_with_omp(trial, omp_threads)
+            trials[omp_threads].append(float(payload["benchmark_wall_seconds"]))
+            trial_records[str(omp_threads)].append({
+                "repetition": repetition,
+                "wall_seconds": payload["benchmark_wall_seconds"],
+                "exact_time_ms": payload["exact"]["time_ms"],
+                "path": str(trial.output),
+                "sha256": hashlib.sha256(trial.output.read_bytes()).hexdigest(),
+            })
+    calibration = build_calibration_record(
+        head_sha=_head_sha(), lock_identity=_locked_runtime_identity(),
+        configuration={
+            "cpu_count": os.cpu_count() or 1,
+            "worker_schedule": _spawn_worker_schedule(),
+            "candidates": list(CANDIDATES), "ef_grid": list(DECISION_EF_GRID),
+            "probes": args.max_probes,
+        },
+        repetitions=trials,
+    )
+    calibration["trial_records"] = trial_records
+    args.calibration_output.parent.mkdir(parents=True, exist_ok=True)
+    args.calibration_output.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
+    calibration_digest = hashlib.sha256(args.calibration_output.read_bytes()).hexdigest()
+
+    acceptance = argparse.Namespace(**vars(args))
+    acceptance.calibration_mode = False
+    acceptance.max_seconds = calibration["calculated_cap_seconds"]
+    acceptance.calibration_reference = {
+        "calibration_sha256": calibration_digest,
+        "calibration_rule_version": CALIBRATION_RULE_VERSION,
+        "selected_omp_threads": calibration["selected_omp_threads"],
+    }
+    return _run_with_omp(acceptance, calibration["selected_omp_threads"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=77_348)
@@ -527,6 +702,8 @@ def main() -> int:
     parser.add_argument("--work-dir", type=Path, default=SKILL_ROOT / ".review-tmp" / "held-out-ann")
     parser.add_argument("--output", type=Path, default=HERE / "index-benchmark.json")
     parser.add_argument("--error-output", type=Path, help="Rejected worker/pool diagnostics path")
+    parser.add_argument("--calibrate", action="store_true", help="Run five OMP 1/2 diagnostics then acceptance")
+    parser.add_argument("--calibration-output", type=Path, help="Non-accepting calibration artifact")
     parser.add_argument(
         "--validate-evidence", type=Path,
         help="Validate an existing comparator artifact without running a benchmark.",
@@ -544,7 +721,8 @@ def main() -> int:
     args.candidates = tuple(value for value in args.candidates.split(",") if value)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        print(json.dumps(run(args), ensure_ascii=False, indent=2))
+        runner = run_calibration_and_acceptance if args.calibrate else run
+        print(json.dumps(runner(args), ensure_ascii=False, indent=2))
     except Exception as exc:
         print(f"[FAIL] held-out ANN comparator: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
