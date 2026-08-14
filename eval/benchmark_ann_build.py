@@ -189,6 +189,12 @@ def build_calibration_record(
         "selection": summary,
         "calculated_cap_seconds": calculated_cap,
     }
+    return finalize_calibration_record(record)
+
+
+def finalize_calibration_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Seal the complete calibration record after all diagnostic fields exist."""
+    record.pop("sha256", None)
     record["sha256"] = hashlib.sha256(
         json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -208,13 +214,17 @@ def run_multivector_batch_spike(
     started = time.perf_counter()
     rows = table.search(vectors).distance_type(metric).ef(ef).limit(limit).to_list()
     elapsed_ms = (time.perf_counter() - started) * 1000
-    observations = []
-    for position, row in enumerate(rows):
+    returned_ids_by_query: dict[int, list[str]] = {index: [] for index in range(len(vectors))}
+    invalid_row_count = 0
+    for row in rows:
         query_index = row.get("query_index") if isinstance(row, dict) else None
         if not isinstance(query_index, int) or not 0 <= query_index < len(vectors):
-            query_index = position if position < len(vectors) else None
-        ids = [str(row.get("chunk_id", ""))] if isinstance(row, dict) else []
-        expected = individual_result_ids[query_index] if query_index is not None else []
+            invalid_row_count += 1
+            continue
+        returned_ids_by_query[query_index].append(str(row.get("chunk_id", "")))
+    observations = []
+    for query_index, expected in enumerate(individual_result_ids):
+        ids = returned_ids_by_query[query_index]
         observations.append({
             "query_index": query_index, "returned_ids": ids,
             "individual_ids": expected, "ids_identical": ids == expected,
@@ -226,6 +236,8 @@ def run_multivector_batch_spike(
         "metric": metric, "ef": ef, "limit": limit, "elapsed_ms": elapsed_ms,
         "latency_contract_validated": False,
         "can_substitute_per_query_acceptance": False,
+        "returned_row_count": len(rows),
+        "invalid_query_index_row_count": invalid_row_count,
         "observations": observations,
     }
 
@@ -720,6 +732,7 @@ def run_manual_calibration(args: argparse.Namespace) -> dict[str, Any]:
         )
         calibration["trial_records"] = trial_records
         calibration["batch_spike_path"] = str(args.calibration_batch_output)
+        finalize_calibration_record(calibration)
         args.calibration_output.parent.mkdir(parents=True, exist_ok=True)
         args.calibration_output.write_text(json.dumps(calibration, ensure_ascii=False, indent=2), encoding="utf-8")
         batch_payload = {

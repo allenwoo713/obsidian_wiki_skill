@@ -657,6 +657,14 @@ def test_calibration_selects_omp_and_derives_cap_from_five_complete_runs() -> No
     assert len(calibration["repetitions"]["1"]) == 5
     assert len(calibration["repetitions"]["2"]) == 5
 
+    calibration["trial_records"] = {"1": [], "2": []}
+    sealed = benchmark_ann_build.finalize_calibration_record(calibration)
+    expected_hash = hashlib.sha256(json.dumps(
+        {key: value for key, value in sealed.items() if key != "sha256"},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    assert sealed["sha256"] == expected_hash
+
     tied = benchmark_ann_build.build_calibration_record(
         head_sha="a" * 40,
         lock_identity={"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
@@ -672,3 +680,41 @@ def test_calibration_selects_omp_and_derives_cap_from_five_complete_runs() -> No
             configuration={"cpu_count": 4, "worker_schedule": {"start_method": "spawn"}},
             repetitions={1: [100.0] * 5, 2: [100.0] * 4},
         )
+
+
+def test_multivector_spike_groups_rows_by_query_index_before_comparison() -> None:
+    class _Query:
+        def distance_type(self, metric):
+            assert metric == "cosine"
+            return self
+
+        def ef(self, value):
+            assert value == 30
+            return self
+
+        def limit(self, value):
+            assert value == 2
+            return self
+
+        def to_list(self):
+            return [
+                {"query_index": 1, "chunk_id": "q1-a"},
+                {"query_index": 0, "chunk_id": "q0-a"},
+                {"query_index": 1, "chunk_id": "q1-b"},
+                {"query_index": 0, "chunk_id": "q0-b"},
+            ]
+
+    class _Table:
+        def search(self, vectors):
+            assert vectors == [[0.0], [1.0]]
+            return _Query()
+
+    spike = benchmark_ann_build.run_multivector_batch_spike(
+        _Table(), [[0.0], [1.0]], metric="cosine", ef=30, limit=2,
+        individual_result_ids=[["q0-a", "q0-b"], ["q1-a", "q1-b"]],
+    )
+
+    assert spike["returned_row_count"] == 4
+    assert spike["invalid_query_index_row_count"] == 0
+    assert [item["ids_identical"] for item in spike["observations"]] == [True, True]
+    assert [item["recall"] for item in spike["observations"]] == [1.0, 1.0]
