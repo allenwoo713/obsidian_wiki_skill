@@ -607,3 +607,32 @@ def test_spawn_worker_failure_writes_rejected_error_evidence_only(
     assert error["error"]["traceback"]
     with pytest.raises(ValueError):
         benchmark_ann_build.validate_evidence(error)
+
+
+def test_post_run_wall_cap_rejection_withholds_scale_evidence_and_persists_timing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = _reduced_comparator_args(tmp_path)
+    args.max_seconds = 0.0
+    monkeypatch.setattr(
+        benchmark_ann_build,
+        "_runtime_identity",
+        lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+    )
+    monkeypatch.setattr(benchmark_ann_build, "ProcessPoolExecutor", _InlineTwoWorkerSchedule)
+
+    with pytest.raises(RuntimeError, match="wall-time cap"):
+        benchmark_ann_build.run(args)
+
+    assert not args.output.exists()
+    error = json.loads(args.error_output.read_text(encoding="utf-8"))
+    assert error["status"] == "reject-evidence"
+    assert error["failure_phase"] == "post_run_validation"
+    assert error["observed"]["benchmark_wall_seconds"] > 0
+    assert error["observed"]["exact_time_ms"] >= 0
+    assert error["error"]["class"] == "RuntimeError"
+    assert "wall-time cap" in error["error"]["message"]
+    assert error["raw_staging_path"]
+    assert Path(error["raw_staging_path"]).is_file()
+    with pytest.raises(ValueError):
+        benchmark_ann_build.validate_evidence(error)
