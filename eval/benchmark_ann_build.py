@@ -158,9 +158,17 @@ def _error_output_path(args: argparse.Namespace) -> Path:
 
 
 def _write_rejected_error(
-    args: argparse.Namespace, exc: Exception, *, matrix_started: float | None
+    args: argparse.Namespace,
+    exc: Exception,
+    *,
+    failure_phase: str,
+    matrix_started: float | None,
+    exact_time_ms: float | None = None,
+    wall_seconds: float | None = None,
+    raw_staging_path: Path | None = None,
+    candidate_runs: list[dict[str, Any]] | None = None,
 ) -> Path:
-    """Persist worker/pool failure diagnostics without manufacturing evidence."""
+    """Persist any rejected comparison without manufacturing approval evidence."""
     output = _error_output_path(args)
     payload = {
         "status": "reject-evidence",
@@ -170,6 +178,16 @@ def _write_rejected_error(
         "worker_schedule": _spawn_worker_schedule(),
         "candidate_assignment": _candidate_assignment(),
         "matrix_started_monotonic": matrix_started,
+        "candidate_processes": [
+            {"candidate": run.get("candidate"), "worker": run.get("worker")}
+            for run in (candidate_runs or [])
+        ],
+        "observed": {
+            "benchmark_wall_seconds": wall_seconds,
+            "exact_time_ms": exact_time_ms,
+        },
+        "failure_phase": failure_phase,
+        "raw_staging_path": str(raw_staging_path) if raw_staging_path else None,
         "error": {
             "class": type(exc).__name__,
             "message": str(exc),
@@ -403,21 +421,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     corpus, queries = _vectors(args.rows, args.dimensions, CORPUS_SEED), _vectors(args.max_probes, args.dimensions, QUERY_SEED)
     overlap = len(_row_hashes(corpus) & _row_hashes(queries))
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="held-out-ann-", dir=args.work_dir) as directory:
-        root = Path(directory)
-        chunk_ids = [f"synthetic::{index:016x}" for index in range(args.rows)]
-        truth_repo_dir = root / "truth"
-        truth_db = lancedb.connect(str(truth_repo_dir))
-        truth_db.create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
-        truth_repository = LanceDbIndexRepository(truth_repo_dir)
-        exact_started = time.perf_counter()
-        exact = truth_repository.search_dense_exact_batch(queries.tolist(), metric="cosine", limit=20, row_batch_size=args.row_batch_size, query_batch_size=args.query_batch_size)
-        exact_time_ms = (time.perf_counter() - exact_started) * 1000
-        matrix_started = time.perf_counter()
-        candidate_runs, records = [], []
-        # Spawn is explicit: children never inherit the parent process's LanceDB
-        # runtime, connection, table handle, or Arrow state.
-        try:
+    matrix_started: float | None = None
+    exact_time_ms: float | None = None
+    wall_seconds: float | None = None
+    candidate_runs: list[dict[str, Any]] = []
+    raw_staging_path = Path(args.work_dir) / "index-benchmark.raw.json"
+    failure_phase = "initialization"
+    try:
+        with tempfile.TemporaryDirectory(prefix="held-out-ann-", dir=args.work_dir) as directory:
+            root = Path(directory)
+            chunk_ids = [f"synthetic::{index:016x}" for index in range(args.rows)]
+            truth_repo_dir = root / "truth"
+            truth_db = lancedb.connect(str(truth_repo_dir))
+            truth_db.create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
+            truth_repository = LanceDbIndexRepository(truth_repo_dir)
+            exact_started = time.perf_counter()
+            exact = truth_repository.search_dense_exact_batch(queries.tolist(), metric="cosine", limit=20, row_batch_size=args.row_batch_size, query_batch_size=args.query_batch_size)
+            exact_time_ms = (time.perf_counter() - exact_started) * 1000
+            matrix_started = time.perf_counter()
+            records: list[dict[str, Any]] = []
+            failure_phase = "candidate_execution"
+            # Spawn is explicit: children never inherit the parent process's LanceDB
+            # runtime, connection, table handle, or Arrow state.
             with ProcessPoolExecutor(
                 max_workers=2, mp_context=multiprocessing.get_context("spawn")
             ) as executor:
@@ -432,53 +457,59 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     candidate_run, candidate_records = future.result()
                     candidate_runs.append(candidate_run)
                     records.extend(candidate_records)
-        except Exception as exc:
-            _write_rejected_error(args, exc, matrix_started=matrix_started)
-            raise
-        accounting_started = time.perf_counter()
-        candidate_runs.sort(key=lambda record: record["candidate"])
-        records.sort(key=lambda record: (record["candidate"], record["query_ef"]))
-        _require(sum(run["normal_ann_request_count"] for run in candidate_runs) == len(args.candidates) * len(args.ef_grid) * args.max_probes, "matrix accounting")
-        accounting_ended = time.perf_counter()
-        matrix_ended = time.perf_counter()
-        wall_seconds = matrix_ended - matrix_started
-    payload: dict[str, Any] = {
-        "evidence_schema_version": EVIDENCE_SCHEMA_VERSION, "benchmark_intent": "held_out_ann_comparator",
-        "configuration": {"rows": args.rows, "dimensions": args.dimensions, "max_probes": args.max_probes, "ef_grid": list(args.ef_grid), "candidates": list(args.candidates), "row_batch_size": args.row_batch_size, "query_batch_size": args.query_batch_size},
-        "corpus": {"count": args.rows, "dimensions": args.dimensions, "seed": "corpus-v1", "sha256": _matrix_digest(corpus)},
-        "queries": {"count": args.max_probes, "dimensions": args.dimensions, "seed": "queries-v1", "sha256": _matrix_digest(queries), "zero_overlap_count": overlap},
-        "source": {"head_sha": _head_sha(), "lock_identity": _locked_runtime_identity()},
-        "exact": {"method": exact.method, "scan_rows": exact.scan_rows, "scan_batches": exact.scan_batches, "time_ms": round(exact_time_ms, 3)},
-        "environment": {
-            "python": platform.python_version(), "os": platform.platform(), "runtime": _runtime_identity(),
-            "cpu_count": os.cpu_count() or 1, "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
-            "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"), "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
-            "runner_name": os.environ.get("RUNNER_NAME"),
-            "runner_os": os.environ.get("RUNNER_OS"),
-            "worker_schedule": _spawn_worker_schedule(),
-        },
-        "candidate_runs": candidate_runs, "records": records,
-        "matrix_timing": {"start_monotonic": matrix_started, "end_monotonic": matrix_ended},
-        "matrix_accounting": {"start_monotonic": accounting_started, "end_monotonic": accounting_ended},
-        "benchmark_wall_seconds": wall_seconds,
-    }
-    payload["benchmark_payload_bytes"] = len(json.dumps(payload, sort_keys=True).encode())
-    failures: list[str] = []
-    try:
-        validate_evidence(payload)
-    except ValueError as exc:
-        failures.append(str(exc))
-    if exact_time_ms / 1000 > args.max_exact_seconds:
-        failures.append("exact-time cap")
-    if wall_seconds > args.max_seconds:
-        failures.append("wall-time cap")
-    if payload["benchmark_payload_bytes"] > args.max_evidence_bytes:
-        failures.append("evidence-size cap")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    if failures:
-        raise RuntimeError("; ".join(failures))
-    return payload
+            accounting_started = time.perf_counter()
+            candidate_runs.sort(key=lambda record: record["candidate"])
+            records.sort(key=lambda record: (record["candidate"], record["query_ef"]))
+            _require(sum(run["normal_ann_request_count"] for run in candidate_runs) == len(args.candidates) * len(args.ef_grid) * args.max_probes, "matrix accounting")
+            accounting_ended = time.perf_counter()
+            matrix_ended = time.perf_counter()
+            wall_seconds = matrix_ended - matrix_started
+        payload: dict[str, Any] = {
+            "evidence_schema_version": EVIDENCE_SCHEMA_VERSION, "benchmark_intent": "held_out_ann_comparator",
+            "configuration": {"rows": args.rows, "dimensions": args.dimensions, "max_probes": args.max_probes, "ef_grid": list(args.ef_grid), "candidates": list(args.candidates), "row_batch_size": args.row_batch_size, "query_batch_size": args.query_batch_size},
+            "corpus": {"count": args.rows, "dimensions": args.dimensions, "seed": "corpus-v1", "sha256": _matrix_digest(corpus)},
+            "queries": {"count": args.max_probes, "dimensions": args.dimensions, "seed": "queries-v1", "sha256": _matrix_digest(queries), "zero_overlap_count": overlap},
+            "source": {"head_sha": _head_sha(), "lock_identity": _locked_runtime_identity()},
+            "exact": {"method": exact.method, "scan_rows": exact.scan_rows, "scan_batches": exact.scan_batches, "time_ms": round(exact_time_ms, 3)},
+            "environment": {
+                "python": platform.python_version(), "os": platform.platform(), "runtime": _runtime_identity(),
+                "cpu_count": os.cpu_count() or 1, "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+                "openblas_num_threads": os.environ.get("OPENBLAS_NUM_THREADS"), "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+                "runner_name": os.environ.get("RUNNER_NAME"), "runner_os": os.environ.get("RUNNER_OS"),
+                "worker_schedule": _spawn_worker_schedule(),
+            },
+            "candidate_runs": candidate_runs, "records": records,
+            "matrix_timing": {"start_monotonic": matrix_started, "end_monotonic": matrix_ended},
+            "matrix_accounting": {"start_monotonic": accounting_started, "end_monotonic": accounting_ended},
+            "benchmark_wall_seconds": wall_seconds,
+        }
+        payload["benchmark_payload_bytes"] = len(json.dumps(payload, sort_keys=True).encode())
+        raw_staging_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        failure_phase = "post_run_validation"
+        failures: list[str] = []
+        try:
+            validate_evidence(payload)
+        except ValueError as exc:
+            failures.append(str(exc))
+        if exact_time_ms / 1000 > args.max_exact_seconds:
+            failures.append("exact-time cap")
+        if wall_seconds > args.max_seconds:
+            failures.append("wall-time cap")
+        if payload["benchmark_payload_bytes"] > args.max_evidence_bytes:
+            failures.append("evidence-size cap")
+        if failures:
+            raise RuntimeError("; ".join(dict.fromkeys(failures)))
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        raw_staging_path.replace(args.output)
+        return payload
+    except Exception as exc:
+        _write_rejected_error(
+            args, exc, failure_phase=failure_phase, matrix_started=matrix_started,
+            exact_time_ms=exact_time_ms, wall_seconds=wall_seconds,
+            raw_staging_path=raw_staging_path if raw_staging_path.exists() else None,
+            candidate_runs=candidate_runs,
+        )
+        raise
 
 
 def main() -> int:
