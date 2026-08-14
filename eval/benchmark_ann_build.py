@@ -9,6 +9,7 @@ import json
 import math
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -120,6 +121,15 @@ def _runtime_identity() -> dict[str, str]:
     }
 
 
+def _head_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("source head") from exc
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
@@ -145,6 +155,9 @@ def validate_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     _require(queries.get("zero_overlap_count") == 0, "self-query overlap")
     records = payload.get("records")
     _require(isinstance(records, list) and len(records) == len(CANDIDATES) * len(DECISION_EF_GRID), "records")
+    source = payload.get("source")
+    _require(isinstance(source, dict) and isinstance(source.get("head_sha"), str) and len(source["head_sha"]) == 40, "source head")
+    _require(source.get("lock_identity") == _locked_runtime_identity(), "lock identity")
     environment = payload.get("environment")
     _require(isinstance(environment, dict), "environment")
     _require(environment.get("runtime") == _locked_runtime_identity(), "runtime identity")
@@ -376,6 +389,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "configuration": {"rows": args.rows, "dimensions": args.dimensions, "max_probes": args.max_probes, "ef_grid": list(args.ef_grid), "candidates": list(args.candidates), "row_batch_size": args.row_batch_size, "query_batch_size": args.query_batch_size},
         "corpus": {"count": args.rows, "dimensions": args.dimensions, "seed": "corpus-v1", "sha256": _matrix_digest(corpus)},
         "queries": {"count": args.max_probes, "dimensions": args.dimensions, "seed": "queries-v1", "sha256": _matrix_digest(queries), "zero_overlap_count": overlap},
+        "source": {"head_sha": _head_sha(), "lock_identity": _locked_runtime_identity()},
         "exact": {"method": exact.method, "scan_rows": exact.scan_rows, "scan_batches": exact.scan_batches, "time_ms": round(exact_time_ms, 3)},
         "environment": {
             "python": platform.python_version(), "os": platform.platform(), "runtime": _runtime_identity(),
