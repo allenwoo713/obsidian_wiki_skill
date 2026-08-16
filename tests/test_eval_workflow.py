@@ -1,4 +1,6 @@
 """Static safety assertions for the fail-closed PR baseline workflow guard."""
+import hashlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -12,6 +14,70 @@ sys.path.insert(0, str(SKILL_ROOT / "eval"))
 from models import ContextBundle, ContextItem  # noqa: E402
 import run_eval  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
+
+
+def _candidate_comparator() -> dict:
+    return {
+        "evidence_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION,
+        "corpus": {"sha256": "c" * 64},
+        "queries": {"sha256": "q" * 64},
+    }
+
+
+def _candidate_record(candidate: str, query_ef: int, ordinal: int) -> dict:
+    return {
+        "candidate": candidate,
+        "query_ef": query_ef,
+        "head_sha": "head",
+        "environment": {"python": "3.13", "platform": "test"},
+        "corpus_sha256": "c" * 64,
+        "queries_sha256": "q" * 64,
+        "candidate_run_id": f"run-{ordinal}",
+        "candidate_index": {
+            "build_id": f"build-{ordinal}",
+            "manifest_sha256": f"{ordinal:064x}",
+            "root_identity": f"candidate-{ordinal}",
+        },
+        "applied_policy": {"candidate": candidate, "query_ef": query_ef},
+        "hybrid_invocation": {
+            "entrypoint": "query.hybrid_search",
+            "trace_id": f"trace-{ordinal}",
+            "digest": f"{ordinal + 20:064x}",
+            "query_count": 1,
+        },
+        "result_sha256": f"{ordinal + 40:064x}",
+        "final_retrieval": {
+            "retrieval": {
+                run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC: 1.0,
+                "result_payload": [{"binding": ordinal, "pages": ["page-a"]}],
+            },
+            "page": {"page_recall_at_5": 1.0},
+            "evidence": {"evidence_recall_at_10": 1.0},
+            "mrr": {"mrr_at_10": 1.0},
+            "latency": {"samples_s": [0.01], "p50_s": 0.01, "p95_s": 0.01},
+            "context": {"overflow_count": 0, "budget_violation_count": 0},
+            "citation": {"violation_count": 0},
+            "graph": {"validated_count": 0, "unsupported_count": 0},
+            "non_regression": {"baseline_refresh": False, "failures": []},
+        },
+    }
+
+
+def _candidate_packet() -> dict:
+    records = [
+        _candidate_record(candidate, query_ef, ordinal)
+        for ordinal, (candidate, query_ef) in enumerate(
+            (candidate, query_ef)
+            for candidate in run_eval.CANDIDATES
+            for query_ef in run_eval.DECISION_EF_GRID
+        )
+    ]
+    return {
+        "schema_version": run_eval.FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION,
+        "head_sha": "head",
+        "environment": {"python": "3.13", "platform": "test"},
+        "records": records,
+    }
 
 
 def test_committed_ann_calibration_reference_is_a_complete_approved_static_binding():
@@ -127,6 +193,104 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
     assert "model-backed-ann-decision" in workflow
     assert "--decision-evidence" in workflow
     assert "--init-baseline" not in workflow.split("model-backed-ann-decision:", 1)[1]
+
+
+@pytest.mark.parametrize(
+    ("shared_field", "message"),
+    [
+        ("candidate_run_id", "candidate run identity"),
+        ("candidate_index", "candidate index identity"),
+        ("hybrid_invocation", "hybrid invocation identity"),
+        ("result_sha256", "candidate result digest"),
+        ("final_retrieval", "candidate result payload"),
+    ],
+)
+def test_candidate_hybrid_packet_rejects_shared_candidate_provenance(
+    shared_field: str, message: str,
+) -> None:
+    packet = _candidate_packet()
+    first, second = packet["records"][:2]
+    second[shared_field] = first[shared_field]
+
+    with pytest.raises(ValueError, match=message):
+        run_eval.validate_candidate_decision_records(packet, _candidate_comparator())
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["retrieval", "page", "evidence", "mrr", "latency", "context", "citation", "graph", "non_regression"],
+)
+def test_candidate_hybrid_packet_requires_complete_candidate_observations(
+    missing_field: str,
+) -> None:
+    packet = _candidate_packet()
+    del packet["records"][0]["final_retrieval"][missing_field]
+
+    with pytest.raises(ValueError, match="candidate-specific final retrieval"):
+        run_eval.validate_candidate_decision_records(packet, _candidate_comparator())
+
+
+def test_candidate_hybrid_driver_builds_every_binding_and_calls_production_entrypoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    builds = []
+    invocations = []
+
+    class FakeIndex:
+        index_dir = tmp_path / ".index"
+
+    class FakePlanner:
+        pass
+
+    class FakeResult:
+        pass
+
+    def fake_build(root, _wiki, mode, full_rebuild, *, candidate_query_policy=None):
+        builds.append((root.name, mode, full_rebuild, candidate_query_policy))
+        staged_wiki = root / "Wiki"
+        staged_wiki.mkdir(parents=True)
+        return FakeIndex(), staged_wiki, 0.01
+
+    def fake_hybrid(index, query, planner, **kwargs):
+        invocations.append((index, query, planner, kwargs))
+        return FakeResult()
+
+    monkeypatch.setattr(run_eval, "_build", fake_build)
+    monkeypatch.setattr(run_eval, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(run_eval, "DefaultQueryPlanner", lambda project_root: FakePlanner())
+    monkeypatch.setattr(run_eval, "_candidate_result_observation", lambda **kwargs: {
+        "retrieval": {run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC: 1.0, "result_payload": [kwargs["query"]]},
+        "page": {"page_recall_at_5": 1.0},
+        "evidence": {"evidence_recall_at_10": 1.0},
+        "mrr": {"mrr_at_10": 1.0},
+        "latency": {"samples_s": [0.01], "p50_s": 0.01, "p95_s": 0.01},
+        "context": {"overflow_count": 0, "budget_violation_count": 0},
+        "citation": {"violation_count": 0},
+        "graph": {"validated_count": 0, "unsupported_count": 0},
+        "non_regression": {"baseline_refresh": False, "failures": []},
+    })
+    monkeypatch.setattr(run_eval, "_candidate_index_identity", lambda **kwargs: {
+        "build_id": kwargs["policy"].candidate + str(kwargs["policy"].query_ef),
+        "manifest_sha256": hashlib.sha256(str(kwargs["root"]).encode()).hexdigest(),
+        "root_identity": kwargs["root"].name,
+    })
+    monkeypatch.setattr(run_eval, "validate_evidence", lambda _evidence: _evidence)
+
+    packet = run_eval.run_candidate_hybrid_evaluation(
+        tmp_path / "wiki", [{"query": "needle", "relevant_pages": ["page-a"], "required_facts": []}],
+        tmp_path / "candidates", 4096, _candidate_comparator(), baseline_quality={},
+    )
+
+    assert len(builds) == len(run_eval.CANDIDATES) * len(run_eval.DECISION_EF_GRID) == 12
+    assert len(invocations) == 12
+    assert all(call[1] == "needle" for call in invocations)
+    assert len(packet["records"]) == 12
+
+
+def test_hybrid_search_interface_remains_candidate_unaware() -> None:
+    parameters = inspect.signature(run_eval.hybrid_search).parameters
+    assert "candidate" not in parameters
+    assert "query_ef" not in parameters
 
 
 def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> None:

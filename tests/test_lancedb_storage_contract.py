@@ -1,6 +1,7 @@
 """Persisted D-01/D-04 contract tests for the first storage tracer."""
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from build_index import WikiIndex, build_storage_contract  # noqa: E402
+import build_index as build_index_module  # noqa: E402
 from obsidian_wiki.domain.index_models import (  # noqa: E402
     FtsIndexConfig,
     RebuildRequiredError,
@@ -494,6 +496,31 @@ def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(
     assert table.queries[-1].ef_value == 157
     repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
     assert table.queries[-1].ef_value == 100
+
+
+def test_candidate_query_policy_is_immutable_and_applies_only_at_build_and_dense_query_boundaries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    policy_type = getattr(build_index_module, "CandidateQueryPolicy")
+    policy = policy_type(candidate="ivf-hnsw-sq", query_ef=75)
+    with pytest.raises((AttributeError, TypeError)):
+        policy.query_ef = 100
+
+    class Repository:
+        def search_dense(self, vector, *, metric, limit, ef):
+            assert ef == 75
+            return [{"chunk_id": "d", "page_id": "p", "path": "p.md", "title": "P", "text": "text", "_distance": 0.1}]
+
+    class Embedder:
+        def encode(self, *_args, **_kwargs):
+            return [[1.0, 0.0]]
+
+    index = WikiIndex(tmp_path / ".index")
+    index._candidate_query_policy = policy
+    monkeypatch.setattr(index, "_get_repository", lambda: Repository())
+    monkeypatch.setattr(index, "_get_embedder", lambda: Embedder())
+    assert index.search_vector("meaning", k=2)[0].chunk_id == "d"
+    assert "candidate_query_policy" in inspect.signature(WikiIndex.build).parameters
 
 
 def test_adapter_rejects_duplicate_or_nonfinite_dense_vectors(tmp_path: Path) -> None:
