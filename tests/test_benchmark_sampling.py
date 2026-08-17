@@ -26,7 +26,7 @@ from obsidian_wiki.domain.index_models import (
     IndexStats,
     SparseChunk,
 )
-from obsidian_wiki.domain.index_policy import select_vector_policy
+from obsidian_wiki.domain.index_policy import PolicyError, select_vector_policy
 from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
@@ -319,21 +319,18 @@ def test_observer_emits_complete_explicit_synthetic_evidence(tmp_path: Path) -> 
     assert evidence["candidate_result_ids"] == []
 
 
-def test_sampled_miss_falls_back_and_policy_reports_scope(tmp_path: Path) -> None:
+def test_sampled_miss_fails_closed_and_policy_reports_scope(tmp_path: Path) -> None:
     chunks = _chunks(tmp_path, 500)
     repository = _CountingRepository([chunk.chunk_id for chunk in chunks], miss_at_20=True)
     observation, evidence, _ = _run_benchmark(
         tmp_path, chunks, max_probes=32, repository=repository
     )
 
-    decision = select_vector_policy(observation, _stats(len(chunks)), evidence=evidence)
-    payload = decision.to_json()
-    assert decision.selected_mode == "exact"
-    assert "sampled" in decision.reason
-    assert "32/500" in decision.reason
-    assert payload["benchmark_scope"] == "sampled"
-    assert payload["benchmark_probe_count"] == 32
-    assert payload["benchmark_probe_total"] == 500
+    # Phase 06（issue #49）：exact 不是可发布结果——采样未达标 fail-closed。
+    with pytest.raises(PolicyError) as raised:
+        select_vector_policy(observation, _stats(len(chunks)), evidence=evidence)
+    assert "sampled" in str(raised.value)
+    assert "32/500" in str(raised.value)
 
 
 def test_eval_manifest_contract_rejects_unversioned_or_inconsistent_evidence() -> None:

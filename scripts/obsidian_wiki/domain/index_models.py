@@ -17,6 +17,14 @@ class RebuildRequiredError(RuntimeError):
 # ``require_current_layout`` 据此拒绝并要求重建。
 INDEX_LAYOUT_VERSION = 6
 
+# Phase 06（issue #49）：固定生产 ANN 契约的兼容版本。format-5 / benchmark
+# evidence-v2 的 mode-ambiguous 构建必须被拒绝重建；新 manifest 绑定批准策略。
+ANN_POLICY_SCHEMA_VERSION = 2
+ANN_DECISION_EVIDENCE_SCHEMA_VERSION = 2
+CANDIDATE_PUBLICATION_EVIDENCE_SCHEMA_VERSION = 3
+# Phase 06 起 manifest 携带固定策略与发布证据；旧 format-5 是 mode-ambiguous。
+INDEX_MANIFEST_FORMAT_VERSION = 6
+
 
 class _JsonRecord:
     """Provide a stable, JSON-safe representation for persisted domain records."""
@@ -69,6 +77,118 @@ class VectorIndexConfig(_JsonRecord):
                 raise ValueError(f"{field_name} must be a positive integer")
         if not self.index_name:
             raise ValueError("Vector index name must be non-empty")
+
+
+@dataclass(frozen=True)
+class ProductionAnnPolicy(_JsonRecord):
+    """Phase 06 批准的唯一生产 ANN 契约（issue #49 / Plan 06-02 决策）。
+
+    值来自源码控制的 ``eval/ann-policy.json``；运行时不可选择类型/ef/exact。
+    """
+
+    policy_schema_version: int
+    selected_index_type: str          # "ivf-hnsw-sq"
+    lancedb_index_type: str           # "hnsw_sq"
+    metric: str                       # "cosine"
+    dimensions: int                   # 384
+    num_partitions: int               # 1
+    m: int                            # 16
+    ef_construction: int              # 300
+    query_ef: int                     # 100
+    recall_at_10_floor: float         # 0.19
+    recall_at_20_floor: float         # 0.17
+    comparator_sha256: str            # Plan 02 决策证据 digest
+    candidate_hybrid_sha256: str
+    reconciliation_sha256: str
+    evidence_run_url: str
+    retention_days: int               # 90
+
+    def __post_init__(self) -> None:
+        if self.policy_schema_version != ANN_POLICY_SCHEMA_VERSION:
+            raise ValueError(
+                f"ann policy schema version must be {ANN_POLICY_SCHEMA_VERSION}, "
+                f"got {self.policy_schema_version!r}"
+            )
+        if self.selected_index_type != "ivf-hnsw-sq" or self.lancedb_index_type != "hnsw_sq":
+            raise ValueError("the only approved production ANN type is ivf-hnsw-sq (hnsw_sq)")
+        if self.metric != "cosine":
+            raise ValueError("the approved production vector metric is cosine")
+        for field_name in (
+            "dimensions", "num_partitions", "m", "ef_construction", "query_ef",
+            "retention_days",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer")
+        for field_name in ("recall_at_10_floor", "recall_at_20_floor"):
+            value = getattr(self, field_name)
+            if not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{field_name} must be between 0.0 and 1.0")
+        for field_name in (
+            "comparator_sha256", "candidate_hybrid_sha256", "reconciliation_sha256",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"{field_name} must be a SHA-256 hex digest")
+        if not isinstance(self.evidence_run_url, str) or not self.evidence_run_url:
+            raise ValueError("evidence_run_url must be non-empty")
+
+
+@dataclass(frozen=True)
+class AnnDecisionEvidence(_JsonRecord):
+    """唯一能授权生产 ANN 策略的锁定 A/B 决策工件摘要。
+
+    只绑定 77,348 x 384 / 恰好 256 held-out query 的两候选决策矩阵；
+    正常 staged build 绝不能把它当发布证据使用（那是 CandidatePublicationEvidence）。
+    """
+
+    evidence_schema_version: int
+    corpus_rows: int
+    dimensions: int
+    held_out_queries: int
+    candidates: Tuple[str, ...]
+    ef_grid: Tuple[int, ...]
+    approved_index_type: str
+    approved_query_ef: int
+    approved_recall_at_10_floor: float
+    approved_recall_at_20_floor: float
+    comparator_sha256: str
+    candidate_hybrid_sha256: str
+    reconciliation_sha256: str
+    evidence_run_url: str
+    approved_by: str
+    approved_at: str
+
+
+@dataclass(frozen=True)
+class CandidatePublicationEvidence(_JsonRecord):
+    """一次 staged candidate 的发布前质量证据。
+
+    ``actual_dense_rows`` 是该 candidate 重开后的真实 dense 行数（与 77,348 的
+    决策语料库无关）；本记录不能授权或重选策略——策略值只能来自批准记录。
+    """
+
+    evidence_schema_version: int
+    actual_dense_rows: int
+    dimensions: int
+    metric: str
+    index_type: str
+    query_ef: int
+    policy_sha256: str
+    decision_evidence_sha256: str
+    benchmark_max_probes: int
+    validation_query_count: int
+    query_source: str
+    query_selection_sha256: str
+    corpus_query_overlap: int
+    exact_result_ids: Tuple[Tuple[str, ...], ...]
+    candidate_result_ids: Tuple[Tuple[str, ...], ...]
+    recall_at_10: float
+    recall_at_20: float
+    unindexed_dense_rows: int
+    exact_verification_ms: float
+    ann_verification_ms: float
+    benchmark_duration_ms: float
 
 
 @dataclass(frozen=True)
