@@ -414,13 +414,30 @@ def test_publication_evidence_requires_complete_top_k_id_rows() -> None:
             CandidatePublicationEvidence(**truncated), policy
         )
 
-    short_row = evidence.to_json()
-    short_row["candidate_result_ids"] = [
-        row[:-1] for row in short_row["candidate_result_ids"]
+    # exact 行必须满额：flat 扫描保证恰好 min(20, rows) 个 ID。
+    short_exact = evidence.to_json()
+    short_exact["exact_result_ids"] = [row[:-1] for row in short_exact["exact_result_ids"]]
+    with pytest.raises(PolicyError):
+        validate_candidate_publication_evidence(
+            CandidatePublicationEvidence(**short_exact), policy
+        )
+
+    # ANN 行允许不足额（Linux LanceDB 实测会返回少于 limit 的行），
+    # 但空行 = 查询失败，必须拒绝。截掉的尾行元素非命中项，recall 声明保持一致。
+    short_candidate = evidence.to_json()
+    short_candidate["candidate_result_ids"] = [
+        row[:-1] for row in short_candidate["candidate_result_ids"]
+    ]
+    validate_candidate_publication_evidence(
+        CandidatePublicationEvidence(**short_candidate), policy
+    )
+    empty_candidate = evidence.to_json()
+    empty_candidate["candidate_result_ids"] = [
+        [] for _ in empty_candidate["candidate_result_ids"]
     ]
     with pytest.raises(PolicyError):
         validate_candidate_publication_evidence(
-            CandidatePublicationEvidence(**short_row), policy
+            CandidatePublicationEvidence(**empty_candidate), policy
         )
 
 

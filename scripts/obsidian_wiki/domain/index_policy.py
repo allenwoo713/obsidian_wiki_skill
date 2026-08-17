@@ -230,12 +230,21 @@ def validate_candidate_publication_evidence(
     ):
         if len(rows) != evidence.validation_query_count:
             raise PolicyError(f"{name} must contain exactly validation_query_count rows")
-        for row in rows:
-            if len(row) != expected_cardinality:
-                raise PolicyError(
-                    f"{name} rows must each contain min(20, actual_dense_rows) = "
-                    f"{expected_cardinality} IDs"
-                )
+    # Flat 精确扫描保证满额 top-k；近似检索只保证"至多满额"——部分 LanceDB
+    # 原生实现（Linux x86_64，CI 实测 lancedb 0.34.0）会返回少于 limit 的行，
+    # 空行才是查询失败。发布证据按各自的真实契约校验。
+    for row in evidence.exact_result_ids:
+        if len(row) != expected_cardinality:
+            raise PolicyError(
+                f"exact_result_ids rows must each contain min(20, actual_dense_rows) = "
+                f"{expected_cardinality} IDs"
+            )
+    for row in evidence.candidate_result_ids:
+        if not 1 <= len(row) <= expected_cardinality:
+            raise PolicyError(
+                f"candidate_result_ids rows must contain 1..min(20, actual_dense_rows) = "
+                f"{expected_cardinality} IDs each"
+            )
     recall_10 = _aggregate_recall(
         evidence.exact_result_ids, evidence.candidate_result_ids, 10
     )
