@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from pathlib import Path
 from typing import Mapping
 
 from obsidian_wiki.domain.index_models import (
@@ -80,6 +81,30 @@ def load_ann_policy_record(data: Mapping) -> ProductionAnnPolicy:
         )
     except (TypeError, ValueError) as exc:
         raise PolicyError(f"ann policy record is invalid: {exc}") from exc
+
+
+def default_ann_policy_path() -> Path:
+    """源码控制的批准策略记录位置（scripts/obsidian_wiki/domain → 仓库根）。"""
+    return Path(__file__).resolve().parents[3] / "eval" / "ann-policy.json"
+
+
+_ANN_POLICY_CACHE: dict[str, ProductionAnnPolicy] = {}
+
+
+def load_ann_policy_file(path: Path | None = None) -> ProductionAnnPolicy:
+    """加载并缓存默认批准策略；记录缺失/非法时 fail-closed。"""
+    resolved = Path(path) if path is not None else default_ann_policy_path()
+    key = str(resolved)
+    cached = _ANN_POLICY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PolicyError(f"approved ann policy record cannot be read: {exc}") from exc
+    policy = load_ann_policy_record(data)
+    _ANN_POLICY_CACHE[key] = policy
+    return policy
 
 
 def validate_ann_decision_evidence(

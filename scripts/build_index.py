@@ -72,7 +72,7 @@ from obsidian_wiki.application.index_build_service import CandidateQueryPolicy
 
 def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
                            page_metadata=None, image_metadata=None, ctx=None,
-                           tokenizer=None, lexicon=None, vector_index_mode="auto",
+                           tokenizer=None, lexicon=None,
                            candidate_query_policy: CandidateQueryPolicy | None = None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
@@ -139,12 +139,17 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
             return chunks, page_metadata_from_pages(pages)
 
     journal = FilesystemPostCommitJournal(Path(index_dir))
+    # Phase 06（issue #49）：candidate_query_policy 仅存在于显式 eval comparator
+    # 构建——repository 绑定 eval candidate；生产构建绑定批准策略（默认加载）。
+    repository_kwargs = (
+        {"eval_candidate_policy": candidate_query_policy}
+        if candidate_query_policy is not None else {}
+    )
     artifact = IndexBuildService(
-        LanceDbIndexRepository(index_dir),
-        reopen_storage=LanceDbIndexRepository,
+        LanceDbIndexRepository(index_dir, **repository_kwargs),
+        reopen_storage=lambda lance_dir: LanceDbIndexRepository(lance_dir, **repository_kwargs),
         manifest_store=FilesystemIndexManifest(),
         post_commit_journal=journal,
-        vector_index_mode=vector_index_mode,
         candidate_query_policy=candidate_query_policy,
     ).build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
@@ -380,7 +385,7 @@ class WikiIndex:
         )
 
     # ---- build ----
-    def build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
+    def build(self, wiki_dir: Path, full_rebuild: bool = False,
                allow_partial_index: bool = False,
                candidate_query_policy: CandidateQueryPolicy | None = None):
         """构建（默认增量）：未变页命中页级向量缓存跳过编码；full_rebuild=True 强制全量重编码。
@@ -395,6 +400,10 @@ class WikiIndex:
         #21 单写者：整个构建（含 embed 阶段）持有 .index/BUILD.lock，并发构建只有一个写者。
         #34：最外层 facade 生成一次不可变 BuildContext，贯穿两层锁 metadata、build
         目录、manifest、ACTIVE_INDEX pointer 与返回 artifact；内层不再独立生成 ID。
+
+        Phase 06（issue #49）：``vector_index_mode`` 已移除——生产构建固定使用
+        批准策略（IVF_HNSW_SQ / ef=100）；``candidate_query_policy`` 仅用于显式
+        eval comparator 构建。
         """
         from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 
@@ -403,13 +412,12 @@ class WikiIndex:
         lock.acquire()
         try:
             return self._build(wiki_dir, full_rebuild=full_rebuild,
-                               vector_index_mode=vector_index_mode,
                                allow_partial_index=allow_partial_index, ctx=ctx,
                                candidate_query_policy=candidate_query_policy)
         finally:
             lock.release()
 
-    def _build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
+    def _build(self, wiki_dir: Path, full_rebuild: bool = False,
                allow_partial_index: bool = False, ctx=None,
                candidate_query_policy: CandidateQueryPolicy | None = None):
         """build() 的锁内主体。"""
@@ -494,24 +502,17 @@ class WikiIndex:
             page_metadata=page_metadata,
             image_metadata=source_images if source_images else None,
             ctx=ctx,
-            vector_index_mode=vector_index_mode,
             candidate_query_policy=candidate_query_policy,
         )
         published_manifest = json.loads(
             outcome.artifact.manifest_path.read_text(encoding="utf-8")
         )
-        selected_mode = published_manifest.get("policy", {}).get("selected_mode")
-        effective_vector_index_mode = (
+        # Phase 06：固定策略——manifest 记录 ann_policy / candidate_query_policy，
+        # 不再有运行时 mode 状态。
+        self._vector_index_mode = (
             candidate_query_policy.candidate
             if candidate_query_policy is not None
-            else vector_index_mode
-        )
-        self._vector_index_mode = (
-            "exact"
-            if effective_vector_index_mode == "exact" or (
-                effective_vector_index_mode == "auto" and selected_mode == "exact"
-            )
-            else effective_vector_index_mode
+            else published_manifest.get("ann_policy", {}).get("selected_index_type", "ivf-hnsw-sq")
         )
         self._candidate_query_policy = candidate_query_policy
         # #21 review #3: single publication — service publishes once with
@@ -1207,14 +1208,12 @@ class WikiIndex:
         self._lexicon = load_lexicon(self._project_root)
         self._load_image_meta()  # #12 多模态：加载图片父文档回溯元数据
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        requested_mode = manifest.get("requested_vector_index_mode", "auto")
-        selected_mode = manifest.get("policy", {}).get("selected_mode")
+        # Phase 06：固定策略加载——eval candidate manifest 绑定 candidate 策略，
+        # 生产 manifest 绑定批准策略；exact/auto 运行时路由已移除。
         self._vector_index_mode = (
-            "exact"
-            if requested_mode == "exact" or (
-                requested_mode == "auto" and selected_mode == "exact"
+            manifest.get("ann_policy", {}).get(
+                "selected_index_type", "ivf-hnsw-sq"
             )
-            else requested_mode
         )
         candidate_policy = manifest.get("candidate_query_policy")
         self._candidate_query_policy = (
@@ -1233,7 +1232,15 @@ class WikiIndex:
             )
             self.pages.append(wiki_page)
             self._page_by_id[page.get("page_id", page_id_of(wiki_page.path))] = wiki_page
-        self._repository = LanceDbIndexRepository(self._resolve_active_lance_dir())
+        # Phase 06：repository 绑定策略——eval candidate manifest 绑定 candidate，
+        # 其余绑定批准生产策略；ef 由仓库内部决定，facade 不传。
+        repository_kwargs = (
+            {"eval_candidate_policy": self._candidate_query_policy}
+            if self._candidate_query_policy is not None else {}
+        )
+        self._repository = LanceDbIndexRepository(
+            self._resolve_active_lance_dir(), **repository_kwargs
+        )
 
     # ---- search ----
     def search_fts(self, query: str, k: int = 20) -> List[ChunkHit]:
@@ -1256,22 +1263,16 @@ class WikiIndex:
         return [self._hit_from_row(r, "fts") for r in rows]
 
     def search_vector(self, query: str, k: int = 20) -> List[ChunkHit]:
-        """向量检索（仅 dense 行）。返回 chunk 级命中（按 page_id 归并前）。"""
+        """向量检索（仅 dense 行）。返回 chunk 级命中（按 page_id 归并前）。
+
+        Phase 06：普通 dense 检索固定走批准 ANN + 批准 ef（仓库内部绑定）；
+        exact 只保留为诊断 API（search_dense_exact），facade 不可达。
+        """
         embedder = self._get_embedder()
         qv = embedder.encode([query], show_progress_bar=False,
                              normalize_embeddings=NORMALIZE_EMBEDDINGS)[0]
         repository = self._get_repository()
-        exact = getattr(self, "_vector_index_mode", "auto") == "exact"
-        search = repository.search_dense_exact if exact else repository.search_dense
-        query_ef = (
-            self._candidate_query_policy.query_ef
-            if self._candidate_query_policy is not None
-            else None
-        )
-        if exact or query_ef is None:
-            rows = search(list(qv), metric=VECTOR_METRIC, limit=k * 4)
-        else:
-            rows = search(list(qv), metric=VECTOR_METRIC, limit=k * 4, ef=query_ef)
+        rows = repository.search_dense(list(qv), metric=VECTOR_METRIC, limit=k * 4)
         return [self._hit_from_row(r, "vector") for r in rows]
 
     def search_page(self, page_id: str, plan, sparse_k: int = 20,
@@ -1293,16 +1294,12 @@ class WikiIndex:
             for query in plan.semantic_queries:
                 vector = embedder.encode([query], show_progress_bar=False,
                                           normalize_embeddings=NORMALIZE_EMBEDDINGS)[0]
-                exact = self._vector_index_mode == "exact"
-                search = repository.search_dense_exact if exact else repository.search_dense
-                kwargs = {
-                    "metric": VECTOR_METRIC,
-                    "limit": dense_k,
-                    "where": repository.page_predicate(page_id),
-                }
-                if not exact and self._candidate_query_policy is not None:
-                    kwargs["ef"] = self._candidate_query_policy.query_ef
-                rows = search(list(vector), **kwargs)
+                rows = repository.search_dense(
+                    list(vector),
+                    metric=VECTOR_METRIC,
+                    limit=dense_k,
+                    where=repository.page_predicate(page_id),
+                )
                 out.extend(self._hit_from_row(row, "vector") for row in rows)
         except Exception as exc:
             logging.getLogger(__name__).warning("restricted vector search failed: %s", exc)
@@ -1413,9 +1410,10 @@ def main():
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
     p.add_argument("--full-rebuild", action="store_true",
                    help="忽略页级向量缓存，强制全量重编码（模型/分块配置变更或缓存疑似损坏时使用）")
-    p.add_argument("--vector-index", default="auto",
+    p.add_argument("--vector-index", default=None,
                    choices=["auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"],
-                   help="向量索引类型（默认 auto：依数据量自适应；评测可强制 exact/ivf-hnsw-flat/sq）")
+                   help="（已废弃）Phase 06 起生产向量索引固定为批准策略 IVF_HNSW_SQ/ef=100；"
+                        "传入任何值都会在构建前被拒绝。旧索引需全量重建。")
     p.add_argument("--allow-partial-index", action="store_true",
                    help="实验用：容忍缺页/0-chunk（降级为 warning）。默认关闭 fail-fast，禁止用于生产发布")
     p.add_argument("--retry-pending", action="store_true",
@@ -1440,6 +1438,16 @@ def main():
             f"still_pending={summary.still_pending}"
         )
         return
+
+    if args.vector_index is not None:
+        # Phase 06（issue #49）：一次性兼容 shim——任何显式 mode 在 embedding/
+        # storage mutation 之前拒绝；运行时类型选择已从生产路径移除。
+        print(
+            f"--vector-index={args.vector_index} 已废弃：生产向量索引固定为批准策略 "
+            "(IVF_HNSW_SQ, ef=100)。请去掉该参数重新构建；旧 mode-ambiguous 索引需全量重建。",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 

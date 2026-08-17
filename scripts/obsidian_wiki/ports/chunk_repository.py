@@ -32,8 +32,14 @@ class ChunkRepository(Protocol):
 
     def search_dense(
         self, vector: Sequence[float], *, metric: str, limit: int = 10,
-        where: str | None = None, ef: int | None = None,
-    ) -> list[Mapping[str, object]]: ...
+        where: str | None = None,
+    ) -> list[Mapping[str, object]]:
+        """Normal dense retrieval — always the approved ANN type at the approved ef.
+
+        Phase 06（issue #49）：生产端口不接受运行时算法或任意 ef 选择；
+        ``ef`` 由仓库绑定的策略决定（eval candidate 绑定除外，见 adapter）。
+        """
+        ...
 
     def search_dense_exact(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None

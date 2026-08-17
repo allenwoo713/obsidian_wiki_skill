@@ -10,8 +10,8 @@ from build_index import WikiIndex
 from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
 
-def test_wikiindex_propagates_requested_vector_mode(monkeypatch, tmp_path):
-    """Eval's exact control must cross the production facade unchanged."""
+def test_wikiindex_build_has_no_runtime_mode_selection(monkeypatch, tmp_path):
+    """Phase 06（issue #49）：facade 不传播 auto/exact/FLAT/SQ 运行时选择。"""
     import build_index as build_module
 
     requested = []
@@ -29,11 +29,14 @@ def test_wikiindex_propagates_requested_vector_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(build_module, "EmbeddingTokenizer", lambda _tokenizer: types.SimpleNamespace(count=len))
 
     def fake_build(*_args, **kwargs):
-        mode = kwargs["vector_index_mode"]
-        requested.append(mode)
-        manifest = tmp_path / f"{mode}.json"
+        assert "vector_index_mode" not in kwargs, "runtime mode selection must be removed"
+        requested.append(sorted(kwargs))
+        manifest = tmp_path / "manifest.json"
         manifest.write_text(
-            json.dumps({"policy": {"selected_mode": "exact" if mode == "exact" else "ann"}}),
+            json.dumps({
+                "policy": {"selected_mode": "ann"},
+                "ann_policy": {"selected_index_type": "ivf-hnsw-sq", "query_ef": 100},
+            }),
             encoding="utf-8",
         )
         return types.SimpleNamespace(artifact=types.SimpleNamespace(manifest_path=manifest))
@@ -42,10 +45,10 @@ def test_wikiindex_propagates_requested_vector_mode(monkeypatch, tmp_path):
     index = WikiIndex(tmp_path / ".index")
     index._embedder = FakeEmbedder()
 
-    index._build(tmp_path / "Wiki", vector_index_mode="exact")
-    index._build(tmp_path / "Wiki", vector_index_mode="ivf-hnsw-flat")
+    index._build(tmp_path / "Wiki")
 
-    assert requested == ["exact", "ivf-hnsw-flat"]
+    assert requested, "facade must still route through build_storage_contract"
+    assert index._vector_index_mode == "ivf-hnsw-sq"  # 来自 manifest 的固定策略
 
 
 def _write_page(wiki: Path, name: str, title: str, body: str, sources=None):

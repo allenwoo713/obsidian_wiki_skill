@@ -21,6 +21,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import build_storage_contract, plan_sparse_chunks, scan_wiki  # noqa: E402
 
 
+def _embed384(seed: int = 0):
+    """Deterministic 384-dim unit vectors (Phase 06 approved policy dimension)."""
+    import math, random as _random
+
+    def embed(texts):
+        out = []
+        for row, _t in enumerate(texts):
+            rng = _random.Random(77 + seed * 1013 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = math.sqrt(sum(v * v for v in raw))
+            out.append([v / norm for v in raw])
+        return out
+    return embed
+
 def _write_big_page(wiki: Path, body: str) -> Path:
     page = wiki / "big.md"
     page.parent.mkdir(parents=True, exist_ok=True)
@@ -71,7 +85,7 @@ def test_storage_contract_honors_token_bounded_dense_chunks(tmp_path: Path) -> N
     artifact = build_storage_contract(
         wiki,
         tmp_path / ".index",
-        embed=lambda texts: [[1.0, float(i + 1)] for i, _ in enumerate(texts)],
+        embed=_embed384(),
         tokenizer=_fake_tokenizer,
         lexicon={},
     )
@@ -118,7 +132,7 @@ def test_production_chunk_planning_runs_after_build_lock_acquire(tmp_path: Path,
     build_storage_contract(
         wiki,
         tmp_path / ".index",
-        embed=lambda texts: [[1.0, float(i + 1)] for i, _ in enumerate(texts)],
+        embed=_embed384(),
         tokenizer=_fake_tokenizer,
         lexicon={},
     )

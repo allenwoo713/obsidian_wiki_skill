@@ -252,8 +252,7 @@ def _fixture_digest(wiki_src: Path) -> str:
 def _candidate_index_identity(*, wi: WikiIndex, root: Path, policy: CandidateQueryPolicy) -> dict:
     manifest_path = wi._resolve_active_manifest()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("candidate_query_policy") != policy.to_json() \
-            or manifest.get("requested_vector_index_mode") != policy.candidate:
+    if manifest.get("candidate_query_policy") != policy.to_json():
         raise ValueError("candidate policy was not applied to the built index")
     return {
         "build_id": manifest["build_id"],
@@ -390,7 +389,7 @@ def run_candidate_hybrid_evaluation(
             policy = CandidateQueryPolicy(candidate=candidate, query_ef=query_ef)
             root = work_dir / f"{candidate}-ef-{query_ef}"
             wi, wiki, build_time = _build(
-                root, wiki_src, "auto", True, candidate_query_policy=policy,
+                root, wiki_src, True, candidate_query_policy=policy,
             )
             planner = DefaultQueryPlanner(project_root=root)
             results, latencies, traces = [], [], []
@@ -549,6 +548,27 @@ def validate_benchmark_contract(manifest: dict) -> dict:
     policy repeats the same scope/counts instead of silently interpreting a
     sampled 1.0 as a corpus-wide proof.
     """
+    if manifest.get("format_version") == 6:
+        # Phase 06：固定策略 manifest——生产构建必须携带通过域验证器的
+        # candidate_publication_evidence；eval candidate 构建除外。
+        if isinstance(manifest.get("candidate_query_policy"), dict):
+            return manifest.get("benchmark") or {}
+        evidence = manifest.get("candidate_publication_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError(
+                "format-6 production manifests require candidate_publication_evidence"
+            )
+        from obsidian_wiki.domain.index_models import CandidatePublicationEvidence
+        from obsidian_wiki.domain.index_policy import (
+            load_ann_policy_file,
+            validate_candidate_publication_evidence,
+        )
+        try:
+            record = CandidatePublicationEvidence(**evidence)
+        except TypeError as exc:
+            raise ValueError(f"publication evidence fields invalid: {exc}") from exc
+        validate_candidate_publication_evidence(record, load_ann_policy_file())
+        return manifest.get("benchmark") or {}
     if manifest.get("format_version") != 5:
         raise ValueError("ANN benchmark evidence requires manifest format_version=5")
     benchmark = manifest.get("benchmark")
@@ -673,14 +693,16 @@ def _stage_project(project_root: Path, wiki_src: Path):
     return wiki
 
 
-def _build(project_root: Path, wiki_src: Path, vector_index_mode: str, full_rebuild: bool,
+def _build(project_root: Path, wiki_src: Path, full_rebuild: bool,
            *, candidate_query_policy: CandidateQueryPolicy | None = None):
+    # Phase 06：普通评测构建走固定生产路径（批准 SQ/ef）；eval candidate
+    # 构建显式传 candidate_query_policy。
     wiki = _stage_project(project_root, wiki_src)
     idx = project_root / ".index"
     wi = WikiIndex(idx)
     t0 = time.perf_counter()
     wi.build(
-        wiki, full_rebuild=full_rebuild, vector_index_mode=vector_index_mode,
+        wiki, full_rebuild=full_rebuild,
         candidate_query_policy=candidate_query_policy,
     )
     dt = time.perf_counter() - t0
@@ -731,7 +753,7 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
 
     # 1) 主索引（exact，小库等价精确）
     main_root = work_dir / "main"
-    main_wi, main_wiki, build_time = _build(main_root, wiki_src, "exact", full_rebuild=True)
+    main_wi, main_wiki, build_time = _build(main_root, wiki_src, full_rebuild=True)
     main_benchmark = _active_benchmark_contract(main_wi)
     planner = DefaultQueryPlanner(project_root=main_root)
 
@@ -741,7 +763,7 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     ann_benchmark = None
     if build_ann:
         ann_root = work_dir / "ann"
-        ann_wi, _, ann_build_time = _build(ann_root, wiki_src, "auto", full_rebuild=True)
+        ann_wi, _, ann_build_time = _build(ann_root, wiki_src, full_rebuild=True)
         ann_benchmark = _active_benchmark_contract(ann_wi)
 
     # 3) 逐查询评测
@@ -940,7 +962,7 @@ def run_graph_contract_evaluation(wiki_src: Path, queries: list, work_dir: Path,
                                   max_tokens: int, hard_max_tokens: int | None = None):
     """Measure graph lift with paired production retrieval on an explicit-link corpus."""
     root = work_dir / "graph-contract"
-    wi, wiki, _ = _build(root, wiki_src, "exact", full_rebuild=True)
+    wi, wiki, _ = _build(root, wiki_src, full_rebuild=True)
     planner = DefaultQueryPlanner(project_root=root)
     failures, detail = [], []
     validated_count = unsupported_count = incremental_gold_pages = 0

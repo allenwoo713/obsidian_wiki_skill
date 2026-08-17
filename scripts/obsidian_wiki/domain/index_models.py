@@ -192,6 +192,33 @@ class CandidatePublicationEvidence(_JsonRecord):
 
 
 @dataclass(frozen=True)
+class CandidateQueryPolicy(_JsonRecord):
+    """Evaluation-only ANN binding applied below hybrid orchestration.
+
+    The policy intentionally carries only the candidate index construction type
+    and the ordinary dense-query ``ef``.  It is never exposed to query planning,
+    hybrid orchestration, or fusion.  （Phase 06：迁至 domain 层，infrastructure
+    的 eval 绑定需要它；application 保留 re-export 兼容旧导入路径。）
+    """
+
+    candidate: str
+    query_ef: int
+
+    def __post_init__(self) -> None:
+        if self.candidate not in {"ivf-hnsw-flat", "ivf-hnsw-sq"}:
+            raise ValueError("candidate must be ivf-hnsw-flat or ivf-hnsw-sq")
+        if (
+            isinstance(self.query_ef, bool)
+            or not isinstance(self.query_ef, int)
+            or self.query_ef <= 0
+        ):
+            raise ValueError("query_ef must be a positive integer")
+
+    def to_json(self) -> dict[str, object]:
+        return {"candidate": self.candidate, "query_ef": self.query_ef}
+
+
+@dataclass(frozen=True)
 class SparseChunk(_JsonRecord):
     chunk_id: str
     page_id: str

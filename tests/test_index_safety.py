@@ -114,7 +114,15 @@ def test_storage_contract_failure_never_changes_active_pointer(tmp_path, monkeyp
     wiki = tmp_path / "Wiki"
     index_dir = tmp_path / ".index"
     _write_page(wiki, "storage.md", "Storage", "stable token", ["raw/storage.docx"])
-    embed = lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)]
+    def embed(texts):  # Phase 06：批准策略固定 384 维
+        import math as _math, random as _random
+        out = []
+        for row, _text in enumerate(texts):
+            rng = _random.Random(5150 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = _math.sqrt(sum(v * v for v in raw))
+            out.append([v / norm for v in raw])
+        return out
     build_storage_contract(wiki, index_dir, embed=embed)
     old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
 
@@ -148,7 +156,15 @@ def test_post_commit_report_failure_returns_published_with_pending(tmp_path, mon
     wiki = tmp_path / "Wiki"
     index_dir = tmp_path / ".index"
     _write_page(wiki, "post.md", "Post", "stable token post commit", ["raw/post.docx"])
-    embed = lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)]  # noqa: E731
+    def embed(texts):  # Phase 06：批准策略固定 384 维
+        import math as _math, random as _random
+        out = []
+        for row, _text in enumerate(texts):
+            rng = _random.Random(5150 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = _math.sqrt(sum(v * v for v in raw))
+            out.append([v / norm for v in raw])
+        return out
 
     def _boom(*_a, **_k):
         raise OSError("report store unavailable")
@@ -189,7 +205,15 @@ def test_single_build_publishes_pointer_exactly_once(tmp_path, monkeypatch):
     wiki = tmp_path / "Wiki"
     index_dir = tmp_path / ".index"
     _write_page(wiki, "once.md", "Once", "stable token single publish", ["raw/once.docx"])
-    embed = lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)]  # noqa: E731
+    def embed(texts):  # Phase 06：批准策略固定 384 维
+        import math as _math, random as _random
+        out = []
+        for row, _text in enumerate(texts):
+            rng = _random.Random(5150 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = _math.sqrt(sum(v * v for v in raw))
+            out.append([v / norm for v in raw])
+        return out
     real_publish = svc_module.publish_pointer
     calls: list[dict] = []
 

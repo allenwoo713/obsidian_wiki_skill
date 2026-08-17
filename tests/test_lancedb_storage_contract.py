@@ -51,6 +51,33 @@ def _write_page(wiki: Path, body: str) -> None:
     )
 
 
+def _write_pages(wiki: Path, count: int, *, body_prefix: str = "PHASE06PAGE") -> None:
+    for index in range(count):
+        page = wiki / "concepts" / f"page-{index:04d}.md"
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(
+            f"# Page {index}\n\n{body_prefix}{index:04d} unique token body.\n",
+            encoding="utf-8",
+        )
+
+
+def _embed384(seed: int = 0):
+    """Deterministic pseudo-random unit vectors at the approved 384 dimensions."""
+    import math
+    import random as _random
+
+    def embed(texts):
+        out = []
+        for row, _text in enumerate(texts):
+            rng = _random.Random(9173 + seed * 100003 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = math.sqrt(sum(value * value for value in raw))
+            out.append([value / norm for value in raw])
+        return out
+
+    return embed
+
+
 def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> None:
     """The direct script wrapper crosses service/port/adapter into LanceDB."""
     long_term = "D01ExactTerm" + "abc123" * 29
@@ -60,7 +87,7 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     artifact = build_storage_contract(
         wiki,
         tmp_path / ".index",
-        embed=lambda texts: [[float(len(text)), 1.0] for text in texts],
+        embed=_embed384(),
     )
 
     db = lancedb.connect(str(artifact.artifact.lance_dir))
@@ -75,6 +102,11 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
 
     manifest = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
+    # Phase 06：manifest 绑定批准策略（不再有 requested_vector_index_mode）。
+    assert manifest["format_version"] == 6
+    assert manifest["ann_policy"]["selected_index_type"] == "ivf-hnsw-sq"
+    assert manifest["ann_policy"]["query_ef"] == 100
+    assert "requested_vector_index_mode" not in manifest
     assert manifest["fts_config"] == {
         "column": "fts_text",
         "base_tokenizer": "whitespace",
@@ -87,43 +119,21 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     assert LanceDbIndexRepository(artifact.artifact.lance_dir).search_sparse(long_term)
 
 
-def test_exact_build_mode_bypasses_candidate_index(
+def test_runtime_mode_selection_is_removed_from_public_surfaces() -> None:
+    """Phase 06（issue #49）：facade/CLI 不暴露 auto/exact/FLAT/SQ 运行时选择。"""
+    facade_params = inspect.signature(build_storage_contract).parameters
+    build_params = inspect.signature(WikiIndex.build).parameters
+    assert "vector_index_mode" not in facade_params
+    assert "vector_index_mode" not in build_params
+    # eval candidate 绑定仍显式存在（仅 eval comparator 使用）。
+    assert "candidate_query_policy" in facade_params
+    assert "candidate_query_policy" in build_params
+
+
+def test_normal_production_build_constructs_only_the_approved_type(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Eval's exact control must not silently become another randomized HNSW build."""
-    wiki = tmp_path / "Wiki"
-    _write_page(wiki, "# Exact control\n\nEXACTMODETERM\n")
-
-    def unexpected_index(*_args, **_kwargs):
-        pytest.fail("exact vector mode must not create a candidate ANN index")
-
-    monkeypatch.setattr(LanceDbIndexRepository, "create_vector_index", unexpected_index)
-    outcome = build_storage_contract(
-        wiki,
-        tmp_path / ".index",
-        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
-        vector_index_mode="exact",
-    )
-    manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
-    dense = lancedb.connect(str(outcome.artifact.lance_dir)).open_table("dense_chunks")
-
-    assert manifest["requested_vector_index_mode"] == "exact"
-    assert manifest["policy"]["selected_mode"] == "exact"
-    assert "dense_hnsw" not in {index.name for index in dense.list_indices()}
-
-
-@pytest.mark.parametrize(
-    ("requested_mode", "expected_index_type"),
-    [
-        ("ivf-hnsw-flat", "hnsw_flat"),
-        ("ivf-hnsw-sq", "hnsw_sq"),
-    ],
-)
-def test_explicit_hnsw_mode_is_not_rewritten_for_small_corpus(
-    requested_mode: str, expected_index_type: str,
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The public force flag must beat the internal small-auto IVF policy."""
+    """唯一可构建的 production candidate 是批准的 hnsw_sq。"""
     wiki = tmp_path / "Wiki"
     _write_page(wiki, "# Forced HNSW\n\nEXPLICITHNSWTERM\n")
     observed_configs: list[VectorIndexConfig] = []
@@ -137,14 +147,14 @@ def test_explicit_hnsw_mode_is_not_rewritten_for_small_corpus(
     outcome = build_storage_contract(
         wiki,
         tmp_path / ".index",
-        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
-        vector_index_mode=requested_mode,
+        embed=_embed384(),
     )
     manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
 
-    assert [config.index_type for config in observed_configs] == [expected_index_type]
-    assert manifest["requested_vector_index_mode"] == requested_mode
-    assert manifest["vector_config"]["index_type"] == expected_index_type
+    assert [config.index_type for config in observed_configs] == ["hnsw_sq"]
+    assert manifest["vector_config"]["index_type"] == "hnsw_sq"
+    assert manifest["policy"]["selected_mode"] == "ann"
+    assert manifest["candidate_publication_evidence"]["index_type"] == "ivf-hnsw-sq"
 
 
 def test_real_lancedb_has_no_storage_mutation_after_final_seal(
@@ -178,7 +188,7 @@ def test_real_lancedb_has_no_storage_mutation_after_final_seal(
     build_storage_contract(
         wiki,
         index_dir,
-        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
+        embed=_embed384(),
     )
 
     assert "seal" in events
@@ -233,7 +243,7 @@ def test_native_fts_creation_failure_is_fatal_and_preserves_active_pointer(
     wiki = tmp_path / "Wiki"
     _write_page(wiki, "# Contract\n\nThe exact token is FTSFAILTERM\n")
     index_dir = tmp_path / ".index"
-    embed = lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
+    embed = _embed384()
     build_storage_contract(wiki, index_dir, embed=embed)
     original_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
 
@@ -302,7 +312,7 @@ def test_context_reads_use_persisted_sparse_metadata_after_load(
     ]
     build_storage_contract(
         wiki, index_dir, sparse_chunks=records,
-        embed=lambda texts: [[1.0, float(number + 1)] for number, _ in enumerate(texts)],
+        embed=_embed384(),
     )
 
     index = WikiIndex(index_dir)
@@ -382,44 +392,84 @@ class _DatabaseSpy:
         return self.dense_table
 
 
-def test_candidate_hnsw_and_exact_bypass_stay_in_adapter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Phase 06：生产绑定只建批准类型；普通查询固定批准 ef、绝不 bypass。"""
     table = _DenseTableSpy()
     monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
-    repository = LanceDbIndexRepository(tmp_path / "lance")
-    config = VectorIndexConfig(
+    repository = LanceDbIndexRepository(tmp_path / "lance")  # 未注入 → 默认批准策略
+    unapproved = VectorIndexConfig(
         index_type="hnsw_flat", metric="cosine", num_partitions=2,
         m=16, ef_construction=300, dense_chunks_count=20,
     )
+    with pytest.raises(ValueError, match="bound to index type"):
+        repository.create_vector_index(unapproved)
 
-    stats = repository.create_vector_index(config)
+    approved = VectorIndexConfig(
+        index_type="hnsw_sq", metric="cosine", num_partitions=2,
+        m=16, ef_construction=300, dense_chunks_count=20,
+    )
+    repository.create_vector_index(approved)
+
     ann = repository.search_dense([1.0, 0.0], metric="cosine", limit=20, where="page_id = 'safe'")
     exact = repository.search_dense_exact([1.0, 0.0], metric="cosine", limit=20, where="page_id = 'safe'")
 
-    column, kwargs = table.index_call
+    _, kwargs = table.index_call
     hnsw = kwargs["config"]
-    assert column == "vector"
-    assert kwargs["name"] == "dense_hnsw"
+    assert type(hnsw).__name__ == "HnswSq"
     assert hnsw.distance_type == "cosine"
     assert hnsw.num_partitions == 2
     assert hnsw.m == 16
     assert hnsw.ef_construction == 300
-    assert stats.unindexed_dense_rows == 0
     assert ann == exact == [{"chunk_id": "dense:1"}]
     assert table.queries[0].exact_bypass is False
     assert table.queries[1].exact_bypass is True
     assert table.queries[0].metric == table.queries[1].metric == "cosine"
     assert table.queries[0].predicate == table.queries[1].predicate == "page_id = 'safe'"
     assert table.queries[0].result_limit == table.queries[1].result_limit == 20
-    # #41: ef value must be set explicitly (was never below lancedb default 1.5*limit,
-    # and floored at 100 for small k). limit=20 -> max(100, ceil(1.5*20)=30) = 100.
+    # 固定批准 ef=100（与 limit 无关；不再有 max(100, 1.5*limit) 启发式）。
     assert table.queries[0].ef_value == 100
     assert table.queries[1].ef_value is None  # exact path bypasses ef
 
 
-def test_small_full_evidence_candidate_uses_single_partition_ivf_flat(
+def test_eval_candidate_binding_builds_its_candidate_and_applies_grid_ef(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Small full-probe builds use an indexed candidate without HNSW randomness."""
+    """显式 eval candidate 绑定：FLAT 可建、声明 ef 生效——仅 eval seam。"""
+    from obsidian_wiki.domain.index_models import CandidateQueryPolicy
+
+    table = _DenseTableSpy()
+    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
+    repository = LanceDbIndexRepository(
+        tmp_path / "lance",
+        eval_candidate_policy=CandidateQueryPolicy(candidate="ivf-hnsw-flat", query_ef=30),
+    )
+    config = VectorIndexConfig(
+        index_type="hnsw_flat", metric="cosine", num_partitions=1,
+        m=16, ef_construction=300, dense_chunks_count=20,
+    )
+    repository.create_vector_index(config)
+    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
+    repository.search_dense_eval([1.0, 0.0], metric="cosine", limit=20, ef=157)
+
+    _, kwargs = table.index_call
+    assert type(kwargs["config"]).__name__ == "HnswFlat"
+    assert kwargs["config"].num_partitions == 1
+    assert table.queries[0].ef_value == 30   # 绑定的 candidate ef
+    assert table.queries[1].ef_value == 157  # 显式 eval grid ef
+    # eval 绑定也拒绝其它类型（SQ 配置进 FLAT 绑定仓库）。
+    with pytest.raises(ValueError, match="bound to index type"):
+        repository.create_vector_index(VectorIndexConfig(
+            index_type="hnsw_sq", metric="cosine", num_partitions=1,
+            m=16, ef_construction=300, dense_chunks_count=20,
+        ))
+
+
+def test_eval_seam_still_builds_ivf_flat_comparator_candidate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """显式 named eval seam 可构建 comparator 声明的 IVF-FLAT（不经过生产端口）。"""
     table = _DenseTableSpy()
     monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
     repository = LanceDbIndexRepository(tmp_path / "lance")
@@ -428,74 +478,13 @@ def test_small_full_evidence_candidate_uses_single_partition_ivf_flat(
         m=16, ef_construction=300, dense_chunks_count=20,
     )
 
-    repository.create_vector_index(config)
+    repository.create_eval_candidate_index(config)
 
     _, kwargs = table.index_call
     ivf = kwargs["config"]
     assert type(ivf).__name__ == "IvfFlat"
     assert ivf.distance_type == "cosine"
     assert ivf.num_partitions == 1
-
-
-def test_explicit_hnsw_sq_config_stays_in_adapter(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """The second public forced HNSW mode must not collapse to FLAT or IVF-FLAT."""
-    table = _DenseTableSpy()
-    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
-    repository = LanceDbIndexRepository(tmp_path / "lance")
-    config = VectorIndexConfig(
-        index_type="hnsw_sq", metric="cosine", num_partitions=2,
-        m=16, ef_construction=300, dense_chunks_count=20,
-    )
-
-    repository.create_vector_index(config)
-
-    _, kwargs = table.index_call
-    sq = kwargs["config"]
-    assert type(sq).__name__ == "HnswSq"
-    assert sq.distance_type == "cosine"
-    assert sq.num_partitions == 2
-    assert sq.m == 16
-    assert sq.ef_construction == 300
-
-
-def test_search_dense_ef_never_regresses_below_lancedb_default_for_large_k(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Large-k production queries (e.g. limit=80) must keep ef == lancedb default.
-
-    lancedb 0.34 uses ef = 1.5*limit by default (=120 for limit=80). A naive
-    `.ef(max(limit, 100))` would have LOWERED this to 100, silently regressing
-    recall on the daily search path. The floor must be max(100, ceil(1.5*limit)).
-    """
-    table = _DenseTableSpy()
-    monkeypatch.setattr(repository_module.lancedb, "connect", lambda _: _DatabaseSpy(table))
-    repository = LanceDbIndexRepository(tmp_path / "lance")
-    config = VectorIndexConfig(
-        index_type="hnsw_flat", metric="cosine", num_partitions=2,
-        m=16, ef_construction=300, dense_chunks_count=20,
-    )
-    repository.create_vector_index(config)
-
-    # limit=80 -> max(100, ceil(1.5*80)=120) = 120 (matches lancedb default)
-    repository.search_dense([1.0, 0.0], metric="cosine", limit=80)
-    assert table.queries[-1].ef_value == 120
-
-    # limit=20 -> max(100, ceil(1.5*20)=30) = 100 (floored, above default)
-    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
-    assert table.queries[-1].ef_value == 100
-
-    # limit=200 -> max(100, ceil(1.5*200)=300) = 300 (follows default, above floor)
-    repository.search_dense([1.0, 0.0], metric="cosine", limit=200)
-    assert table.queries[-1].ef_value == 300
-
-    # Build-time evidence may explicitly request exhaustive breadth without
-    # changing the online default for ordinary retrieval calls.
-    repository.search_dense([1.0, 0.0], metric="cosine", limit=20, ef=157)
-    assert table.queries[-1].ef_value == 157
-    repository.search_dense([1.0, 0.0], metric="cosine", limit=20)
-    assert table.queries[-1].ef_value == 100
 
 
 def test_candidate_query_policy_is_immutable_and_applies_only_at_build_and_dense_query_boundaries(
@@ -510,18 +499,21 @@ def test_candidate_query_policy_is_immutable_and_applies_only_at_build_and_dense
     _write_page(wiki, "# Candidate policy\n\nCANDIDATEPOLICYTERM\n")
     outcome = build_storage_contract(
         wiki, tmp_path / ".index",
-        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
+        embed=_embed384(),
         candidate_query_policy=policy,
     )
     manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["candidate_query_policy"] == {
         "candidate": "ivf-hnsw-sq", "query_ef": 75,
     }
-    assert manifest["requested_vector_index_mode"] == "ivf-hnsw-sq"
+    assert manifest["vector_config"]["index_type"] == "hnsw_sq"
+    # eval candidate 构建不经过生产发布门禁，policy 记录 eval 语义。
+    assert manifest["policy"]["selected_mode"] == "ann"
+    assert "candidate_publication_evidence" not in manifest
 
     class Repository:
-        def search_dense(self, vector, *, metric, limit, ef):
-            assert ef == 75
+        def search_dense(self, vector, *, metric, limit):
+            # Phase 06：facade 不再传 ef——eval ef 由仓库绑定策略决定。
             return [{"chunk_id": "d", "page_id": "p", "path": "p.md", "title": "P", "text": "text", "_distance": 0.1}]
 
     class Embedder:
@@ -559,42 +551,58 @@ def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path)
     index_dir = tmp_path / ".index"
 
     artifact = build_storage_contract(
-        wiki, index_dir, embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
+        wiki, index_dir, embed=_embed384()
     )
 
     manifest = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
     assert (index_dir / "ACTIVE_INDEX").exists()
-    assert manifest["format_version"] >= 4
+    assert manifest["format_version"] == 6
     assert manifest["validation"]["schema_counts"] == {"sparse_chunks_count": 1, "dense_chunks_count": 1}
     assert manifest["validation"]["exact_term_validated"] is True
     assert manifest["config_hashes"]["fts_config"]
     assert manifest["sdk_versions"]["lancedb"]
-    assert manifest["policy"]["selected_mode"] in {"ann", "exact"}
+    assert manifest["policy"]["selected_mode"] == "ann"
+    # Phase 06：发布证据绑定实际行数与动态验证 query 数。
+    evidence = manifest["candidate_publication_evidence"]
+    assert evidence["actual_dense_rows"] == 1
+    assert evidence["validation_query_count"] == min(256, 1)
+    assert evidence["query_ef"] == 100
+    assert evidence["corpus_query_overlap"] == 0
 
 
-def test_complete_non_promoting_candidate_publishes_exact_policy(tmp_path: Path) -> None:
+def test_publication_gate_failure_preserves_active_pointer(tmp_path: Path) -> None:
+    """Phase 06：发布门禁失败 → .failed 标记 + 旧 ACTIVE_INDEX 字节不变。"""
+    from obsidian_wiki.domain.index_policy import PolicyError
+
     wiki = tmp_path / "Wiki"
-    _write_page(wiki, "# Contract\n\nThe standalone exact token is FALLBACKTERM\n")
+    _write_pages(wiki, 4, body_prefix="GATEFAIL")
     index_dir = tmp_path / ".index"
+    build_storage_contract(wiki, index_dir, embed=_embed384())
+    original_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+
     service = IndexBuildService(
         LanceDbIndexRepository(index_dir),
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
         post_commit_journal=FilesystemPostCommitJournal(index_dir),
-        benchmark_observer=lambda _stats: BenchmarkObservation(
-            recall_at_10=0.9, recall_at_20=1.0, latency_p50_ms=1.0,
-            latency_p95_ms=2.0, build_time_ms=3.0, disk_bytes=4,
-        ),
     )
 
-    artifact = service.build(
-        wiki, index_dir, embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)]
-    )
+    def _rejecting_validation(*_args, **_kwargs):
+        raise PolicyError("staged candidate recall@10 0.1200 is below the approved floor 0.19")
 
-    assert (index_dir / "ACTIVE_INDEX").exists()
-    manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["policy"]["selected_mode"] == "exact"
-    assert manifest["policy"]["reason"].startswith("recall@10")
+    real_validation = IndexBuildService._publication_validation
+    IndexBuildService._publication_validation = _rejecting_validation
+    try:
+        with pytest.raises(PolicyError, match="below the approved floor"):
+            service.build(wiki, index_dir, embed=_embed384(seed=1))
+    finally:
+        IndexBuildService._publication_validation = real_validation
+
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == original_pointer
+    failed_markers = list((index_dir / "builds").glob("build_*/.failed"))
+    assert failed_markers
+    marker_text = failed_markers[0].read_text(encoding="utf-8")
+    assert "below the approved floor" in marker_text
 
 
 # --- Issue #47 C/D — strict two-table persistence + fail-closed kind purity. ---
@@ -669,9 +677,8 @@ def test_context_rows_returns_union_without_collision(tmp_path: Path):
 
 
 def test_require_current_layout_rejects_stale_layout_version(tmp_path: Path):
-    """Fail-closed migration guard (issue #47 F): an index built under an older
-    layout version must be rejected, forcing a rebuild, not served from a
-    contaminated/old schema."""
+    """Fail-closed migration guard (issue #47 F + Phase 06)：旧布局与旧
+    format-5 mode-ambiguous manifest 都必须被拒绝并要求重建。"""
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({
         "layout": "sparse_chunks+dense_chunks",
@@ -680,9 +687,20 @@ def test_require_current_layout_rejects_stale_layout_version(tmp_path: Path):
     with pytest.raises(RebuildRequiredError):
         LanceDbIndexRepository.require_current_layout(manifest)
 
+    # Phase 06（issue #49）：format-5 / 缺 format_version 的 mode-ambiguous
+    # manifest（requested_vector_index_mode / exact 回退时代）同样拒绝。
+    manifest.write_text(json.dumps({
+        "layout": "sparse_chunks+dense_chunks",
+        "index_layout_version": 6,
+        "format_version": 5,
+    }), encoding="utf-8")
+    with pytest.raises(RebuildRequiredError, match="mode-ambiguous"):
+        LanceDbIndexRepository.require_current_layout(manifest)
+
     manifest.write_text(json.dumps({
         "layout": "sparse_chunks+dense_chunks",
         "index_layout_version": 6,  # current
+        "format_version": 6,
     }), encoding="utf-8")
     # Current version is accepted without raising.
     LanceDbIndexRepository.require_current_layout(manifest)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import statistics
 import time
@@ -25,18 +26,28 @@ from obsidian_wiki.application.durable_filesystem import CommitUncertainError
 from obsidian_wiki.domain.index_models import (
     BenchmarkObservation,
     BuildContext,
+    CANDIDATE_PUBLICATION_EVIDENCE_SCHEMA_VERSION,
+    CandidatePublicationEvidence,
+    CandidateQueryPolicy,
     DenseChunk,
     FtsIndexConfig,
     INDEX_LAYOUT_VERSION,
+    INDEX_MANIFEST_FORMAT_VERSION,
     IndexStats,
     PostCommitTask,
     PostCommitTaskState,
+    ProductionAnnPolicy,
     SparseChunk,
     StorageArtifact,
     VectorIndexConfig,
     VectorPolicyDecision,
 )
-from obsidian_wiki.domain.index_policy import select_vector_policy
+from obsidian_wiki.domain.index_policy import (
+    PolicyError,
+    load_ann_policy_file,
+    production_policy_sha256,
+    validate_candidate_publication_evidence,
+)
 from obsidian_wiki.ports.chunk_repository import ChunkRepository
 from obsidian_wiki.ports.index_manifest import IndexManifestStore
 from obsidian_wiki.ports.post_commit import PostCommitJournal
@@ -48,35 +59,17 @@ BenchmarkObserver = Callable[[IndexStats], BenchmarkObservation]
 PlanProvider = Callable[
     [Path], tuple[Sequence["SparseChunk"], "list[dict] | None"]
 ]
-# #41：构建期 ANN 自检的最大 probe 数。recall 语义从「全量最小」变为
-# 「bottom-k SHA-256 样本最小」；evidence 与 policy 必须自证该口径。
+# #41→Phase 06：构建期 held-out 验证的最大 query 数。只决定
+# ``min(BENCHMARK_MAX_PROBES, actual_dense_rows)`` 的验证采样规模，
+# 不能影响索引类型 / 查询 ef / 任何生产策略值。
 BENCHMARK_MAX_PROBES = 256
+# Phase 06：held-out 验证 query 的确定性流种子（跨平台 Mersenne Twister 可复现）。
+_VALIDATION_QUERY_SEED = 20260817
+_VALIDATION_QUERY_SOURCE = "deterministic_disjoint_unit_v1"
 
-
-@dataclass(frozen=True)
-class CandidateQueryPolicy:
-    """Evaluation-only ANN binding applied below hybrid orchestration.
-
-    The policy intentionally carries only the candidate index construction type
-    and the ordinary dense-query ``ef``.  It is never exposed to query planning,
-    hybrid orchestration, or fusion.
-    """
-
-    candidate: str
-    query_ef: int
-
-    def __post_init__(self) -> None:
-        if self.candidate not in {"ivf-hnsw-flat", "ivf-hnsw-sq"}:
-            raise ValueError("candidate must be ivf-hnsw-flat or ivf-hnsw-sq")
-        if (
-            isinstance(self.query_ef, bool)
-            or not isinstance(self.query_ef, int)
-            or self.query_ef <= 0
-        ):
-            raise ValueError("query_ef must be a positive integer")
-
-    def to_json(self) -> dict[str, object]:
-        return {"candidate": self.candidate, "query_ef": self.query_ef}
+# 兼容 re-export：CandidateQueryPolicy 已迁至 domain（infrastructure 的 eval
+# 绑定需要它）；旧导入路径继续可用。
+__all__ = ["IndexBuildService", "CandidateQueryPolicy", "BENCHMARK_MAX_PROBES"]
 
 
 class IndexBuildService:
@@ -92,15 +85,20 @@ class IndexBuildService:
         fts_config: FtsIndexConfig | None = None,
         benchmark_observer: BenchmarkObserver | None = None,
         benchmark_max_probes: int = BENCHMARK_MAX_PROBES,
-        vector_index_mode: str = "auto",
         candidate_query_policy: CandidateQueryPolicy | None = None,
+        ann_policy: ProductionAnnPolicy | None = None,
     ):
         """#37：``post_commit_journal`` 为必填依赖——每个发布路径都必须在 pointer
         commit 前 durable prepare 失效 intent；不需要 invalidation 的调用方必须显式
         注入 deliberate no-op port，遗漏绝不能静默禁用契约。
 
-        #41：``benchmark_max_probes`` 在 storage mutation 之前验证（构造时即拒绝
-        非法值）；bool 是 int 子类，须显式拒绝。
+        #41→Phase 06：``benchmark_max_probes`` 在 storage mutation 之前验证（构造时
+        即拒绝非法值）；bool 是 int 子类，须显式拒绝。它只决定 held-out 验证的
+        query 数，不影响任何生产策略值。
+
+        Phase 06（issue #49）：``vector_index_mode`` 已移除——生产构建固定使用
+        ``ann_policy``（默认加载 ``eval/ann-policy.json`` 的批准策略）。
+        ``candidate_query_policy`` 仅用于 eval comparator 构建，不经过发布门禁。
         """
         if (
             isinstance(benchmark_max_probes, bool)
@@ -110,13 +108,6 @@ class IndexBuildService:
             raise ValueError(
                 f"benchmark_max_probes must be a positive integer, got {benchmark_max_probes!r}"
             )
-        if vector_index_mode not in {
-            "auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"
-        }:
-            raise ValueError(
-                "vector_index_mode must be auto, exact, ivf-hnsw-flat, or ivf-hnsw-sq, "
-                f"got {vector_index_mode!r}"
-            )
         self._storage = storage
         self._reopen_storage = reopen_storage
         self._manifest_store = manifest_store
@@ -124,12 +115,8 @@ class IndexBuildService:
         self._benchmark_observer = benchmark_observer
         self._post_commit_journal = post_commit_journal
         self._benchmark_max_probes = benchmark_max_probes
-        if candidate_query_policy is not None:
-            if vector_index_mode not in {"auto", candidate_query_policy.candidate}:
-                raise ValueError("candidate policy conflicts with vector_index_mode")
-            vector_index_mode = candidate_query_policy.candidate
-        self._vector_index_mode = vector_index_mode
         self._candidate_query_policy = candidate_query_policy
+        self._ann_policy = ann_policy if ann_policy is not None else load_ann_policy_file()
 
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -225,21 +212,22 @@ class IndexBuildService:
             # 不能放在 persist 后（当前已修复：先建索引，再最终 seal）。
             reopened = self._reopen_storage(lance_dir)
             dimension = len(dense_chunks[0].vector)
-            forced_index_types = {
-                "ivf-hnsw-flat": "hnsw_flat",
-                "ivf-hnsw-sq": "hnsw_sq",
-            }
-            candidate_index_type = forced_index_types.get(self._vector_index_mode)
-            if candidate_index_type is None:
-                # Only auto may substitute deterministic one-partition IVF-FLAT
-                # for a small corpus whose policy evidence covers every row.
-                # Exact creates no candidate; its placeholder config remains HNSW.
-                candidate_index_type = (
-                    "ivf_flat"
-                    if self._vector_index_mode == "auto"
-                    and len(dense_chunks) <= self._benchmark_max_probes
-                    else "hnsw_flat"
-                )
+            # Phase 06（issue #49）：唯一的 candidate 选择——批准策略。
+            # 无 corpus 大小 / probe / 运行时输入分支；eval candidate 构建由
+            # 调用方显式传入 eval-bound repository。
+            if self._candidate_query_policy is not None:
+                eval_types = {
+                    "ivf-hnsw-flat": "hnsw_flat",
+                    "ivf-hnsw-sq": "hnsw_sq",
+                }
+                candidate_index_type = eval_types[self._candidate_query_policy.candidate]
+            else:
+                if dimension != self._ann_policy.dimensions:
+                    raise RuntimeError(
+                        f"embedding dimension {dimension} does not match the approved "
+                        f"ann policy dimension {self._ann_policy.dimensions}"
+                    )
+                candidate_index_type = self._ann_policy.lancedb_index_type
             vector_config = VectorIndexConfig(
                 index_type=candidate_index_type,
                 metric="cosine", num_partitions=1,
@@ -247,8 +235,7 @@ class IndexBuildService:
                 dense_chunks_count=len(dense_chunks),
             )
             index_started = time.perf_counter()
-            if self._vector_index_mode != "exact":
-                reopened.create_vector_index(vector_config)
+            reopened.create_vector_index(vector_config)
             index_build_ms = (time.perf_counter() - index_started) * 1000
             # issue #47: the exact-term validation probes the FTS (sparse) table,
             # so the sampled term must come from the lexical corpus that is
@@ -256,9 +243,7 @@ class IndexBuildService:
             exact_term = self._exact_term(lexical_chunks)
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term,
-                vector_index_name=(
-                    None if self._vector_index_mode == "exact" else vector_config.index_name
-                ),
+                vector_index_name=vector_config.index_name,
             )
             if (
                 counts.sparse_chunks_count != len(lexical_chunks)
@@ -269,38 +254,59 @@ class IndexBuildService:
                     f"sparse={counts.sparse_chunks_count}/{len(lexical_chunks)} "
                     f"dense={counts.dense_chunks_count}/{len(dense_chunks)}"
                 )
-            benchmark, benchmark_evidence = self._benchmark(
-                # #41: reopen a fresh connection — lancedb 0.34 HNSW is not fully
-                # visible to the connection that created it; a new connection sees
-                # the complete index (recall 1.0 vs 0.70 on the creating connection).
-                self._reopen_storage(lance_dir),
-                dense_chunks,
-                vector_stats,
-                build_time_ms=index_build_ms,
-                disk_bytes=self._disk_bytes(build_dir),
-                wiki_dir=wiki_dir,
-            )
-            policy = select_vector_policy(benchmark, vector_stats, evidence=benchmark_evidence)
-            if self._vector_index_mode == "exact":
-                policy = VectorPolicyDecision(
-                    selected_mode="exact",
-                    reason="exact vector mode explicitly requested",
+            if self._candidate_query_policy is not None:
+                # Eval candidate 构建：不经过生产发布门禁（FLAT/低 ef 达不到
+                # 生产 floors 是预期），benchmark 记录 synthetic observer 证据。
+                benchmark, benchmark_evidence = self._observer_benchmark(
+                    dense_chunks
+                )
+                policy_decision = VectorPolicyDecision(
+                    selected_mode="ann",
+                    reason="evaluation candidate build; production publication gate not applicable",
                     benchmark=benchmark,
                     index_stats=vector_stats,
                     benchmark_scope=benchmark_evidence["probe_scope"],
                     benchmark_probe_count=benchmark_evidence["probe_count"],
                     benchmark_probe_total=benchmark_evidence["probe_total"],
                 )
+                publication_evidence = None
+            else:
+                # Phase 06：发布门禁——真实 staged candidate 的 held-out
+                # CandidatePublicationEvidence 验证（fail-closed，任何失败都不
+                # publish、不改写旧 ACTIVE_INDEX）。使用重开连接（HNSW 可见性）。
+                publication_evidence, benchmark = self._publication_validation(
+                    self._reopen_storage(lance_dir),
+                    dense_chunks,
+                    vector_stats=vector_stats,
+                    actual_dense_rows=counts.dense_chunks_count,
+                    unindexed_dense_rows=vector_stats.unindexed_dense_rows,
+                    build_time_ms=index_build_ms,
+                    disk_bytes=self._disk_bytes(build_dir),
+                )
+                policy_decision = VectorPolicyDecision(
+                    selected_mode="ann",
+                    reason=(
+                        "approved fixed ann policy validated by held-out "
+                        "publication evidence"
+                    ),
+                    benchmark=benchmark,
+                    index_stats=vector_stats,
+                    benchmark_scope="held_out",
+                    benchmark_probe_count=publication_evidence.validation_query_count,
+                    benchmark_probe_total=counts.dense_chunks_count,
+                )
             # #36 follow-up：最终 seal = 最后 storage mutation 之后的耐久边界。
             self._storage.seal(lance_dir)
             manifest = self._manifest(
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
-                benchmark={**benchmark.to_json(), **benchmark_evidence}, policy=policy.to_json(),
+                benchmark=benchmark.to_json(),
+                policy=policy_decision.to_json(),
                 sparse_chunks=sparse_chunks, generation=generation, build_id=ctx.build_id,
                 page_metadata=page_metadata, image_metadata=image_metadata,
-                requested_vector_index_mode=self._vector_index_mode,
                 candidate_query_policy=self._candidate_query_policy,
+                ann_policy=self._ann_policy,
+                publication_evidence=publication_evidence,
             )
             # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
             if build_dir.name != ctx.build_id or manifest.get("build_id") != ctx.build_id:
@@ -350,8 +356,9 @@ class IndexBuildService:
                   build_id: str = "",
                   page_metadata: list[dict] | None = None,
                   image_metadata: list[dict] | None = None,
-                  requested_vector_index_mode: str = "auto",
-                  candidate_query_policy: CandidateQueryPolicy | None = None) -> dict:
+                  candidate_query_policy: CandidateQueryPolicy | None = None,
+                  ann_policy: ProductionAnnPolicy | None = None,
+                  publication_evidence: CandidatePublicationEvidence | None = None) -> dict:
         fts_config = self._fts_config.to_json()
         vector_config_json = vector_config.to_json()
         # facade 提供的 page_metadata 含完整 page_type/sources/links/aliases/sha256；
@@ -373,9 +380,10 @@ class IndexBuildService:
                 for chunk in sparse_chunks
             ]
         manifest = {
-            # #41：v4 → v5——recall 语义从「全量最小」变为「样本最小」（或显式
-            # synthetic observer），v4-shaped record 不得静默携带 sampled 语义。
-            "format_version": 5,
+            # Phase 06（issue #49）：v5 → v6——manifest 绑定固定批准策略与（生产
+            # 构建的）held-out 发布证据；不再有 requested_vector_index_mode。
+            # v5 / benchmark evidence-v2 是 mode-ambiguous，加载时须拒绝重建。
+            "format_version": INDEX_MANIFEST_FORMAT_VERSION,
             "layout": "sparse_chunks+dense_chunks",
             "generation": generation,
             "build_id": build_id,
@@ -387,7 +395,17 @@ class IndexBuildService:
             "fts_rows_count": sum(1 for c in sparse_chunks if c.chunk_kind == "sparse"),
             "fts_config": fts_config,
             "vector_config": vector_config_json,
-            "requested_vector_index_mode": requested_vector_index_mode,
+            "ann_policy": {
+                "selected_index_type": ann_policy.selected_index_type,
+                "lancedb_index_type": ann_policy.lancedb_index_type,
+                "query_ef": ann_policy.query_ef,
+                "metric": ann_policy.metric,
+                "dimensions": ann_policy.dimensions,
+                "recall_at_10_floor": ann_policy.recall_at_10_floor,
+                "recall_at_20_floor": ann_policy.recall_at_20_floor,
+                "policy_sha256": production_policy_sha256(ann_policy),
+                "comparator_sha256": ann_policy.comparator_sha256,
+            } if ann_policy is not None else None,
             "config_hashes": {
                 "fts_config": self._stable_hash(fts_config),
                 "vector_config": self._stable_hash(vector_config_json),
@@ -408,6 +426,8 @@ class IndexBuildService:
             manifest["images"] = image_metadata
         if candidate_query_policy is not None:
             manifest["candidate_query_policy"] = candidate_query_policy.to_json()
+        if publication_evidence is not None:
+            manifest["candidate_publication_evidence"] = publication_evidence.to_json()
         return manifest
 
     @staticmethod
@@ -432,186 +452,163 @@ class IndexBuildService:
                 continue
         return max_gen + 1
 
-    @staticmethod
-    def _benchmark_probe_keys(
-        dense_chunks: Sequence[DenseChunk], wiki_dir: Path
-    ) -> tuple[str, ...]:
-        """#41 portable probe keys：与 checkout root / 平台无关。
+    def _observer_benchmark(
+        self, dense_chunks: Sequence[DenseChunk]
+    ) -> tuple[BenchmarkObservation, dict]:
+        """Synthetic observer benchmark for eval candidate builds only.
 
-        chunk_id 含绝对 page_id（换根目录或 Windows runner 会选出不同 probe），
-        因此 key 只用 wiki-relative POSIX path + chunk-id content suffix +
-        chunk_kind + chunk_index 构造，跨机器可复现。``_make_chunk_id`` 的
-        chunk_id 形如 ``{absolute_page_id}::{16位hash}``，取 ``::`` 后片段即可。
+        Eval candidate（FLAT / 低 ef）达不到生产 floors 是预期——它们不经过
+        发布门禁；benchmark 记录 synthetic 证据以保持 manifest 结构一致。
         """
-        resolved_wiki = Path(wiki_dir).resolve()
-        keys: list[str] = []
-        for chunk in dense_chunks:
-            chunk_path = Path(chunk.path).resolve()
-            try:
-                relative = os.path.relpath(chunk_path, resolved_wiki)
-            except ValueError:  # 不同盘符（Windows）无公共根
-                relative = str(chunk_path)
-            relative = relative.replace(os.sep, "/")
-            suffix = (
-                chunk.chunk_id.rsplit("::", 1)[-1]
-                if "::" in chunk.chunk_id
-                else chunk.content_hash
+        observation = (
+            self._benchmark_observer(IndexStats(index_name="dense_hnsw", indexed_rows=len(dense_chunks), unindexed_dense_rows=0))
+            if self._benchmark_observer is not None
+            else BenchmarkObservation(
+                recall_at_10=0.0, recall_at_20=0.0,
+                latency_p50_ms=0.0, latency_p95_ms=0.0,
+                build_time_ms=0.0, disk_bytes=0,
             )
-            keys.append(f"{relative}::{suffix}::{chunk.chunk_kind}::{chunk.chunk_index}")
-        return tuple(keys)
+        )
+        evidence = {
+            "evidence_schema_version": 2,
+            "evidence_source": "observer",
+            "probe_scope": "synthetic",
+            "sampling_method": "synthetic",
+            "probe_count": 0,
+            "probe_total": len(dense_chunks),
+            "probe_coverage": 0.0,
+            "result_limit": 20,
+            "recall_aggregation": "none",
+            "benchmark_duration_ms": 0.0,
+            "exact_result_ids": [],
+            "candidate_result_ids": [],
+        }
+        return observation, evidence
 
-    def _benchmark(
+    def _validation_queries(self, count: int) -> tuple[tuple[float, ...], ...]:
+        """独立确定性流的单位向量验证 query（与 corpus 行零重叠）。
+
+        种子固定 → 跨平台/跨 runner 可复现（Mersenne Twister）；向量由
+        gauss 流归一化生成，连续随机分布与任何 corpus 行都不相等（调用处
+        再显式校验一次重叠 = 0）。
+        """
+        import random as _random
+
+        rng = _random.Random(_VALIDATION_QUERY_SEED)
+        queries: list[tuple[float, ...]] = []
+        for _ in range(count):
+            while True:
+                raw = [rng.gauss(0.0, 1.0) for _ in range(self._ann_policy.dimensions)]
+                norm = math.sqrt(sum(value * value for value in raw))
+                if norm > 1e-6:
+                    queries.append(tuple(value / norm for value in raw))
+                    break
+        return tuple(queries)
+
+    def _publication_validation(
         self,
         repository: ChunkRepository,
         dense_chunks: Sequence[DenseChunk],
-        stats: IndexStats,
         *,
+        vector_stats: IndexStats,
+        actual_dense_rows: int,
+        unindexed_dense_rows: int,
         build_time_ms: float,
         disk_bytes: int,
-        wiki_dir: Path,
-        row_batch_size: int = 8192,
-        query_batch_size: int = 32,
-    ) -> tuple[BenchmarkObservation, dict]:
-        """Measure the candidate against exact bypass with the same query contract.
+    ) -> tuple[CandidatePublicationEvidence, BenchmarkObservation]:
+        """Phase 06 发布门禁：held-out 验证真实 staged candidate（fail-closed）。
 
-        Latency is evidence only.  The policy consumes only deterministic recall
-        and coverage observations, so runner variance cannot change publication.
-
-        #41：probe 数受 ``benchmark_max_probes`` 上限约束——total ≤ cap 走全量
-        （scope=full，顺序不变），超过则按 (sha256(key), key) 排序取 bottom-k
-        （scope=sampled，确定性、与输入顺序无关）。evidence 显式记录采样口径，
-        observer 分支输出 synthetic evidence 且不查询 repository。
+        - query 数 = ``min(benchmark_max_probes, actual_dense_rows)``，来自独立
+          确定性流且与 corpus 零重叠；
+        - exact truth 走 #41 streamed batch-exact；candidate 走普通端口（固定
+          批准 ef）；
+        - 聚合 recall@10/20 与 floors 比较——任何失败抛 PolicyError，构建标记
+          failed，旧 ACTIVE_INDEX 保持不变。
         """
+        policy = self._ann_policy
         benchmark_started = time.perf_counter()
-        if self._benchmark_observer is not None:
-            observation = self._benchmark_observer(stats)
-            return observation, {
-                "evidence_schema_version": 2,
-                "evidence_source": "observer",
-                "probe_scope": "synthetic",
-                "sampling_method": "synthetic",
-                "sampling_key_schema": "wiki_relative_path+chunk_suffix+kind+chunk_index:v1",
-                "probe_keys": [],
-                "probe_selection_sha256": hashlib.sha256(b"").hexdigest(),
-                "probe_count": 0,
-                "probe_total": len(dense_chunks),
-                "probe_coverage": 0.0,
-                "result_limit": 20,
-                "recall_aggregation": "minimum",
-                "benchmark_duration_ms": 0.0,
-                "probe_selection_ms": 0.0,
-                "exact_verification_ms": 0.0,
-                "ann_verification_ms": 0.0,
-                "recall_assembly_ms": 0.0,
-                "exact_method": "observer",
-                "exact_scan_rows": 0,
-                "exact_scan_batches": 0,
-                "ann_query_count": 0,
-                "exact_result_ids": [],
-                "candidate_result_ids": [],
-            }
+        count = min(self._benchmark_max_probes, actual_dense_rows)
+        queries = self._validation_queries(count)
+        corpus_vectors = {
+            tuple(float(value) for value in chunk.vector) for chunk in dense_chunks
+        }
+        corpus_query_overlap = sum(1 for query in queries if query in corpus_vectors)
+        if corpus_query_overlap:
+            raise PolicyError(
+                f"{corpus_query_overlap} validation queries overlap indexed corpus rows"
+            )
+        query_selection_sha256 = hashlib.sha256(
+            "\n".join(
+                ",".join(format(value, ".17g") for value in query) for query in queries
+            ).encode("utf-8")
+        ).hexdigest()
 
-        selection_started = time.perf_counter()
-        keys = self._benchmark_probe_keys(dense_chunks, wiki_dir)
-        total = len(dense_chunks)
-        if total <= self._benchmark_max_probes:
-            probe_indices = list(range(total))
-            probe_keys = list(keys)
-            scope = "full"
-            sampling_method = "full"
-        else:
-            ranked = sorted(
-                (hashlib.sha256(key.encode("utf-8")).hexdigest(), key, index)
-                for index, key in enumerate(keys)
-            )[: self._benchmark_max_probes]
-            probe_indices = [index for _digest, _key, index in ranked]
-            probe_keys = [key for _digest, key, _index in ranked]
-            scope = "sampled"
-            sampling_method = "bottom_k_sha256_v1"
-        probe_selection_ms = (time.perf_counter() - selection_started) * 1000
-
-        # #41: one streamed batch exact scan replaces the 256 independent scalar
-        # bypass_vector_index full scans that dominated build-time cost.
-        probe_vectors = [dense_chunks[index].vector for index in probe_indices]
         exact_batch = repository.search_dense_exact_batch(
-            probe_vectors,
-            metric="cosine",
-            limit=20,
-            row_batch_size=row_batch_size,
-            query_batch_size=query_batch_size,
+            list(queries), metric=policy.metric, limit=20
         )
-        exact_ids = [list(ids) for ids in exact_batch.result_ids]
-        if len(exact_ids) != len(probe_indices):
-            raise RuntimeError("Batch exact result count does not match probe count")
+        exact_ids = [list(row_ids) for row_ids in exact_batch.result_ids]
+        if len(exact_ids) != count:
+            raise RuntimeError("Batch exact result count does not match validation query count")
 
         ann_started = time.perf_counter()
         candidate_ids: list[list[str]] = []
         candidate_durations: list[float] = []
-        for index in probe_indices:
-            chunk = dense_chunks[index]
+        for query in queries:
             started = time.perf_counter()
-            candidate = repository.search_dense(
-                chunk.vector, metric="cosine", limit=20, where=None,
-                # Benchmark-only exhaustive breadth. Online calls retain the
-                # stable max(100, ceil(1.5*limit)) adapter policy.
-                ef=total if scope == "full" else None,
-            )
+            rows = repository.search_dense(list(query), metric=policy.metric, limit=20)
             candidate_durations.append((time.perf_counter() - started) * 1000)
-            candidate_ids.append([str(row["chunk_id"]) for row in candidate])
+            candidate_ids.append([str(row["chunk_id"]) for row in rows])
         ann_verification_ms = (time.perf_counter() - ann_started) * 1000
 
-        recall_started = time.perf_counter()
-        recalls: dict[int, list[float]] = {10: [], 20: []}
-        for exact_row_ids, candidate_row_ids in zip(exact_ids, candidate_ids, strict=True):
-            if not exact_row_ids:
-                raise RuntimeError("Batch exact benchmark returned no dense rows")
-            for recall_limit in recalls:
-                truth = set(exact_row_ids[:recall_limit])
-                observed = set(candidate_row_ids[:recall_limit])
-                recalls[recall_limit].append(len(truth & observed) / len(truth))
-        recall_assembly_ms = (time.perf_counter() - recall_started) * 1000
+        recalls: dict[int, float] = {}
+        for recall_limit in (10, 20):
+            hits = total = 0
+            for truth, observed in zip(exact_ids, candidate_ids, strict=True):
+                truth_prefix = set(truth[:recall_limit])
+                hits += len(truth_prefix & set(observed[:recall_limit]))
+                total += len(truth_prefix)
+            if total <= 0:
+                raise PolicyError("publication validation produced no truth IDs to score")
+            recalls[recall_limit] = hits / total
 
         def percentile_95(samples: Sequence[float]) -> float:
             ordered = sorted(samples)
             return ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
 
         observation = BenchmarkObservation(
-            recall_at_10=min(recalls[10]),
-            recall_at_20=min(recalls[20]),
+            recall_at_10=recalls[10],
+            recall_at_20=recalls[20],
             latency_p50_ms=statistics.median(candidate_durations),
             latency_p95_ms=percentile_95(candidate_durations),
             build_time_ms=build_time_ms,
             disk_bytes=disk_bytes,
         )
-        probe_count = len(probe_indices)
-        evidence = {
-            "evidence_schema_version": 2,
-            "evidence_source": "measured",
-            "probe_scope": scope,
-            "sampling_method": sampling_method,
-            "sampling_key_schema": "wiki_relative_path+chunk_suffix+kind+chunk_index:v1",
-            "probe_keys": probe_keys,
-            "probe_selection_sha256": hashlib.sha256(
-                "\n".join(probe_keys).encode("utf-8")
-            ).hexdigest(),
-            "probe_count": probe_count,
-            "probe_total": total,
-            "probe_coverage": probe_count / total,
-            "result_limit": 20,
-            "recall_aggregation": "minimum",
-            "benchmark_duration_ms": (time.perf_counter() - benchmark_started) * 1000,
-            "probe_selection_ms": probe_selection_ms,
-            "exact_verification_ms": exact_batch.elapsed_ms,
-            "ann_verification_ms": ann_verification_ms,
-            "recall_assembly_ms": recall_assembly_ms,
-            "exact_method": exact_batch.method,
-            "exact_scan_rows": exact_batch.scan_rows,
-            "exact_scan_batches": exact_batch.scan_batches,
-            "ann_query_count": len(probe_indices),
-            "exact_result_ids": exact_ids,
-            "candidate_result_ids": candidate_ids,
-        }
-        return observation, evidence
+        evidence = CandidatePublicationEvidence(
+            evidence_schema_version=CANDIDATE_PUBLICATION_EVIDENCE_SCHEMA_VERSION,
+            actual_dense_rows=actual_dense_rows,
+            dimensions=policy.dimensions,
+            metric=policy.metric,
+            index_type=policy.selected_index_type,
+            query_ef=policy.query_ef,
+            policy_sha256=production_policy_sha256(policy),
+            decision_evidence_sha256=policy.comparator_sha256,
+            benchmark_max_probes=self._benchmark_max_probes,
+            validation_query_count=count,
+            query_source=_VALIDATION_QUERY_SOURCE,
+            query_selection_sha256=query_selection_sha256,
+            corpus_query_overlap=corpus_query_overlap,
+            exact_result_ids=tuple(tuple(row_ids) for row_ids in exact_ids),
+            candidate_result_ids=tuple(tuple(row_ids) for row_ids in candidate_ids),
+            recall_at_10=recalls[10],
+            recall_at_20=recalls[20],
+            unindexed_dense_rows=unindexed_dense_rows,
+            exact_verification_ms=exact_batch.elapsed_ms,
+            ann_verification_ms=ann_verification_ms,
+            benchmark_duration_ms=(time.perf_counter() - benchmark_started) * 1000,
+        )
+        validate_candidate_publication_evidence(evidence, policy)
+        return evidence, observation
+
 
     @staticmethod
     def _sha256_file(path: Path) -> str:

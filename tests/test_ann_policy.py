@@ -127,13 +127,25 @@ def test_vector_config_rejects_non_dense_population_inputs() -> None:
         )
 
 
-def test_service_records_exact_and_candidate_id_sets_before_ann_promotion(tmp_path: Path) -> None:
-    """D-02: promotion evidence is persisted, not inferred from timing."""
+def test_service_records_publication_evidence_and_fixed_ann_policy(tmp_path: Path) -> None:
+    """Phase 06：真实构建发布固定 SQ 策略 + held-out 发布证据。"""
+    import math
+    import random as _random
+
     wiki = tmp_path / "Wiki"
     for index in range(20):
         page = wiki / "concepts" / f"page-{index:02d}.md"
         page.parent.mkdir(parents=True, exist_ok=True)
         page.write_text(f"# Page {index}\n\nUNIQUE{index:02d}\n", encoding="utf-8")
+
+    def embed(texts):
+        out = []
+        for row, _text in enumerate(texts):
+            rng = _random.Random(4242 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = math.sqrt(sum(value * value for value in raw))
+            out.append([value / norm for value in raw])
+        return out
 
     index_dir = tmp_path / ".index"
     artifact = IndexBuildService(
@@ -141,29 +153,64 @@ def test_service_records_exact_and_candidate_id_sets_before_ann_promotion(tmp_pa
         reopen_storage=LanceDbIndexRepository,
         manifest_store=FilesystemIndexManifest(),
         post_commit_journal=FilesystemPostCommitJournal(index_dir),
-    ).build(
-        wiki,
-        index_dir,
-        # Tie-free by construction: a shared strictly-decreasing tail makes every
-        # non-self cosine distinct, so exact top-k has ONE valid ordering. Plain
-        # one-hot vectors leave a 19-way tie at score 0.0, and the two engines
-        # (numpy batch exact vs lancedb HNSW) break that tie differently, which
-        # made recall@10 platform-dependent noise rather than a real signal.
-        embed=lambda texts: [
-            [1.0 if column == row else 1.0 / (2 ** (column + 2)) for column in range(20)]
-            for row, _text in enumerate(texts)
-        ],
-    )
+    ).build(wiki, index_dir, embed=embed)
 
     manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
     benchmark = manifest["benchmark"]
-    assert benchmark["recall_at_10"] == 1.0
-    assert benchmark["recall_at_20"] == 1.0
-    assert benchmark["exact_result_ids"]
-    assert benchmark["candidate_result_ids"]
-    assert manifest["vector_config"]["index_type"] == "ivf_flat"
+    assert benchmark["recall_at_10"] >= 0.19
+    assert benchmark["recall_at_20"] >= 0.17
+    evidence = manifest["candidate_publication_evidence"]
+    assert evidence["actual_dense_rows"] == 20
+    assert evidence["validation_query_count"] == min(256, 20)
+    assert len(evidence["exact_result_ids"]) == 20
+    assert evidence["query_source"] == "deterministic_disjoint_unit_v1"
+    assert evidence["corpus_query_overlap"] == 0
+    assert manifest["vector_config"]["index_type"] == "hnsw_sq"
     assert manifest["vector_config"]["num_partitions"] == 1
+    assert manifest["ann_policy"]["query_ef"] == 100
     assert manifest["policy"]["selected_mode"] == "ann"
+
+
+def test_service_probe_cap_changes_only_validation_query_count(tmp_path: Path) -> None:
+    """BENCHMARK_MAX_PROBES 只改验证 query 数，不改类型/ef/成功路径。"""
+    import math
+    import random as _random
+
+    def embed(texts):
+        out = []
+        for row, _text in enumerate(texts):
+            rng = _random.Random(9100 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = math.sqrt(sum(value * value for value in raw))
+            out.append([value / norm for value in raw])
+        return out
+
+    results = {}
+    for probes in (256, 37):
+        wiki = tmp_path / f"Wiki{probes}"
+        for index in range(8):
+            page = wiki / "concepts" / f"page-{index:02d}.md"
+            page.parent.mkdir(parents=True, exist_ok=True)
+            page.write_text(f"# Page {index}\n\nCAP{probes}UNIQUE{index:02d}\n", encoding="utf-8")
+        index_dir = tmp_path / f".index{probes}"
+        IndexBuildService(
+            LanceDbIndexRepository(index_dir),
+            reopen_storage=LanceDbIndexRepository,
+            manifest_store=FilesystemIndexManifest(),
+            post_commit_journal=FilesystemPostCommitJournal(index_dir),
+            benchmark_max_probes=probes,
+        ).build(wiki, index_dir, embed=embed)
+        manifest = json.loads(
+            next((index_dir / "builds").glob("build_*/manifest.json")).read_text(encoding="utf-8")
+        )
+        results[probes] = manifest
+
+    for probes, manifest in results.items():
+        evidence = manifest["candidate_publication_evidence"]
+        assert evidence["benchmark_max_probes"] == probes
+        assert evidence["validation_query_count"] == min(probes, 8)
+    assert results[256]["vector_config"]["index_type"] == results[37]["vector_config"]["index_type"] == "hnsw_sq"
+    assert results[256]["ann_policy"]["query_ef"] == results[37]["ann_policy"]["query_ef"] == 100
 
 
 # ---- Phase 06（issue #49）：固定生产 ANN 契约 ---------------------------------

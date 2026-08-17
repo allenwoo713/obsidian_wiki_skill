@@ -458,7 +458,13 @@ def _candidate_worker(
     db.create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
     table_create_end = time.perf_counter()
     pre_index_bytes = _directory_bytes(lance_dir)
-    repository = LanceDbIndexRepository(lance_dir)
+    from obsidian_wiki.domain.index_models import CandidateQueryPolicy
+    repository = LanceDbIndexRepository(
+        lance_dir,
+        eval_candidate_policy=CandidateQueryPolicy(
+            candidate=candidate, query_ef=ef_grid[0] if ef_grid else 100
+        ),
+    )
     index_build_start = time.perf_counter()
     stats = repository.create_vector_index(VectorIndexConfig(
         index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
@@ -474,7 +480,7 @@ def _candidate_worker(
         samples, latencies = [], []
         for index, vector in enumerate(queries):
             request_started = time.perf_counter()
-            result = repository.search_dense(vector.tolist(), metric="cosine", limit=20, ef=ef)
+            result = repository.search_dense_eval(vector.tolist(), metric="cosine", limit=20, ef=ef)
             latencies.append((time.perf_counter() - request_started) * 1000)
             assembly_start = time.perf_counter()
             candidate_20 = [str(row.get("chunk_id", "")) for row in result]
@@ -679,13 +685,13 @@ def _run_actual_batch_spike(args: argparse.Namespace, omp_threads: int) -> dict[
         lancedb.connect(str(lance_dir)).create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
         repository = LanceDbIndexRepository(lance_dir)
         candidate = CANDIDATES[0]
-        repository.create_vector_index(VectorIndexConfig(
+        repository.create_eval_candidate_index(VectorIndexConfig(
             index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
             m=16, ef_construction=300, dense_chunks_count=args.rows,
         ))
         ef, limit = DECISION_EF_GRID[0], 20
         individual_result_ids = [
-            [str(row.get("chunk_id", "")) for row in repository.search_dense(vector.tolist(), metric="cosine", limit=limit, ef=ef)]
+            [str(row.get("chunk_id", "")) for row in repository.search_dense_eval(vector.tolist(), metric="cosine", limit=limit, ef=ef)]
             for vector in queries
         ]
         spike = run_multivector_batch_spike(

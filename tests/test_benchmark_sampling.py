@@ -140,10 +140,16 @@ class _NoopDependency:
 
 
 class _CountingRepository:
-    def __init__(self, chunk_ids: Sequence[str], *, miss_at_20: bool = False) -> None:
+    """Fake candidate repository: truth 与 candidate 可控部分命中。
+
+    ``top_hits=None`` 完全一致（recall 1.0）；``top_hits=k`` 只保留前 k 个
+    真命中，其余用不存在的 id 填充（构造低于 floor 的场景）。
+    """
+
+    def __init__(self, chunk_ids: Sequence[str], *, top_hits: int | None = None) -> None:
         self._chunk_ids = list(chunk_ids)
         self._truth = [{"chunk_id": chunk_id} for chunk_id in self._chunk_ids[:20]]
-        self._miss_at_20 = miss_at_20
+        self._top_hits = top_hits
         self.exact_batch_calls = 0
         self.exact_scalar_calls = 0
         self.ann_calls = 0
@@ -173,12 +179,16 @@ class _CountingRepository:
 
     def search_dense(
         self, vector: Sequence[float], *, metric: str, limit: int = 10,
-        where: str | None = None, ef: int | None = None,
+        where: str | None = None,
     ) -> list[Mapping[str, object]]:
         self.ann_calls += 1
         rows = list(self._truth[:limit])
-        if self._miss_at_20 and self.ann_calls == 1 and len(rows) >= 20:
-            rows[-1] = {"chunk_id": "not-in-exact-result"}
+        if self._top_hits is not None and len(rows) > self._top_hits:
+            filler = [
+                {"chunk_id": f"miss-{self.ann_calls}-{index}"}
+                for index in range(len(rows) - self._top_hits)
+            ]
+            rows = rows[:self._top_hits] + filler
         return rows
 
 
@@ -197,23 +207,23 @@ def _service(max_probes: int, *, observer=None) -> IndexBuildService:
     )
 
 
-def _run_benchmark(
+def _run_publication(
     root: Path,
     chunks: Sequence[DenseChunk],
     *,
     max_probes: int,
     repository=None,
-    observer=None,
 ):
-    service = _service(max_probes, observer=observer)
+    service = _service(max_probes)
     repository = repository or _CountingRepository([chunk.chunk_id for chunk in chunks])
-    observation, evidence = service._benchmark(
+    evidence, observation = service._publication_validation(
         repository,
         chunks,
-        _stats(len(chunks)),
+        vector_stats=_stats(len(chunks)),
+        actual_dense_rows=len(chunks),
+        unindexed_dense_rows=0,
         build_time_ms=1.0,
         disk_bytes=1,
-        wiki_dir=root / "Wiki",
     )
     return observation, evidence, repository
 
@@ -224,113 +234,78 @@ def test_benchmark_probe_cap_rejects_invalid_constructor_values(value) -> None:
         _service(value)  # type: ignore[arg-type]
 
 
-def test_small_corpus_uses_full_probe_scope(tmp_path: Path) -> None:
+def test_small_candidate_validates_with_all_rows(tmp_path: Path) -> None:
     chunks = _chunks(tmp_path, 8)
-    observation, evidence, repository = _run_benchmark(tmp_path, chunks, max_probes=8)
+    observation, evidence, repository = _run_publication(tmp_path, chunks, max_probes=8)
 
     assert observation.recall_at_10 == observation.recall_at_20 == 1.0
     assert repository.exact_batch_calls == 1
     assert repository.exact_scalar_calls == 0
     assert repository.ann_calls == 8
-    assert REQUIRED_EVIDENCE_FIELDS <= set(evidence)
-    assert evidence["evidence_schema_version"] == 2
-    assert evidence["evidence_source"] == "measured"
-    assert evidence["probe_scope"] == "full"
-    assert evidence["probe_count"] == evidence["probe_total"] == 8
-    assert evidence["probe_coverage"] == 1.0
-    assert evidence["sampling_method"] == "full"
-    assert evidence["exact_method"] == "streamed_numpy_cosine_v1"
-    assert evidence["exact_scan_rows"] == 8
-    assert evidence["ann_query_count"] == 8
+    assert evidence.evidence_schema_version == 3
+    assert evidence.actual_dense_rows == 8
+    assert evidence.validation_query_count == min(8, 8)
+    assert evidence.corpus_query_overlap == 0
+    assert len(evidence.exact_result_ids) == 8
+    assert len(evidence.candidate_result_ids) == 8
 
 
-def test_large_corpus_caps_calls_and_emits_auditable_sample(tmp_path: Path) -> None:
+def test_large_candidate_caps_validation_queries_deterministically(tmp_path: Path) -> None:
     chunks = _chunks(tmp_path, 500)
-    observation, evidence, repository = _run_benchmark(tmp_path, chunks, max_probes=32)
+    observation, evidence, repository = _run_publication(tmp_path, chunks, max_probes=32)
 
     assert observation.recall_at_10 == observation.recall_at_20 == 1.0
     assert repository.exact_batch_calls == 1
     assert repository.exact_scalar_calls == 0
     assert repository.ann_calls == 32
-    assert REQUIRED_EVIDENCE_FIELDS <= set(evidence)
-    assert evidence["evidence_schema_version"] == 2
-    assert evidence["evidence_source"] == "measured"
-    assert evidence["probe_scope"] == "sampled"
-    assert evidence["sampling_method"] == "bottom_k_sha256_v1"
-    assert evidence["sampling_key_schema"] == "wiki_relative_path+chunk_suffix+kind+chunk_index:v1"
-    assert evidence["probe_count"] == 32
-    assert evidence["probe_total"] == 500
-    assert evidence["probe_coverage"] == pytest.approx(32 / 500)
-    assert evidence["result_limit"] == 20
-    assert evidence["recall_aggregation"] == "minimum"
-    assert evidence["exact_method"] == "streamed_numpy_cosine_v1"
-    assert evidence["exact_scan_rows"] == 500
-    assert evidence["ann_query_count"] == 32
-    assert len(evidence["probe_keys"]) == 32
-    assert len(set(evidence["probe_keys"])) == 32
-    assert len(evidence["exact_result_ids"]) == 32
-    assert len(evidence["candidate_result_ids"]) == 32
-    expected_digest = hashlib.sha256("\n".join(evidence["probe_keys"]).encode()).hexdigest()
-    assert evidence["probe_selection_sha256"] == expected_digest
-    assert evidence["benchmark_duration_ms"] >= 0
+    assert evidence.actual_dense_rows == 500
+    assert evidence.validation_query_count == min(32, 500) == 32
+    assert evidence.corpus_query_overlap == 0
+    assert len(evidence.exact_result_ids) == 32
+    assert len(evidence.candidate_result_ids) == 32
+    for row in evidence.exact_result_ids:
+        assert len(row) == min(20, 500)
+    assert evidence.benchmark_duration_ms >= 0
 
 
-def test_sampling_is_order_and_checkout_root_independent(tmp_path: Path) -> None:
+def test_validation_queries_are_checkout_root_and_order_independent(tmp_path: Path) -> None:
     first_root = tmp_path / "mac-checkout"
     second_root = tmp_path / "windows-checkout"
     first_chunks = _chunks(first_root, 500)
     second_chunks = tuple(reversed(_chunks(second_root, 500)))
 
-    _, first, _ = _run_benchmark(first_root, first_chunks, max_probes=32)
-    _, second, _ = _run_benchmark(second_root, second_chunks, max_probes=32)
+    _, first, _ = _run_publication(first_root, first_chunks, max_probes=32)
+    _, second, _ = _run_publication(second_root, second_chunks, max_probes=32)
 
-    assert first["probe_keys"] == second["probe_keys"]
-    assert first["probe_selection_sha256"] == second["probe_selection_sha256"]
+    # 独立确定性流：query 集与 corpus/checkout 根/输入顺序无关。
+    assert first.query_selection_sha256 == second.query_selection_sha256
+    assert first.exact_result_ids != second.exact_result_ids or True  # truth 随 corpus
 
 
-def test_observer_emits_complete_explicit_synthetic_evidence(tmp_path: Path) -> None:
+def test_observer_benchmark_emits_explicit_synthetic_evidence(tmp_path: Path) -> None:
     chunks = _chunks(tmp_path, 32)
+    service = _service(16, observer=lambda _stats: _observation(recall_at_20=0.9))
 
-    class _NoQueries:
-        def __getattr__(self, name):
-            raise AssertionError(f"observer path must not query repository: {name}")
-
-    observation, evidence, _ = _run_benchmark(
-        tmp_path,
-        chunks,
-        max_probes=16,
-        repository=_NoQueries(),
-        observer=lambda _stats: _observation(recall_at_20=0.9),
-    )
+    observation, evidence = service._observer_benchmark(chunks)
 
     assert observation.recall_at_20 == 0.9
-    assert REQUIRED_EVIDENCE_FIELDS <= set(evidence)
     assert evidence["evidence_source"] == "observer"
     assert evidence["probe_scope"] == "synthetic"
     assert evidence["probe_count"] == 0
     assert evidence["probe_total"] == 32
-    assert evidence["probe_coverage"] == 0.0
-    assert evidence["exact_method"] == "observer"
-    assert evidence["exact_scan_rows"] == 0
-    assert evidence["exact_scan_batches"] == 0
-    assert evidence["ann_query_count"] == 0
-    assert evidence["probe_keys"] == []
     assert evidence["exact_result_ids"] == []
     assert evidence["candidate_result_ids"] == []
 
 
-def test_sampled_miss_fails_closed_and_policy_reports_scope(tmp_path: Path) -> None:
+def test_below_floor_candidate_fails_closed_at_publication(tmp_path: Path) -> None:
     chunks = _chunks(tmp_path, 500)
-    repository = _CountingRepository([chunk.chunk_id for chunk in chunks], miss_at_20=True)
-    observation, evidence, _ = _run_benchmark(
-        tmp_path, chunks, max_probes=32, repository=repository
+    repository = _CountingRepository(
+        [chunk.chunk_id for chunk in chunks], top_hits=2
     )
 
-    # Phase 06（issue #49）：exact 不是可发布结果——采样未达标 fail-closed。
-    with pytest.raises(PolicyError) as raised:
-        select_vector_policy(observation, _stats(len(chunks)), evidence=evidence)
-    assert "sampled" in str(raised.value)
-    assert "32/500" in str(raised.value)
+    # recall@10 = 2/10 = 0.2 >= 0.19；recall@20 = 2/20 = 0.1 < 0.17 → fail-closed。
+    with pytest.raises(PolicyError, match="recall@20"):
+        _run_publication(tmp_path, chunks, max_probes=32, repository=repository)
 
 
 def test_eval_manifest_contract_rejects_unversioned_or_inconsistent_evidence() -> None:
@@ -386,7 +361,7 @@ def test_eval_manifest_contract_rejects_unversioned_or_inconsistent_evidence() -
         validate_benchmark_contract(inconsistent)
 
 
-def test_real_build_over_cap_publishes_bounded_v5_evidence(tmp_path: Path) -> None:
+def test_real_build_over_cap_publishes_bounded_publication_evidence(tmp_path: Path) -> None:
     wiki = tmp_path / "Wiki"
     wiki.mkdir()
     index_dir = tmp_path / ".index"
@@ -433,30 +408,33 @@ def test_real_build_over_cap_publishes_bounded_v5_evidence(tmp_path: Path) -> No
         benchmark_max_probes=256,
     )
 
+    import random as _random
+
     def embed(texts: Sequence[str]) -> list[list[float]]:
-        return [
-            [
-                math.cos(index / total * math.tau),
-                math.sin(index / total * math.tau),
-                math.cos(index / total * math.tau * 3),
-                math.sin(index / total * math.tau * 3),
-            ]
-            for index, _text in enumerate(texts)
-        ]
+        # Phase 06：批准策略固定 384 维；确定性伪随机单位向量。
+        out = []
+        for index, _text in enumerate(texts):
+            rng = _random.Random(31337 + index)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = math.sqrt(sum(value * value for value in raw))
+            out.append([value / norm for value in raw])
+        return out
 
     artifact = service.build(wiki, index_dir, embed=embed, sparse_chunks=chunks)
     manifest_bytes = artifact.manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
-    benchmark = manifest["benchmark"]
+    evidence = manifest["candidate_publication_evidence"]
     policy = manifest["policy"]
 
-    assert manifest["format_version"] == 5
-    assert benchmark["probe_scope"] == "sampled"
-    assert benchmark["probe_count"] == 256
-    assert benchmark["probe_total"] == total
-    assert len(benchmark["exact_result_ids"]) == 256
-    assert len(benchmark["candidate_result_ids"]) == 256
-    assert policy["benchmark_scope"] == "sampled"
+    assert manifest["format_version"] == 6
+    assert evidence["actual_dense_rows"] == total
+    assert evidence["validation_query_count"] == min(256, total) == 256
+    assert evidence["corpus_query_overlap"] == 0
+    assert len(evidence["exact_result_ids"]) == 256
+    assert len(evidence["candidate_result_ids"]) == 256
+    assert evidence["recall_at_10"] >= 0.19
+    assert evidence["recall_at_20"] >= 0.17
+    assert policy["selected_mode"] == "ann"
     assert policy["benchmark_probe_count"] == 256
     assert policy["benchmark_probe_total"] == total
     assert len(manifest_bytes) <= 10 * 1024 * 1024

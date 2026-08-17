@@ -181,7 +181,7 @@ def test_eval_exempts_community_report_rows():
     assert _citation_violations(bundle) == []
 
 
-def test_eval_builds_ann_candidate_through_auto_policy(monkeypatch, tmp_path):
+def test_eval_builds_fixed_production_path_without_mode_selection(monkeypatch, tmp_path):
     """Dedicated Eval must opt into internal policy, not misuse a public force flag."""
     requested_modes = []
 
@@ -193,8 +193,9 @@ def test_eval_builds_ann_candidate_through_auto_policy(monkeypatch, tmp_path):
         def build(self, *_args, **_kwargs):
             return None
 
-    def fake_build(root, _wiki, mode, full_rebuild):
-        requested_modes.append((root.name, mode, full_rebuild))
+    def fake_build(root, _wiki, full_rebuild):
+        # Phase 06：_build 无 mode 参数——固定生产路径。
+        requested_modes.append((root.name, full_rebuild))
         staged_wiki = root / "Wiki"
         staged_wiki.mkdir(parents=True, exist_ok=True)
         (staged_wiki / "page.md").write_text("fixture", encoding="utf-8")
@@ -214,8 +215,8 @@ def test_eval_builds_ann_candidate_through_auto_policy(monkeypatch, tmp_path):
     )
 
     assert requested_modes[:2] == [
-        ("main", "exact", True),
-        ("ann", "auto", True),
+        ("main", True),
+        ("ann", True),
     ]
     assert metrics["index_benchmark"] == {"main": {}, "ann": {}}
     assert detail == []
@@ -331,8 +332,8 @@ def test_candidate_hybrid_driver_builds_every_binding_and_calls_production_entry
         def count_tokens(text):
             return max(1, len(text) // 4)
 
-    def fake_build(root, _wiki, mode, full_rebuild, *, candidate_query_policy=None):
-        builds.append((root.name, mode, full_rebuild, candidate_query_policy))
+    def fake_build(root, _wiki, full_rebuild, *, candidate_query_policy=None):
+        builds.append((root.name, full_rebuild, candidate_query_policy))
         staged_wiki = root / "Wiki"
         staged_wiki.mkdir(parents=True)
         (staged_wiki / "page-a.md").write_text("needle fact", encoding="utf-8")
