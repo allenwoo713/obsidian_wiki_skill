@@ -8,6 +8,7 @@ import os
 import statistics
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Sequence
@@ -52,6 +53,32 @@ PlanProvider = Callable[
 BENCHMARK_MAX_PROBES = 256
 
 
+@dataclass(frozen=True)
+class CandidateQueryPolicy:
+    """Evaluation-only ANN binding applied below hybrid orchestration.
+
+    The policy intentionally carries only the candidate index construction type
+    and the ordinary dense-query ``ef``.  It is never exposed to query planning,
+    hybrid orchestration, or fusion.
+    """
+
+    candidate: str
+    query_ef: int
+
+    def __post_init__(self) -> None:
+        if self.candidate not in {"ivf-hnsw-flat", "ivf-hnsw-sq"}:
+            raise ValueError("candidate must be ivf-hnsw-flat or ivf-hnsw-sq")
+        if (
+            isinstance(self.query_ef, bool)
+            or not isinstance(self.query_ef, int)
+            or self.query_ef <= 0
+        ):
+            raise ValueError("query_ef must be a positive integer")
+
+    def to_json(self) -> dict[str, object]:
+        return {"candidate": self.candidate, "query_ef": self.query_ef}
+
+
 class IndexBuildService:
     """Partition canonical Markdown into physically separate sparse/dense rows."""
 
@@ -66,6 +93,7 @@ class IndexBuildService:
         benchmark_observer: BenchmarkObserver | None = None,
         benchmark_max_probes: int = BENCHMARK_MAX_PROBES,
         vector_index_mode: str = "auto",
+        candidate_query_policy: CandidateQueryPolicy | None = None,
     ):
         """#37：``post_commit_journal`` 为必填依赖——每个发布路径都必须在 pointer
         commit 前 durable prepare 失效 intent；不需要 invalidation 的调用方必须显式
@@ -96,7 +124,12 @@ class IndexBuildService:
         self._benchmark_observer = benchmark_observer
         self._post_commit_journal = post_commit_journal
         self._benchmark_max_probes = benchmark_max_probes
+        if candidate_query_policy is not None:
+            if vector_index_mode not in {"auto", candidate_query_policy.candidate}:
+                raise ValueError("candidate policy conflicts with vector_index_mode")
+            vector_index_mode = candidate_query_policy.candidate
         self._vector_index_mode = vector_index_mode
+        self._candidate_query_policy = candidate_query_policy
 
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -267,6 +300,7 @@ class IndexBuildService:
                 sparse_chunks=sparse_chunks, generation=generation, build_id=ctx.build_id,
                 page_metadata=page_metadata, image_metadata=image_metadata,
                 requested_vector_index_mode=self._vector_index_mode,
+                candidate_query_policy=self._candidate_query_policy,
             )
             # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
             if build_dir.name != ctx.build_id or manifest.get("build_id") != ctx.build_id:
@@ -316,7 +350,8 @@ class IndexBuildService:
                   build_id: str = "",
                   page_metadata: list[dict] | None = None,
                   image_metadata: list[dict] | None = None,
-                  requested_vector_index_mode: str = "auto") -> dict:
+                  requested_vector_index_mode: str = "auto",
+                  candidate_query_policy: CandidateQueryPolicy | None = None) -> dict:
         fts_config = self._fts_config.to_json()
         vector_config_json = vector_config.to_json()
         # facade 提供的 page_metadata 含完整 page_type/sources/links/aliases/sha256；
@@ -371,6 +406,8 @@ class IndexBuildService:
         }
         if image_metadata is not None:
             manifest["images"] = image_metadata
+        if candidate_query_policy is not None:
+            manifest["candidate_query_policy"] = candidate_query_policy.to_json()
         return manifest
 
     @staticmethod

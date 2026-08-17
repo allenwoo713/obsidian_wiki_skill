@@ -11,7 +11,7 @@ SKILL_ROOT = Path(__file__).resolve().parent.parent
 APPROVED_CALIBRATION = SKILL_ROOT / "eval" / "approved_ann_calibration.json"
 sys.path.insert(0, str(SKILL_ROOT / "eval"))
 
-from models import ContextBundle, ContextItem  # noqa: E402
+from models import ChunkHit, ContextBundle, ContextItem  # noqa: E402
 import run_eval  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
 
@@ -25,14 +25,19 @@ def _candidate_comparator() -> dict:
 
 
 def _candidate_record(candidate: str, query_ef: int, ordinal: int) -> dict:
-    return {
+    record = {
         "candidate": candidate,
         "query_ef": query_ef,
         "head_sha": "head",
-        "environment": {"python": "3.13", "platform": "test"},
+        "pr_head_sha": "pr-head",
+        "actions_merge_checkout_sha": "merge-head",
+        "environment": {
+            "python": "3.13", "platform": "test", "lancedb": "0.34.0",
+            "numpy": "2.2.6", "pyarrow": "25.0.0",
+        },
         "corpus_sha256": "c" * 64,
         "queries_sha256": "q" * 64,
-        "candidate_run_id": f"run-{ordinal}",
+        "candidate_run_id": "pending",
         "candidate_index": {
             "build_id": f"build-{ordinal}",
             "manifest_sha256": f"{ordinal:064x}",
@@ -41,11 +46,23 @@ def _candidate_record(candidate: str, query_ef: int, ordinal: int) -> dict:
         "applied_policy": {"candidate": candidate, "query_ef": query_ef},
         "hybrid_invocation": {
             "entrypoint": "query.hybrid_search",
-            "trace_id": f"trace-{ordinal}",
-            "digest": f"{ordinal + 20:064x}",
+            "trace_id": "pending",
+            "digest": "pending",
             "query_count": 1,
+            "traces": [{
+                "ordinal": 0,
+                "query_sha256": f"{ordinal + 10:064x}",
+                "result_sha256": f"{ordinal + 20:064x}",
+                "latency_s": 0.01,
+            }],
         },
-        "result_sha256": f"{ordinal + 40:064x}",
+        "result_sha256": "pending",
+        "input_binding": {
+            "fixture_sha256": "f" * 64,
+            "evaluation_queries_sha256": "e" * 64,
+            "comparator_corpus_sha256": "c" * 64,
+            "comparator_queries_sha256": "q" * 64,
+        },
         "final_retrieval": {
             "retrieval": {
                 run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC: 1.0,
@@ -61,6 +78,24 @@ def _candidate_record(candidate: str, query_ef: int, ordinal: int) -> dict:
             "non_regression": {"baseline_refresh": False, "failures": []},
         },
     }
+    traces = record["hybrid_invocation"]["traces"]
+    run_id = run_eval._stable_json_digest({
+        "candidate": candidate,
+        "query_ef": query_ef,
+        "build_id": record["candidate_index"]["build_id"],
+        "traces": traces,
+    })
+    record["candidate_run_id"] = run_id
+    record["hybrid_invocation"]["trace_id"] = run_eval._stable_json_digest({
+        "run_id": run_id, "entrypoint": "query.hybrid_search",
+    })
+    record["hybrid_invocation"]["digest"] = run_eval._stable_json_digest({
+        "run_id": run_id, "traces": traces,
+    })
+    record["result_sha256"] = run_eval._stable_json_digest({
+        "run_id": run_id, "final_retrieval": record["final_retrieval"],
+    })
+    return record
 
 
 def _candidate_packet() -> dict:
@@ -75,7 +110,13 @@ def _candidate_packet() -> dict:
     return {
         "schema_version": run_eval.FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION,
         "head_sha": "head",
-        "environment": {"python": "3.13", "platform": "test"},
+        "pr_head_sha": "pr-head",
+        "actions_merge_checkout_sha": "merge-head",
+        "environment": {
+            "python": "3.13", "platform": "test", "lancedb": "0.34.0",
+            "numpy": "2.2.6", "pyarrow": "25.0.0",
+        },
+        "comparator_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION,
         "records": records,
     }
 
@@ -185,7 +226,11 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
     assert run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC == "functional_final_retrieval_ann_overlap_at_10"
     with pytest.raises(ValueError, match="candidate records"):
         run_eval.validate_candidate_decision_records(
-            {"schema_version": 1, "records": []},
+            {
+                "schema_version": run_eval.FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION,
+                "comparator_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION,
+                "records": [],
+            },
             {"evidence_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION},
         )
 
@@ -193,6 +238,12 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
     assert "model-backed-ann-decision" in workflow
     assert "--decision-evidence" in workflow
     assert "--init-baseline" not in workflow.split("model-backed-ann-decision:", 1)[1]
+    model_job = workflow.split("model-backed-ann-decision:", 1)[1].split("reconcile-ann-decision:", 1)[0]
+    assert "candidate-hybrid-ann-decision.json" in model_job
+    assert "--validate-candidate-hybrid-evidence" in model_job
+    assert "GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in model_job
+    assert "if: success()" in model_job
+    assert "candidate-hybrid-ann-decision-error" in model_job
 
 
 @pytest.mark.parametrize(
@@ -230,6 +281,16 @@ def test_candidate_hybrid_packet_requires_complete_candidate_observations(
         run_eval.validate_candidate_decision_records(packet, _candidate_comparator())
 
 
+def test_candidate_hybrid_packet_rejects_nonlocked_numpy_identity() -> None:
+    packet = _candidate_packet()
+    packet["environment"] = {**packet["environment"], "numpy": "2.5.1"}
+    for record in packet["records"]:
+        record["environment"] = packet["environment"]
+
+    with pytest.raises(ValueError, match="locked candidate environment"):
+        run_eval.validate_candidate_decision_records(packet, _candidate_comparator())
+
+
 def test_candidate_hybrid_driver_builds_every_binding_and_calls_production_entrypoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -237,47 +298,66 @@ def test_candidate_hybrid_driver_builds_every_binding_and_calls_production_entry
     invocations = []
 
     class FakeIndex:
-        index_dir = tmp_path / ".index"
+        def __init__(self, index_dir):
+            self.index_dir = index_dir
+            self.pages = []
+            self._lexicon = set()
 
-    class FakePlanner:
-        pass
+        @staticmethod
+        def _hit(channel):
+            return ChunkHit(
+                chunk_id=f"page-a:{channel}", page_id="page-a",
+                path="Wiki/page-a.md", title="Page A", page_type="concept",
+                section_path=[], heading="", chunk_kind="dense",
+                text="needle fact", channel=channel, score=1.0,
+            )
 
-    class FakeResult:
-        pass
+        def search_fts_terms(self, *_args, **_kwargs):
+            return [self._hit("fts")]
+
+        def search_vector(self, *_args, **_kwargs):
+            return [self._hit("vector")]
+
+        def search_page(self, *_args, **_kwargs):
+            return []
+
+        def get_chunk(self, chunk_id):
+            return self._hit("vector" if chunk_id.endswith("vector") else "fts")
+
+        def get_page_sources(self, _page_id):
+            return []
+
+        @staticmethod
+        def count_tokens(text):
+            return max(1, len(text) // 4)
 
     def fake_build(root, _wiki, mode, full_rebuild, *, candidate_query_policy=None):
         builds.append((root.name, mode, full_rebuild, candidate_query_policy))
         staged_wiki = root / "Wiki"
         staged_wiki.mkdir(parents=True)
-        return FakeIndex(), staged_wiki, 0.01
+        (staged_wiki / "page-a.md").write_text("needle fact", encoding="utf-8")
+        return FakeIndex(root / ".index"), staged_wiki, 0.01
 
+    real_hybrid_search = run_eval.hybrid_search
     def fake_hybrid(index, query, planner, **kwargs):
         invocations.append((index, query, planner, kwargs))
-        return FakeResult()
+        return real_hybrid_search(index, query, planner, **kwargs)
 
     monkeypatch.setattr(run_eval, "_build", fake_build)
     monkeypatch.setattr(run_eval, "hybrid_search", fake_hybrid)
-    monkeypatch.setattr(run_eval, "DefaultQueryPlanner", lambda project_root: FakePlanner())
-    monkeypatch.setattr(run_eval, "_candidate_result_observation", lambda **kwargs: {
-        "retrieval": {run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC: 1.0, "result_payload": [kwargs["query"]]},
-        "page": {"page_recall_at_5": 1.0},
-        "evidence": {"evidence_recall_at_10": 1.0},
-        "mrr": {"mrr_at_10": 1.0},
-        "latency": {"samples_s": [0.01], "p50_s": 0.01, "p95_s": 0.01},
-        "context": {"overflow_count": 0, "budget_violation_count": 0},
-        "citation": {"violation_count": 0},
-        "graph": {"validated_count": 0, "unsupported_count": 0},
-        "non_regression": {"baseline_refresh": False, "failures": []},
-    })
     monkeypatch.setattr(run_eval, "_candidate_index_identity", lambda **kwargs: {
         "build_id": kwargs["policy"].candidate + str(kwargs["policy"].query_ef),
         "manifest_sha256": hashlib.sha256(str(kwargs["root"]).encode()).hexdigest(),
         "root_identity": kwargs["root"].name,
     })
     monkeypatch.setattr(run_eval, "validate_evidence", lambda _evidence: _evidence)
+    monkeypatch.setattr(run_eval, "_decision_environment", lambda: {
+        "python": "3.13", "platform": "test", "lancedb": "0.34.0",
+        "numpy": "2.2.6", "pyarrow": "25.0.0",
+    })
 
     packet = run_eval.run_candidate_hybrid_evaluation(
-        tmp_path / "wiki", [{"query": "needle", "relevant_pages": ["page-a"], "required_facts": []}],
+        tmp_path / "wiki", [{"query": "needle", "relevant_pages": ["page-a"], "required_facts": ["needle fact"]}],
         tmp_path / "candidates", 4096, _candidate_comparator(), baseline_quality={},
     )
 
@@ -333,6 +413,8 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "issue41-scale-benchmark" in reconciliation
     assert "model-backed-ann-decision" in reconciliation
     assert "eval/reconcile_ann_gate.py" in reconciliation
+    assert '--expected-head "${{ github.sha }}"' in reconciliation
+    assert '--expected-pr-head "${{ github.event.pull_request.head.sha }}"' in reconciliation
     assert "Architecture (ubuntu-latest, Python 3.10)" in reconciliation
     assert "Architecture (windows-latest, Python 3.13)" in reconciliation
 

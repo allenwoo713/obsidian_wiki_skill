@@ -67,11 +67,13 @@ from chunk_plan import (
 )
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
+from obsidian_wiki.application.index_build_service import CandidateQueryPolicy
 
 
 def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
                            page_metadata=None, image_metadata=None, ctx=None,
-                           tokenizer=None, lexicon=None, vector_index_mode="auto"):
+                           tokenizer=None, lexicon=None, vector_index_mode="auto",
+                           candidate_query_policy: CandidateQueryPolicy | None = None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -143,6 +145,7 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
         manifest_store=FilesystemIndexManifest(),
         post_commit_journal=journal,
         vector_index_mode=vector_index_mode,
+        candidate_query_policy=candidate_query_policy,
     ).build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
         page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx,
@@ -298,6 +301,7 @@ class WikiIndex:
         self._built_model_name: Optional[str] = None
         self._force_encode: bool = False  # --full-rebuild 时置 True，忽略页缓存强制重编码
         self._vector_index_mode: str = "auto"
+        self._candidate_query_policy: CandidateQueryPolicy | None = None
         # #12 多模态：图片父文档回溯元数据（rel_path → meta），由 _load_image_meta 填充
         self._image_meta: Dict[str, dict] = {}
 
@@ -377,7 +381,8 @@ class WikiIndex:
 
     # ---- build ----
     def build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
-               allow_partial_index: bool = False):
+               allow_partial_index: bool = False,
+               candidate_query_policy: CandidateQueryPolicy | None = None):
         """构建（默认增量）：未变页命中页级向量缓存跳过编码；full_rebuild=True 强制全量重编码。
 
         无论增量与否都写入全新 builds/<id>/lance_db（删除页自然不入表 → 无残留），
@@ -399,12 +404,14 @@ class WikiIndex:
         try:
             return self._build(wiki_dir, full_rebuild=full_rebuild,
                                vector_index_mode=vector_index_mode,
-                               allow_partial_index=allow_partial_index, ctx=ctx)
+                               allow_partial_index=allow_partial_index, ctx=ctx,
+                               candidate_query_policy=candidate_query_policy)
         finally:
             lock.release()
 
     def _build(self, wiki_dir: Path, full_rebuild: bool = False, vector_index_mode: str = "auto",
-               allow_partial_index: bool = False, ctx=None):
+               allow_partial_index: bool = False, ctx=None,
+               candidate_query_policy: CandidateQueryPolicy | None = None):
         """build() 的锁内主体。"""
         # Keep the long-standing public call signature, but route every actual
         # build through the D-01 service.  #22 incremental/publisher work and
@@ -488,18 +495,25 @@ class WikiIndex:
             image_metadata=source_images if source_images else None,
             ctx=ctx,
             vector_index_mode=vector_index_mode,
+            candidate_query_policy=candidate_query_policy,
         )
         published_manifest = json.loads(
             outcome.artifact.manifest_path.read_text(encoding="utf-8")
         )
         selected_mode = published_manifest.get("policy", {}).get("selected_mode")
-        self._vector_index_mode = (
-            "exact"
-            if vector_index_mode == "exact" or (
-                vector_index_mode == "auto" and selected_mode == "exact"
-            )
+        effective_vector_index_mode = (
+            candidate_query_policy.candidate
+            if candidate_query_policy is not None
             else vector_index_mode
         )
+        self._vector_index_mode = (
+            "exact"
+            if effective_vector_index_mode == "exact" or (
+                effective_vector_index_mode == "auto" and selected_mode == "exact"
+            )
+            else effective_vector_index_mode
+        )
+        self._candidate_query_policy = candidate_query_policy
         # #21 review #3: single publication — service publishes once with
         # complete manifest (pages/images injected before publish_pointer).
         self._repository = None
@@ -1202,6 +1216,12 @@ class WikiIndex:
             )
             else requested_mode
         )
+        candidate_policy = manifest.get("candidate_query_policy")
+        self._candidate_query_policy = (
+            CandidateQueryPolicy(**candidate_policy)
+            if isinstance(candidate_policy, dict)
+            else None
+        )
         self._page_by_id = {}
         self.pages = []
         for page in manifest.get("pages", []):
@@ -1241,12 +1261,17 @@ class WikiIndex:
         qv = embedder.encode([query], show_progress_bar=False,
                              normalize_embeddings=NORMALIZE_EMBEDDINGS)[0]
         repository = self._get_repository()
-        search = (
-            repository.search_dense_exact
-            if getattr(self, "_vector_index_mode", "auto") == "exact"
-            else repository.search_dense
+        exact = getattr(self, "_vector_index_mode", "auto") == "exact"
+        search = repository.search_dense_exact if exact else repository.search_dense
+        query_ef = (
+            self._candidate_query_policy.query_ef
+            if self._candidate_query_policy is not None
+            else None
         )
-        rows = search(list(qv), metric=VECTOR_METRIC, limit=k * 4)
+        if exact or query_ef is None:
+            rows = search(list(qv), metric=VECTOR_METRIC, limit=k * 4)
+        else:
+            rows = search(list(qv), metric=VECTOR_METRIC, limit=k * 4, ef=query_ef)
         return [self._hit_from_row(r, "vector") for r in rows]
 
     def search_page(self, page_id: str, plan, sparse_k: int = 20,
@@ -1268,15 +1293,16 @@ class WikiIndex:
             for query in plan.semantic_queries:
                 vector = embedder.encode([query], show_progress_bar=False,
                                           normalize_embeddings=NORMALIZE_EMBEDDINGS)[0]
-                search = (
-                    repository.search_dense_exact
-                    if self._vector_index_mode == "exact"
-                    else repository.search_dense
-                )
-                rows = search(
-                    list(vector), metric=VECTOR_METRIC, limit=dense_k,
-                    where=repository.page_predicate(page_id),
-                )
+                exact = self._vector_index_mode == "exact"
+                search = repository.search_dense_exact if exact else repository.search_dense
+                kwargs = {
+                    "metric": VECTOR_METRIC,
+                    "limit": dense_k,
+                    "where": repository.page_predicate(page_id),
+                }
+                if not exact and self._candidate_query_policy is not None:
+                    kwargs["ef"] = self._candidate_query_policy.query_ef
+                rows = search(list(vector), **kwargs)
                 out.extend(self._hit_from_row(row, "vector") for row in rows)
         except Exception as exc:
             logging.getLogger(__name__).warning("restricted vector search failed: %s", exc)

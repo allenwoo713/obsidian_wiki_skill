@@ -36,7 +36,8 @@ def _canonical_sha256(payload: dict) -> str:
 
 
 def reconcile(
-    *, scale_evidence: Path, model_records: Path, conclusions: dict[str, str], expected_head: str
+    *, scale_evidence: Path, model_records: Path, conclusions: dict[str, str],
+    expected_head: str, expected_pr_head: str,
 ) -> dict:
     """Validate one same-head numeric-success evidence set before reporting it."""
     for name in ("test-and-eval", "scale", "model-backed"):
@@ -44,6 +45,8 @@ def reconcile(
             raise ValueError(f"required job {name} != \"success\"")
     if not isinstance(expected_head, str) or len(expected_head) != 40:
         raise ValueError("expected head")
+    if not isinstance(expected_pr_head, str) or len(expected_pr_head) != 40:
+        raise ValueError("expected PR head")
 
     scale = validate_evidence(_read_json(scale_evidence))
     source = scale["source"]
@@ -52,11 +55,17 @@ def reconcile(
     model = validate_candidate_decision_records(_read_json(model_records), scale)
     if model.get("head_sha") != expected_head:
         raise ValueError("model artifact head")
+    if model.get("actions_merge_checkout_sha") != expected_head:
+        raise ValueError("model artifact Actions merge checkout")
+    if model.get("pr_head_sha") != expected_pr_head:
+        raise ValueError("model artifact PR head")
 
     return {
         "schema_version": 1,
         "all_required_jobs_numeric_success": True,
         "head_sha": expected_head,
+        "actions_merge_checkout_sha": expected_head,
+        "pr_head_sha": expected_pr_head,
         "comparator_sha256": _canonical_sha256(scale),
         "scale_lock_identity": source["lock_identity"],
         "scale_runtime_identity": scale["environment"]["runtime"],
@@ -77,6 +86,7 @@ def main() -> int:
     parser.add_argument("--scale", required=True)
     parser.add_argument("--model-backed", required=True)
     parser.add_argument("--expected-head", required=True)
+    parser.add_argument("--expected-pr-head", required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
@@ -89,6 +99,7 @@ def main() -> int:
                 "model-backed": args.model_backed,
             },
             expected_head=args.expected_head,
+            expected_pr_head=args.expected_pr_head,
         )
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)

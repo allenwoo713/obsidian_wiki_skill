@@ -287,10 +287,12 @@ jobs:
           if-no-files-found: ignore
 
   model-backed-ann-decision:
-    name: "Model-backed final-retrieval decision records"
+    name: "Model-backed candidate-specific hybrid decision records"
     if: github.event_name == 'pull_request'
     needs: issue41-scale-benchmark
     runs-on: ubuntu-latest
+    env:
+      GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -317,16 +319,30 @@ jobs:
           python eval/run_eval.py
           --work-dir .review-tmp/model-backed-ann
           --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
-          --decision-output eval/model-ann-decision.json
+          --decision-output eval/candidate-hybrid-ann-decision.json
+      - name: Validate all twelve candidate-specific production hybrid records
+        run: >
+          python eval/run_eval.py
+          --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
+          --validate-candidate-hybrid-evidence eval/candidate-hybrid-ann-decision.json
       - name: Upload model-backed candidate decision records
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: model-backed-ann-decision
+          name: candidate-hybrid-ann-decision
           path: |
-            eval/model-ann-decision.json
+            eval/candidate-hybrid-ann-decision.json
             eval/results.json
             eval/detail.jsonl
+      - name: Upload rejected candidate-hybrid diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-hybrid-ann-decision-error
+          path: |
+            eval/results.json
+            eval/detail.jsonl
+          if-no-files-found: ignore
 
   reconcile-ann-decision:
     name: "Eval ANN decision reconciliation"
@@ -354,18 +370,19 @@ jobs:
         if: ${{ always() }}
         uses: actions/download-artifact@v4
         with:
-          name: model-backed-ann-decision
+          name: candidate-hybrid-ann-decision
           path: .review-tmp/reconcile/model
       - name: Reconcile numeric same-head Eval evidence
         if: ${{ always() }}
         run: >
           python eval/reconcile_ann_gate.py
           --scale-evidence .review-tmp/reconcile/scale/index-benchmark.json
-          --model-records .review-tmp/reconcile/model/model-ann-decision.json
+          --model-records .review-tmp/reconcile/model/candidate-hybrid-ann-decision.json
           --test-and-eval "${{ needs.test-and-eval.result }}"
           --scale "${{ needs.issue41-scale-benchmark.result }}"
           --model-backed "${{ needs.model-backed-ann-decision.result }}"
           --expected-head "${{ github.sha }}"
+          --expected-pr-head "${{ github.event.pull_request.head.sha }}"
           --output .review-tmp/reconcile/ann-reconciliation.json
       - name: Upload reconciliation diagnostics
         if: ${{ always() }}

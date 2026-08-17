@@ -506,6 +506,19 @@ def test_candidate_query_policy_is_immutable_and_applies_only_at_build_and_dense
     with pytest.raises((AttributeError, TypeError)):
         policy.query_ef = 100
 
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# Candidate policy\n\nCANDIDATEPOLICYTERM\n")
+    outcome = build_storage_contract(
+        wiki, tmp_path / ".index",
+        embed=lambda texts: [[1.0, float(index + 1)] for index, _ in enumerate(texts)],
+        candidate_query_policy=policy,
+    )
+    manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["candidate_query_policy"] == {
+        "candidate": "ivf-hnsw-sq", "query_ef": 75,
+    }
+    assert manifest["requested_vector_index_mode"] == "ivf-hnsw-sq"
+
     class Repository:
         def search_dense(self, vector, *, metric, limit, ef):
             assert ef == 75
@@ -515,7 +528,7 @@ def test_candidate_query_policy_is_immutable_and_applies_only_at_build_and_dense
         def encode(self, *_args, **_kwargs):
             return [[1.0, 0.0]]
 
-    index = WikiIndex(tmp_path / ".index")
+    index = WikiIndex(tmp_path / ".query-index")
     index._candidate_query_policy = policy
     monkeypatch.setattr(index, "_get_repository", lambda: Repository())
     monkeypatch.setattr(index, "_get_embedder", lambda: Embedder())
