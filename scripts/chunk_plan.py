@@ -45,6 +45,10 @@ def chunk_records_to_sparse(records: Sequence[chunking.ChunkRecord], lexicon) ->
             token_count=r.token_count, content_hash=r.content_hash,
             forced_split=r.forced_split, continuation_index=r.continuation_index,
             start_char=r.start_char, end_char=r.end_char,
+            structure_kind=r.structure_kind,
+            table_header_text=r.table_header_text,
+            table_header_start_char=r.table_header_start_char,
+            table_header_end_char=r.table_header_end_char,
         ))
     return chunks
 

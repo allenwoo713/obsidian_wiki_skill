@@ -25,10 +25,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import math
+import os
+import platform
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -39,14 +43,422 @@ HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
 SCRIPTS = SKILL_ROOT / "scripts"
 FIXTURES_WIKI = SKILL_ROOT / "tests" / "fixtures" / "wiki"
+GRAPH_CONTRACT_WIKI = SKILL_ROOT / "tests" / "fixtures" / "graph_contract" / "wiki"
+GRAPH_CONTRACT_QUERIES = HERE / "graph_queries.jsonl"
 
 sys.path.insert(0, str(SCRIPTS))
 
-from build_index import WikiIndex  # noqa: E402
+from build_index import CandidateQueryPolicy, WikiIndex  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
 from chunking import CHUNK_SCHEMA_VERSION  # noqa: E402
+try:  # ``python eval/run_eval.py`` has eval/ rather than repo root on sys.path.
+    from eval.benchmark_ann_build import (  # noqa: E402
+        CANDIDATES, DECISION_EF_GRID, EVIDENCE_SCHEMA_VERSION, validate_evidence,
+    )
+except ModuleNotFoundError:  # pragma: no cover - exercised by the CLI entry point
+    from benchmark_ann_build import (  # noqa: E402
+        CANDIDATES, DECISION_EF_GRID, EVIDENCE_SCHEMA_VERSION, validate_evidence,
+    )
+
+
+FUNCTIONAL_FINAL_RETRIEVAL_METRIC = "functional_final_retrieval_ann_overlap_at_10"
+FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION = 2
+_CANDIDATE_OBSERVATION_FIELDS = {
+    "retrieval", "page", "evidence", "mrr", "latency", "context",
+    "citation", "graph", "non_regression",
+}
+
+
+def _head_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unavailable"
+
+
+def _decision_environment() -> dict[str, str]:
+    return {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "lancedb": importlib.metadata.version("lancedb"),
+        "numpy": importlib.metadata.version("numpy"),
+        "pyarrow": importlib.metadata.version("pyarrow"),
+    }
+
+
+def _stable_json_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _source_identities() -> tuple[str, str]:
+    checkout = os.environ.get("GITHUB_SHA") or _head_sha()
+    pr_head = os.environ.get("GITHUB_PR_HEAD_SHA") or checkout
+    return pr_head, checkout
+
+
+def _all_finite(value: object) -> bool:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return True
+    if isinstance(value, (int, float)):
+        return math.isfinite(float(value))
+    if isinstance(value, dict):
+        return all(_all_finite(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_all_finite(item) for item in value)
+    return False
+
+
+def validate_candidate_decision_records(
+    packet: dict, comparator_evidence: dict
+) -> dict:
+    """Fail closed before a model-backed packet can be considered for approval."""
+    if comparator_evidence.get("evidence_schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("comparator evidence schema")
+    if packet.get("schema_version") != FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION:
+        raise ValueError("decision schema")
+    if packet.get("comparator_schema_version") != EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("comparator binding schema")
+    records = packet.get("records")
+    expected = {(candidate, ef) for candidate in CANDIDATES for ef in DECISION_EF_GRID}
+    if not isinstance(records, list) or len(records) != len(expected):
+        raise ValueError("candidate records")
+    if not packet.get("pr_head_sha") or not packet.get("actions_merge_checkout_sha"):
+        raise ValueError("source identities")
+    environment = packet.get("environment")
+    if not isinstance(environment, dict) or {
+        "lancedb": environment.get("lancedb"),
+        "numpy": environment.get("numpy"),
+        "pyarrow": environment.get("pyarrow"),
+    } != {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"}:
+        raise ValueError("locked candidate environment")
+    seen = set()
+    run_ids, index_ids, invocation_ids, result_digests, payload_digests = set(), set(), set(), set(), set()
+    for record in records:
+        if not isinstance(record, dict) or (record.get("candidate"), record.get("query_ef")) not in expected:
+            raise ValueError("candidate/grid binding")
+        binding = (record["candidate"], record["query_ef"])
+        if binding in seen:
+            raise ValueError("duplicate candidate record")
+        seen.add(binding)
+        if record.get("head_sha") != packet.get("head_sha") or record.get("environment") != packet.get("environment"):
+            raise ValueError("mixed head or environment")
+        if record.get("pr_head_sha") != packet.get("pr_head_sha") \
+                or record.get("actions_merge_checkout_sha") != packet.get("actions_merge_checkout_sha"):
+            raise ValueError("mixed source identities")
+        if record.get("corpus_sha256") != comparator_evidence.get("corpus", {}).get("sha256") \
+                or record.get("queries_sha256") != comparator_evidence.get("queries", {}).get("sha256"):
+            raise ValueError("mixed comparator evidence")
+        policy = record.get("applied_policy")
+        if policy != {"candidate": record["candidate"], "query_ef": record["query_ef"]}:
+            raise ValueError("candidate policy binding")
+        run_id = record.get("candidate_run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("candidate run identity")
+        if run_id in run_ids:
+            raise ValueError("candidate run identity")
+        run_ids.add(run_id)
+        index = record.get("candidate_index")
+        if not isinstance(index, dict) or not all(index.get(key) for key in (
+            "build_id", "manifest_sha256", "root_identity",
+        )):
+            raise ValueError("candidate index identity")
+        index_id = (index["build_id"], index["manifest_sha256"], index["root_identity"])
+        if index_id in index_ids:
+            raise ValueError("candidate index identity")
+        index_ids.add(index_id)
+        invocation = record.get("hybrid_invocation")
+        if not isinstance(invocation, dict) or invocation.get("entrypoint") != "query.hybrid_search" \
+                or not invocation.get("trace_id") or not invocation.get("digest") \
+                or invocation.get("query_count", 0) <= 0:
+            raise ValueError("hybrid invocation identity")
+        invocation_id = (invocation["trace_id"], invocation["digest"])
+        if invocation_id in invocation_ids:
+            raise ValueError("hybrid invocation identity")
+        invocation_ids.add(invocation_id)
+        traces = invocation.get("traces")
+        if not isinstance(traces, list) or len(traces) != invocation["query_count"]:
+            raise ValueError("hybrid invocation identity")
+        expected_run_id = _stable_json_digest({
+            "candidate": record["candidate"], "query_ef": record["query_ef"],
+            "build_id": index["build_id"], "traces": traces,
+        })
+        if run_id != expected_run_id:
+            raise ValueError("candidate run identity")
+        if invocation["digest"] != _stable_json_digest({"run_id": run_id, "traces": traces}) \
+                or invocation["trace_id"] != _stable_json_digest({
+                    "run_id": run_id, "entrypoint": "query.hybrid_search",
+                }):
+            raise ValueError("hybrid invocation identity")
+        result_digest = record.get("result_sha256")
+        if not isinstance(result_digest, str) or len(result_digest) != 64 \
+                or result_digest in result_digests:
+            raise ValueError("candidate result digest")
+        result_digests.add(result_digest)
+        metrics = record.get("final_retrieval")
+        if not isinstance(metrics, dict) or set(metrics) != _CANDIDATE_OBSERVATION_FIELDS:
+            raise ValueError("candidate-specific final retrieval")
+        retrieval = metrics.get("retrieval")
+        if not isinstance(retrieval, dict) or FUNCTIONAL_FINAL_RETRIEVAL_METRIC not in retrieval \
+                or not isinstance(retrieval.get("result_payload"), list):
+            raise ValueError("candidate-specific final retrieval")
+        latency = metrics.get("latency")
+        if not isinstance(latency, dict) or not isinstance(latency.get("samples_s"), list) \
+                or not latency["samples_s"]:
+            raise ValueError("candidate-specific final retrieval")
+        non_regression = metrics.get("non_regression")
+        if not isinstance(non_regression, dict) or non_regression.get("baseline_refresh") is not False \
+                or non_regression.get("failures") != []:
+            raise ValueError("candidate-specific final retrieval")
+        if not _all_finite(metrics):
+            raise ValueError("non-finite candidate metric")
+        payload_digest = _stable_json_digest(metrics)
+        if payload_digest in payload_digests:
+            raise ValueError("candidate result payload")
+        payload_digests.add(payload_digest)
+        if result_digest != _stable_json_digest({
+            "run_id": run_id, "final_retrieval": metrics,
+        }):
+            raise ValueError("candidate result digest")
+        binding_input = record.get("input_binding")
+        if not isinstance(binding_input, dict) or not all(binding_input.get(key) for key in (
+            "fixture_sha256", "evaluation_queries_sha256", "comparator_corpus_sha256",
+            "comparator_queries_sha256",
+        )):
+            raise ValueError("immutable input binding")
+        if binding_input["comparator_corpus_sha256"] != comparator_evidence["corpus"]["sha256"] \
+                or binding_input["comparator_queries_sha256"] != comparator_evidence["queries"]["sha256"]:
+            raise ValueError("immutable input binding")
+    if seen != expected:
+        raise ValueError("incomplete candidate records")
+    return packet
+
+
+def _fixture_digest(wiki_src: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(Path(wiki_src).rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(wiki_src).as_posix().encode("utf-8"))
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _candidate_index_identity(*, wi: WikiIndex, root: Path, policy: CandidateQueryPolicy) -> dict:
+    manifest_path = wi._resolve_active_manifest()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("candidate_query_policy") != policy.to_json():
+        raise ValueError("candidate policy was not applied to the built index")
+    return {
+        "build_id": manifest["build_id"],
+        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "root_identity": _stable_json_digest({
+            "root": root.name, "build_id": manifest["build_id"], "policy": policy.to_json(),
+        }),
+    }
+
+
+def _candidate_result_payload(result) -> dict:
+    bundle = result.bundle
+    return {
+        "query": result.query,
+        "plan": result.plan.to_json(),
+        "pages": [candidate.page_id for candidate in result.candidates[:10]],
+        "items": [
+            {
+                "page_id": item.page_id,
+                "path": str(item.path),
+                "scope": item.scope,
+                "evidence": [hit.chunk_id for hit in item.evidence],
+                "graph_paths": [
+                    {
+                        "source": path.source_id, "target": path.target_id,
+                        "signals": list(path.edge_signals),
+                    }
+                    for path in item.graph_paths
+                ],
+            }
+            for item in bundle.items
+        ],
+        "context_sha256": hashlib.sha256((bundle.context_text or "").encode("utf-8")).hexdigest(),
+        "token_count": bundle.token_count,
+    }
+
+
+def _percentile(values: list[float], percentile: int) -> float:
+    ordered = sorted(values)
+    position = max(0, min(len(ordered) - 1, int(round(
+        (percentile / 100) * (len(ordered) - 1)
+    ))))
+    return ordered[position]
+
+
+def _candidate_result_observation(*, query: list[dict], results: list,
+                                  latencies: list[float], baseline_quality: dict,
+                                  binding: dict[str, object]) -> dict:
+    page_recalls, evidence_recalls, reciprocal_ranks = [], [], []
+    context_overflow = budget_violations = citation_violations = 0
+    graph_validated = graph_unsupported = 0
+    payload = []
+    for specification, result in zip(query, results):
+        gold = specification.get("relevant_pages", [])
+        pages = result.candidates[:10]
+        top5_hits = sum(1 for candidate in pages[:5] if _page_hit(candidate, gold))
+        page_recalls.append(min(1.0, top5_hits / max(1, len(gold))))
+        required = specification.get("required_facts") or []
+        context = result.bundle.context_text or ""
+        evidence_recalls.append(
+            sum(fact in context for fact in required) / len(required) if required else 1.0
+        )
+        rank = next((ordinal for ordinal, candidate in enumerate(pages, 1)
+                     if _page_hit(candidate, gold)), None)
+        reciprocal_ranks.append(1.0 / rank if rank else 0.0)
+        context_overflow += int(result.bundle.token_count > result.bundle.effective_budget_tokens)
+        budget_violations += int(bool(result.bundle.budget_contract_violations()))
+        citation_violations += len(_citation_violations(result.bundle))
+        graph_validated += result.graph_validated_count
+        graph_unsupported += sum(
+            1 for item in result.bundle.items
+            if item.inclusion_reason == "graph_expansion" and not item.evidence
+        )
+        payload.append({
+            "binding": dict(binding),
+            "observation": _candidate_result_payload(result),
+        })
+    page_recall = statistics.mean(page_recalls)
+    evidence_recall = statistics.mean(evidence_recalls)
+    mrr = statistics.mean(reciprocal_ranks)
+    functional = statistics.mean(
+        min(1.0, sum(_page_hit(candidate, spec.get("relevant_pages", []))
+                     for candidate in result.candidates[:10]) / max(1, len(spec.get("relevant_pages", []))))
+        for spec, result in zip(query, results)
+    )
+    failures = []
+    for name, current in (
+        ("page_recall_at_5", page_recall),
+        ("evidence_recall_at_10", evidence_recall),
+        ("mrr_at_10", mrr),
+        (FUNCTIONAL_FINAL_RETRIEVAL_METRIC, functional),
+    ):
+        reference = baseline_quality.get(name)
+        if reference is not None and current < float(reference) - 0.02:
+            failures.append(name)
+    if context_overflow or budget_violations or citation_violations or graph_unsupported:
+        failures.append("zero-tolerance contract")
+    return {
+        "retrieval": {
+            FUNCTIONAL_FINAL_RETRIEVAL_METRIC: round(functional, 4),
+            "result_payload": payload,
+        },
+        "page": {"page_recall_at_5": round(page_recall, 4)},
+        "evidence": {"evidence_recall_at_10": round(evidence_recall, 4)},
+        "mrr": {"mrr_at_10": round(mrr, 4)},
+        "latency": {
+            "samples_s": [round(value, 6) for value in latencies],
+            "p50_s": round(_percentile(latencies, 50), 6),
+            "p95_s": round(_percentile(latencies, 95), 6),
+        },
+        "context": {"overflow_count": context_overflow, "budget_violation_count": budget_violations},
+        "citation": {"violation_count": citation_violations},
+        "graph": {"validated_count": graph_validated, "unsupported_count": graph_unsupported},
+        "non_regression": {"baseline_refresh": False, "failures": failures},
+    }
+
+
+def run_candidate_hybrid_evaluation(
+    wiki_src: Path, queries: list[dict], work_dir: Path, max_tokens: int,
+    comparator_evidence: dict, *, baseline_quality: dict,
+    hard_max_tokens: int | None = None,
+) -> dict:
+    """Build and measure every FLAT/SQ × ef binding through ``hybrid_search``."""
+    validate_evidence(comparator_evidence)
+    if not queries:
+        raise ValueError("candidate hybrid evaluation requires queries")
+    head, environment = _head_sha(), _decision_environment()
+    pr_head, checkout = _source_identities()
+    fixture_sha = _fixture_digest(wiki_src)
+    evaluation_queries_sha = _stable_json_digest(queries)
+    records = []
+    for candidate in CANDIDATES:
+        for query_ef in DECISION_EF_GRID:
+            policy = CandidateQueryPolicy(candidate=candidate, query_ef=query_ef)
+            root = work_dir / f"{candidate}-ef-{query_ef}"
+            wi, wiki, build_time = _build(
+                root, wiki_src, True, candidate_query_policy=policy,
+            )
+            planner = DefaultQueryPlanner(project_root=root)
+            results, latencies, traces = [], [], []
+            for ordinal, specification in enumerate(queries):
+                started = time.perf_counter()
+                result = hybrid_search(
+                    wi, specification["query"], planner, k=10, max_tokens=max_tokens,
+                    hard_max_tokens=hard_max_tokens, wiki_dir=wiki,
+                    intent_override="auto", allow_local_fallback=True,
+                )
+                latency = time.perf_counter() - started
+                results.append(result)
+                latencies.append(latency)
+                traces.append({
+                    "ordinal": ordinal,
+                    "query_sha256": hashlib.sha256(specification["query"].encode("utf-8")).hexdigest(),
+                    "result_sha256": _stable_json_digest(_candidate_result_payload(result)),
+                    "latency_s": round(latency, 6),
+                })
+            final_retrieval = _candidate_result_observation(
+                query=queries, results=results, latencies=latencies,
+                baseline_quality=baseline_quality,
+                binding=policy.to_json(),
+            )
+            index_identity = _candidate_index_identity(wi=wi, root=root, policy=policy)
+            run_id = _stable_json_digest({
+                "candidate": candidate, "query_ef": query_ef,
+                "build_id": index_identity["build_id"], "traces": traces,
+            })
+            invocation_digest = _stable_json_digest({"run_id": run_id, "traces": traces})
+            result_digest = _stable_json_digest({"run_id": run_id, "final_retrieval": final_retrieval})
+            records.append({
+                "candidate": candidate,
+                "query_ef": query_ef,
+                "candidate_run_id": run_id,
+                "candidate_index": {**index_identity, "build_time_s": round(build_time, 4)},
+                "applied_policy": policy.to_json(),
+                "hybrid_invocation": {
+                    "entrypoint": "query.hybrid_search",
+                    "trace_id": _stable_json_digest({"run_id": run_id, "entrypoint": "query.hybrid_search"}),
+                    "digest": invocation_digest,
+                    "query_count": len(queries),
+                    "traces": traces,
+                },
+                "result_sha256": result_digest,
+                "final_retrieval": final_retrieval,
+                "input_binding": {
+                    "fixture_sha256": fixture_sha,
+                    "evaluation_queries_sha256": evaluation_queries_sha,
+                    "comparator_corpus_sha256": comparator_evidence["corpus"]["sha256"],
+                    "comparator_queries_sha256": comparator_evidence["queries"]["sha256"],
+                },
+                "head_sha": head,
+                "pr_head_sha": pr_head,
+                "actions_merge_checkout_sha": checkout,
+                "environment": environment,
+                "corpus_sha256": comparator_evidence["corpus"]["sha256"],
+                "queries_sha256": comparator_evidence["queries"]["sha256"],
+            })
+    packet = {
+        "schema_version": FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION,
+        "head_sha": head,
+        "pr_head_sha": pr_head,
+        "actions_merge_checkout_sha": checkout,
+        "environment": environment,
+        "comparator_schema_version": EVIDENCE_SCHEMA_VERSION,
+        "records": records,
+    }
+    return validate_candidate_decision_records(packet, comparator_evidence)
 
 
 def _citation_violations(bundle):
@@ -136,6 +548,27 @@ def validate_benchmark_contract(manifest: dict) -> dict:
     policy repeats the same scope/counts instead of silently interpreting a
     sampled 1.0 as a corpus-wide proof.
     """
+    if manifest.get("format_version") == 6:
+        # Phase 06：固定策略 manifest——生产构建必须携带通过域验证器的
+        # candidate_publication_evidence；eval candidate 构建除外。
+        if isinstance(manifest.get("candidate_query_policy"), dict):
+            return manifest.get("benchmark") or {}
+        evidence = manifest.get("candidate_publication_evidence")
+        if not isinstance(evidence, dict):
+            raise ValueError(
+                "format-6 production manifests require candidate_publication_evidence"
+            )
+        from obsidian_wiki.domain.index_models import CandidatePublicationEvidence
+        from obsidian_wiki.domain.index_policy import (
+            load_ann_policy_file,
+            validate_candidate_publication_evidence,
+        )
+        try:
+            record = CandidatePublicationEvidence(**evidence)
+        except TypeError as exc:
+            raise ValueError(f"publication evidence fields invalid: {exc}") from exc
+        validate_candidate_publication_evidence(record, load_ann_policy_file())
+        return manifest.get("benchmark") or {}
     if manifest.get("format_version") != 5:
         raise ValueError("ANN benchmark evidence requires manifest format_version=5")
     benchmark = manifest.get("benchmark")
@@ -260,12 +693,18 @@ def _stage_project(project_root: Path, wiki_src: Path):
     return wiki
 
 
-def _build(project_root: Path, wiki_src: Path, vector_index_mode: str, full_rebuild: bool):
+def _build(project_root: Path, wiki_src: Path, full_rebuild: bool,
+           *, candidate_query_policy: CandidateQueryPolicy | None = None):
+    # Phase 06：普通评测构建走固定生产路径（批准 SQ/ef）；eval candidate
+    # 构建显式传 candidate_query_policy。
     wiki = _stage_project(project_root, wiki_src)
     idx = project_root / ".index"
     wi = WikiIndex(idx)
     t0 = time.perf_counter()
-    wi.build(wiki, full_rebuild=full_rebuild, vector_index_mode=vector_index_mode)
+    wi.build(
+        wiki, full_rebuild=full_rebuild,
+        candidate_query_policy=candidate_query_policy,
+    )
     dt = time.perf_counter() - t0
     wi.load()
     # 生成图谱（供 hybrid_search 的 relations 扩展通道使用）
@@ -314,21 +753,21 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
 
     # 1) 主索引（exact，小库等价精确）
     main_root = work_dir / "main"
-    main_wi, main_wiki, build_time = _build(main_root, wiki_src, "exact", full_rebuild=True)
+    main_wi, main_wiki, build_time = _build(main_root, wiki_src, full_rebuild=True)
     main_benchmark = _active_benchmark_contract(main_wi)
     planner = DefaultQueryPlanner(project_root=main_root)
 
-    # 2) ANN 索引（独立 project，复用语义内容；向量层走 IVF_HNSW_FLAT）
+    # 2) ANN candidate（独立 project，复用语义内容；auto 选择受自检的索引策略）
     ann_wi = None
     ann_build_time = None
     ann_benchmark = None
     if build_ann:
         ann_root = work_dir / "ann"
-        ann_wi, _, ann_build_time = _build(ann_root, wiki_src, "ivf-hnsw-flat", full_rebuild=True)
+        ann_wi, _, ann_build_time = _build(ann_root, wiki_src, full_rebuild=True)
         ann_benchmark = _active_benchmark_contract(ann_wi)
 
     # 3) 逐查询评测
-    page_recalls, evid_recalls, mrrs, exact_hits, ann_recalls = [], [], [], [], []
+    page_recalls, evid_recalls, mrrs, exact_hits, functional_ann_overlaps = [], [], [], [], []
     latencies = []
     context_overflow = 0
     budget_violations = 0
@@ -339,8 +778,6 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     expanded_queries = 0           # effective > base（意图倍率生效）
     max_effective_budget = 0
     graph_only_unsupported = 0
-    graph_trigger_queries = 0
-    graph_trigger_validated = 0
     bundle_tokens = []
     detail = []
 
@@ -348,12 +785,10 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         gold = q["relevant_pages"]
         plan = planner.plan(q["query"])
         t0 = time.perf_counter()
-        # The marked fixture deliberately leaves expansion room after the
-        # direct seed so this evaluation exercises restricted graph validation.
-        search_k = 1 if q.get("graph_trigger") else 10
-        res = hybrid_search(main_wi, q["query"], planner, k=search_k,
+        res = hybrid_search(main_wi, q["query"], planner, k=10,
                             max_tokens=max_tokens, hard_max_tokens=hard_max_tokens,
-                            wiki_dir=main_wiki, intent_override="auto")
+                            wiki_dir=main_wiki, intent_override="auto",
+                            allow_local_fallback=True)
         latencies.append(time.perf_counter() - t0)
 
         cands = res.candidates
@@ -382,7 +817,9 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         if ann_wi is not None:
             exact_ids = set(_chunk_ids(main_wi, q["query"], 10))
             ann_ids = set(_chunk_ids(ann_wi, q["query"], 10))
-            ann_recalls.append(len(exact_ids & ann_ids) / len(exact_ids) if exact_ids else 1.0)
+            functional_ann_overlaps.append(
+                len(exact_ids & ann_ids) / len(exact_ids) if exact_ids else 1.0
+            )
 
         # Context overflow：以本次实际分配的预算为准（effective = base × 意图倍率，
         # 再受 hard cap 限制）。assemble_context 按 effective 截断 → 应恒 0。
@@ -411,9 +848,6 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
         if bundle.effective_budget_tokens > bundle.requested_base_budget_tokens:
             expanded_queries += 1
         max_effective_budget = max(max_effective_budget, bundle.effective_budget_tokens)
-        if q.get("graph_trigger"):
-            graph_trigger_queries += 1
-            graph_trigger_validated += res.graph_validated_count
         for it in res.bundle.items:
             if it.inclusion_reason == "graph_expansion" and not it.evidence:
                 graph_only_unsupported += 1
@@ -468,13 +902,16 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
             "evidence_recall_at_10": round(statistics.mean(evid_recalls), 4),
             "exact_lookup_hit_at_3": round(statistics.mean(exact_hits), 4) if exact_hits else None,
             "mrr_at_10": round(statistics.mean(mrrs), 4),
-            "ann_recall_at_10": round(statistics.mean(ann_recalls), 4) if ann_recalls else None,
+            # This 157-row fixture verifies the real model-backed retrieval path;
+            # it is explicitly not a large-scale ANN-quality KPI.
+            FUNCTIONAL_FINAL_RETRIEVAL_METRIC: (
+                round(statistics.mean(functional_ann_overlaps), 4)
+                if functional_ann_overlaps else None
+            ),
             "context_overflow_count": context_overflow,
             "budget_contract_violation_count": budget_violations,
             "citation_path_contract_violation_count": citation_path_violations,
             "graph_only_unsupported_count": graph_only_unsupported,
-            "graph_trigger_query_count": graph_trigger_queries,
-            "graph_trigger_validated_count": graph_trigger_validated,
         },
         "budget": {
             "policy": _BUDGET_POLICY,
@@ -509,6 +946,87 @@ def run_evaluation(wiki_src: Path, queries: list, work_dir: Path, max_tokens: in
     return metrics, detail
 
 
+def _recall_at_5(candidates, gold_pages):
+    hits = sum(1 for candidate in candidates[:5] if _page_hit(candidate, gold_pages))
+    return min(1.0, hits / max(1, len(gold_pages)))
+
+
+def _evidence_recall(bundle, required_facts):
+    if not required_facts:
+        return 1.0
+    context = bundle.context_text or ""
+    return sum(fact in context for fact in required_facts) / len(required_facts)
+
+
+def run_graph_contract_evaluation(wiki_src: Path, queries: list, work_dir: Path,
+                                  max_tokens: int, hard_max_tokens: int | None = None):
+    """Measure graph lift with paired production retrieval on an explicit-link corpus."""
+    root = work_dir / "graph-contract"
+    wi, wiki, _ = _build(root, wiki_src, full_rebuild=True)
+    planner = DefaultQueryPlanner(project_root=root)
+    failures, detail = [], []
+    validated_count = unsupported_count = incremental_gold_pages = 0
+    off_recalls, on_recalls = [], []
+
+    for query in queries:
+        k = int(query.get("k", 5))
+        common = {"k": k, "max_tokens": max_tokens,
+                  "hard_max_tokens": hard_max_tokens, "wiki_dir": wiki}
+        without_graph = hybrid_search(wi, query["query"], planner,
+                                      enable_graph=False, **common)
+        with_graph = hybrid_search(wi, query["query"], planner,
+                                   enable_graph=True, **common)
+        gold = query["relevant_pages"]
+        off_recall = _recall_at_5(without_graph.candidates, gold)
+        on_recall = _recall_at_5(with_graph.candidates, gold)
+        off_recalls.append(off_recall)
+        on_recalls.append(on_recall)
+        off_gold = {c.page_id for c in without_graph.candidates[:5] if _page_hit(c, gold)}
+        on_gold = {c.page_id for c in with_graph.candidates[:5] if _page_hit(c, gold)}
+        added = len(on_gold - off_gold)
+        incremental_gold_pages += added
+        validated_count += with_graph.graph_validated_count
+        graph_items = [item for item in with_graph.bundle.items
+                       if item.inclusion_reason == "graph_expansion"]
+        unsupported_count += sum(1 for item in graph_items if not item.evidence)
+        required_gain = int(query.get("min_incremental_gold_pages", 0))
+        if added < required_gain:
+            failures.append(f"{query['query']}: incremental_gold_pages={added} < required {required_gain}")
+        if on_recall < off_recall:
+            failures.append(f"{query['query']}: graph recall regressed {off_recall:.4f}->{on_recall:.4f}")
+        detail.append({
+            "query": query["query"], "k": k,
+            "page_recall_without_graph": off_recall,
+            "page_recall_with_graph": on_recall,
+            "evidence_recall_without_graph": _evidence_recall(without_graph.bundle, query.get("required_facts", [])),
+            "evidence_recall_with_graph": _evidence_recall(with_graph.bundle, query.get("required_facts", [])),
+            "incremental_gold_pages": added,
+            "graph_validated_count": with_graph.graph_validated_count,
+            "direct_top5": [Path(c.page_id).name for c in without_graph.candidates[:5]],
+            "graph_top5": [Path(c.page_id).name for c in with_graph.candidates[:5]],
+            "graph_evidence": [{"page": Path(item.page_id).name,
+                                "evidence_chunks": [ev.chunk_id for ev in item.evidence],
+                                "paths": [{"source": Path(path.source_id).name,
+                                           "target": Path(path.target_id).name,
+                                           "signals": path.edge_signals}
+                                          for path in item.graph_paths]}
+                               for item in graph_items],
+        })
+    if unsupported_count:
+        failures.append(f"graph_only_unsupported_count={unsupported_count} > 0")
+    if validated_count <= 0:
+        failures.append("graph contract fixture did not produce a validated graph result")
+    return {
+        "n_queries": len(queries),
+        "page_recall_at_5_without_graph": round(statistics.mean(off_recalls), 4),
+        "page_recall_at_5_with_graph": round(statistics.mean(on_recalls), 4),
+        "incremental_gold_pages": incremental_gold_pages,
+        "graph_validated_count": validated_count,
+        "graph_only_unsupported_count": unsupported_count,
+        "failures": failures,
+    }, detail
+
+
 def load_queries(path: Path):
     out = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -522,6 +1040,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wiki", type=Path, default=FIXTURES_WIKI)
     ap.add_argument("--queries", type=Path, default=HERE / "queries.jsonl")
+    ap.add_argument("--graph-wiki", type=Path, default=GRAPH_CONTRACT_WIKI)
+    ap.add_argument("--graph-queries", type=Path, default=GRAPH_CONTRACT_QUERIES)
     ap.add_argument("--baselines", type=Path, default=HERE / "baselines.json")
     ap.add_argument("--work-dir", type=Path, default=None,
                     help="构建临时目录（默认系统临时目录；本地建议 D: 盘避免 C: 虚拟化）")
@@ -534,12 +1054,60 @@ def main():
     ap.add_argument("--init-baseline", action="store_true", help="把当前指标写为 baselines.json 并退出 0")
     ap.add_argument("--force-compare", action="store_true",
                     help="忽略 chunk_schema_version 不匹配，强制对比旧基线（仅本地调试用，CI 不应使用）")
+    ap.add_argument("--decision-evidence", type=Path,
+                    help="Validated held-out comparator artifact used only to bind decision records")
+    ap.add_argument("--decision-output", type=Path, default=HERE / "model-ann-decision.json",
+                    help="Machine-readable model-backed decision records (never a production policy)")
+    ap.add_argument("--validate-candidate-hybrid-evidence", type=Path,
+                    help="Validate an existing candidate-specific hybrid packet and exit")
+    ap.add_argument("--validate-ann-policy", action="store_true",
+                    help="Validate the tracked eval/ann-policy.json against the approved "
+                         "Phase 06 contract (type/ef/floors/digests) and exit")
     args = ap.parse_args()
+
+    if args.validate_ann_policy:
+        # Phase 06：把源码控制的批准策略作为身份门禁——任何字段被篡改即失败。
+        from obsidian_wiki.domain.index_policy import (
+            PolicyError,
+            load_ann_policy_file,
+            production_policy_sha256,
+        )
+        try:
+            policy = load_ann_policy_file()
+        except PolicyError as exc:
+            print(f"[ERROR] ann policy record invalid: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({
+            "valid": True,
+            "selected_index_type": policy.selected_index_type,
+            "lancedb_index_type": policy.lancedb_index_type,
+            "query_ef": policy.query_ef,
+            "recall_at_10_floor": policy.recall_at_10_floor,
+            "recall_at_20_floor": policy.recall_at_20_floor,
+            "policy_sha256": production_policy_sha256(policy),
+            "comparator_sha256": policy.comparator_sha256,
+        }, sort_keys=True))
+        return 0
+
+    if args.validate_candidate_hybrid_evidence is not None:
+        if args.decision_evidence is None:
+            print("[ERROR] --decision-evidence is required for candidate validation", file=sys.stderr)
+            return 2
+        comparator_evidence = json.loads(args.decision_evidence.read_text(encoding="utf-8"))
+        validate_evidence(comparator_evidence)
+        packet = json.loads(args.validate_candidate_hybrid_evidence.read_text(encoding="utf-8"))
+        validate_candidate_decision_records(packet, comparator_evidence)
+        print(json.dumps({"valid": True, "records": len(packet["records"])}, sort_keys=True))
+        return 0
 
     if not args.wiki.exists():
         print(f"[ERROR] fixture wiki 不存在: {args.wiki}", file=sys.stderr)
         return 2
+    if not args.graph_wiki.exists() or not args.graph_queries.exists():
+        print("[ERROR] graph contract fixture or queries missing", file=sys.stderr)
+        return 2
     queries = load_queries(args.queries)
+    graph_queries = load_queries(args.graph_queries)
     work_dir = args.work_dir or Path(tempfile.mkdtemp(prefix="obs_wiki_eval_"))
     print(f"[info] work-dir = {work_dir}", file=sys.stderr)
 
@@ -547,20 +1115,45 @@ def main():
                              build_ann=not args.no_ann, regression_pp=args.regression_pp,
                              hard_max_tokens=args.hard_max_tokens)
 
-    (HERE / "results.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2),
-                                       encoding="utf-8")
-    (HERE / "detail.jsonl").write_text(
-        "\n".join(json.dumps(d, ensure_ascii=False) for d in detail), encoding="utf-8")
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
-
-    # This is a publication contract, not a baseline-relative quality metric:
-    # enforce it before all baseline setup/absence/schema early-return paths.
+    # This is a publication contract, not a baseline-relative quality metric.
+    # Enforce it at the primary evaluation boundary: unsafe evidence must not
+    # trigger unrelated graph/model work or reach any baseline write path.
     citation_failures = _citation_contract_failures(metrics)
     if citation_failures:
         print("\n[FAIL] citation 路径契约未通过：", file=sys.stderr)
         for failure in citation_failures:
             print("  - " + failure, file=sys.stderr)
         return 1
+
+    graph_metrics, graph_detail = run_graph_contract_evaluation(
+        args.graph_wiki, graph_queries, work_dir, args.max_tokens,
+        hard_max_tokens=args.hard_max_tokens)
+    metrics["graph_contract"] = graph_metrics
+
+    if args.decision_evidence is not None:
+        comparator_evidence = json.loads(args.decision_evidence.read_text(encoding="utf-8"))
+        baseline_quality = {}
+        if args.baselines.exists():
+            baseline_quality = json.loads(
+                args.baselines.read_text(encoding="utf-8")
+            ).get("quality", {})
+        packet = run_candidate_hybrid_evaluation(
+            args.wiki, queries, work_dir / "candidate-hybrid", args.max_tokens,
+            comparator_evidence, baseline_quality=baseline_quality,
+            hard_max_tokens=args.hard_max_tokens,
+        )
+        args.decision_output.parent.mkdir(parents=True, exist_ok=True)
+        args.decision_output.write_text(
+            json.dumps(packet, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    (HERE / "results.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+    (HERE / "detail.jsonl").write_text(
+        "\n".join(json.dumps(d, ensure_ascii=False) for d in detail), encoding="utf-8")
+    (HERE / "graph_detail.jsonl").write_text(
+        "\n".join(json.dumps(d, ensure_ascii=False) for d in graph_detail), encoding="utf-8")
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
     if args.init_baseline:
         baseline_obj = dict(metrics)
@@ -609,7 +1202,6 @@ def main():
     check_drop("evidence_recall_at_10", mq["evidence_recall_at_10"], bq["evidence_recall_at_10"])
     check_drop("exact_lookup_hit_at_3", mq["exact_lookup_hit_at_3"], bq["exact_lookup_hit_at_3"])
     check_drop("mrr_at_10", mq["mrr_at_10"], bq["mrr_at_10"])
-    check_drop("ann_recall_at_10", mq["ann_recall_at_10"], bq["ann_recall_at_10"])
 
     if mq["context_overflow_count"] > 0:
         failures.append(
@@ -621,19 +1213,8 @@ def main():
             f"：{metrics['budget']['violation_samples']}")
     if mq["graph_only_unsupported_count"] > 0:
         failures.append(f"graph_only_unsupported_count={mq['graph_only_unsupported_count']} > 0")
-    if mq.get("graph_trigger_query_count", 0) <= 0 or mq.get("graph_trigger_validated_count", 0) <= 0:
-        failures.append("graph trigger fixture did not produce a validated graph result")
-    if mq["ann_recall_at_10"] is not None and mq["ann_recall_at_10"] < 0.98:
-        failures.append(f"ann_recall_at_10={mq['ann_recall_at_10']:.4f} < 0.98")
-    ann_benchmark = metrics.get("index_benchmark", {}).get("ann")
-    if ann_benchmark is not None and ann_benchmark.get("selected_mode") != "ann":
-        failures.append(
-            "ANN evaluation build was not promoted: "
-            f"selected_mode={ann_benchmark.get('selected_mode')} "
-            f"scope={ann_benchmark.get('probe_scope')} "
-            f"probes={ann_benchmark.get('probe_count')}/{ann_benchmark.get('probe_total')}"
-        )
-
+    failures.extend("graph contract: " + failure
+                    for failure in metrics["graph_contract"]["failures"])
     if failures:
         print("\n[FAIL] 评测未通过：", file=sys.stderr)
         for f in failures:

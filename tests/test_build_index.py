@@ -10,6 +10,47 @@ from build_index import WikiIndex
 from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
 
+def test_wikiindex_build_has_no_runtime_mode_selection(monkeypatch, tmp_path):
+    """Phase 06（issue #49）：facade 不传播 auto/exact/FLAT/SQ 运行时选择。"""
+    import build_index as build_module
+
+    requested = []
+
+    class FakeEmbedder:
+        tokenizer = object()
+
+        def get_embedding_dimension(self):
+            return 2
+
+        def encode(self, texts, **kwargs):
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(build_module, "scan_wiki", lambda *_args: [])
+    monkeypatch.setattr(build_module, "EmbeddingTokenizer", lambda _tokenizer: types.SimpleNamespace(count=len))
+
+    def fake_build(*_args, **kwargs):
+        assert "vector_index_mode" not in kwargs, "runtime mode selection must be removed"
+        requested.append(sorted(kwargs))
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text(
+            json.dumps({
+                "policy": {"selected_mode": "ann"},
+                "ann_policy": {"selected_index_type": "ivf-hnsw-sq", "query_ef": 100},
+            }),
+            encoding="utf-8",
+        )
+        return types.SimpleNamespace(artifact=types.SimpleNamespace(manifest_path=manifest))
+
+    monkeypatch.setattr(build_module, "build_storage_contract", fake_build)
+    index = WikiIndex(tmp_path / ".index")
+    index._embedder = FakeEmbedder()
+
+    index._build(tmp_path / "Wiki")
+
+    assert requested, "facade must still route through build_storage_contract"
+    assert index._vector_index_mode == "ivf-hnsw-sq"  # 来自 manifest 的固定策略
+
+
 def _write_page(wiki: Path, name: str, title: str, body: str, sources=None):
     d = wiki / "concepts"
     d.mkdir(parents=True, exist_ok=True)

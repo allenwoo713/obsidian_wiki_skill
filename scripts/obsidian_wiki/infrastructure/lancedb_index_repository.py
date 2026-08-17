@@ -12,26 +12,78 @@ from typing import Mapping, Sequence
 import lancedb
 import numpy as np
 import pyarrow as pa
-from lancedb.index import HnswFlat
+from lancedb.index import HnswFlat, HnswSq, IvfFlat
 
 from obsidian_wiki.domain.index_models import (
+    CandidateQueryPolicy,
     DenseChunk,
     ExactBatchResult,
     FtsIndexConfig,
     FtsIndexStats,
+    INDEX_LAYOUT_VERSION,
+    INDEX_MANIFEST_FORMAT_VERSION,
     IndexSchemaCounts,
     IndexStats,
+    ProductionAnnPolicy,
     RebuildRequiredError,
     SparseChunk,
     VectorIndexConfig,
 )
+from obsidian_wiki.domain.index_policy import load_ann_policy_file
+
+# eval candidate 名 → LanceDB 索引类型（仅供显式 eval seam 使用）。
+_EVAL_CANDIDATE_TYPES = {
+    "ivf-hnsw-flat": "hnsw_flat",
+    "ivf-hnsw-sq": "hnsw_sq",
+}
 
 
 class LanceDbIndexRepository:
-    """The sole location where #17 domain values become LanceDB calls."""
+    """The sole location where #17 domain values become LanceDB calls.
 
-    def __init__(self, lance_dir: Path):
+    Phase 06（issue #49）：仓库实例绑定一种 ANN 策略——默认加载批准的
+    生产策略（IVF_HNSW_SQ / ef=100）；显式传入 ``eval_candidate_policy``
+    才进入 evaluation-comparator 模式（FLAT/SQ × 声明 ef）。生产端口上
+    不存在运行时类型/ef/exact 选择。
+    """
+
+    def __init__(
+        self,
+        lance_dir: Path,
+        *,
+        ann_policy: ProductionAnnPolicy | None = None,
+        eval_candidate_policy: CandidateQueryPolicy | None = None,
+    ):
         self._lance_dir = Path(lance_dir)
+        if ann_policy is not None and eval_candidate_policy is not None:
+            raise ValueError(
+                "ann_policy and eval_candidate_policy are mutually exclusive"
+            )
+        self._ann_policy = ann_policy
+        self._eval_candidate_policy = eval_candidate_policy
+        # A repository instance owns one normal dense-table handle.  This keeps
+        # LanceDB's ordinary ANN builder path intact while avoiding a reconnect
+        # for every request in a bounded validation matrix.
+        self._dense_table_handle = None
+        self._dense_table_open_count = 0
+
+    def _bound_policy(self) -> ProductionAnnPolicy:
+        return self._ann_policy if self._ann_policy is not None else load_ann_policy_file()
+
+    def _bound_query_ef(self) -> int:
+        if self._eval_candidate_policy is not None:
+            return self._eval_candidate_policy.query_ef
+        return self._bound_policy().query_ef
+
+    def _bound_index_type(self) -> str:
+        if self._eval_candidate_policy is not None:
+            return _EVAL_CANDIDATE_TYPES[self._eval_candidate_policy.candidate]
+        return self._bound_policy().lancedb_index_type
+
+    @property
+    def dense_table_open_count(self) -> int:
+        """Number of physical dense-table opens performed by this instance."""
+        return self._dense_table_open_count
 
     @staticmethod
     def validate_dense_chunks(dense_chunks: Sequence[DenseChunk]) -> int:
@@ -56,11 +108,20 @@ class LanceDbIndexRepository:
         dense_chunks: Sequence[DenseChunk],
         fts_config: FtsIndexConfig,
     ) -> None:
+        # Persistence can replace the table underneath a previously opened
+        # handle.  Invalidate before the first mutating SDK operation so a later
+        # normal query cannot observe a stale dense table.
+        self._dense_table_handle = None
         if not sparse_chunks:
             raise ValueError("Sparse persistence requires at least one row")
         dimensions = self.validate_dense_chunks(dense_chunks)
         if len({chunk.chunk_id for chunk in sparse_chunks}) != len(sparse_chunks):
             raise ValueError("Sparse persistence rejects duplicate chunk IDs")
+        # issue #47：两表严格语义分离，写入前 fail-closed 拒绝混入的另一种 kind。
+        if any(c.chunk_kind != "sparse" for c in sparse_chunks):
+            raise ValueError("sparse_chunks accepts only chunk_kind='sparse' (issue #47)")
+        if any(c.chunk_kind != "dense" for c in dense_chunks):
+            raise ValueError("dense_chunks accepts only chunk_kind='dense' (issue #47)")
         db = lancedb.connect(str(lance_dir))
         sparse_schema = pa.schema([
             pa.field("chunk_id", pa.string()), pa.field("page_id", pa.string()),
@@ -72,6 +133,10 @@ class LanceDbIndexRepository:
             pa.field("token_count", pa.int64()), pa.field("content_hash", pa.string()),
             pa.field("forced_split", pa.bool_()), pa.field("continuation_index", pa.int64()),
             pa.field("start_char", pa.int64()), pa.field("end_char", pa.int64()),
+            pa.field("structure_kind", pa.string()),
+            pa.field("table_header_text", pa.string()),
+            pa.field("table_header_start_char", pa.int64()),
+            pa.field("table_header_end_char", pa.int64()),
         ])
         dense_schema = pa.schema([
             pa.field("chunk_id", pa.string()), pa.field("page_id", pa.string()),
@@ -130,18 +195,51 @@ class LanceDbIndexRepository:
                     os.close(fd)
 
     def create_vector_index(self, config: VectorIndexConfig) -> IndexStats:
+        """Build only this repository's bound index type (Phase 06 fail-closed)."""
+        bound_type = self._bound_index_type()
+        if config.index_type != bound_type:
+            raise ValueError(
+                f"repository is bound to index type {bound_type!r}; refusing to "
+                f"build {config.index_type!r} (runtime ANN selection is removed)"
+            )
+        return self._build_hnsw_index(config)
+
+    def create_eval_candidate_index(self, config: VectorIndexConfig) -> IndexStats:
+        """Evaluation-comparator-only construction of a declared candidate.
+
+        仅限 ``eval/benchmark_ann_build.py`` 的显式 eval seam——生产端口/
+        facade 不可达；调用方必须自己声明完整 candidate 配置。
+        """
+        if config.index_type not in {"hnsw_flat", "hnsw_sq", "ivf_flat"}:
+            raise ValueError("eval candidate construction requires a known index type")
+        return self._build_hnsw_index(config)
+
+    def _build_hnsw_index(self, config: VectorIndexConfig) -> IndexStats:
         table = self._dense_table()
         if table.count_rows() != config.dense_chunks_count:
             raise ValueError("Vector index config dense_chunks_count does not match dense table")
-        # `VectorIndexConfig` permits only hnsw_flat; keep current SDK objects adapter-local.
-        table.create_index(
-            "vector",
-            config=HnswFlat(
+        if config.index_type == "ivf_flat":
+            index_config = IvfFlat(
+                distance_type=config.metric,
+                num_partitions=config.num_partitions,
+            )
+        elif config.index_type == "hnsw_sq":
+            index_config = HnswSq(
                 distance_type=config.metric,
                 num_partitions=config.num_partitions,
                 m=config.m,
                 ef_construction=config.ef_construction,
-            ),
+            )
+        else:
+            index_config = HnswFlat(
+                distance_type=config.metric,
+                num_partitions=config.num_partitions,
+                m=config.m,
+                ef_construction=config.ef_construction,
+            )
+        table.create_index(
+            "vector",
+            config=index_config,
             replace=True,
             name=config.index_name,
         )
@@ -163,7 +261,9 @@ class LanceDbIndexRepository:
             raise RuntimeError(f"FTS index statistics unavailable for {index_name}")
         return FtsIndexStats(index_name=index_name, indexed_rows=stats.num_indexed_rows)
 
-    def validate_reopened(self, *, dimension: int, exact_term: str) -> tuple[IndexSchemaCounts, IndexStats, FtsIndexStats]:
+    def validate_reopened(
+        self, *, dimension: int, exact_term: str, vector_index_name: str | None = "dense_hnsw"
+    ) -> tuple[IndexSchemaCounts, IndexStats, FtsIndexStats]:
         """Inspect persisted data through a new connection, never cached input rows."""
         if not exact_term or not exact_term.strip() or any(char.isspace() for char in exact_term.strip()):
             raise ValueError("Exact-term validation requires one non-empty token")
@@ -172,12 +272,19 @@ class LanceDbIndexRepository:
             raise RuntimeError("Persisted artifact must contain exactly sparse_chunks and dense_chunks")
         sparse = db.open_table("sparse_chunks")
         dense = db.open_table("dense_chunks")
+        # 两表共享的上下文列；structure_kind/table_header_* 为 sparse 表独有
+        # （dense 表 schema 不含），仅计入 required_sparse 校验（issue #47）。
         context_columns = {
             "page_type", "section_path", "heading", "chunk_kind", "chunk_index",
             "parent_section_id", "token_count", "content_hash", "forced_split",
             "continuation_index", "start_char", "end_char",
         }
-        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text", *context_columns}
+        sparse_only = {
+            "structure_kind", "table_header_text",
+            "table_header_start_char", "table_header_end_char",
+        }
+        required_sparse = {"chunk_id", "page_id", "path", "title", "text", "fts_text",
+                          *context_columns, *sparse_only}
         required_dense = {"chunk_id", "page_id", "path", "title", "text", "vector", *context_columns}
         if set(sparse.schema.names) != required_sparse or set(dense.schema.names) != required_dense:
             raise RuntimeError("Persisted table schemas do not satisfy the two-table contract")
@@ -201,7 +308,15 @@ class LanceDbIndexRepository:
             raise RuntimeError("Native FTS statistics show unindexed sparse rows")
         if not self.search_sparse(exact_term, limit=1):
             raise RuntimeError("Native FTS exact-term validation failed")
-        vector_stats = self.vector_index_stats("dense_hnsw")
+        vector_stats = (
+            self.vector_index_stats(vector_index_name)
+            if vector_index_name is not None
+            else IndexStats(
+                index_name="exact_scan",
+                indexed_rows=len(dense_rows),
+                unindexed_dense_rows=0,
+            )
+        )
         return (
             IndexSchemaCounts(len(sparse_rows), len(dense_rows)),
             vector_stats,
@@ -213,23 +328,53 @@ class LanceDbIndexRepository:
         return self._sparse_table().search(query, query_type="fts").limit(limit).to_list()
 
     def context_rows(self, predicate: str) -> list[Mapping[str, object]]:
-        """Read canonical chunk text/metadata from sparse_chunks for context assembly.
+        """Union sparse + dense retrieval rows for context assembly (issue #47).
 
-        This deliberately never opens the retired ``chunks`` table.  Sparse rows
-        retain every ChunkRecord (including dense leaf metadata), whereas the
-        dense table is intentionally limited to vector-bearing leaves.
+        The two physical tables are strictly separated; context assembly reads
+        both and deduplicates by ``chunk_id`` (dense wins on collision, since it
+        carries the vector-bearing leaf).  Sorted by
+        (page_id, chunk_index, chunk_id) for deterministic ordering.
         """
-        return self._sparse_table().search().where(predicate).to_list()
+        def _normalize(row: Mapping[str, object]) -> dict:
+            return {**row}
+
+        sparse = self._sparse_table().search().where(predicate).to_list()
+        dense = self._dense_table().search().where(predicate).to_list()
+        rows = {row["chunk_id"]: _normalize(row) for row in sparse}
+        rows.update({row["chunk_id"]: _normalize(row) for row in dense})
+        return sorted(rows.values(), key=lambda r: (r["page_id"], r["chunk_index"], r["chunk_id"]))
 
     def search_dense(
-        self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
+        self, vector: Sequence[float], *, metric: str, limit: int = 10,
+        where: str | None = None,
     ) -> list[Mapping[str, object]]:
-        return self._search_dense(vector, metric=metric, limit=limit, where=where, exact=False)
+        """Normal dense retrieval at the bound policy's fixed ef."""
+        return self._search_dense(
+            vector, metric=metric, limit=limit, where=where, exact=False
+        )
+
+    def search_dense_eval(
+        self, vector: Sequence[float], *, metric: str, limit: int = 10,
+        ef: int, where: str | None = None,
+    ) -> list[Mapping[str, object]]:
+        """Evaluation-comparator-only dense query with a declared ef.
+
+        仅限 ``eval/benchmark_ann_build.py`` 的显式 grid 查询；生产端口/facade
+        不可达，也不进入任何发布证据。
+        """
+        if not isinstance(ef, int) or isinstance(ef, bool) or ef <= 0:
+            raise ValueError("eval dense query requires a positive ef")
+        return self._search_dense(
+            vector, metric=metric, limit=limit, where=where, exact=False, ef=ef
+        )
 
     def search_dense_exact(
         self, vector: Sequence[float], *, metric: str, limit: int = 10, where: str | None = None
     ) -> list[Mapping[str, object]]:
-        return self._search_dense(vector, metric=metric, limit=limit, where=where, exact=True)
+        """Diagnostic/benchmark-only exact dense scan (never a production route)."""
+        return self._search_dense(
+            vector, metric=metric, limit=limit, where=where, exact=True
+        )
 
     def search_dense_exact_batch(
         self,
@@ -358,7 +503,8 @@ class LanceDbIndexRepository:
         return "page_id = '{}'".format(page_id.replace("'", "''"))
 
     def _search_dense(
-        self, vector: Sequence[float], *, metric: str, limit: int, where: str | None, exact: bool
+        self, vector: Sequence[float], *, metric: str, limit: int,
+        where: str | None, exact: bool, ef: int | None = None,
     ) -> list[Mapping[str, object]]:
         if metric not in {"cosine", "l2", "dot"}:
             raise ValueError("Vector metric must be cosine, l2, or dot")
@@ -369,12 +515,9 @@ class LanceDbIndexRepository:
             if exact:
                 query = query.bypass_vector_index()
             else:
-                # #41: lancedb 0.34 HNSW default ef (=1.5*limit) is too low for
-                # build-time self-probe recall (recall@10/20 == 1.0 gate). Floor
-                # ef at 100; but never go BELOW lancedb's own default (1.5*limit),
-                # since large-k production queries (e.g. limit=80) would otherwise
-                # regress from ef=120 to 100. Floor = max(100, ceil(1.5*limit)).
-                query = query.ef(max(100, (limit * 3 + 1) // 2))
+                # Phase 06（issue #49）：普通查询固定使用绑定策略的 ef
+                # （生产=批准 ef=100；eval candidate=声明的 grid ef）。
+                query = query.ef(ef if ef is not None else self._bound_query_ef())
             if where is not None:
                 query = query.where(where)
             return query.limit(limit).to_list()
@@ -386,7 +529,10 @@ class LanceDbIndexRepository:
         return lancedb.connect(str(self._lance_dir)).open_table("sparse_chunks")
 
     def _dense_table(self):
-        return lancedb.connect(str(self._lance_dir)).open_table("dense_chunks")
+        if self._dense_table_handle is None:
+            self._dense_table_handle = lancedb.connect(str(self._lance_dir)).open_table("dense_chunks")
+            self._dense_table_open_count += 1
+        return self._dense_table_handle
 
     @staticmethod
     def require_current_layout(manifest_path: Path) -> None:
@@ -396,3 +542,15 @@ class LanceDbIndexRepository:
             raise RebuildRequiredError("Index manifest cannot be interpreted; rebuild required") from exc
         if manifest.get("layout") != "sparse_chunks+dense_chunks":
             raise RebuildRequiredError("Legacy index layout detected; rebuild required")
+        # issue #47：旧构建（被污染的两表 / 旧 schema）缺少 index_layout_version，
+        # 据此明确要求重建，而非在污染的稀疏表上继续服务。
+        if manifest.get("index_layout_version") != INDEX_LAYOUT_VERSION:
+            raise RebuildRequiredError("Index layout version mismatch; rebuild required")
+        # Phase 06（issue #49）：format-5/evidence-v2 是 mode-ambiguous 的旧契约
+        # （requested_vector_index_mode / exact 回退），在任何查询路由前拒绝并
+        # 要求全新构建；不支持原地迁移。
+        if manifest.get("format_version") != INDEX_MANIFEST_FORMAT_VERSION:
+            raise RebuildRequiredError(
+                "mode-ambiguous legacy index manifest detected (format "
+                f"{manifest.get('format_version')!r}); a fresh full rebuild is required"
+            )

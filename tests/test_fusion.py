@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from models import ChunkHit
@@ -111,3 +113,80 @@ def test_assemble_context_per_type_budget_enforced():
     # 省略原因标明 dense_budget_exhausted
     omitted_reasons = [o["reason"] for o in bundle.omitted_items]
     assert any("dense_budget_exhausted" in r for r in omitted_reasons)
+
+
+# --- Issue #47 E: page-level RRF contributes once per page per channel ----------
+# Before #47 a single page with N FTS fragments received N RRF contributions,
+# inflating its score and biasing retrieval toward fragmented pages. The fix
+# scores each page once per channel while still retaining every fragment.
+
+def test_one_rrf_contribution_per_page_per_channel():
+    fts = [_hit("P", "P", "fts", 5.0 - i, text=f"f{i}") for i in range(3)]
+    out = page_level_rrf(fts, [], k=5)
+    assert len(out) == 1
+    # Exactly 1/(60+1) — not 1/61 + 1/62 + 1/63.
+    assert out[0].rrf_score == pytest.approx(1.0 / 61.0)
+
+
+def test_nondefault_rrf_denominator_applies_to_public_and_ranking_scores():
+    from fusion import page_ranking_score
+
+    hits = [_hit("P", "P", "fts", 5.0 - i, text=f"f{i}") for i in range(3)]
+    candidate = page_level_rrf(hits, [], k=1, k_rrf=10)[0]
+
+    assert candidate.rrf_score == pytest.approx(1.0 / 11.0)
+    assert page_ranking_score(candidate, k_rrf=10) == pytest.approx(
+        1.0 / 11.0 + 1.0 / 12.0 + 1.0 / 13.0)
+
+
+def test_all_fragments_retained_as_evidence():
+    fts = [_hit("P", "P", "fts", 5.0 - i, text=f"f{i}") for i in range(3)]
+    out = page_level_rrf(fts, [], k=5)
+    assert len(out[0].sparse_evidence) == 3
+
+
+def test_bounded_evidence_strength_reranks_without_changing_rrf_score():
+    sparse = [_hit("supported", "Supported", "fts", 5.0 - i, text=f"s{i}")
+              for i in range(4)]
+    sparse.append(_hit("thin", "Thin", "fts", 4.5, text="thin"))
+    out = page_level_rrf(sparse, [], k=2)
+    assert [candidate.page_id for candidate in out] == ["supported", "thin"]
+    supported = out[0]
+    assert supported.rrf_score == pytest.approx(1.0 / 61.0)
+
+
+def test_evidence_strength_is_capped_against_unbounded_fragment_bias():
+    five = [_hit("five", "Five", "fts", 10.0 - i, text=f"f{i}") for i in range(5)]
+    many = [_hit("many", "Many", "fts", 5.0 - i * .01, text=f"m{i}") for i in range(12)]
+    out = page_level_rrf(five + many, [], k=2)
+    assert [candidate.page_id for candidate in out] == ["five", "many"]
+    from fusion import page_ranking_score
+    from dataclasses import replace
+    extras = [replace(hit, rank=hit.rank + 100) for hit in out[1].sparse_evidence]
+    many_more = replace(out[1], sparse_evidence=out[1].sparse_evidence + extras)
+    assert page_ranking_score(out[1]) == pytest.approx(page_ranking_score(many_more))
+
+
+def test_two_channels_give_two_contributions():
+    fts = [_hit("P", "P", "fts", 5.0, text="a")]
+    vec = [_hit("P", "P", "vector", 9.0, text="b")]
+    out = page_level_rrf(fts, vec, k=5)
+    assert len(out) == 1
+    # fts once + vector once = 2/61.
+    assert out[0].rrf_score == pytest.approx(2.0 / 61.0)
+    assert out[0].sparse_evidence and out[0].dense_evidence
+
+
+def test_dual_channel_outranks_single_channel():
+    dual = page_level_rrf(
+        [_hit("P", "P", "fts", 5.0, text="a")],
+        [_hit("P", "P", "vector", 9.0, text="b")],
+        k=5,
+    )[0]
+    single = page_level_rrf(
+        [_hit("Q", "Q", "fts", 5.0, text="a")],
+        [],
+        k=5,
+    )[0]
+    # A page present in both channels scores exactly double a single-channel page.
+    assert dual.rrf_score == pytest.approx(2.0 * single.rrf_score)

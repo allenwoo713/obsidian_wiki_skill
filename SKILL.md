@@ -142,6 +142,8 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<用
 
 **增量原理：** 两层增量。①源文档层：`manifest.json` 记录每个源文件 SHA256，未变更文件零开销跳过解析。②索引层（#7）：`build_index.py` 按页内 dense chunk 内容哈希做页级向量缓存，未变页复用缓存向量跳过 torch 编码；索引经 `ACTIVE_INDEX` 指针原子发布（#11），构建崩溃不影响活动索引。
 
+**固定向量索引契约（Phase 06 / issue #49）：** 生产 dense 检索固定为源码控制 `eval/ann-policy.json` 的唯一批准策略——`IVF_HNSW_SQ`（cosine、`num_partitions=1`、`ef_construction=300`）+ 查询 `ef=100`，held-out floors Recall@10 ≥ 0.19 / Recall@20 ≥ 0.17。**没有运行时类型/ef/exact 选择，也没有 exact 回退**：exact 仅为诊断 API。每次构建在发布前用确定性 held-out 验证 query（数量 = `min(BENCHMARK_MAX_PROBES, dense_rows)`）对照 batch-exact 真值校验 recall，不达标即拒绝发布并保留旧 `ACTIVE_INDEX`。旧 format-5 mode-ambiguous 索引加载即报 `RebuildRequiredError`，需全量重建（`--vector-index` 参数已废弃，传入即 exit 2）。策略校验：`python eval/run_eval.py --validate-ann-policy`。
+
 ---
 
 ## ⚠️ 强制检索规则（MANDATORY — 不可跳过）

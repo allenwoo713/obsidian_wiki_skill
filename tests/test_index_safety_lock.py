@@ -50,6 +50,20 @@ LOCK_NAME = "BUILD.lock"
 _BUILD_ID_RE = re.compile(r"^build_\d{8}T\d{12}_[0-9a-f]{32}$")
 
 
+def _embed384(seed: int = 0):
+    """Deterministic 384-dim unit vectors (Phase 06 approved policy dimension)."""
+    import math, random as _random
+
+    def embed(texts):
+        out = []
+        for row, _t in enumerate(texts):
+            rng = _random.Random(77 + seed * 1013 + row)
+            raw = [rng.gauss(0.0, 1.0) for _ in range(384)]
+            norm = math.sqrt(sum(v * v for v in raw))
+            out.append([v / norm for v in raw])
+        return out
+    return embed
+
 def _index(tmp_path: Path) -> Path:
     idx = tmp_path / ".index"
     idx.mkdir(parents=True)
@@ -522,7 +536,7 @@ def test_build_context_flows_through_service_build(tmp_path):
     )
     index_dir = tmp_path / ".index"
     ctx = _ctx()
-    embed = lambda texts: [[1.0] * 16 for _ in texts]  # noqa: E731
+    embed = _embed384()
     artifact = IndexBuildService(
         LanceDbIndexRepository(index_dir),
         reopen_storage=LanceDbIndexRepository,

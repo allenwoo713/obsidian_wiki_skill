@@ -22,7 +22,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Iterator, List, NamedTuple, Optional
 
 # --------------------------------------------------------------------------
 # Config (issue #1: default parameters)
@@ -38,12 +38,19 @@ SPARSE_OVERLAP_CHARS = 100
 # 压缩前缀而非吞掉正文，保证 body_budget >= MIN_BODY_RESERVE。
 MIN_BODY_RESERVE = 200
 
+# issue #47：sparse / dense 分表后，schema 版本必须独立，使 sparse-only 改动
+# （如本 issue 的 block-first 重构）不会使未变的 dense ID / 向量缓存失效。
+# 注意 dense 仍用 v3（与历史向量缓存兼容），sparse 升到 v4。
+SPARSE_CHUNK_SCHEMA_VERSION = 4
+DENSE_CHUNK_SCHEMA_VERSION = 3
+
 # #13：chunk_id 契约升级。v2 把 ID 编成 `schema:page_id:kind:index`，
 # 前方插入/删除 chunk 会导致后续 ID 全漂移；v3 改为内容哈希
 # （page_id::{sha256(kind|body|occurrence)}），与位置无关，插入无关
 # section 后未修改 chunk 的 ID 保持不变。vec_cache namespace / checkpoint
 # signature / eval 归一化均随之失效旧缓存、强制全量重编码。
-CHUNK_SCHEMA_VERSION = 3
+# 默认版本保留为 dense（历史兼容）；sparse 调用方显式传 SPARSE_CHUNK_SCHEMA_VERSION。
+CHUNK_SCHEMA_VERSION = DENSE_CHUNK_SCHEMA_VERSION
 
 Tokenizer = Callable[[str], int]
 
@@ -142,6 +149,11 @@ class ChunkRecord:
     content_hash: str
     forced_split: bool = False          # #13 review：sparse 超长强制切片时为 True
     continuation_index: int = -1        # #13 review：强制切片的续片序号（从 0）
+    # issue #47：结构感知 provenance（原样保留真实 source span，不伪造连续切片）。
+    structure_kind: str = "paragraph"   # paragraph|quote|list|code|table
+    table_header_text: str = ""         # 大表窗口重复 header 的真实文本
+    table_header_start_char: int = -1   # header 真实起始 offset
+    table_header_end_char: int = -1     # header 真实结束 offset
 
 
 @dataclass
@@ -440,7 +452,7 @@ def _norm(text: str) -> str:
 
 
 def _make_chunk_id(page_id: str, chunk_kind: str, body_text: str,
-                   occurrence: int) -> str:
+                   occurrence: int, schema_version: int = CHUNK_SCHEMA_VERSION) -> str:
     """Position-stable chunk ID (issue #13).
 
     Derived from ``(chunk_kind, normalized body, occurrence)`` — NOT from
@@ -451,8 +463,11 @@ def _make_chunk_id(page_id: str, chunk_kind: str, body_text: str,
 
     ``page_id`` is kept as a namespace prefix so two pages with identical body
     text still get distinct, unique IDs in the LanceDB table.
+
+    issue #47：``schema_version`` 按 kind 区分（sparse v4 / dense v3），使
+    sparse-only 改动不会使未变的 dense ID / 向量缓存失效。
     """
-    payload = f"{chunk_kind}|{_norm(body_text)}|{occurrence}|v{CHUNK_SCHEMA_VERSION}"
+    payload = f"{chunk_kind}|{_norm(body_text)}|{occurrence}|v{schema_version}"
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     return f"{page_id}::{h}"
 
@@ -523,11 +538,13 @@ def chunk_page(page_id: str, path: Path, title: str, page_type: str,
         prefix = (" / ".join(sec.section_path) + "\n") if sec.section_path else ""
         psec_id = _section_id(page_id, sec.section_path)
 
-        # --- sparse section chunk(s): block-boundary safe + 真·硬上限 (issue #13 review) ---
-        for sp_text, sp_prefix, sp_start, sp_end, forced, cont_idx in \
+        # --- sparse section chunk(s): block-first 结构感知 + 真·硬上限 (issue #47) ---
+        for (sp_text, sp_prefix, sp_start, sp_end, forced, cont_idx,
+             structure_kind, th_text, th_start, th_end) in \
                 _sparse_chunks_for_section(sec, prefix, tok, stats):
             body = sp_text[len(sp_prefix):] if sp_prefix and sp_text.startswith(sp_prefix) else sp_text
-            cid = _make_chunk_id(page_id, "sparse", body, _occ("sparse", body))
+            cid = _make_chunk_id(page_id, "sparse", body, _occ("sparse", body),
+                                 SPARSE_CHUNK_SCHEMA_VERSION)
             records.append(ChunkRecord(
                 chunk_id=cid, page_id=page_id, path=Path(path), title=title,
                 page_type=page_type, chunk_kind="sparse",
@@ -538,6 +555,10 @@ def chunk_page(page_id: str, path: Path, title: str, page_type: str,
                 token_count=len(sp_text) // 4,  # sparse is char-budgeted (no vector)
                 content_hash=hashlib.sha256(sp_text.encode("utf-8")).hexdigest()[:16],
                 forced_split=forced, continuation_index=cont_idx,
+                structure_kind=structure_kind,
+                table_header_text=th_text,
+                table_header_start_char=th_start,
+                table_header_end_char=th_end,
             ))
             idx += 1
 
@@ -547,7 +568,8 @@ def chunk_page(page_id: str, path: Path, title: str, page_type: str,
             segs.extend(_seg_block(b, tok))
         for dtext, dstart, dend in _pack_dense(prefix, segs, tok):
             body = dtext[len(prefix):] if dtext.startswith(prefix) else dtext
-            cid = _make_chunk_id(page_id, "dense", body, _occ("dense", body))
+            cid = _make_chunk_id(page_id, "dense", body, _occ("dense", body),
+                                 DENSE_CHUNK_SCHEMA_VERSION)
             records.append(ChunkRecord(
                 chunk_id=cid, page_id=page_id, path=Path(path), title=title,
                 page_type=page_type, chunk_kind="dense",
@@ -562,89 +584,178 @@ def chunk_page(page_id: str, path: Path, title: str, page_type: str,
     return records
 
 
+class _SparseYield(NamedTuple):
+    """Block-first sparse 规划的一次产出（issue #47）。"""
+    text: str
+    start: int
+    end: int
+    forced: bool
+    cont_idx: int
+    structure_kind: str
+    table_header_text: str
+    table_header_start_char: int
+    table_header_end_char: int
+
+
 def _sparse_chunks_for_section(sec: "Section", prefix: str,
                                tokenizer: Tokenizer,
                                stats: Optional[dict] = None):
-    """Yield ``(full_text, eff_prefix, start_char, end_char, forced, cont_idx)``.
+    """Yield 10-tuple ``(full_text, eff_prefix, start, end, forced, cont_idx,
+    structure_kind, table_header_text, table_header_start_char, table_header_end_char)``.
 
-    硬上限保证：对每个输出 chunk 的 ``full_text``（= eff_prefix + body）断言
-    ``len(full_text) <= SPARSE_HARD_MAX_CHARS``；超限即抛 ChunkBuildError（最终守卫）。
-
-    边界策略（best-effort）：Markdown block → 句子/行/表格行 原子切分，绝不切断
-    表格/列表/代码/``[[wikilink]]``。最终硬限制（mandatory）：单个原子仍超限时，
-    按 cell（表格）或按字符（其它）强制切片，并标记 ``forced=True`` 与
-    ``continuation_index``，且保留真实原始 span。
+    issue #47：block-first 结构感知。每个 Markdown block 默认成为 1 个 exact-span
+    sparse chunk（段落/引用/列表/代码/小表整体），仅当超过硬上限（SPARSE_HARD_MAX_CHARS
+    减 section 前缀）时才 fallback 切片；大表按 header-aware 连续行窗口切分，每个数据
+    行恰好覆盖一次。绝不把多个 block 拼成 1 个 chunk 再谎称是 1 段连续 source span。
     """
     eff_prefix = _effective_prefix(prefix)
     prefix_len = len(eff_prefix)
     body_budget = SPARSE_HARD_MAX_CHARS - prefix_len
     if body_budget < MIN_BODY_RESERVE:
         body_budget = MIN_BODY_RESERVE
-    units = _sparse_atomic_units(sec.blocks)
-    if not units:
-        return
 
-    # A single ChunkRecord has one [start,end) interval.  Do not manufacture a
-    # joined body from disjoint/normalised units and then claim it is one source
-    # slice.  Persist one exact atomic source interval per sparse record; the
-    # retrieval layer still receives every sentence/line/row and no citation
-    # can point at text that was never in its span.
-    for unit in units:
-        if len(unit.text) > body_budget:
-            for piece_text, ps, pe, cidx in _force_split_sparse_unit(unit, body_budget):
-                full = (eff_prefix + piece_text) if eff_prefix else piece_text
-                if len(full) > SPARSE_HARD_MAX_CHARS:
-                    raise ChunkBuildError(
-                        f"sparse 硬上限被违反: len={len(full)} > {SPARSE_HARD_MAX_CHARS}")
-                yield (full, eff_prefix, ps, pe, True, cidx)
-                if stats is not None:
-                    stats["forced_sparse_splits"] += 1
-            continue
-        full = (eff_prefix + unit.text) if eff_prefix else unit.text
+    for y in _sparse_blocks_for_section(sec, body_budget, tokenizer, stats):
+        full = (eff_prefix + y.text) if eff_prefix else y.text
         if len(full) > SPARSE_HARD_MAX_CHARS:
             raise ChunkBuildError(
                 f"sparse 硬上限被违反: len={len(full)} > {SPARSE_HARD_MAX_CHARS}")
-        yield (full, eff_prefix, unit.start_char, unit.end_char, False, -1)
+        yield (full, eff_prefix, y.start, y.end, y.forced, y.cont_idx,
+               y.structure_kind, y.table_header_text,
+               y.table_header_start_char, y.table_header_end_char)
 
 
-def _sparse_atomic_units(blocks: List["Block"]) -> List["Block"]:
-    """将 section 的 blocks 切成内部边界安全的原子单元，每个单元携带真实 span。
+def _sparse_blocks_for_section(sec: "Section", body_budget: int,
+                               tokenizer: Tokenizer,
+                               stats: Optional[dict] = None) -> Iterator["_SparseYield"]:
+    """Block-first sparse planning (issue #47).
 
-    - paragraph/quote/list → 句子
-    - code → 行
-    - table → 表格行（窗口期若发现某行仍超限，再按 cell 强制切）
-    不在此处强制切片 —— 超限单元透传，由窗口期的 fallback 处理。
+    一个 Markdown block → 一个 exact-span sparse chunk；仅当该 block 单独超限时才
+    fallback。大表按 header-aware 连续行窗口切分。
     """
-    units: List[Block] = []
-    for b in blocks:
-        if b.kind in ("paragraph", "quote", "list"):
-            offset = 0
-            for s in split_sentences(b.text):
-                if not s.strip():
-                    offset += len(s)
-                    continue
-                st = b.text.find(s, offset)
-                if st < 0:
-                    st = offset
-                units.append(Block(kind=b.kind, text=s,
-                                  start_char=b.start_char + st,
-                                  end_char=b.start_char + st + len(s)))
-                offset = st + len(s)
-        elif b.kind in ("code", "table"):
-            # splitlines(keepends=True) plus a rolling cursor is essential for
-            # repeated identical rows/lines: ``find`` from zero maps every
-            # duplicate to its first occurrence.
-            cursor = 0
-            for raw in b.text.splitlines(keepends=True):
-                line = raw.rstrip("\r\n")
-                if line.strip():
-                    units.append(Block(kind=b.kind, text=line,
-                                      start_char=b.start_char + cursor,
-                                      end_char=b.start_char + cursor + len(line)))
-                cursor += len(raw)
+    for block in sec.blocks:
+        if not block.text.strip():
+            continue
+        if block.kind == "table" and len(block.text) > body_budget:
+            yield from _split_large_table_windows(block, body_budget)
+            continue
+        if len(block.text) <= body_budget:
+            yield _SparseYield(
+                text=block.text, start=block.start_char, end=block.end_char,
+                forced=False, cont_idx=-1, structure_kind=block.kind,
+                table_header_text="", table_header_start_char=-1,
+                table_header_end_char=-1,
+            )
+            continue
+        # 单 block 超限（段落/引用/列表/代码）→ 边界安全 fallback 切片。
+        for piece_text, ps, pe, cidx in _force_split_sparse_unit(block, body_budget):
+            yield _SparseYield(
+                text=piece_text, start=ps, end=pe, forced=True, cont_idx=cidx,
+                structure_kind=block.kind, table_header_text="",
+                table_header_start_char=-1, table_header_end_char=-1,
+            )
+            if stats is not None:
+                stats["forced_sparse_splits"] += 1
+
+
+def _lines_with_absolute_spans(block: "Block") -> List[tuple]:
+    """表格/代码 block 的逐行 (text, start_char, end_char)；滚动 cursor 保留真实 offset。"""
+    out: List[tuple] = []
+    cursor = 0
+    for raw in block.text.splitlines(keepends=True):
+        line = raw.rstrip("\r\n")
+        if line.strip():
+            out.append((line, block.start_char + cursor, block.start_char + cursor + len(line)))
+        cursor += len(raw)
+    return out
+
+
+def _pack_complete_rows(rows: List[tuple], budget: int) -> List[List[tuple]]:
+    """把完整数据行贪心打包进窗口；绝不切断行。单行长于 budget 时独占一个窗口。"""
+    windows: List[List[tuple]] = []
+    cur: List[tuple] = []
+    cur_len = 0
+    for row in rows:
+        row_len = len(row[0])
+        if cur and cur_len + 1 + row_len > budget:
+            windows.append(cur)
+            cur, cur_len = [], 0
+        cur.append(row)
+        cur_len += row_len + (1 if len(cur) > 1 else 0)
+    if cur:
+        windows.append(cur)
+    return windows
+
+
+def _split_large_table_windows(block: "Block", body_budget: int) -> Iterator["_SparseYield"]:
+    """大表按 header-aware 连续行窗口切分（issue #47）。
+
+    header = 第 1 行(表头) + 第 2 行(分隔符)；每个窗口覆盖若干完整数据行，且每个
+    数据行恰好出现一次。``text`` 为行窗口原文（真实 span），``table_header_*``
+    为真实 header span —— 绝不伪造单一连续 source slice。
+
+    超长表头自身也被强制切片（保证其源内容被真实 span 覆盖，不静默丢弃，issue #13）；
+    超长数据行按 cell 感知字符切片（真实 span，不丢单元格内容）。
+    """
+    lines = _lines_with_absolute_spans(block)
+    if len(lines) < 3:  # 仅表头+分隔符，无数据行 → 整表一个 chunk
+        yield _SparseYield(
+            text=block.text, start=block.start_char, end=block.end_char,
+            forced=False, cont_idx=-1, structure_kind="table",
+            table_header_text="", table_header_start_char=-1,
+            table_header_end_char=-1,
+        )
+        return
+    header = lines[:2]
+    rows = lines[2:]
+    header_text = "\n".join(line[0] for line in header)
+    header_start = header[0][1]
+    header_end = header[-1][2]
+
+    # issue #13 硬上限 + #47：超长表头自身也必须被真实 span 覆盖（强制切片），
+    # 否则表头内容在 block-first 规划下会整段丢失。
+    if len(header_text) > body_budget:
+        for piece, ps, pe in _char_slice_text(header_text, body_budget, header_start):
+            yield _SparseYield(
+                text=piece, start=ps, end=pe, forced=True, cont_idx=-1,
+                structure_kind="table",
+                table_header_text=header_text,
+                table_header_start_char=header_start,
+                table_header_end_char=header_end,
+            )
+
+    # 数据行打包成窗口；单条超长行自身按 cell/字符强制切片（真实 span，不丢内容）。
+    for window in _pack_complete_rows(rows, body_budget):
+        overlong = [w for w in window if len(w[0]) > body_budget]
+        if overlong:
+            for w in window:
+                if len(w[0]) <= body_budget:
+                    yield _SparseYield(
+                        text=w[0], start=w[1], end=w[2], forced=False, cont_idx=-1,
+                        structure_kind="table",
+                        table_header_text=header_text,
+                        table_header_start_char=header_start,
+                        table_header_end_char=header_end,
+                    )
+                else:
+                    for piece, ps, pe in _split_table_row(w[0], w[1], body_budget):
+                        yield _SparseYield(
+                            text=piece, start=ps, end=pe, forced=True, cont_idx=-1,
+                            structure_kind="table",
+                            table_header_text=header_text,
+                            table_header_start_char=header_start,
+                            table_header_end_char=header_end,
+                        )
         else:
-            units.append(b)
-    return units
+            start = window[0][1]
+            end = window[-1][2]
+            yield _SparseYield(
+                text=block.text[start - block.start_char: end - block.start_char],
+                start=start, end=end, forced=False, cont_idx=-1,
+                structure_kind="table",
+                table_header_text=header_text,
+                table_header_start_char=header_start,
+                table_header_end_char=header_end,
+            )
 
 
 def _force_split_sparse_unit(unit: "Block", body_budget: int):
@@ -652,7 +763,7 @@ def _force_split_sparse_unit(unit: "Block", body_budget: int):
     每段 ``len(text) <= body_budget``（最终拼接 prefix 后 <= 硬上限）。保留真实 span，
     续片序号从 0 起。"""
     if unit.kind == "table":
-        frags = _split_table_row(unit, body_budget)
+        frags = _split_table_row(unit.text, unit.start_char, body_budget)
     else:
         frags = _char_slice_text(unit.text, body_budget, unit.start_char)
     return [(t, s, e, i) for i, (t, s, e) in enumerate(frags)]
@@ -674,21 +785,20 @@ def _table_cells_row(text: str):
     return cells
 
 
-def _split_table_row(row_unit: "Block", body_budget: int):
+def _split_table_row(row_text: str, row_start: int, body_budget: int):
     """超长表格行按 cell 强制切片；单个 cell 仍超限时按字符切片。返回
     ``(text, start, end)`` 片段，每段 ``len(text) <= body_budget``，且保留真实 span
-    （偏移叠加 ``row_unit.start_char``，span 与片段文本逐字符一致）。绝不丢弃单元格内容。
+    （偏移叠加 ``row_start``，span 与片段文本逐字符一致）。绝不丢弃单元格内容。
 
-    span 约定：片段文本为 ``|`` + cell 内容 + ``|``，故其源区间必须同时覆盖首尾管道，
-    即 ``[cells[lo][1]-1, cells[hi][2]+1]``（cell 内容的 rel 起止 ±1 个管道）；
-    单 cell 字符切片片段同理取 ``[ps-1, pe+1]``。
+    span 约定：片段文本为 ``|`` + cell 内容 + ``|``（cell 感知切片的天然边界），
+    单 cell 字符切片片段同理取 ``[ps, pe]`` 的源区间。
     """
     # Fragment exact source slices rather than synthesising leading/trailing
     # pipes.  This handles optional trailing pipes and escaped/duplicate cell
     # text without claiming an out-of-range or fabricated span.  Prefer table
     # separators as cut points; an overlong cell falls through to the mandatory
     # character fallback.
-    text = row_unit.text
+    text = row_text
     cuts = [0]
     escaped = False
     for i, ch in enumerate(text):
@@ -709,7 +819,7 @@ def _split_table_row(row_unit: "Block", body_budget: int):
         if end <= start:
             end = min(start + body_budget, len(text))
         piece = text[start:end]
-        frags.append((piece, row_unit.start_char + start, row_unit.start_char + end))
+        frags.append((piece, row_start + start, row_start + end))
         start = end
     return frags
 

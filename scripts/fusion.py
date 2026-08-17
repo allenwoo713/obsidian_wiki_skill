@@ -20,6 +20,21 @@ from models import (
 )
 
 _FM_RE = re.compile(r"^---\n.*?\n---\n(.*)$", re.DOTALL)
+_EVIDENCE_RANK_CAP = 5
+
+
+def page_ranking_score(candidate: PageCandidate, k_rrf: int = 60) -> float:
+    """Order pages by bounded fragment-rank corroboration.
+
+    The public ``rrf_score`` still contributes exactly once per page/channel.
+    Ordering may use up to five returned fragment ranks per channel as bounded
+    corroboration; additional fragmentation cannot increase this signal.
+    """
+    score = 0.0
+    for evidence in (candidate.sparse_evidence, candidate.dense_evidence):
+        for hit in sorted(evidence, key=lambda item: item.rank)[:_EVIDENCE_RANK_CAP]:
+            score += 1.0 / (k_rrf + hit.rank)
+    return score
 
 
 def _read_full_content(path: Path, max_chars: Optional[int] = None) -> str:
@@ -50,7 +65,9 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
     """
     # 归并：保留每一路的所有命中证据；呈现文本随后去重，provenance 不去重。
     pages: dict = {}
-    for channel_hits in (fts_hits, vector_hits):
+    # issue #47 E：每页每路只贡献一次 RRF（同页多 fragment 不再叠加曝光偏置）。
+    scored_pages: dict = {"fts": set(), "vector": set()}
+    for channel, channel_hits in (("fts", fts_hits), ("vector", vector_hits)):
         for rank, h in enumerate(channel_hits, 1):
             pid = h.page_id
             entry = pages.get(pid)
@@ -61,8 +78,10 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
                     "fts_hits": [], "vec_hits": [], "rrf": 0.0,
                 }
                 pages[pid] = entry
-            entry["rrf"] += 1.0 / (k_rrf + rank)
-            if channel_hits is fts_hits:
+            if pid not in scored_pages[channel]:
+                entry["rrf"] += 1.0 / (k_rrf + rank)
+                scored_pages[channel].add(pid)
+            if channel == "fts":
                 entry["fts_hits"].append((rank, h))
                 if entry["fts_rank"] is None or rank < entry["fts_rank"]:
                     entry["fts_rank"] = rank
@@ -88,7 +107,7 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
             rrf_score=e["rrf"], sparse_rank=e["fts_rank"], dense_rank=e["vec_rank"],
             sparse_evidence=sparse_ev, dense_evidence=dense_ev,
         ))
-    candidates.sort(key=lambda c: -c.rrf_score)
+    candidates.sort(key=lambda c: (-page_ranking_score(c, k_rrf), -c.rrf_score, c.page_id))
     return candidates[:k]
 
 
