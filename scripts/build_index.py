@@ -944,7 +944,7 @@ def main():
     import argparse
     p = argparse.ArgumentParser(
         prog="build_index.py",
-        description="构建 分层分块 + LanceDB FTS + 自适应向量索引",
+        description="构建 分层分块 + LanceDB FTS + 固定向量索引（批准策略 IVF_HNSW_SQ/ef=100）",
     )
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
     p.add_argument("--full-rebuild", action="store_true",

@@ -165,10 +165,24 @@ python eval/run_eval.py
 | Evidence Recall@10 | ≥ 0.85 |
 | Exact lookup Hit@3 | ≥ 0.95 |
 | MRR@10 | ≥ 0.75 |
-| ANN Recall@10 | ≥ 0.98 |
+| Dense ANN Recall@10 / @20（77,348 x 384 held-out 生产 KPI） | ≥ 0.19 / ≥ 0.17 |
 | Context overflow / Graph-only unsupported | = 0 |
 
 并记录性能（构建/增量时间、embedding 数、索引磁盘、P50/95/99 延迟、peak memory、ContextBundle token）。CI（`.github/workflows/eval.yml`）在 PR 上自动运行测试 + 评测，结果与 `baselines.json` 对比，回归超阈值即失败。
+
+#### 固定向量索引契约（Phase 06 / issue #49）
+
+生产 dense 检索只有**一条**批准策略，记录在源码控制的 `eval/ann-policy.json`（决策证据：issue #49）：
+
+- **索引类型**：`IVF_HNSW_SQ`（cosine，`num_partitions=1`，`m=16`，`ef_construction=300`）
+- **查询 ef**：`100`（查询期探索参数；不可运行时选择）
+- **held-out floors**：Recall@10 ≥ `0.19`、Recall@20 ≥ `0.17`（针对锁定的 77,348 x 384 / 256 held-out 压力测量；生产构建的发布门禁见下）
+- **证据保留**：GitHub Actions artifacts 保留 90 天
+- **exact 检索**：仅为诊断/基准 API（`search_dense_exact*`），生产路径不可达，**不存在 exact 回退**
+- **发布门禁**：每次构建在 seal/manifest/发布之前生成 held-out 确定性 disjoint 验证 query（数量 = `min(BENCHMARK_MAX_PROBES, dense_rows)`），对比 streamed batch-exact 真值计算聚合 recall，低于 floor 即拒绝发布（staging 标记 `.failed`，旧 `ACTIVE_INDEX` 字节不变）
+- **旧索引兼容**：format-5 及更早的 mode-ambiguous manifest（`--vector-index`/exact 回退时代）加载时直接 `RebuildRequiredError`，需全量重建，不做原地迁移；`--vector-index` CLI 参数保留一个版本仅作前置拒绝 shim（exit 2）
+
+`BENCHMARK_MAX_PROBES` 只影响验证采样规模，不能改变类型/ef/任何策略值。`python eval/run_eval.py --validate-ann-policy` 可校验策略记录完整性。
 
 > **tests/** 与 **eval/** 目录已公开（issue #9），含可复现的脱敏评测集与单元测试，无需外部私有文档即可运行。
 

@@ -46,6 +46,8 @@ jobs:
           python -c "import importlib.metadata as metadata;
           print(', '.join(f'{package}={metadata.version(package)}' for package in
           ('lancedb', 'pyarrow', 'sentence-transformers')))"
+      - name: Validate approved production ANN policy record (Phase 06)
+        run: python eval/run_eval.py --validate-ann-policy
       # #17 API coverage: adapter call shapes, persisted real artifacts, exact-bypass
       # and ANN policy, SDK-free import boundaries, and installed-version reporting.
       # D-03 timing and resource values are recorded observations, never timing gates.
@@ -246,6 +248,8 @@ jobs:
           assert len(value['calibration_sha256']) == 64, 'invalid committed calibration digest';
           env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
           [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
+      - name: Validate approved production ANN policy record (Phase 06)
+        run: python eval/run_eval.py --validate-ann-policy
       - name: Run static-cap held-out FLAT/SQ ANN acceptance comparator
         env:
           # Bind native thread pools to the approved calibration setting so the

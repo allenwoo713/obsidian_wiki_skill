@@ -1060,7 +1060,34 @@ def main():
                     help="Machine-readable model-backed decision records (never a production policy)")
     ap.add_argument("--validate-candidate-hybrid-evidence", type=Path,
                     help="Validate an existing candidate-specific hybrid packet and exit")
+    ap.add_argument("--validate-ann-policy", action="store_true",
+                    help="Validate the tracked eval/ann-policy.json against the approved "
+                         "Phase 06 contract (type/ef/floors/digests) and exit")
     args = ap.parse_args()
+
+    if args.validate_ann_policy:
+        # Phase 06：把源码控制的批准策略作为身份门禁——任何字段被篡改即失败。
+        from obsidian_wiki.domain.index_policy import (
+            PolicyError,
+            load_ann_policy_file,
+            production_policy_sha256,
+        )
+        try:
+            policy = load_ann_policy_file()
+        except PolicyError as exc:
+            print(f"[ERROR] ann policy record invalid: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({
+            "valid": True,
+            "selected_index_type": policy.selected_index_type,
+            "lancedb_index_type": policy.lancedb_index_type,
+            "query_ef": policy.query_ef,
+            "recall_at_10_floor": policy.recall_at_10_floor,
+            "recall_at_20_floor": policy.recall_at_20_floor,
+            "policy_sha256": production_policy_sha256(policy),
+            "comparator_sha256": policy.comparator_sha256,
+        }, sort_keys=True))
+        return 0
 
     if args.validate_candidate_hybrid_evidence is not None:
         if args.decision_evidence is None:
