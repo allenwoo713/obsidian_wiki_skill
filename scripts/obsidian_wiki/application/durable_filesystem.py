@@ -29,16 +29,29 @@ def _fsync_dir(path: Path) -> None:
 
 
 def _replace_win(source: Path, target: Path) -> None:
-    """Windows：MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)（ctypes，stdlib）。"""
+    """Windows：MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)（ctypes，stdlib）。
+
+    ponytail: 目标被并发进程短暂持有时首次 replace 会共享冲突
+    (ERROR_SHARING_VIOLATION=32 / ERROR_LOCK_VIOLATION=33)；重试可自愈，
+    避免发布误判失败。其它错误立即抛出。
+    """
     import ctypes
+    import time
     from ctypes import wintypes  # noqa: F401 (初始化 ctypes)
 
     MOVEFILE_REPLACE_EXISTING = 0x1
     MOVEFILE_WRITE_THROUGH = 0x8
-    result = ctypes.windll.kernel32.MoveFileExW(
-        str(source), str(target), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
-    if not result:
-        raise OSError(ctypes.get_last_error(), f"MoveFileExW failed: {target}")
+    last_err = 0
+    for _ in range(5):
+        ok = ctypes.windll.kernel32.MoveFileExW(
+            str(source), str(target), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+        if ok:
+            return
+        last_err = ctypes.GetLastError()
+        if last_err not in (32, 33):
+            break
+        time.sleep(0.2)
+    raise OSError(last_err, f"MoveFileExW failed: {target}")
 
 
 def atomic_write_bytes(target: Path, data: bytes) -> None:
