@@ -177,3 +177,56 @@ def test_windows_replace_uses_write_through_and_propagates_failure(tmp_path, mon
     with pytest.raises(OSError, match="MoveFileExW failed"):
         _replace_win(tmp_path / "source", tmp_path / "target")
     assert observed["flags"] == 0x1 | 0x8
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MoveFileExW contract")
+def test_windows_replace_retries_on_sharing_violation_then_succeeds(tmp_path, monkeypatch):
+    """#36：首次共享冲突(32)重试后应成功，不误判发布失败。"""
+    import ctypes
+    from types import SimpleNamespace
+
+    observed: dict[str, object] = {}
+    calls = {"n": 0}
+
+    def _move_file(source, target, flags):
+        observed.update(flags=flags)
+        calls["n"] += 1
+        # 前两次模拟共享冲突，第三次成功
+        return 0 if calls["n"] <= 2 else 1
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(MoveFileExW=_move_file)),
+    )
+    monkeypatch.setattr(ctypes, "GetLastError", lambda: 32)
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)  # 跳过退避等待
+
+    _replace_win(tmp_path / "source", tmp_path / "target")
+    assert calls["n"] == 3, "应在第 3 次重试成功"
+    assert observed["flags"] == 0x1 | 0x8, "重试仍须携带 WRITE_THROUGH"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows MoveFileExW contract")
+def test_windows_replace_exhausts_retries_on_persistent_lock(tmp_path, monkeypatch):
+    """#36：持续锁冲突(33)超过重试上限(5)必须上抛 OSError。"""
+    import ctypes
+    from types import SimpleNamespace
+
+    calls = {"n": 0}
+
+    def _move_file(source, target, flags):
+        calls["n"] += 1
+        return 0  # 始终失败
+
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(MoveFileExW=_move_file)),
+    )
+    monkeypatch.setattr(ctypes, "GetLastError", lambda: 33)
+    monkeypatch.setattr("time.sleep", lambda *a, **k: None)  # 跳过退避等待
+
+    with pytest.raises(OSError, match="MoveFileExW failed"):
+        _replace_win(tmp_path / "source", tmp_path / "target")
+    assert calls["n"] == 5, "重试上限应为 range(5)=5 次"
