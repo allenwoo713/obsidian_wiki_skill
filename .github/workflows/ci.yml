@@ -142,7 +142,8 @@ jobs:
           tests/test_sparse_structure_contract.py
           tests/test_fusion.py
           tests/test_community_reports.py
-          tests/test_eval_workflow.py -q
+          tests/test_eval_workflow.py
+          tests/test_query_result.py -q
 
       - name: Enforce package import contracts
         working-directory: scripts

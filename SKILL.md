@@ -554,7 +554,17 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/audit_images.py <pro
 
 ### agent 检索答案合成工作流
 
-`query.py` 返回 text 和 images 两组。agent 合成答案时：
+`query.py` 返回 `text`（段落）和 `images`（图片）两组命中，字段形状一致（score/title/path/evidence/sources/citation）。
+
+> **解析契约（强制）**：脚本解析 JSON **必须**用稳定接口，不要直接读顶层 `text`/`images` 键，也不要找 `results`/`hits`：
+> ```python
+> from obsidian_wiki.query_result import load_hits
+> hits = load_hits("tmp/rf_out.json")   # 合并 text+images，每项带 kind 判别
+> for h in hits:
+>     print(h["kind"], h["score"], h["title"], h["path"])
+> ```
+
+agent 合成答案时：
 1. **text** → 提取段落作 prose
 2. **images** → 嵌入 `![[xxx.png]]` + 引用 caption
 3. 必要时 agent 直接 `Read` 图片确认细节（多模态读图）
