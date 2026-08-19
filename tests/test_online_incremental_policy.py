@@ -205,3 +205,57 @@ def test_compatibility_digest_changes_for_all_locked_identity_inputs():
     changed["ann_policy"]["policy_sha256"] = "b" * 64
 
     assert compatibility_digest_from_manifest(base) != compatibility_digest_from_manifest(changed)
+
+
+def _tiny_plan(text: str):
+    from obsidian_wiki.domain.index_models import SparseChunk
+
+    common = dict(
+        page_id="notes/telemetry.md", path="notes/telemetry.md", title="Telemetry", text=text,
+        content_hash=text, end_char=len(text),
+    )
+    return (
+        SparseChunk(**common, chunk_id="notes/telemetry.md::sparse", fts_text=text, chunk_kind="sparse"),
+        SparseChunk(**common, chunk_id="notes/telemetry.md::dense", fts_text=text, chunk_kind="dense"),
+    )
+
+
+def _tiny_embed(texts):
+    vectors = []
+    for offset, _text in enumerate(texts):
+        raw = [float((offset + index) % 13 + 1) for index in range(384)]
+        norm = math.sqrt(sum(value * value for value in raw))
+        vectors.append([value / norm for value in raw])
+    return vectors
+
+
+def test_telemetry_in_snapshot_and_incremental_manifests_reconciles_physical_rows(tmp_path):
+    from build_index import build_storage_contract
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    initial = _tiny_plan("initial telemetry payload")
+    snapshot = build_storage_contract(wiki_dir, index_dir, embed=_tiny_embed, sparse_chunks=initial)
+    snapshot_manifest = json.loads(snapshot.artifact.manifest_path.read_text(encoding="utf-8"))
+
+    snapshot_telemetry = snapshot_manifest["build_telemetry"]
+    assert snapshot_telemetry["mode_selected"] == "snapshot"
+    assert set(snapshot_telemetry["timings"]) == {
+        "scan_parse_ms", "chunking_ms", "embedding_cache_hit_ms", "embedding_cache_miss_ms",
+        "serialization_write_ms", "fts_catch_up_ms", "vector_catch_up_ms", "validation_ms",
+        "publication_ms", "index_rebuild_ms",
+    }
+    for table in ("sparse_rows", "dense_rows"):
+        rows = snapshot_telemetry[table]
+        assert rows["physically_written"] == rows["inserted"] + rows["updated"]
+
+    incremental = IncrementalIndexService().build(
+        wiki_dir, index_dir, canonical_chunks=_tiny_plan("changed telemetry payload"), embed=_tiny_embed,
+    )
+    incremental_manifest = json.loads(incremental.artifact.manifest_path.read_text(encoding="utf-8"))
+    incremental_telemetry = incremental_manifest["build_telemetry"]
+    assert incremental_telemetry["mode_selected"] == "incremental"
+    assert incremental_telemetry["sparse_rows"]["physically_written"] == incremental.sparse_mutation.physically_written
+    assert incremental_telemetry["dense_rows"]["physically_written"] == incremental.dense_mutation.physically_written
