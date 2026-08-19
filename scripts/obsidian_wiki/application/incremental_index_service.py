@@ -196,7 +196,8 @@ class IncrementalIndexService:
                 from obsidian_wiki.domain.index_models import StorageArtifact
                 return IncrementalBuildResult(
                     StorageArtifact(lance_dir, manifest_path, len(lexical), len(dense), ctx.build_id, generation),
-                    source_tables, sparse_delta, dense_delta, sparse_coverage, dense_coverage,
+                    source_tables, sparse_delta, dense_delta, sparse_result, dense_result,
+                    sparse_coverage, dense_coverage,
                 )
             except Exception as exc:
                 (build_dir / ".failed").write_text(

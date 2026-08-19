@@ -83,5 +83,7 @@ class IncrementalBuildResult(_JsonRecord):
     source_tables: Tuple[SourceTableIdentity, ...]
     sparse_delta: TableDelta
     dense_delta: TableDelta
+    sparse_mutation: MutationResult
+    dense_mutation: MutationResult
     sparse_coverage: CoverageObservation
     dense_coverage: CoverageObservation
