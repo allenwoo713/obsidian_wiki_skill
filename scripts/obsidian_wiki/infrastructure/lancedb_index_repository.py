@@ -281,17 +281,25 @@ class LanceDbIndexRepository:
         if target_path.exists():
             raise RuntimeError(f"incremental clone target already exists: {target_path}")
         target = lancedb.connect(str(target_path))
-        identities: list[SourceTableIdentity] = []
+        identities = self.source_table_identities()
         for name in ("sparse_chunks", "dense_chunks"):
             table = source.open_table(name)
-            version = int(table.version)
-            count = int(table.count_rows())
+            identity = next(item for item in identities if item.table_name == name)
             target.clone_table(
                 name, str(self._lance_dir / f"{name}.lance"),
-                source_version=version, is_shallow=True,
+                source_version=identity.version, is_shallow=True,
             )
-            identities.append(SourceTableIdentity(name, version, count))
-        return tuple(identities)
+        return identities
+
+    def source_table_identities(self) -> tuple[SourceTableIdentity, ...]:
+        """Read the exact two-table source lineage before any staged clone is created."""
+        source = lancedb.connect(str(self._lance_dir))
+        if set(source.table_names()) != {"sparse_chunks", "dense_chunks"}:
+            raise RuntimeError("incremental clone source must be the exact two-table layout")
+        return tuple(
+            SourceTableIdentity(name, int(source.open_table(name).version), int(source.open_table(name).count_rows()))
+            for name in ("sparse_chunks", "dense_chunks")
+        )
 
     def table_rows(self, table_name: str) -> tuple[Mapping[str, object], ...]:
         if table_name not in {"sparse_chunks", "dense_chunks"}:

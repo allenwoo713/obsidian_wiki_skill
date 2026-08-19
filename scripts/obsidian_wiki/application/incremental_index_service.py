@@ -10,18 +10,23 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from obsidian_wiki.application.active_index_pointer import (
-    publish_pointer, record_building, record_validated, resolve_active_lance_dir,
+    publish_pointer, read_generation_record, reconcile_committed_record, record_building,
+    record_validated, resolve_active_lance_dir,
 )
 from obsidian_wiki.application.build_lock import BuildLock, new_build_context
+from obsidian_wiki.application.durable_filesystem import CommitUncertainError
 from obsidian_wiki.application.index_build_service import IndexBuildService
 from obsidian_wiki.domain.incremental_models import (
-    CoverageObservation, IncrementalBuildResult, TableDelta,
+    CoverageObservation, IncrementalBuildResult, IncrementalJournalRecord,
+    IncrementalJournalState, MutationResult, SourceTableIdentity, TableDelta,
 )
 from obsidian_wiki.domain.index_models import (
     DenseChunk, FtsIndexConfig, INDEX_LAYOUT_VERSION, INDEX_MANIFEST_FORMAT_VERSION,
     PostCommitTask, PostCommitTaskState, SparseChunk, VectorIndexConfig,
 )
+from obsidian_wiki.domain.index_publication_models import GenerationState
 from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
@@ -103,6 +108,107 @@ class IncrementalIndexService:
             end_char=chunk.end_char,
         ) for chunk, vector in zip(dense_sources, vectors))
 
+    @staticmethod
+    def _digest(value: object) -> str:
+        if isinstance(value, bytes):
+            payload = value
+        else:
+            payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _plan_digest(cls, lexical: Sequence[SparseChunk], dense: Sequence[DenseChunk]) -> str:
+        return cls._digest({
+            "sparse": [chunk.to_json() for chunk in lexical],
+            "dense": [chunk.to_json() for chunk in dense],
+        })
+
+    @staticmethod
+    def _source_match(
+        record: IncrementalJournalRecord, *, pointer_digest: str,
+        source_build_id: str,
+        source_tables: tuple[SourceTableIdentity, ...], plan_digest: str,
+        config_digest: str, policy_digest: str, index_dir: Path,
+    ) -> bool:
+        target = index_dir / record.target_build
+        return (
+            record.prior_pointer_sha256 == pointer_digest
+            and record.source_build_id == source_build_id
+            and record.source_tables == source_tables
+            and record.plan_sha256 == plan_digest
+            and record.config_sha256 == config_digest
+            and record.policy_sha256 == policy_digest
+            and target == index_dir / "builds" / record.build_id
+            and target.is_dir() and not target.is_symlink()
+        )
+
+    def recover(self, index_dir: Path) -> tuple[str, ...]:
+        """Reconcile only possibly committed pointer writes under the normal build lock."""
+        ctx = new_build_context()
+        lock = BuildLock(index_dir, ctx=ctx)
+        lock.acquire()
+        try:
+            journal = FilesystemIncrementalJournal(index_dir)
+            reconciled: list[str] = []
+            for record in journal.nonterminal():
+                if record.state is not IncrementalJournalState.VALIDATED:
+                    continue
+                build_dir = index_dir / record.target_build
+                if build_dir != index_dir / "builds" / record.build_id:
+                    journal.abort(record.build_id, "target path containment mismatch; snapshot required")
+                    continue
+                committed = reconcile_committed_record(
+                    index_dir, build_dir, build_id=record.build_id, generation=record.generation,
+                )
+                lifecycle = read_generation_record(build_dir)
+                if not committed and lifecycle is not None and lifecycle.state is GenerationState.PUBLISHED:
+                    try:
+                        committed = resolve_active_lance_dir(index_dir) == build_dir / "lance_db"
+                    except RuntimeError:
+                        committed = False
+                if committed:
+                    journal.transition(record.build_id, IncrementalJournalState.PUBLISHED, boundary="pointer_reconciled")
+                    reconciled.append(record.build_id)
+            return tuple(reconciled)
+        finally:
+            lock.release()
+
+    @staticmethod
+    def required_ancestor_build_ids(index_dir: Path) -> frozenset[str]:
+        """Return source generations reachable from ACTIVE_INDEX or unfinished staging.
+
+        Absence/corruption is intentionally handled by ``assert_cleanup_allowed`` as a
+        fail-closed condition; this method only returns proven edges.
+        """
+        try:
+            pointer = json.loads((Path(index_dir) / "ACTIVE_INDEX").read_text(encoding="utf-8"))
+            active_build = str(pointer["build_id"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return frozenset()
+        journal = FilesystemIncrementalJournal(index_dir)
+        edges = {record.build_id: record.source_build_id for record in journal.records()}
+        roots = [active_build, *(record.build_id for record in journal.nonterminal())]
+        required: set[str] = set()
+        for root in roots:
+            current = root
+            seen: set[str] = set()
+            while current in edges:
+                if current in seen:
+                    return frozenset()
+                seen.add(current)
+                current = edges[current]
+                required.add(current)
+        return frozenset(required)
+
+    @classmethod
+    def assert_cleanup_allowed(cls, index_dir: Path, build_id: str, *, probe_verified: bool = False) -> None:
+        """Fail closed: Phase 4 records retention evidence but enables no pruning."""
+        if not probe_verified:
+            raise RuntimeError("lineage cleanup probe evidence is missing; retain generation")
+        required = cls.required_ancestor_build_ids(index_dir)
+        if not required or build_id in required:
+            raise RuntimeError("lineage retention guard blocks reachable or unproven generation cleanup")
+
     def build(self, wiki_dir: Path, index_dir: Path, *, canonical_chunks: Sequence[SparseChunk],
               embed: Embedder, page_metadata: list[dict] | None = None) -> IncrementalBuildResult:
         del wiki_dir  # Canonical planning occurs under the caller's existing writer boundary.
@@ -111,7 +217,7 @@ class IncrementalIndexService:
         lock.acquire()
         try:
             active_lance = resolve_active_lance_dir(index_dir)
-            self._assert_current_manifest(active_lance)
+            source_manifest = self._assert_current_manifest(active_lance)
             lexical = tuple(chunk for chunk in canonical_chunks if chunk.chunk_kind == "sparse")
             if not lexical or len(lexical) + sum(1 for chunk in canonical_chunks if chunk.chunk_kind == "dense") != len(canonical_chunks):
                 raise RuntimeError("canonical plan must contain only non-empty sparse and dense populations")
@@ -122,13 +228,49 @@ class IncrementalIndexService:
                 raise ValueError("cross-kind stable chunk IDs are forbidden")
 
             source = LanceDbIndexRepository(active_lance)
-            generation = IndexBuildService._next_generation(index_dir)
-            build_dir = index_dir / "builds" / ctx.build_id
+            source_tables = source.source_table_identities()
+            pointer_payload = (index_dir / "ACTIVE_INDEX").read_bytes()
+            pointer_digest = self._digest(pointer_payload)
+            source_build_id = str(json.loads(pointer_payload.decode("utf-8"))["build_id"])
+            plan_digest = self._plan_digest(lexical, dense)
+            config_digest = self._digest(source_manifest)
+            policy_digest = self._digest(source_manifest["ann_policy"])
+            journal = FilesystemIncrementalJournal(index_dir)
+            if journal.has_invalid_records():
+                raise RuntimeError("incremental recovery journal is malformed; snapshot required")
+            pending = journal.nonterminal()
+            if len(pending) > 1:
+                raise RuntimeError("multiple incremental recovery candidates; snapshot required")
+            if pending:
+                record = pending[0]
+                if not self._source_match(
+                    record, pointer_digest=pointer_digest, source_tables=source_tables,
+                    source_build_id=source_build_id,
+                    plan_digest=plan_digest, config_digest=config_digest, policy_digest=policy_digest,
+                    index_dir=index_dir,
+                ):
+                    journal.abort(record.build_id, "source identity mismatch; snapshot required")
+                    raise RuntimeError("incremental recovery identity mismatch; snapshot required")
+                build_id = record.build_id
+                generation = record.generation
+                build_dir = index_dir / record.target_build
+            else:
+                build_id = ctx.build_id
+                generation = IndexBuildService._next_generation(index_dir)
+                build_dir = index_dir / "builds" / build_id
+                build_dir.mkdir(parents=True, exist_ok=False)
+                record_building(build_dir, build_id=build_id, generation=generation)
+                record = journal.prepare(IncrementalJournalRecord(
+                    schema_version=1, build_id=build_id, generation=generation,
+                    state=IncrementalJournalState.PREPARED,
+                    prior_pointer_sha256=pointer_digest, source_tables=source_tables,
+                    source_build_id=source_build_id,
+                    plan_sha256=plan_digest, config_sha256=config_digest, policy_sha256=policy_digest,
+                    target_build=f"builds/{build_id}", last_completed_boundary="prepared",
+                ))
             lance_dir = build_dir / "lance_db"
-            build_dir.mkdir(parents=True, exist_ok=False)
-            record_building(build_dir, build_id=ctx.build_id, generation=generation)
+            pointer_committed = False
             try:
-                source_tables = source.clone_tables(lance_dir)
                 sparse_delta, sparse_added, sparse_updated = self._delta(
                     "sparse_chunks", source.table_rows("sparse_chunks"),
                     tuple(chunk.__dict__ for chunk in lexical),
@@ -137,17 +279,40 @@ class IncrementalIndexService:
                     "dense_chunks", source.table_rows("dense_chunks"),
                     tuple(chunk.__dict__ for chunk in dense),
                 )
+                if record.state is IncrementalJournalState.PREPARED:
+                    cloned = source.clone_tables(lance_dir)
+                    if cloned != source_tables:
+                        raise RuntimeError("source table versions changed during clone; snapshot required")
+                    record = journal.transition(build_id, IncrementalJournalState.CLONED, boundary="clone")
                 staging = LanceDbIndexRepository(lance_dir)
-                sparse_result = staging.apply_delta("sparse_chunks", added=sparse_added, updated=sparse_updated, deleted_ids=sparse_delta.deleted_ids)
-                dense_result = staging.apply_delta("dense_chunks", added=dense_added, updated=dense_updated, deleted_ids=dense_delta.deleted_ids)
+                if record.state is IncrementalJournalState.CLONED and record.last_completed_boundary != "sparse_mutated":
+                    sparse_result = staging.apply_delta("sparse_chunks", added=sparse_added, updated=sparse_updated, deleted_ids=sparse_delta.deleted_ids)
+                    journal.checkpoint(build_id, boundary="sparse_mutated")
+                    record = journal.load(build_id)
+                    assert record is not None
+                else:
+                    sparse_result = MutationResult("sparse_chunks", len(sparse_delta.added_ids), len(sparse_delta.updated_ids), len(sparse_delta.deleted_ids))
+                if record.state is IncrementalJournalState.CLONED:
+                    dense_result = staging.apply_delta("dense_chunks", added=dense_added, updated=dense_updated, deleted_ids=dense_delta.deleted_ids)
+                    record = journal.transition(build_id, IncrementalJournalState.MUTATED, boundary="dense_mutated")
+                else:
+                    dense_result = MutationResult("dense_chunks", len(dense_delta.added_ids), len(dense_delta.updated_ids), len(dense_delta.deleted_ids))
                 if sparse_result.physically_written != len(sparse_delta.physically_written_ids) or dense_result.physically_written != len(dense_delta.physically_written_ids):
                     raise RuntimeError("adapter mutation accounting does not reconcile with delta")
-                sparse_coverage = staging.catch_up(self._fts_config)
                 vector_config = VectorIndexConfig(
                     index_type="hnsw_sq", metric="cosine", num_partitions=1, m=16,
                     ef_construction=300, dense_chunks_count=len(dense),
                 )
-                staging.create_vector_index(vector_config)
+                if record.state is IncrementalJournalState.MUTATED:
+                    sparse_coverage = staging.catch_up(self._fts_config)
+                    staging.create_vector_index(vector_config)
+                    record = journal.transition(build_id, IncrementalJournalState.CAUGHT_UP, boundary="index_catch_up")
+                else:
+                    fts_stats = staging.fts_index_stats()
+                    sparse_coverage = CoverageObservation(
+                        "sparse_chunks", len(staging.table_rows("sparse_chunks")),
+                        fts_stats.indexed_rows, fts_stats.unindexed_rows,
+                    )
                 dense_stats = staging.vector_index_stats(vector_config.index_name)
                 dense_coverage = CoverageObservation("dense_chunks", len(dense), dense_stats.indexed_rows, dense_stats.unindexed_dense_rows)
                 if (sparse_coverage.unindexed_rows is None or sparse_coverage.unindexed_rows != 0
@@ -174,35 +339,43 @@ class IncrementalIndexService:
                     build_time_ms=(time.perf_counter() - index_build_started) * 1000,
                     disk_bytes=publisher._disk_bytes(build_dir),
                 )
-                staging.seal(lance_dir)
-                manifest = publisher._manifest(
+                if record.state is IncrementalJournalState.CAUGHT_UP:
+                    staging.seal(lance_dir)
+                    manifest = publisher._manifest(
                     counts=counts.to_json(), vector_stats=vector_stats.to_json(), fts_stats=fts_stats.to_json(),
                     vector_config=vector_config, benchmark=benchmark.to_json(),
                     policy={"selected_mode": "ann", "reason": "approved fixed ann policy validated by held-out publication evidence", "benchmark": benchmark.to_json(), "index_stats": vector_stats.to_json(), "benchmark_scope": "held_out", "benchmark_probe_count": publication_evidence.validation_query_count, "benchmark_probe_total": counts.dense_chunks_count},
-                    sparse_chunks=canonical_chunks, generation=generation, build_id=ctx.build_id,
+                    sparse_chunks=canonical_chunks, generation=generation, build_id=build_id,
                     page_metadata=page_metadata, ann_policy=publisher._ann_policy,
                     publication_evidence=publication_evidence,
                 )
-                manifest_path = build_dir / "manifest.json"
-                FilesystemIndexManifest().write(manifest_path, manifest)
-                record_validated(build_dir, generation=generation, build_id=ctx.build_id,
-                                 manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest())
+                    manifest_path = build_dir / "manifest.json"
+                    FilesystemIndexManifest().write(manifest_path, manifest)
+                    record_validated(build_dir, generation=generation, build_id=build_id,
+                                     manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest())
+                    record = journal.transition(build_id, IncrementalJournalState.VALIDATED, boundary="manifest_validated")
+                else:
+                    manifest_path = build_dir / "manifest.json"
                 FilesystemPostCommitJournal(index_dir).prepare(PostCommitTask(
                     task_id=uuid.uuid4().hex, task_type="community_report_invalidation",
-                    build_id=ctx.build_id, generation=generation, state=PostCommitTaskState.PREPARED,
+                    build_id=build_id, generation=generation, state=PostCommitTaskState.PREPARED,
                     prepared_at=datetime.now(timezone.utc).isoformat(),
                 ))
-                publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
+                publish_pointer(index_dir, build_dir, generation=generation, build_id=build_id)
+                pointer_committed = True
+                journal.transition(build_id, IncrementalJournalState.PUBLISHED, boundary="pointer_published")
                 from obsidian_wiki.domain.index_models import StorageArtifact
                 return IncrementalBuildResult(
-                    StorageArtifact(lance_dir, manifest_path, len(lexical), len(dense), ctx.build_id, generation),
+                    StorageArtifact(lance_dir, manifest_path, len(lexical), len(dense), build_id, generation),
                     source_tables, sparse_delta, dense_delta, sparse_result, dense_result,
                     sparse_coverage, dense_coverage,
                 )
+            except CommitUncertainError:
+                # replace may have committed; restart must reconcile pointer before journal classification.
+                raise
             except Exception as exc:
-                (build_dir / ".failed").write_text(
-                    f"incremental failed before publication: {type(exc).__name__}: {exc}", encoding="utf-8",
-                )
+                if not pointer_committed:
+                    journal.abort(build_id, f"{type(exc).__name__}: {exc}")
                 raise
         finally:
             lock.release()
