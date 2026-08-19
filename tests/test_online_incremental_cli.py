@@ -235,3 +235,24 @@ def test_explicit_incremental_contract_mismatch_fails_closed_without_snapshot_al
         WikiIndex(index_dir).build(wiki_dir, build_mode="incremental")
 
     assert (index_dir / "ACTIVE_INDEX").read_bytes() == pointer
+
+
+def test_auto_does_not_swallow_commit_uncertainty(tmp_path, monkeypatch) -> None:
+    import obsidian_wiki.application.incremental_index_service as incremental_module
+    from obsidian_wiki.application.durable_filesystem import CommitUncertainError
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, "uncertain baseline")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+    baseline = WikiIndex(index_dir).build(wiki_dir)
+    _enable_auto_incremental(index_dir, baseline.artifact.manifest_path)
+    _write_page(wiki_dir, "uncertain edit")
+    monkeypatch.setattr(
+        incremental_module, "publish_pointer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CommitUncertainError("pointer uncertain")),
+    )
+
+    with pytest.raises(CommitUncertainError, match="pointer uncertain"):
+        WikiIndex(index_dir).build(wiki_dir, build_mode="auto")
