@@ -17,6 +17,7 @@ from compare_build_modes import (  # noqa: E402
     run_mode_comparison,
     validate_comparison_artifact,
 )
+from obsidian_wiki.application.incremental_policy import load_build_mode_policy  # noqa: E402
 
 
 def _run(tmp_path: Path, *, scenarios: tuple[str, ...]) -> dict:
@@ -84,3 +85,28 @@ def test_scenario_matrix_and_artifact_fail_closed(tmp_path: Path) -> None:
         mutate(invalid)
         with pytest.raises(ValueError):
             validate_comparison_artifact(invalid)
+
+
+def test_v1_policy_contract_extension_keeps_legacy_policy_and_rejects_bad_digest(tmp_path: Path) -> None:
+    """The typed drift extension is backward compatible and fail closed."""
+    legacy = {
+        "schema_version": 1,
+        "enabled": True,
+        "compatibility_digest": "a" * 64,
+        "evidence_observation_ids": ["snapshot-a"],
+        "minimum_compatible_observations": 1,
+        "max_evidence_age_seconds": 60.0,
+        "match": "all",
+        "criteria": [{"metric": "snapshot_p95_ms", "operator": "gte", "threshold": 1.0}],
+    }
+    policy = tmp_path / "legacy.json"
+    policy.write_text(json.dumps(legacy), encoding="utf-8")
+    loaded = load_build_mode_policy(tmp_path, policy.name)
+    assert loaded.policy is not None
+    assert loaded.policy.compatibility_contract is None
+
+    bad = dict(legacy, compatibility_contract={"fts_config": {}})
+    policy.write_text(json.dumps(bad), encoding="utf-8")
+    rejected = load_build_mode_policy(tmp_path, policy.name)
+    assert rejected.policy is None
+    assert rejected.reason == "policy_schema_invalid"

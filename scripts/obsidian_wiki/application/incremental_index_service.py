@@ -20,7 +20,7 @@ from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 from obsidian_wiki.application.durable_filesystem import CommitUncertainError
 from obsidian_wiki.application.index_build_service import IndexBuildService
 from obsidian_wiki.domain.incremental_models import (
-    BuildTelemetry, BuildTiming, CoverageObservation, IncrementalBuildResult,
+    BuildModeContractDriftCode, BuildTelemetry, BuildTiming, CoverageObservation, IncrementalBuildResult,
     IncrementalJournalRecord, IncrementalJournalState, MutationResult,
     SourceTableIdentity, TableDelta, TableRowCounts,
 )
@@ -43,9 +43,19 @@ Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 class IncrementalFallbackEligible(RuntimeError):
     """A pre-clone contract failure that the public dispatcher must snapshot."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(
+        self, reason: str, *, contract_drift: BuildModeContractDriftCode | None = None,
+    ) -> None:
         self.reason = reason
+        self.contract_drift = contract_drift
         super().__init__(reason)
+
+    @property
+    def selection_reason(self) -> str:
+        """Stable public reason without inferring a subtype from error text."""
+        if self.contract_drift is None:
+            return self.reason
+        return f"{self.reason}:{self.contract_drift.value}"
 
 
 class IncrementalIndexService:
@@ -108,13 +118,17 @@ class IncrementalIndexService:
             }
             vector = manifest["vector_config"]
             ann = manifest["ann_policy"]
+            if manifest.get("fts_config") != FtsIndexConfig().to_json():
+                raise IncrementalFallbackEligible(
+                    "incompatible_active_contract",
+                    contract_drift=BuildModeContractDriftCode.FTS_CONFIG,
+                )
             if (
                 manifest.get("layout") != "sparse_chunks+dense_chunks"
                 or manifest.get("format_version") != INDEX_MANIFEST_FORMAT_VERSION
                 or manifest.get("index_layout_version") != INDEX_LAYOUT_VERSION
                 or manifest.get("sparse_chunk_schema_version") != chunking.SPARSE_CHUNK_SCHEMA_VERSION
                 or manifest.get("dense_chunk_schema_version") != chunking.DENSE_CHUNK_SCHEMA_VERSION
-                or manifest.get("fts_config") != FtsIndexConfig().to_json()
                 or not isinstance(vector, dict)
                 or any(vector.get(name) != value for name, value in expected_vector.items())
                 or not isinstance(ann, dict)

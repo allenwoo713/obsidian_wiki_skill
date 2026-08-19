@@ -177,8 +177,13 @@ class IndexBuildService:
                         "index_catch_up_unproven",
                     }:
                         raise
+                    selection_reason = (
+                        exc.selection_reason
+                        if exc.contract_drift is not None
+                        else f"incremental_runtime_fallback:{exc.reason}"
+                    )
                     selection = BuildModeSelection(
-                        "snapshot", f"incremental_runtime_fallback:{exc.reason}",
+                        "snapshot", selection_reason,
                         selection.policy_sha256, selection.compatibility_digest,
                         selection.evidence_observation_ids, selection.calculated_values,
                     )
@@ -461,6 +466,13 @@ class IndexBuildService:
                 (resolve_active_lance_dir(index_dir).parent / "manifest.json").read_text(encoding="utf-8")
             )
             compatibility_digest = compatibility_digest_from_manifest(active_manifest)
+            from obsidian_wiki.application.incremental_policy import policy_contract_drift
+            drift = policy_contract_drift(policy_load, active_manifest)
+            if drift is not None:
+                return BuildModeSelection(
+                    "snapshot", f"incompatible_active_contract:{drift.value}",
+                    policy_load.policy_sha256, compatibility_digest, (),
+                )
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError, TypeError):
             return BuildModeSelection("snapshot", "active_contract_unavailable", policy_load.policy_sha256, placeholder, ())
         observations: list[BuildTelemetry] = []

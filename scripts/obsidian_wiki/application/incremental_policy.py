@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from obsidian_wiki.domain.incremental_models import (
-    BuildModeCriterion,
+    BuildModeContractDriftCode, BuildModeCriterion,
     BuildModePolicy,
     BuildModePolicyLoad,
     BuildModeSelection,
@@ -25,6 +25,7 @@ _ENABLED_FIELDS = frozenset({
     "schema_version", "enabled", "compatibility_digest", "evidence_observation_ids",
     "minimum_compatible_observations", "max_evidence_age_seconds", "match", "criteria",
 })
+_ENABLED_FIELDS_WITH_CONTRACT = _ENABLED_FIELDS | frozenset({"compatibility_contract"})
 _IDENTITY_FIELDS = (
     "layout", "index_layout_version", "sparse_chunk_schema_version",
     "dense_chunk_schema_version", "fts_config", "vector_config", "ann_policy", "sdk_versions",
@@ -37,7 +38,7 @@ def _canonical_sha256(value: object) -> str:
     ).hexdigest()
 
 
-def compatibility_digest_from_manifest(manifest: Mapping[str, object]) -> str:
+def compatibility_identity_from_manifest(manifest: Mapping[str, object]) -> dict[str, object]:
     """Bind mode evidence to every storage/ANN/SDK identity input that affects rows."""
     if not isinstance(manifest, Mapping):
         raise ValueError("manifest compatibility input must be a mapping")
@@ -47,8 +48,11 @@ def compatibility_digest_from_manifest(manifest: Mapping[str, object]) -> str:
     ann_policy = manifest["ann_policy"]
     if not isinstance(ann_policy, Mapping) or not isinstance(ann_policy.get("policy_sha256"), str):
         raise ValueError("manifest approved ANN policy identity is missing")
-    identity = {name: manifest[name] for name in _IDENTITY_FIELDS}
-    return _canonical_sha256(identity)
+    return {name: manifest[name] for name in _IDENTITY_FIELDS}
+
+
+def compatibility_digest_from_manifest(manifest: Mapping[str, object]) -> str:
+    return _canonical_sha256(compatibility_identity_from_manifest(manifest))
 
 
 def _failed_load(reason: str) -> BuildModePolicyLoad:
@@ -80,7 +84,7 @@ def _parse_policy(data: object) -> BuildModePolicy:
         if set(data) != _DISABLED_FIELDS:
             raise ValueError("disabled policy fields are invalid")
         return BuildModePolicy(schema_version=1, enabled=False)
-    if set(data) != _ENABLED_FIELDS:
+    if set(data) not in {_ENABLED_FIELDS, _ENABLED_FIELDS_WITH_CONTRACT}:
         raise ValueError("enabled policy fields are invalid")
     raw_criteria = data["criteria"]
     if not isinstance(raw_criteria, list):
@@ -90,14 +94,33 @@ def _parse_policy(data: object) -> BuildModePolicy:
         if not isinstance(item, dict) or set(item) != {"metric", "operator", "threshold"}:
             raise ValueError("policy criterion fields are invalid")
         criteria.append(BuildModeCriterion(**item))
+    contract = data.get("compatibility_contract")
+    if contract is not None:
+        if not isinstance(contract, dict) or set(contract) != set(_IDENTITY_FIELDS):
+            raise ValueError("policy compatibility_contract fields are invalid")
+        if _canonical_sha256(contract) != data["compatibility_digest"]:
+            raise ValueError("policy compatibility_contract digest is invalid")
     return BuildModePolicy(
         schema_version=data["schema_version"], enabled=data["enabled"],
         compatibility_digest=data["compatibility_digest"],
         evidence_observation_ids=tuple(data["evidence_observation_ids"]),
         minimum_compatible_observations=data["minimum_compatible_observations"],
         max_evidence_age_seconds=data["max_evidence_age_seconds"],
-        match=data["match"], criteria=tuple(criteria),
+        match=data["match"], criteria=tuple(criteria), compatibility_contract=contract,
     )
+
+
+def policy_contract_drift(
+    loaded: BuildModePolicyLoad, active_manifest: Mapping[str, object],
+) -> BuildModeContractDriftCode | None:
+    """Classify only explicit structured policy contracts; legacy policies stay opaque."""
+    policy = loaded.policy
+    if policy is None or policy.compatibility_contract is None:
+        return None
+    active = compatibility_identity_from_manifest(active_manifest)
+    if policy.compatibility_contract["fts_config"] != active["fts_config"]:
+        return BuildModeContractDriftCode.FTS_CONFIG
+    return None
 
 
 def load_build_mode_policy(project_root: Path, policy_path: Path | None = None) -> BuildModePolicyLoad:

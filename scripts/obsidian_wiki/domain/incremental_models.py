@@ -87,6 +87,12 @@ _BUILD_MODE_METRICS = frozenset({
 })
 
 
+class BuildModeContractDriftCode(str, Enum):
+    """Typed mismatch identities persisted by the public auto dispatcher."""
+
+    FTS_CONFIG = "fts_config"
+
+
 def _finite_non_negative(field_name: str, value: object) -> None:
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or value < 0):
@@ -202,6 +208,7 @@ class BuildModePolicy(_JsonRecord):
     max_evidence_age_seconds: float | None = None
     match: str | None = None
     criteria: Tuple[BuildModeCriterion, ...] = ()
+    compatibility_contract: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or not isinstance(self.enabled, bool):
@@ -210,12 +217,14 @@ class BuildModePolicy(_JsonRecord):
             if any(value not in (None, ()) for value in (
                 self.compatibility_digest, self.evidence_observation_ids,
                 self.minimum_compatible_observations, self.max_evidence_age_seconds,
-                self.match, self.criteria,
+                self.match, self.criteria, self.compatibility_contract,
             )):
                 raise ValueError("disabled policy carries enabled-only fields")
             return
         if not isinstance(self.compatibility_digest, str) or not _BUILD_MODE_POLICY_SHA256.fullmatch(self.compatibility_digest):
             raise ValueError("enabled policy compatibility_digest must be sha256")
+        if self.compatibility_contract is not None and not isinstance(self.compatibility_contract, dict):
+            raise ValueError("policy compatibility_contract must be an object when supplied")
         if (not self.evidence_observation_ids
                 or any(not isinstance(item, str) or not item for item in self.evidence_observation_ids)
                 or len(set(self.evidence_observation_ids)) != len(self.evidence_observation_ids)):
