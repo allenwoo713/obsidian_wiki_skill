@@ -32,6 +32,10 @@ def _chunks(*, text: str) -> tuple[SparseChunk, ...]:
         path="concepts/online.md", title="Online", text=text,
         content_hash=text, end_char=len(text),
     )
+    return (
+        SparseChunk(**common, chunk_id=f"{page_id}::sparse-stable", fts_text=text, chunk_kind="sparse"),
+        SparseChunk(**common, chunk_id=f"{page_id}::dense-stable", fts_text=text, chunk_kind="dense"),
+    )
 
 
 def _page_chunks(page: str, *, text: str, suffix: str = "stable") -> tuple[SparseChunk, ...]:
@@ -43,10 +47,6 @@ def _page_chunks(page: str, *, text: str, suffix: str = "stable") -> tuple[Spars
     return (
         SparseChunk(**common, chunk_id=f"{page_id}::sparse-{suffix}", fts_text=text, chunk_kind="sparse"),
         SparseChunk(**common, chunk_id=f"{page_id}::dense-{suffix}", fts_text=text, chunk_kind="dense"),
-    )
-    return (
-        SparseChunk(**common, chunk_id=f"{page_id}::sparse-stable", fts_text=text, chunk_kind="sparse"),
-        SparseChunk(**common, chunk_id=f"{page_id}::dense-stable", fts_text=text, chunk_kind="dense"),
     )
 
 
