@@ -15,18 +15,29 @@ sys.path.insert(0, str(SKILL_ROOT / "eval"))
 from compare_build_modes import (  # noqa: E402
     REQUIRED_SCENARIOS,
     _artifact_digest,
+    run_diagnostic_comparison,
     run_mode_comparison,
+    validate_diagnostic_comparison_artifact,
     validate_comparison_artifact,
 )
 from obsidian_wiki.application.incremental_policy import load_build_mode_policy  # noqa: E402
 
 
-def _run(tmp_path: Path, *, scenarios: tuple[str, ...]) -> dict:
+def _run(tmp_path: Path) -> dict:
     output = tmp_path / "equivalence.json"
     artifact = run_mode_comparison(
         work_dir=tmp_path / "work",
         output=output,
-        scenarios=scenarios,
+    )
+    assert output.exists()
+    assert json.loads(output.read_text(encoding="utf-8")) == artifact
+    return artifact
+
+
+def _run_diagnostic(tmp_path: Path, *, scenario: str) -> dict:
+    output = tmp_path / "diagnostic.json"
+    artifact = run_diagnostic_comparison(
+        work_dir=tmp_path / "work", output=output, scenario=scenario,
     )
     assert output.exists()
     assert json.loads(output.read_text(encoding="utf-8")) == artifact
@@ -42,17 +53,16 @@ def _refresh_digest(artifact: dict) -> dict:
 @pytest.fixture(scope="module")
 def full_acceptance_artifact(tmp_path_factory: pytest.TempPathFactory) -> dict:
     """Build the complete public facade/query artifact once for mutation cases."""
-    return _run(
-        tmp_path_factory.mktemp("full-comparison"),
-        scenarios=REQUIRED_SCENARIOS,
-    )
+    return _run(tmp_path_factory.mktemp("full-comparison"))
 
 
 def test_public_snapshot_incremental_retrieval_equivalence(tmp_path: Path) -> None:
     """An edit uses public build/load/hybrid_search in both build modes."""
-    artifact = _run(tmp_path, scenarios=("page_edit",))
+    artifact = _run_diagnostic(tmp_path, scenario="page_edit")
 
-    validate_comparison_artifact(artifact)
+    validate_diagnostic_comparison_artifact(artifact)
+    with pytest.raises(ValueError, match="comparison artifact kind: diagnostic"):
+        validate_comparison_artifact(artifact)
     assert artifact["verdict"] == "pass"
     scenario = artifact["scenarios"]["page_edit"]
     assert scenario["verdict"] == "pass"
@@ -75,6 +85,8 @@ def test_scenario_matrix_and_artifact_fail_closed(full_acceptance_artifact: dict
 
     validate_comparison_artifact(artifact)
     assert artifact["verdict"] == "pass"
+    assert artifact["artifact_kind"] == "acceptance"
+    assert tuple(artifact["scenario_names"]) == REQUIRED_SCENARIOS
     assert set(artifact["scenarios"]) == set(REQUIRED_SCENARIOS)
     assert artifact["scenarios"]["page_deletion"]["deleted_page_absent"] is True
     assert artifact["scenarios"]["unchanged_rebuild"]["incremental"]["telemetry"]["written_rows"] == 0
@@ -147,6 +159,12 @@ def test_acceptance_validator_rejects_digest_valid_duplicate_unexpected_and_disa
     _refresh_digest(disagreement)
     with pytest.raises(ValueError, match="comparison acceptance scenarios declaration mismatch"):
         validate_comparison_artifact(disagreement)
+
+    malformed = copy.deepcopy(full_acceptance_artifact)
+    malformed["scenario_names"] = "page_edit"
+    _refresh_digest(malformed)
+    with pytest.raises(ValueError, match="comparison acceptance scenarios declaration"):
+        validate_comparison_artifact(malformed)
 
 
 def test_v1_policy_contract_extension_keeps_legacy_policy_and_rejects_bad_digest(tmp_path: Path) -> None:

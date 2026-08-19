@@ -42,7 +42,9 @@ from run_eval import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+ACCEPTANCE_ARTIFACT_KIND = "acceptance"
+DIAGNOSTIC_ARTIFACT_KIND = "diagnostic"
 REQUIRED_SCENARIOS = (
     "page_edit",
     "split_merge",
@@ -406,8 +408,7 @@ def _artifact_digest(artifact: dict[str, object]) -> str:
     return _canonical_sha256(payload)
 
 
-def validate_comparison_artifact(artifact: dict[str, object]) -> dict[str, object]:
-    """Reject stale, partial, policy-drifted, or non-equivalent evidence."""
+def _validate_artifact_inputs(artifact: dict[str, object]) -> None:
     if not isinstance(artifact, dict) or artifact.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("comparison artifact schema")
     inputs = artifact.get("inputs")
@@ -419,9 +420,10 @@ def validate_comparison_artifact(artifact: dict[str, object]) -> dict[str, objec
         raise ValueError("comparison artifact baseline binding")
     if inputs["ann_policy_sha256"] != _sha256_bytes((HERE / "ann-policy.json").read_bytes()):
         raise ValueError("comparison artifact ANN policy binding")
-    scenarios = artifact.get("scenarios")
-    if not isinstance(scenarios, dict) or not scenarios or not set(scenarios).issubset(REQUIRED_SCENARIOS):
-        raise ValueError("comparison artifact scenarios")
+
+
+def _validate_scenario_evidence(scenarios: dict[str, object]) -> None:
+    """Preserve all per-scenario storage and retrieval safety requirements."""
     for name, scenario in scenarios.items():
         if not isinstance(scenario, dict) or scenario.get("verdict") != "pass":
             raise ValueError(f"comparison scenario failed: {name}")
@@ -456,17 +458,65 @@ def validate_comparison_artifact(artifact: dict[str, object]) -> dict[str, objec
                 raise ValueError("comparison configuration fallback")
         if name == "failure_recovery" and scenario.get("recovery_preserved_active") is not True:
             raise ValueError("comparison failure recovery")
+
+
+def _validate_digest_and_verdict(artifact: dict[str, object]) -> None:
     if artifact.get("verdict") != "pass" or artifact.get("artifact_sha256") != _artifact_digest(artifact):
         raise ValueError("comparison artifact verdict or digest")
+
+
+def validate_comparison_artifact(artifact: dict[str, object]) -> dict[str, object]:
+    """Accept only the complete canonical production comparison matrix."""
+    if not isinstance(artifact, dict) or artifact.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("comparison artifact schema")
+    kind = artifact.get("artifact_kind")
+    if kind != ACCEPTANCE_ARTIFACT_KIND:
+        raise ValueError(f"comparison artifact kind: {kind}")
+    scenario_names = artifact.get("scenario_names")
+    if not isinstance(scenario_names, list) or not all(isinstance(name, str) for name in scenario_names):
+        raise ValueError("comparison acceptance scenarios declaration")
+    seen: set[str] = set()
+    for name in scenario_names:
+        if name in seen:
+            raise ValueError(f"comparison acceptance scenarios duplicated: {name}")
+        seen.add(name)
+    required = set(REQUIRED_SCENARIOS)
+    declared = set(scenario_names)
+    missing = [name for name in REQUIRED_SCENARIOS if name not in declared]
+    if missing:
+        raise ValueError(f"comparison acceptance scenarios missing: {missing[0]}")
+    unexpected = [name for name in scenario_names if name not in required]
+    if unexpected:
+        raise ValueError(f"comparison acceptance scenarios unexpected: {unexpected[0]}")
+    scenarios = artifact.get("scenarios")
+    if not isinstance(scenarios, dict) or set(scenarios) != declared:
+        raise ValueError("comparison acceptance scenarios declaration mismatch")
+    _validate_artifact_inputs(artifact)
+    _validate_scenario_evidence(scenarios)
+    _validate_digest_and_verdict(artifact)
     return artifact
 
 
-def run_mode_comparison(*, work_dir: Path, output: Path,
-                        scenarios: Iterable[str] = REQUIRED_SCENARIOS) -> dict[str, object]:
-    """Run isolated public builds and persist a digest-bound JSON artifact."""
-    selected = tuple(scenarios)
-    if not selected or len(set(selected)) != len(selected) or any(name not in REQUIRED_SCENARIOS for name in selected):
-        raise ValueError("comparison scenarios must be unique supported names")
+def validate_diagnostic_comparison_artifact(artifact: dict[str, object]) -> dict[str, object]:
+    """Validate one explicitly non-accepting local diagnostic artifact."""
+    if not isinstance(artifact, dict) or artifact.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("comparison artifact schema")
+    if artifact.get("artifact_kind") != DIAGNOSTIC_ARTIFACT_KIND:
+        raise ValueError(f"comparison artifact kind: {artifact.get('artifact_kind')}")
+    scenario_names = artifact.get("scenario_names")
+    scenarios = artifact.get("scenarios")
+    if not isinstance(scenario_names, list) or len(scenario_names) != 1 or scenario_names[0] not in REQUIRED_SCENARIOS:
+        raise ValueError("comparison diagnostic scenario declaration")
+    if not isinstance(scenarios, dict) or set(scenarios) != set(scenario_names):
+        raise ValueError("comparison diagnostic scenario declaration mismatch")
+    _validate_artifact_inputs(artifact)
+    _validate_scenario_evidence(scenarios)
+    _validate_digest_and_verdict(artifact)
+    return artifact
+
+
+def _run_comparison(*, work_dir: Path, output: Path, selected: tuple[str, ...],
+                    artifact_kind: str, validator) -> dict[str, object]:
     baseline_before = (HERE / "baselines.json").read_bytes()
     policy_before = (HERE / "ann-policy.json").read_bytes()
     work_dir = Path(work_dir)
@@ -479,33 +529,58 @@ def run_mode_comparison(*, work_dir: Path, output: Path,
         raise RuntimeError("comparison attempted to modify an accepted baseline or ANN policy")
     artifact: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
+        "artifact_kind": artifact_kind,
         "inputs": {
             "fixture_sha256": _canonical_sha256(_initial_files()),
             "queries_sha256": _canonical_sha256([_comparison_query(name) for name in selected]),
             "baselines_sha256": _sha256_bytes(baseline_before),
             "ann_policy_sha256": _sha256_bytes(policy_before),
         },
+        "scenario_names": list(selected),
         "scenarios": records,
         "verdict": "pass" if all(item["verdict"] == "pass" for item in records.values()) else "fail",
     }
     artifact["artifact_sha256"] = _artifact_digest(artifact)
-    validate_comparison_artifact(artifact)
+    validator(artifact)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(artifact, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     return artifact
+
+
+def run_mode_comparison(*, work_dir: Path, output: Path) -> dict[str, object]:
+    """Run and persist the only accepting, complete production matrix."""
+    return _run_comparison(
+        work_dir=work_dir, output=output, selected=REQUIRED_SCENARIOS,
+        artifact_kind=ACCEPTANCE_ARTIFACT_KIND,
+        validator=validate_comparison_artifact,
+    )
+
+
+def run_diagnostic_comparison(*, work_dir: Path, output: Path, scenario: str) -> dict[str, object]:
+    """Run one named local diagnostic that is structurally non-accepting."""
+    if scenario not in REQUIRED_SCENARIOS:
+        raise ValueError(f"unknown comparison scenario: {scenario}")
+    return _run_comparison(
+        work_dir=work_dir, output=output, selected=(scenario,),
+        artifact_kind=DIAGNOSTIC_ARTIFACT_KIND,
+        validator=validate_diagnostic_comparison_artifact,
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--scenario", action="append", choices=REQUIRED_SCENARIOS)
+    parser.add_argument("--diagnostic-scenario", choices=REQUIRED_SCENARIOS)
     args = parser.parse_args()
-    artifact = run_mode_comparison(
-        work_dir=args.work_dir, output=args.output,
-        scenarios=tuple(args.scenario) if args.scenario else REQUIRED_SCENARIOS,
-    )
-    print(json.dumps({"verdict": artifact["verdict"], "artifact_sha256": artifact["artifact_sha256"]}, sort_keys=True))
+    if args.diagnostic_scenario:
+        artifact = run_diagnostic_comparison(
+            work_dir=args.work_dir, output=args.output,
+            scenario=args.diagnostic_scenario,
+        )
+    else:
+        artifact = run_mode_comparison(work_dir=args.work_dir, output=args.output)
+    print(json.dumps({"verdict": artifact["verdict"], "artifact_kind": artifact["artifact_kind"], "artifact_sha256": artifact["artifact_sha256"]}, sort_keys=True))
     return 0
 
 
