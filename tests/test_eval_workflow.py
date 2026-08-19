@@ -86,6 +86,11 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     assert "python eval/compare_build_modes.py" in test_and_eval
     assert "--work-dir .review-tmp/phase04-modes" in test_and_eval
     assert "--output .review-tmp/phase04-modes/equivalence.json" in test_and_eval
+    comparator = test_and_eval.split("Run #22 public build-mode equivalence gate", 1)[1].split(
+        "Run #39 production CLI real-model tail-recall gate", 1
+    )[0]
+    assert "--diagnostic-scenario" not in comparator
+    assert "--scenario" not in comparator
     assert "test -s .review-tmp/phase04-modes/equivalence.json" in test_and_eval
     assert "--init-baseline" not in test_and_eval
     for suite in (
@@ -102,6 +107,9 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     assert ".review-tmp/phase04-modes/equivalence.json" in phase04_artifact
     assert ".review-tmp/phase04-modes/acceptance.json" in phase04_artifact
     assert "if-no-files-found: error" in phase04_artifact
+    assert test_and_eval.index("Run #22 public build-mode equivalence gate") < test_and_eval.index(
+        "Upload #22 equivalence and telemetry evidence"
+    )
     assert "--max-seconds 60" in workflow
     assert "static_cap_seconds" in workflow
     assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in workflow

@@ -12,6 +12,7 @@ import pytest
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SKILL_ROOT / "eval"))
 
+import compare_build_modes as compare_build_modes  # noqa: E402
 from compare_build_modes import (  # noqa: E402
     REQUIRED_SCENARIOS,
     _artifact_digest,
@@ -165,6 +166,45 @@ def test_acceptance_validator_rejects_digest_valid_duplicate_unexpected_and_disa
     _refresh_digest(malformed)
     with pytest.raises(ValueError, match="comparison acceptance scenarios declaration"):
         validate_comparison_artifact(malformed)
+
+
+def test_comparison_cli_dispatches_default_acceptance_and_explicit_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Only an explicit diagnostic selector can dispatch a non-accepting run."""
+    calls: list[tuple[str, Path, Path, str | None]] = []
+
+    def acceptance(*, work_dir: Path, output: Path) -> dict:
+        calls.append(("acceptance", work_dir, output, None))
+        return {
+            "verdict": "pass", "artifact_kind": "acceptance",
+            "artifact_sha256": "a" * 64,
+        }
+
+    def diagnostic(*, work_dir: Path, output: Path, scenario: str) -> dict:
+        calls.append(("diagnostic", work_dir, output, scenario))
+        return {
+            "verdict": "pass", "artifact_kind": "diagnostic",
+            "artifact_sha256": "d" * 64,
+        }
+
+    monkeypatch.setattr(compare_build_modes, "run_mode_comparison", acceptance)
+    monkeypatch.setattr(compare_build_modes, "run_diagnostic_comparison", diagnostic)
+    output = tmp_path / "equivalence.json"
+    monkeypatch.setattr(sys, "argv", [
+        "compare_build_modes.py", "--work-dir", str(tmp_path / "work"),
+        "--output", str(output),
+    ])
+    assert compare_build_modes.main() == 0
+    assert calls == [("acceptance", tmp_path / "work", output, None)]
+
+    diagnostic_output = tmp_path / "diagnostic.json"
+    monkeypatch.setattr(sys, "argv", [
+        "compare_build_modes.py", "--work-dir", str(tmp_path / "diagnostic-work"),
+        "--output", str(diagnostic_output), "--diagnostic-scenario", "page_edit",
+    ])
+    assert compare_build_modes.main() == 0
+    assert calls[-1] == ("diagnostic", tmp_path / "diagnostic-work", diagnostic_output, "page_edit")
 
 
 def test_v1_policy_contract_extension_keeps_legacy_policy_and_rejects_bad_digest(tmp_path: Path) -> None:
