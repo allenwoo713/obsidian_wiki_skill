@@ -300,3 +300,26 @@ def test_policy_compatibility_mismatch_selects_snapshot(tmp_path):
 
     assert selection.selected_mode == "snapshot"
     assert selection.reason == "policy_compatibility_mismatch"
+
+
+def test_compatible_explicit_incremental_does_not_read_auto_policy(tmp_path, monkeypatch):
+    from build_index import build_storage_contract
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    import obsidian_wiki.application.incremental_policy as policy_module
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_tiny_embed, sparse_chunks=_tiny_plan("first"))
+    monkeypatch.setattr(
+        policy_module, "load_build_mode_policy",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("auto policy was read")),
+    )
+
+    outcome = IncrementalIndexService().build(
+        wiki_dir, index_dir, canonical_chunks=_tiny_plan("changed"), embed=_tiny_embed,
+    )
+
+    telemetry = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == telemetry["mode_selected"] == "incremental"
+    assert telemetry["selection_reason"] == "explicit_incremental"

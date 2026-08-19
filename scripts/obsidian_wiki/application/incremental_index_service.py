@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+
+import chunking
 
 from obsidian_wiki.application.active_index_pointer import (
     publish_pointer, read_generation_record, reconcile_committed_record, record_building,
@@ -31,9 +34,18 @@ from obsidian_wiki.infrastructure.filesystem_incremental_journal import Filesyst
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
+from obsidian_wiki.domain.index_policy import load_ann_policy_file, production_policy_sha256
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
+
+
+class IncrementalFallbackEligible(RuntimeError):
+    """A pre-clone contract failure that the public dispatcher must snapshot."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 class IncrementalIndexService:
@@ -82,15 +94,45 @@ class IncrementalIndexService:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError("incremental source manifest is unreadable; snapshot required") from exc
-        if not isinstance(manifest, dict) or (
-            manifest.get("layout") != "sparse_chunks+dense_chunks"
-            or manifest.get("format_version") != INDEX_MANIFEST_FORMAT_VERSION
-            or manifest.get("index_layout_version") != INDEX_LAYOUT_VERSION
-        ):
-            raise RuntimeError("incremental source contract mismatch; snapshot required")
-        ann = manifest.get("ann_policy")
-        if not isinstance(ann, dict) or ann.get("selected_index_type") != "ivf-hnsw-sq" or ann.get("query_ef") != 100:
-            raise RuntimeError("incremental source ANN contract mismatch; snapshot required")
+        if not isinstance(manifest, dict):
+            raise IncrementalFallbackEligible("incompatible_active_contract")
+        try:
+            approved_ann = load_ann_policy_file()
+            expected_vector = {
+                "index_type": approved_ann.lancedb_index_type,
+                "metric": approved_ann.metric,
+                "num_partitions": approved_ann.num_partitions,
+                "m": approved_ann.m,
+                "ef_construction": approved_ann.ef_construction,
+                "index_name": "dense_hnsw",
+            }
+            vector = manifest["vector_config"]
+            ann = manifest["ann_policy"]
+            if (
+                manifest.get("layout") != "sparse_chunks+dense_chunks"
+                or manifest.get("format_version") != INDEX_MANIFEST_FORMAT_VERSION
+                or manifest.get("index_layout_version") != INDEX_LAYOUT_VERSION
+                or manifest.get("sparse_chunk_schema_version") != chunking.SPARSE_CHUNK_SCHEMA_VERSION
+                or manifest.get("dense_chunk_schema_version") != chunking.DENSE_CHUNK_SCHEMA_VERSION
+                or manifest.get("fts_config") != FtsIndexConfig().to_json()
+                or not isinstance(vector, dict)
+                or any(vector.get(name) != value for name, value in expected_vector.items())
+                or not isinstance(ann, dict)
+                or ann.get("selected_index_type") != approved_ann.selected_index_type
+                or ann.get("lancedb_index_type") != approved_ann.lancedb_index_type
+                or ann.get("query_ef") != approved_ann.query_ef
+                or ann.get("metric") != approved_ann.metric
+                or ann.get("dimensions") != approved_ann.dimensions
+                or ann.get("policy_sha256") != production_policy_sha256(approved_ann)
+                or manifest.get("sdk_versions") != {
+                    package: importlib.metadata.version(package)
+                    for package in ("lancedb", "pyarrow", "sentence-transformers")
+                }
+            ):
+                raise ValueError("active storage identity differs from current contract")
+            compatibility_digest_from_manifest(manifest)
+        except (KeyError, TypeError, ValueError, importlib.metadata.PackageNotFoundError) as exc:
+            raise IncrementalFallbackEligible("incompatible_active_contract") from exc
         return manifest
 
     @staticmethod

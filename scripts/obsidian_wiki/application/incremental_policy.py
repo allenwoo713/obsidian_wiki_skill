@@ -171,7 +171,14 @@ def select_auto_build_mode(
     if len(named) < policy.minimum_compatible_observations:
         return BuildModeSelection("snapshot", "evidence_insufficient", loaded.policy_sha256, current_compatibility_digest, tuple(item.observation_id for item in named))
     values = {
-        "snapshot_p95_ms": _p95([item.timings.serialization_write_ms + item.timings.fts_catch_up_ms + item.timings.vector_catch_up_ms for item in named]),
+        "snapshot_p95_ms": _p95([
+            item.timings.scan_parse_ms + item.timings.chunking_ms
+            + item.timings.embedding_cache_hit_ms + item.timings.embedding_cache_miss_ms
+            + item.timings.serialization_write_ms + item.timings.fts_catch_up_ms
+            + item.timings.vector_catch_up_ms + item.timings.validation_ms
+            + item.timings.publication_ms
+            for item in named
+        ]),
         "peak_staged_disk_bytes": float(max(item.peak_staged_disk_bytes for item in named)),
         "index_rebuild_ms": _p95([item.timings.index_rebuild_ms for item in named]),
     }
