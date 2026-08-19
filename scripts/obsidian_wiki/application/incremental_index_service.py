@@ -17,8 +17,9 @@ from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 from obsidian_wiki.application.durable_filesystem import CommitUncertainError
 from obsidian_wiki.application.index_build_service import IndexBuildService
 from obsidian_wiki.domain.incremental_models import (
-    CoverageObservation, IncrementalBuildResult, IncrementalJournalRecord,
-    IncrementalJournalState, MutationResult, SourceTableIdentity, TableDelta,
+    BuildTelemetry, BuildTiming, CoverageObservation, IncrementalBuildResult,
+    IncrementalJournalRecord, IncrementalJournalState, MutationResult,
+    SourceTableIdentity, TableDelta, TableRowCounts,
 )
 from obsidian_wiki.domain.index_models import (
     DenseChunk, FtsIndexConfig, INDEX_LAYOUT_VERSION, INDEX_MANIFEST_FORMAT_VERSION,
@@ -29,6 +30,7 @@ from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemInd
 from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
@@ -212,6 +214,7 @@ class IncrementalIndexService:
     def build(self, wiki_dir: Path, index_dir: Path, *, canonical_chunks: Sequence[SparseChunk],
               embed: Embedder, page_metadata: list[dict] | None = None) -> IncrementalBuildResult:
         del wiki_dir  # Canonical planning occurs under the caller's existing writer boundary.
+        build_started = time.perf_counter()
         ctx = new_build_context()
         lock = BuildLock(index_dir, ctx=ctx)
         lock.acquire()
@@ -221,7 +224,9 @@ class IncrementalIndexService:
             lexical = tuple(chunk for chunk in canonical_chunks if chunk.chunk_kind == "sparse")
             if not lexical or len(lexical) + sum(1 for chunk in canonical_chunks if chunk.chunk_kind == "dense") != len(canonical_chunks):
                 raise RuntimeError("canonical plan must contain only non-empty sparse and dense populations")
+            embedding_started = time.perf_counter()
             dense = self._dense_plan(canonical_chunks, embed)
+            embedding_cache_miss_ms = (time.perf_counter() - embedding_started) * 1000
             if not dense or len({chunk.chunk_id for chunk in lexical}) != len(lexical) or len({chunk.chunk_id for chunk in dense}) != len(dense):
                 raise ValueError("canonical sparse/dense populations require unique stable IDs")
             if {chunk.chunk_id for chunk in lexical} & {chunk.chunk_id for chunk in dense}:
@@ -285,6 +290,7 @@ class IncrementalIndexService:
                         raise RuntimeError("source table versions changed during clone; snapshot required")
                     record = journal.transition(build_id, IncrementalJournalState.CLONED, boundary="clone")
                 staging = LanceDbIndexRepository(lance_dir)
+                write_started = time.perf_counter()
                 if record.state is IncrementalJournalState.CLONED and record.last_completed_boundary != "sparse_mutated":
                     sparse_result = staging.apply_delta("sparse_chunks", added=sparse_added, updated=sparse_updated, deleted_ids=sparse_delta.deleted_ids)
                     journal.checkpoint(build_id, boundary="sparse_mutated")
@@ -299,15 +305,22 @@ class IncrementalIndexService:
                     dense_result = MutationResult("dense_chunks", len(dense_delta.added_ids), len(dense_delta.updated_ids), len(dense_delta.deleted_ids))
                 if sparse_result.physically_written != len(sparse_delta.physically_written_ids) or dense_result.physically_written != len(dense_delta.physically_written_ids):
                     raise RuntimeError("adapter mutation accounting does not reconcile with delta")
+                serialization_write_ms = (time.perf_counter() - write_started) * 1000
                 vector_config = VectorIndexConfig(
                     index_type="hnsw_sq", metric="cosine", num_partitions=1, m=16,
                     ef_construction=300, dense_chunks_count=len(dense),
                 )
                 if record.state is IncrementalJournalState.MUTATED:
+                    fts_started = time.perf_counter()
                     sparse_coverage = staging.catch_up(self._fts_config)
+                    fts_catch_up_ms = (time.perf_counter() - fts_started) * 1000
+                    vector_started = time.perf_counter()
                     staging.create_vector_index(vector_config)
+                    vector_catch_up_ms = (time.perf_counter() - vector_started) * 1000
                     record = journal.transition(build_id, IncrementalJournalState.CAUGHT_UP, boundary="index_catch_up")
                 else:
+                    fts_catch_up_ms = 0.0
+                    vector_catch_up_ms = 0.0
                     fts_stats = staging.fts_index_stats()
                     sparse_coverage = CoverageObservation(
                         "sparse_chunks", len(staging.table_rows("sparse_chunks")),
@@ -320,6 +333,7 @@ class IncrementalIndexService:
                     or dense_coverage.unindexed_rows is None or dense_coverage.unindexed_rows != 0
                     or dense_coverage.indexed_rows != len(dense)):
                     raise RuntimeError("staged index coverage is incomplete")
+                validation_started = time.perf_counter()
                 reopened = LanceDbIndexRepository(lance_dir)
                 counts, vector_stats, fts_stats = reopened.validate_reopened(
                     dimension=len(dense[0].vector), exact_term=IndexBuildService._exact_term(lexical),
@@ -339,16 +353,47 @@ class IncrementalIndexService:
                     build_time_ms=(time.perf_counter() - index_build_started) * 1000,
                     disk_bytes=publisher._disk_bytes(build_dir),
                 )
+                validation_ms = (time.perf_counter() - validation_started) * 1000
                 if record.state is IncrementalJournalState.CAUGHT_UP:
                     staging.seal(lance_dir)
-                    manifest = publisher._manifest(
-                    counts=counts.to_json(), vector_stats=vector_stats.to_json(), fts_stats=fts_stats.to_json(),
-                    vector_config=vector_config, benchmark=benchmark.to_json(),
-                    policy={"selected_mode": "ann", "reason": "approved fixed ann policy validated by held-out publication evidence", "benchmark": benchmark.to_json(), "index_stats": vector_stats.to_json(), "benchmark_scope": "held_out", "benchmark_probe_count": publication_evidence.validation_query_count, "benchmark_probe_total": counts.dense_chunks_count},
-                    sparse_chunks=canonical_chunks, generation=generation, build_id=build_id,
-                    page_metadata=page_metadata, ann_policy=publisher._ann_policy,
-                    publication_evidence=publication_evidence,
-                )
+                    manifest_kwargs = dict(
+                        counts=counts.to_json(), vector_stats=vector_stats.to_json(), fts_stats=fts_stats.to_json(),
+                        vector_config=vector_config, benchmark=benchmark.to_json(),
+                        policy={"selected_mode": "ann", "reason": "approved fixed ann policy validated by held-out publication evidence", "benchmark": benchmark.to_json(), "index_stats": vector_stats.to_json(), "benchmark_scope": "held_out", "benchmark_probe_count": publication_evidence.validation_query_count, "benchmark_probe_total": counts.dense_chunks_count},
+                        sparse_chunks=canonical_chunks, generation=generation, build_id=build_id,
+                        page_metadata=page_metadata, ann_policy=publisher._ann_policy,
+                        publication_evidence=publication_evidence,
+                    )
+                    manifest = publisher._manifest(**manifest_kwargs)
+                    telemetry = BuildTelemetry(
+                        schema_version=1, observation_id=build_id,
+                        mode_requested="incremental", mode_selected="incremental",
+                        selection_reason="explicit_incremental",
+                        compatibility_digest=compatibility_digest_from_manifest(manifest),
+                        completed_at_epoch_seconds=time.time(),
+                        timings=BuildTiming(
+                            scan_parse_ms=(time.perf_counter() - build_started) * 1000,
+                            chunking_ms=0.0, embedding_cache_hit_ms=0.0,
+                            embedding_cache_miss_ms=embedding_cache_miss_ms,
+                            serialization_write_ms=serialization_write_ms,
+                            fts_catch_up_ms=fts_catch_up_ms, vector_catch_up_ms=vector_catch_up_ms,
+                            validation_ms=validation_ms, publication_ms=0.0,
+                            index_rebuild_ms=vector_catch_up_ms,
+                        ),
+                        sparse_rows=TableRowCounts(
+                            inserted=sparse_result.inserted, updated=sparse_result.updated,
+                            deleted=sparse_result.deleted, unchanged=len(sparse_delta.unchanged_ids),
+                            physically_written=sparse_result.physically_written,
+                        ),
+                        dense_rows=TableRowCounts(
+                            inserted=dense_result.inserted, updated=dense_result.updated,
+                            deleted=dense_result.deleted, unchanged=len(dense_delta.unchanged_ids),
+                            physically_written=dense_result.physically_written,
+                        ),
+                        embedding_cache_hits=0, embedding_cache_misses=len(dense),
+                        peak_staged_disk_bytes=publisher._disk_bytes(build_dir), completed=True,
+                    )
+                    manifest = publisher._manifest(**manifest_kwargs, build_telemetry=telemetry)
                     manifest_path = build_dir / "manifest.json"
                     FilesystemIndexManifest().write(manifest_path, manifest)
                     record_validated(build_dir, generation=generation, build_id=build_id,

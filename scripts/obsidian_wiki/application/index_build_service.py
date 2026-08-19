@@ -42,6 +42,7 @@ from obsidian_wiki.domain.index_models import (
     VectorIndexConfig,
     VectorPolicyDecision,
 )
+from obsidian_wiki.domain.incremental_models import BuildTelemetry, BuildTiming, TableRowCounts
 from obsidian_wiki.domain.index_policy import (
     PolicyError,
     load_ann_policy_file,
@@ -51,6 +52,7 @@ from obsidian_wiki.domain.index_policy import (
 from obsidian_wiki.ports.chunk_repository import ChunkRepository
 from obsidian_wiki.ports.index_manifest import IndexManifestStore
 from obsidian_wiki.ports.post_commit import PostCommitJournal
+from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
@@ -154,6 +156,7 @@ class IndexBuildService:
         image_metadata: list[dict] | None = None,
         plan_provider: PlanProvider | None = None,
     ) -> StorageArtifact:
+        build_started = time.perf_counter()
         # #39 (review)：持锁后再分块。显式 sparse_chunks > plan_provider > 回退整页 plan。
         if sparse_chunks is None and plan_provider is not None:
             planned_chunks, planned_pages = plan_provider(wiki_dir)
@@ -170,7 +173,9 @@ class IndexBuildService:
             raise RuntimeError("Canonical chunk plan contains no sparse (lexical) retrieval chunks")
         if not dense_sources:
             raise RuntimeError("Canonical chunk plan contains no dense retrieval chunks")
+        embed_started = time.perf_counter()
         vectors = embed([chunk.text for chunk in dense_sources])
+        embedding_cache_miss_ms = (time.perf_counter() - embed_started) * 1000
         if len(vectors) != len(dense_sources):
             raise RuntimeError("Embedder returned a vector count different from the dense chunk plan")
         dense_chunks = tuple(
@@ -206,7 +211,9 @@ class IndexBuildService:
         # #35：build 目录创建后立即耐久写 BUILDING（missing → building）。
         record_building(build_dir, build_id=ctx.build_id, generation=generation)
         try:
+            write_started = time.perf_counter()
             self._storage.persist(lance_dir, lexical_chunks, dense_chunks, self._fts_config)
+            serialization_write_ms = (time.perf_counter() - write_started) * 1000
             # #36 follow-up：所有 storage mutation（persist / create_vector_index）都
             # 必须在最终 seal 之前完成——vector index 创建会改写 LanceDB，故 seal
             # 不能放在 persist 后（当前已修复：先建索引，再最终 seal）。
@@ -241,6 +248,7 @@ class IndexBuildService:
             # so the sampled term must come from the lexical corpus that is
             # actually indexed there — not from a dense chunk that never enters FTS.
             exact_term = self._exact_term(lexical_chunks)
+            validation_started = time.perf_counter()
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term,
                 vector_index_name=vector_config.index_name,
@@ -295,9 +303,10 @@ class IndexBuildService:
                     benchmark_probe_count=publication_evidence.validation_query_count,
                     benchmark_probe_total=counts.dense_chunks_count,
                 )
+            validation_ms = (time.perf_counter() - validation_started) * 1000
             # #36 follow-up：最终 seal = 最后 storage mutation 之后的耐久边界。
             self._storage.seal(lance_dir)
-            manifest = self._manifest(
+            manifest_kwargs = dict(
                 counts=counts.to_json(), vector_stats=vector_stats.to_json(),
                 fts_stats=fts_stats.to_json(), vector_config=vector_config,
                 benchmark=benchmark.to_json(),
@@ -308,6 +317,37 @@ class IndexBuildService:
                 ann_policy=self._ann_policy,
                 publication_evidence=publication_evidence,
             )
+            manifest = self._manifest(**manifest_kwargs)
+            telemetry = BuildTelemetry(
+                schema_version=1, observation_id=ctx.build_id,
+                mode_requested="snapshot", mode_selected="snapshot",
+                selection_reason="explicit_snapshot",
+                compatibility_digest=compatibility_digest_from_manifest(manifest),
+                completed_at_epoch_seconds=time.time(),
+                timings=BuildTiming(
+                    scan_parse_ms=(time.perf_counter() - build_started) * 1000,
+                    chunking_ms=0.0,
+                    embedding_cache_hit_ms=0.0,
+                    embedding_cache_miss_ms=embedding_cache_miss_ms,
+                    serialization_write_ms=serialization_write_ms,
+                    fts_catch_up_ms=0.0,
+                    vector_catch_up_ms=index_build_ms,
+                    validation_ms=validation_ms,
+                    publication_ms=0.0,
+                    index_rebuild_ms=index_build_ms,
+                ),
+                sparse_rows=TableRowCounts(
+                    inserted=len(lexical_chunks), updated=0, deleted=0, unchanged=0,
+                    physically_written=len(lexical_chunks),
+                ),
+                dense_rows=TableRowCounts(
+                    inserted=len(dense_chunks), updated=0, deleted=0, unchanged=0,
+                    physically_written=len(dense_chunks),
+                ),
+                embedding_cache_hits=0, embedding_cache_misses=len(dense_chunks),
+                peak_staged_disk_bytes=self._disk_bytes(build_dir), completed=True,
+            )
+            manifest = self._manifest(**manifest_kwargs, build_telemetry=telemetry)
             # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
             if build_dir.name != ctx.build_id or manifest.get("build_id") != ctx.build_id:
                 raise RuntimeError(
@@ -358,7 +398,8 @@ class IndexBuildService:
                   image_metadata: list[dict] | None = None,
                   candidate_query_policy: CandidateQueryPolicy | None = None,
                   ann_policy: ProductionAnnPolicy | None = None,
-                  publication_evidence: CandidatePublicationEvidence | None = None) -> dict:
+                  publication_evidence: CandidatePublicationEvidence | None = None,
+                  build_telemetry: BuildTelemetry | None = None) -> dict:
         fts_config = self._fts_config.to_json()
         vector_config_json = vector_config.to_json()
         # facade 提供的 page_metadata 含完整 page_type/sources/links/aliases/sha256；
@@ -428,6 +469,8 @@ class IndexBuildService:
             manifest["candidate_query_policy"] = candidate_query_policy.to_json()
         if publication_evidence is not None:
             manifest["candidate_publication_evidence"] = publication_evidence.to_json()
+        if build_telemetry is not None:
+            manifest["build_telemetry"] = build_telemetry.to_json()
         return manifest
 
     @staticmethod
