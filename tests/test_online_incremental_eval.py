@@ -57,8 +57,8 @@ def full_acceptance_artifact(tmp_path_factory: pytest.TempPathFactory) -> dict:
     return _run(tmp_path_factory.mktemp("full-comparison"))
 
 
-def test_public_snapshot_incremental_retrieval_equivalence(tmp_path: Path) -> None:
-    """An edit uses public build/load/hybrid_search in both build modes."""
+def test_diagnostic_artifact_public_snapshot_incremental_retrieval_equivalence(tmp_path: Path) -> None:
+    """An edit uses public build/load/hybrid_search in both diagnostic modes."""
     artifact = _run_diagnostic(tmp_path, scenario="page_edit")
 
     validate_diagnostic_comparison_artifact(artifact)
