@@ -73,7 +73,10 @@ from obsidian_wiki.application.index_build_service import CandidateQueryPolicy
 def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
                            page_metadata=None, image_metadata=None, ctx=None,
                            tokenizer=None, lexicon=None,
-                           candidate_query_policy: CandidateQueryPolicy | None = None):
+                           candidate_query_policy: CandidateQueryPolicy | None = None,
+                           build_mode: str = "snapshot",
+                           build_mode_policy=None,
+                           outer_lock_held: bool = False):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -154,7 +157,8 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
     ).build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
         page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx,
-        plan_provider=plan_provider)
+        plan_provider=plan_provider, build_mode=build_mode,
+        build_mode_policy=build_mode_policy, outer_lock_held=outer_lock_held)
     # #37：pointer commit 之后执行 post-commit（可观察、可重试；失败保留 PREPARED）。
     post_commit_status, warnings = _run_post_commit(Path(index_dir), journal, artifact)
     # #34：outcome 的 build_id/generation 必须来自 artifact（单一事实来源），
@@ -384,8 +388,11 @@ class WikiIndex:
     # ---- build ----
     def build(self, wiki_dir: Path, full_rebuild: bool = False,
                allow_partial_index: bool = False,
-               candidate_query_policy: CandidateQueryPolicy | None = None):
-        """构建（默认增量）：未变页命中页级向量缓存跳过编码；full_rebuild=True 强制全量重编码。
+               candidate_query_policy: CandidateQueryPolicy | None = None,
+               build_mode: str = "snapshot",
+               build_mode_policy_path: Path | None = None,
+               build_mode_policy=None):
+        """Build a snapshot, staged incremental candidate, or evidence-gated auto mode.
 
         无论增量与否都写入全新 builds/<id>/lance_db（删除页自然不入表 → 无残留），
         校验通过后经 #11 指针原子发布。增量的加速点在于跳过未变页的 torch 编码。
@@ -403,6 +410,16 @@ class WikiIndex:
         eval comparator 构建。
         """
         from obsidian_wiki.application.build_lock import BuildLock, new_build_context
+        from obsidian_wiki.application.incremental_policy import load_build_mode_policy
+
+        if build_mode not in {"snapshot", "incremental", "auto"}:
+            raise ValueError("build_mode must be snapshot, incremental, or auto")
+        project_root = Path(wiki_dir).parent
+        # Only auto reads the policy: explicit snapshot ignores even an invalid path,
+        # while explicit incremental remains policy-independent.
+        policy_load = build_mode_policy if build_mode == "auto" else None
+        if build_mode == "auto" and policy_load is None:
+            policy_load = load_build_mode_policy(project_root, build_mode_policy_path)
 
         ctx = new_build_context()
         lock = BuildLock(self.index_dir, ctx=ctx)
@@ -410,13 +427,15 @@ class WikiIndex:
         try:
             return self._build(wiki_dir, full_rebuild=full_rebuild,
                                allow_partial_index=allow_partial_index, ctx=ctx,
-                               candidate_query_policy=candidate_query_policy)
+                               candidate_query_policy=candidate_query_policy,
+                               build_mode=build_mode, build_mode_policy=policy_load)
         finally:
             lock.release()
 
     def _build(self, wiki_dir: Path, full_rebuild: bool = False,
                allow_partial_index: bool = False, ctx=None,
-               candidate_query_policy: CandidateQueryPolicy | None = None):
+               candidate_query_policy: CandidateQueryPolicy | None = None,
+               build_mode: str = "snapshot", build_mode_policy=None):
         """build() 的锁内主体。"""
         # Keep the long-standing public call signature, but route every actual
         # build through the D-01 service.  #22 incremental/publisher work and
@@ -500,6 +519,9 @@ class WikiIndex:
             image_metadata=source_images if source_images else None,
             ctx=ctx,
             candidate_query_policy=candidate_query_policy,
+            build_mode=build_mode,
+            build_mode_policy=build_mode_policy,
+            outer_lock_held=True,
         )
         published_manifest = json.loads(
             outcome.artifact.manifest_path.read_text(encoding="utf-8")
@@ -949,6 +971,12 @@ def main():
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
     p.add_argument("--full-rebuild", action="store_true",
                    help="忽略页级向量缓存，强制全量重编码（模型/分块配置变更或缓存疑似损坏时使用）")
+    p.add_argument("--incremental", action="store_true",
+                   help="（已废弃）仅复用 embedding 缓存；仍会发布全新的 sparse/dense 表和索引快照。")
+    p.add_argument("--build-mode", choices=["snapshot", "incremental", "auto"], default="snapshot",
+                   help="存储构建模式：snapshot（默认）、真实 staged incremental，或证据驱动 auto。")
+    p.add_argument("--build-mode-policy", default=None,
+                   help="auto 模式的项目内 JSON policy 相对路径；无效策略安全回退到 snapshot。")
     p.add_argument("--vector-index", default=None,
                    choices=["auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"],
                    help="（已废弃）Phase 06 起生产向量索引固定为批准策略 IVF_HNSW_SQ/ef=100；"
@@ -963,6 +991,8 @@ def main():
     idx_dir = proj / ".index"
 
     if args.retry_pending:
+        if args.incremental or args.full_rebuild or args.build_mode != "snapshot" or args.build_mode_policy is not None:
+            p.error("--retry-pending cannot be combined with build-mode or cache flags")
         from obsidian_wiki.application.post_commit_service import retry_pending
         from obsidian_wiki.infrastructure.filesystem_community_reports import FilesystemCommunityReportStore
         from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
@@ -988,28 +1018,37 @@ def main():
         )
         sys.exit(2)
 
-    from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
+    if args.incremental and args.build_mode != "snapshot":
+        p.error("--incremental is legacy embedding-cache reuse and conflicts with --build-mode")
 
-    model_path = Path(os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or SKILL_EMBEDDER_DIR)
-    embedder = SentenceTransformerEmbedder(model_path)
+    from obsidian_wiki.application.incremental_policy import load_build_mode_policy
+    # Parse policy before model construction or any storage mutation.  Explicit
+    # snapshot intentionally bypasses policy validation entirely.
+    policy_load = (
+        load_build_mode_policy(proj, Path(args.build_mode_policy))
+        if args.build_mode == "auto" else None
+    )
+
     from obsidian_wiki.application.build_lock import BuildLockHeldError
     from obsidian_wiki.domain.index_models import PostCommitStatus
-    # issue #39：注入真实 embedding tokenizer + lexicon，使 build_storage_contract
-    # 走 token 有界分块（大文档切片而非整页被模型 128-token 截断）。
-    tokenizer = EmbeddingTokenizer(getattr(embedder, "tokenizer", None)).count
-    lexicon = load_lexicon(proj)
     try:
-        outcome = build_storage_contract(
-            wiki, idx_dir, embed=embedder.embed, tokenizer=tokenizer, lexicon=lexicon,
+        outcome = WikiIndex(idx_dir).build(
+            wiki, full_rebuild=args.full_rebuild,
+            build_mode=args.build_mode,
+            build_mode_policy_path=(Path(args.build_mode_policy) if args.build_mode == "auto" else None),
+            build_mode_policy=policy_load,
         )
     except BuildLockHeldError as exc:
         print(f"索引构建被拒：{exc}", file=sys.stderr)
         sys.exit(1)
     artifact = outcome.artifact
-    mode = "全量重建" if args.full_rebuild else "增量"
+    telemetry = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
     print(
-        f"索引构建完成（{mode}）: sparse={artifact.sparse_count}, "
-        f"dense={artifact.dense_count} → {artifact.lance_dir}"
+        "索引构建完成 "
+        f"requested={telemetry['mode_requested']} selected={telemetry['mode_selected']} "
+        f"reason={telemetry['selection_reason']} policy_digest="
+        f"{telemetry.get('build_mode_policy_sha256')} cache={'bypass' if args.full_rebuild else 'reuse'}: "
+        f"sparse={artifact.sparse_count}, dense={artifact.dense_count} → {artifact.lance_dir}"
     )
     # #37：pending outcome 的 CLI exit code 必须为 0；stderr 输出明确 warning 与 retry action。
     if outcome.post_commit_status != PostCommitStatus.COMPLETE:

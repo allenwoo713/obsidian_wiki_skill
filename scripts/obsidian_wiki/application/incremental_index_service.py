@@ -255,11 +255,37 @@ class IncrementalIndexService:
 
     def build(self, wiki_dir: Path, index_dir: Path, *, canonical_chunks: Sequence[SparseChunk],
               embed: Embedder, page_metadata: list[dict] | None = None) -> IncrementalBuildResult:
+        """Backward-compatible direct entry point for existing integration gates."""
+        try:
+            return self.build_staged(
+                wiki_dir, index_dir, canonical_chunks=canonical_chunks, embed=embed,
+                page_metadata=page_metadata, ctx=new_build_context(),
+            )
+        except IncrementalFallbackEligible as exc:
+            # The legacy direct service surface predates public auto dispatch
+            # and retains its original adapter error contract.  Only
+            # ``build_staged`` carries the typed signal to IndexBuildService.
+            if exc.__cause__ is not None:
+                raise exc.__cause__ from exc
+            raise
+
+    def build_staged(self, wiki_dir: Path, index_dir: Path, *, canonical_chunks: Sequence[SparseChunk],
+                     embed: Embedder, page_metadata: list[dict] | None = None,
+                     ctx: BuildContext, mode_requested: str = "incremental",
+                     selection_reason: str = "explicit_incremental",
+                     build_mode_policy_sha256: str | None = None,
+                     outer_lock_held: bool = False) -> IncrementalBuildResult:
+        """Build an unpublished incremental candidate for the caller's request.
+
+        The public dispatcher owns the request-scoped context and outer writer
+        boundary; direct callers retain the historical lock acquisition.
+        """
         del wiki_dir  # Canonical planning occurs under the caller's existing writer boundary.
         build_started = time.perf_counter()
-        ctx = new_build_context()
-        lock = BuildLock(index_dir, ctx=ctx)
-        lock.acquire()
+        lock = None
+        if not outer_lock_held:
+            lock = BuildLock(index_dir, ctx=ctx)
+            lock.acquire()
         try:
             active_lance = resolve_active_lance_dir(index_dir)
             source_manifest = self._assert_current_manifest(active_lance)
@@ -281,7 +307,7 @@ class IncrementalIndexService:
             source_build_id = str(json.loads(pointer_payload.decode("utf-8"))["build_id"])
             plan_digest = self._plan_digest(lexical, dense)
             config_digest = self._digest(source_manifest)
-            policy_digest = self._digest(source_manifest["ann_policy"])
+            policy_digest = build_mode_policy_sha256 or self._digest(source_manifest["ann_policy"])
             journal = FilesystemIncrementalJournal(index_dir)
             if journal.has_invalid_records():
                 raise RuntimeError("incremental recovery journal is malformed; snapshot required")
@@ -327,9 +353,12 @@ class IncrementalIndexService:
                     tuple(chunk.__dict__ for chunk in dense),
                 )
                 if record.state is IncrementalJournalState.PREPARED:
-                    cloned = source.clone_tables(lance_dir)
+                    try:
+                        cloned = source.clone_tables(lance_dir)
+                    except Exception as exc:
+                        raise IncrementalFallbackEligible("shallow_clone_unavailable") from exc
                     if cloned != source_tables:
-                        raise RuntimeError("source table versions changed during clone; snapshot required")
+                        raise IncrementalFallbackEligible("shallow_clone_unavailable")
                     record = journal.transition(build_id, IncrementalJournalState.CLONED, boundary="clone")
                 staging = LanceDbIndexRepository(lance_dir)
                 write_started = time.perf_counter()
@@ -354,7 +383,10 @@ class IncrementalIndexService:
                 )
                 if record.state is IncrementalJournalState.MUTATED:
                     fts_started = time.perf_counter()
-                    sparse_coverage = staging.catch_up(self._fts_config)
+                    try:
+                        sparse_coverage = staging.catch_up(self._fts_config)
+                    except Exception as exc:
+                        raise IncrementalFallbackEligible("index_catch_up_unproven") from exc
                     fts_catch_up_ms = (time.perf_counter() - fts_started) * 1000
                     vector_started = time.perf_counter()
                     staging.create_vector_index(vector_config)
@@ -409,8 +441,8 @@ class IncrementalIndexService:
                     manifest = publisher._manifest(**manifest_kwargs)
                     telemetry = BuildTelemetry(
                         schema_version=1, observation_id=build_id,
-                        mode_requested="incremental", mode_selected="incremental",
-                        selection_reason="explicit_incremental",
+                        mode_requested=mode_requested, mode_selected="incremental",
+                        selection_reason=selection_reason,
                         compatibility_digest=compatibility_digest_from_manifest(manifest),
                         completed_at_epoch_seconds=time.time(),
                         timings=BuildTiming(
@@ -434,6 +466,7 @@ class IncrementalIndexService:
                         ),
                         embedding_cache_hits=0, embedding_cache_misses=len(dense),
                         peak_staged_disk_bytes=publisher._disk_bytes(build_dir), completed=True,
+                        build_mode_policy_sha256=build_mode_policy_sha256,
                     )
                     manifest = publisher._manifest(**manifest_kwargs, build_telemetry=telemetry)
                     manifest_path = build_dir / "manifest.json"
@@ -465,4 +498,5 @@ class IncrementalIndexService:
                     journal.abort(build_id, f"{type(exc).__name__}: {exc}")
                 raise
         finally:
-            lock.release()
+            if lock is not None:
+                lock.release()

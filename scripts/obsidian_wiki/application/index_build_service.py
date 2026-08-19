@@ -53,6 +53,8 @@ from obsidian_wiki.ports.chunk_repository import ChunkRepository
 from obsidian_wiki.ports.index_manifest import IndexManifestStore
 from obsidian_wiki.ports.post_commit import PostCommitJournal
 from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
+from obsidian_wiki.application.incremental_policy import select_auto_build_mode
+from obsidian_wiki.domain.incremental_models import BuildModePolicyLoad, BuildModeSelection
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
@@ -127,6 +129,9 @@ class IndexBuildService:
         image_metadata: list[dict] | None = None,
         ctx: BuildContext | None = None,
         plan_provider: PlanProvider | None = None,
+        build_mode: str = "snapshot",
+        build_mode_policy: BuildModePolicyLoad | None = None,
+        outer_lock_held: bool = False,
     ) -> StorageArtifact:
         """#21/#34 单写者构建：最外层传入或创建一次 BuildContext，锁 metadata、
         build 目录、manifest、pointer 与返回 artifact 共用同一个 build_id；
@@ -136,18 +141,62 @@ class IndexBuildService:
         ``(wiki_dir) -> (sparse_chunks, page_metadata)``。分块必须在 BUILD.lock
         获取之后、针对已加锁的 Wiki 快照执行；调用方传入的 ``sparse_chunks``
         （显式计划）仍然优先。"""
+        if build_mode not in {"snapshot", "incremental", "auto"}:
+            raise ValueError("build_mode must be snapshot, incremental, or auto")
         ctx = ctx or new_build_context()
-        lock = BuildLock(index_dir, ctx=ctx)
-        lock.acquire()
+        lock = None
+        if not outer_lock_held:
+            lock = BuildLock(index_dir, ctx=ctx)
+            lock.acquire()
         try:
+            if sparse_chunks is None and plan_provider is not None:
+                sparse_chunks, planned_pages = plan_provider(wiki_dir)
+                if page_metadata is None and planned_pages is not None:
+                    page_metadata = planned_pages
+            sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
+            selection = self._select_build_mode(
+                index_dir, build_mode=build_mode, policy_load=build_mode_policy,
+            )
+            if selection.selected_mode == "incremental":
+                from obsidian_wiki.application.incremental_index_service import (
+                    IncrementalFallbackEligible,
+                    IncrementalIndexService,
+                )
+                try:
+                    result = IncrementalIndexService(fts_config=self._fts_config).build_staged(
+                        wiki_dir, index_dir, canonical_chunks=sparse_chunks, embed=embed,
+                        page_metadata=page_metadata, ctx=ctx,
+                        mode_requested=build_mode, selection_reason=selection.reason,
+                        build_mode_policy_sha256=selection.policy_sha256,
+                        outer_lock_held=True,
+                    )
+                    return result.artifact
+                except IncrementalFallbackEligible as exc:
+                    if build_mode != "auto" or exc.reason not in {
+                        "incompatible_active_contract", "shallow_clone_unavailable",
+                        "index_catch_up_unproven",
+                    }:
+                        raise
+                    selection = BuildModeSelection(
+                        "snapshot", f"incremental_runtime_fallback:{exc.reason}",
+                        selection.policy_sha256, selection.compatibility_digest,
+                        selection.evidence_observation_ids, selection.calculated_values,
+                    )
+                    # A staged candidate may already occupy ctx.build_id.  Keep the same
+                    # request owner/timestamp while allocating a fresh unpublished target.
+                    replacement = new_build_context()
+                    ctx = BuildContext(replacement.build_id, ctx.started_at, ctx.owner_nonce)
             return self._build(
                 wiki_dir, index_dir, embed=embed,
                 sparse_chunks=sparse_chunks, ctx=ctx,
                 page_metadata=page_metadata, image_metadata=image_metadata,
-                plan_provider=plan_provider,
+                plan_provider=None, mode_requested=build_mode,
+                selection_reason=selection.reason,
+                build_mode_policy_sha256=selection.policy_sha256,
             )
         finally:
-            lock.release()
+            if lock is not None:
+                lock.release()
 
     def _build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -155,6 +204,9 @@ class IndexBuildService:
         page_metadata: list[dict] | None = None,
         image_metadata: list[dict] | None = None,
         plan_provider: PlanProvider | None = None,
+        mode_requested: str = "snapshot",
+        selection_reason: str = "explicit_snapshot",
+        build_mode_policy_sha256: str | None = None,
     ) -> StorageArtifact:
         build_started = time.perf_counter()
         # #39 (review)：持锁后再分块。显式 sparse_chunks > plan_provider > 回退整页 plan。
@@ -320,8 +372,8 @@ class IndexBuildService:
             manifest = self._manifest(**manifest_kwargs)
             telemetry = BuildTelemetry(
                 schema_version=1, observation_id=ctx.build_id,
-                mode_requested="snapshot", mode_selected="snapshot",
-                selection_reason="explicit_snapshot",
+                mode_requested=mode_requested, mode_selected="snapshot",
+                selection_reason=selection_reason,
                 compatibility_digest=compatibility_digest_from_manifest(manifest),
                 completed_at_epoch_seconds=time.time(),
                 timings=BuildTiming(
@@ -346,6 +398,7 @@ class IndexBuildService:
                 ),
                 embedding_cache_hits=0, embedding_cache_misses=len(dense_chunks),
                 peak_staged_disk_bytes=self._disk_bytes(build_dir), completed=True,
+                build_mode_policy_sha256=build_mode_policy_sha256,
             )
             manifest = self._manifest(**manifest_kwargs, build_telemetry=telemetry)
             # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
@@ -389,6 +442,48 @@ class IndexBuildService:
                 encoding="utf-8",
             )
             raise
+
+    def _select_build_mode(
+        self, index_dir: Path, *, build_mode: str,
+        policy_load: BuildModePolicyLoad | None,
+    ) -> BuildModeSelection:
+        """Choose only from injected policy evidence while the one writer lock is held."""
+        placeholder = "0" * 64
+        if build_mode == "snapshot":
+            return BuildModeSelection("snapshot", "explicit_snapshot", None, placeholder, ())
+        if build_mode == "incremental":
+            return BuildModeSelection("incremental", "explicit_incremental", None, placeholder, ())
+        if policy_load is None:
+            raise RuntimeError("auto build mode requires a parsed policy load")
+        try:
+            from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir
+            active_manifest = json.loads(
+                (resolve_active_lance_dir(index_dir).parent / "manifest.json").read_text(encoding="utf-8")
+            )
+            compatibility_digest = compatibility_digest_from_manifest(active_manifest)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError, TypeError):
+            return BuildModeSelection("snapshot", "active_contract_unavailable", policy_load.policy_sha256, placeholder, ())
+        observations: list[BuildTelemetry] = []
+        for manifest_path in (index_dir / "builds").glob("*/manifest.json") if (index_dir / "builds").is_dir() else ():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                raw = manifest["build_telemetry"]
+                observations.append(BuildTelemetry(
+                    schema_version=raw["schema_version"], observation_id=raw["observation_id"],
+                    mode_requested=raw["mode_requested"], mode_selected=raw["mode_selected"],
+                    selection_reason=raw["selection_reason"], compatibility_digest=raw["compatibility_digest"],
+                    completed_at_epoch_seconds=raw["completed_at_epoch_seconds"],
+                    timings=BuildTiming(**raw["timings"]), sparse_rows=TableRowCounts(**raw["sparse_rows"]),
+                    dense_rows=TableRowCounts(**raw["dense_rows"]), embedding_cache_hits=raw["embedding_cache_hits"],
+                    embedding_cache_misses=raw["embedding_cache_misses"], peak_staged_disk_bytes=raw["peak_staged_disk_bytes"],
+                    completed=raw["completed"], build_mode_policy_sha256=raw.get("build_mode_policy_sha256"),
+                ))
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+                continue
+        return select_auto_build_mode(
+            policy_load, observations, current_compatibility_digest=compatibility_digest,
+            now_epoch_seconds=time.time(),
+        )
 
     def _manifest(self, *, counts: dict, vector_stats: dict, fts_stats: dict,
                   vector_config: VectorIndexConfig, benchmark: dict, policy: dict,

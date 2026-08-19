@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import inspect
+import json
+import math
+from pathlib import Path
+import subprocess
+import sys
 
+import pytest
 from build_index import WikiIndex
 
 
@@ -13,3 +19,219 @@ def test_public_facade_exposes_explicit_incremental_mode() -> None:
 
     assert parameters["build_mode"].default == "snapshot"
     assert "build_mode_policy_path" in parameters
+
+
+class _Embedder:
+    """Model-free approved-dimension embedder for the real public facade."""
+
+    class _Tokenizer:
+        def encode(self, text: str):
+            return text.split() or ["_"]
+
+    tokenizer = _Tokenizer()
+
+    def get_embedding_dimension(self) -> int:
+        return 384
+
+    def encode(self, texts, **_kwargs):
+        rows = []
+        for offset, _text in enumerate(texts):
+            raw = [float((offset + item) % 17 + 1) for item in range(384)]
+            norm = math.sqrt(sum(value * value for value in raw))
+            rows.append([value / norm for value in raw])
+        return rows
+
+
+def _write_page(wiki_dir: Path, text: str) -> None:
+    (wiki_dir / "online.md").write_text(
+        f"---\ntitle: Online\ntype: concept\n---\n{text}\n", encoding="utf-8"
+    )
+
+
+def _enable_auto_incremental(index_dir: Path, manifest_path: Path) -> str:
+    from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    telemetry = manifest["build_telemetry"]
+    policy = {
+        "schema_version": 1,
+        "enabled": True,
+        "compatibility_digest": compatibility_digest_from_manifest(manifest),
+        "evidence_observation_ids": [telemetry["observation_id"]],
+        "minimum_compatible_observations": 1,
+        "max_evidence_age_seconds": 3600.0,
+        "match": "all",
+        "criteria": [{"metric": "snapshot_p95_ms", "operator": "gte", "threshold": 0.001}],
+    }
+    path = index_dir / "build-mode-policy.json"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    return path.read_text(encoding="utf-8")
+
+
+def test_explicit_incremental_public_facade_reaches_staged_publication(tmp_path, monkeypatch) -> None:
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, "original public facade payload")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+
+    WikiIndex(index_dir).build(wiki_dir)
+    prior_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    _write_page(wiki_dir, "edited public facade payload")
+
+    outcome = WikiIndex(index_dir).build(wiki_dir, build_mode="incremental")
+
+    assert outcome.published
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() != prior_pointer
+    telemetry = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == telemetry["mode_selected"] == "incremental"
+    assert telemetry["selection_reason"] == "explicit_incremental"
+
+
+def test_default_snapshot_is_reported_by_the_public_facade(tmp_path, monkeypatch) -> None:
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    _write_page(wiki_dir, "default snapshot payload")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+
+    outcome = WikiIndex(tmp_path / ".index").build(wiki_dir)
+
+    telemetry = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == telemetry["mode_selected"] == "snapshot"
+    assert telemetry["selection_reason"] == "explicit_snapshot"
+
+
+def test_single_lock_covers_public_incremental_dispatch(tmp_path, monkeypatch) -> None:
+    import obsidian_wiki.application.build_lock as lock_module
+    import obsidian_wiki.application.incremental_index_service as incremental_module
+    import obsidian_wiki.application.index_build_service as service_module
+
+    calls: list[str] = []
+    real_lock = lock_module.BuildLock
+
+    class _TrackingBuildLock(real_lock):
+        def acquire(self, *args, **kwargs):
+            calls.append(self.ctx.build_id)
+            return super().acquire(*args, **kwargs)
+
+    monkeypatch.setattr(lock_module, "BuildLock", _TrackingBuildLock)
+    monkeypatch.setattr(service_module, "BuildLock", _TrackingBuildLock)
+    monkeypatch.setattr(incremental_module, "BuildLock", _TrackingBuildLock)
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, "single writer baseline")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+    WikiIndex(index_dir).build(wiki_dir)
+    _write_page(wiki_dir, "single writer edit")
+    calls.clear()
+
+    WikiIndex(index_dir).build(wiki_dir, build_mode="incremental")
+
+    assert len(calls) == 1
+
+
+def test_auto_without_policy_is_a_truthful_snapshot(tmp_path, monkeypatch) -> None:
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, "auto missing policy baseline")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+    WikiIndex(index_dir).build(wiki_dir)
+    _write_page(wiki_dir, "auto missing policy edit")
+
+    outcome = WikiIndex(index_dir).build(wiki_dir, build_mode="auto")
+
+    telemetry = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == "auto"
+    assert telemetry["mode_selected"] == "snapshot"
+    assert telemetry["selection_reason"] == "policy_missing"
+    assert telemetry["build_mode_policy_sha256"] is None
+
+
+def test_auto_with_compatible_policy_reaches_incremental(tmp_path, monkeypatch) -> None:
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, "auto compatible baseline")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+    baseline = WikiIndex(index_dir).build(wiki_dir)
+    _enable_auto_incremental(index_dir, baseline.artifact.manifest_path)
+    _write_page(wiki_dir, "auto compatible edit")
+
+    outcome = WikiIndex(index_dir).build(wiki_dir, build_mode="auto")
+
+    telemetry = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == "auto"
+    assert telemetry["mode_selected"] == "incremental"
+    assert telemetry["selection_reason"] == "policy_criteria_met"
+    assert telemetry["build_mode_policy_sha256"]
+
+
+@pytest.mark.parametrize("fault", ["clone", "catch_up"])
+def test_auto_pre_pointer_fault_falls_back_to_queryable_snapshot(tmp_path, monkeypatch, fault) -> None:
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, f"auto {fault} baseline")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+    baseline = WikiIndex(index_dir).build(wiki_dir)
+    policy_bytes = _enable_auto_incremental(index_dir, baseline.artifact.manifest_path)
+    old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    _write_page(wiki_dir, f"auto {fault} edit")
+
+    method = "clone_tables" if fault == "clone" else "catch_up"
+    monkeypatch.setattr(
+        LanceDbIndexRepository, method,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(f"{fault} fault")),
+    )
+    outcome = WikiIndex(index_dir).build(wiki_dir, build_mode="auto")
+
+    telemetry = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == "auto"
+    assert telemetry["mode_selected"] == "snapshot"
+    assert telemetry["selection_reason"] == f"incremental_runtime_fallback:{'shallow_clone_unavailable' if fault == 'clone' else 'index_catch_up_unproven'}"
+    assert telemetry["build_mode_policy_sha256"]
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() != old_pointer
+    assert outcome.artifact.lance_dir.exists()
+    assert (index_dir / "build-mode-policy.json").read_text(encoding="utf-8") == policy_bytes
+
+
+def test_legacy_incremental_cannot_relabel_a_storage_mode_before_model_load(tmp_path) -> None:
+    result = subprocess.run(
+        [sys.executable, "scripts/build_index.py", str(tmp_path), "--incremental", "--build-mode", "incremental"],
+        cwd=Path(__file__).parent.parent,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "legacy embedding-cache reuse" in result.stderr
+
+
+def test_explicit_incremental_contract_mismatch_fails_closed_without_snapshot_alias(tmp_path, monkeypatch) -> None:
+    from obsidian_wiki.application.incremental_index_service import (
+        IncrementalFallbackEligible,
+        IncrementalIndexService,
+    )
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    _write_page(wiki_dir, "explicit mismatch baseline")
+    monkeypatch.setattr(WikiIndex, "_get_embedder", lambda self: _Embedder())
+    baseline = WikiIndex(index_dir).build(wiki_dir)
+    pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    _write_page(wiki_dir, "explicit mismatch edit")
+    monkeypatch.setattr(
+        IncrementalIndexService, "_assert_current_manifest",
+        staticmethod(lambda _path: (_ for _ in ()).throw(IncrementalFallbackEligible("incompatible_active_contract"))),
+    )
+
+    with pytest.raises(IncrementalFallbackEligible, match="incompatible_active_contract"):
+        WikiIndex(index_dir).build(wiki_dir, build_mode="incremental")
+
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == pointer
