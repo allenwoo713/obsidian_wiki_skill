@@ -361,6 +361,9 @@ class FtsIndexStats(_JsonRecord):
 
     index_name: str
     indexed_rows: int
+    # A missing native observation is unsafe for staged publication.  The
+    # incremental service rejects it rather than guessing that FTS is caught up.
+    unindexed_rows: int | None = None
 
 
 @dataclass(frozen=True)

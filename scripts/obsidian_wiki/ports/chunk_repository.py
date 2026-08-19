@@ -13,6 +13,11 @@ from obsidian_wiki.domain.index_models import (
     SparseChunk,
     VectorIndexConfig,
 )
+from obsidian_wiki.domain.incremental_models import (
+    CoverageObservation,
+    MutationResult,
+    SourceTableIdentity,
+)
 
 
 class ChunkRepository(Protocol):
@@ -60,6 +65,17 @@ class ChunkRepository(Protocol):
     def vector_index_stats(self, index_name: str) -> IndexStats: ...
 
     def fts_index_stats(self, index_name: str = "fts_text_idx") -> FtsIndexStats: ...
+
+    def clone_tables(self, target_lance_dir: Path) -> tuple[SourceTableIdentity, ...]: ...
+
+    def table_rows(self, table_name: str) -> tuple[Mapping[str, object], ...]: ...
+
+    def apply_delta(
+        self, table_name: str, *, added: Sequence[Mapping[str, object]],
+        updated: Sequence[Mapping[str, object]], deleted_ids: Sequence[str],
+    ) -> MutationResult: ...
+
+    def catch_up(self, fts_config: FtsIndexConfig) -> CoverageObservation: ...
 
     def seal(self, lance_dir: Path) -> None:
         """#36：建立「数据已可耐久读取」的发布前边界——关闭写入 connection、

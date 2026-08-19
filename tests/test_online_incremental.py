@@ -28,13 +28,13 @@ def _embed(texts):
 def _chunks(*, text: str) -> tuple[SparseChunk, ...]:
     page_id = "concepts/online.md"
     common = dict(
-        chunk_id=f"{page_id}::stable", page_id=page_id,
+        page_id=page_id,
         path="concepts/online.md", title="Online", text=text,
         content_hash=text, end_char=len(text),
     )
     return (
-        SparseChunk(**common, fts_text=text, chunk_kind="sparse"),
-        SparseChunk(**common, fts_text=text, chunk_kind="dense"),
+        SparseChunk(**common, chunk_id=f"{page_id}::sparse-stable", fts_text=text, chunk_kind="sparse"),
+        SparseChunk(**common, chunk_id=f"{page_id}::dense-stable", fts_text=text, chunk_kind="dense"),
     )
 
 
