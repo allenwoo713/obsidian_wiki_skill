@@ -64,6 +64,52 @@ def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> N
         assert required in readme_contract
 
 
+def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
+    """D-06/D-08/D-09/D-10: a green workflow must exercise production paths."""
+    ci = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    architecture = ci.split("  architecture:", 1)[1]
+    assert "runs-on: ${{ matrix.os }}" in architecture
+    assert "os: [ubuntu-latest, windows-latest]" in architecture
+    assert "self-hosted" not in architecture
+    for suite in (
+        "tests/test_online_incremental.py",
+        "tests/test_online_incremental_policy.py",
+        "tests/test_online_incremental_cli.py",
+        "tests/test_online_incremental_eval.py",
+    ):
+        assert suite in architecture
+
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    test_and_eval = workflow.split("  test-and-eval:", 1)[1].split("  issue41-manual-calibration:", 1)[0]
+    bootstrap_at = test_and_eval.index("Bootstrap local embedding model")
+    phase04_at = test_and_eval.index("Run #22 public build-mode equivalence gate")
+    assert bootstrap_at < phase04_at
+    assert "python eval/compare_build_modes.py" in test_and_eval
+    assert "--work-dir .review-tmp/phase04-modes" in test_and_eval
+    assert "--output .review-tmp/phase04-modes/equivalence.json" in test_and_eval
+    assert "test -s .review-tmp/phase04-modes/equivalence.json" in test_and_eval
+    assert "--init-baseline" not in test_and_eval
+    for suite in (
+        "tests/test_online_incremental.py",
+        "tests/test_online_incremental_policy.py",
+        "tests/test_online_incremental_cli.py",
+        "tests/test_online_incremental_eval.py",
+    ):
+        assert suite in test_and_eval
+
+    phase04_artifact = test_and_eval.split("Upload #22 equivalence and telemetry evidence", 1)[1]
+    assert "if: success()" in phase04_artifact
+    assert "phase04-build-mode-evidence" in phase04_artifact
+    assert ".review-tmp/phase04-modes/equivalence.json" in phase04_artifact
+    assert "if-no-files-found: error" in phase04_artifact
+    assert "--max-seconds 60" in workflow
+    assert "static_cap_seconds" in workflow
+    assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in workflow
+    assert "numpy':'2.2.6" in workflow
+    assert "reconcile-ann-decision:" in workflow
+    assert "if: ${{ always() }}" in workflow.split("reconcile-ann-decision:", 1)[1]
+
+
 def _candidate_comparator() -> dict:
     return {
         "evidence_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION,
