@@ -15,6 +15,13 @@ from build_index import build_storage_contract  # noqa: E402
 from obsidian_wiki.domain.index_models import SparseChunk  # noqa: E402
 
 
+def _active_rows(index_dir: Path) -> tuple[dict[str, object], ...]:
+    from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    return tuple(LanceDbIndexRepository(resolve_active_lance_dir(index_dir)).table_rows("sparse_chunks"))
+
+
 def _embed(texts):
     """Small deterministic, approved-dimension test embedder."""
     vectors = []
@@ -171,3 +178,223 @@ def test_row_accounting_reports_only_physical_upserts(tmp_path):
         assert mutation.updated == len(delta.updated_ids)
         assert mutation.deleted == len(delta.deleted_ids)
         assert mutation.physically_written == len(delta.physically_written_ids)
+
+
+def test_journal_requires_monotonic_identity_bound_durable_transitions(tmp_path):
+    """Journal records survive reconstruction but reject malformed or skipped states."""
+    from obsidian_wiki.domain.incremental_models import (
+        IncrementalJournalRecord,
+        IncrementalJournalState,
+        SourceTableIdentity,
+    )
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+
+    index_dir = tmp_path / ".index"
+    build_id = "build_20260819T000000000000_" + "a" * 32
+    prepared = IncrementalJournalRecord(
+        schema_version=1, build_id=build_id, generation=2,
+        state=IncrementalJournalState.PREPARED,
+        prior_pointer_sha256="b" * 64,
+        source_build_id="build_20260819T000000000000_" + "f" * 32,
+        source_tables=(
+            SourceTableIdentity("sparse_chunks", 3, 2),
+            SourceTableIdentity("dense_chunks", 4, 2),
+        ),
+        plan_sha256="c" * 64, config_sha256="d" * 64, policy_sha256="e" * 64,
+        target_build=f"builds/{build_id}", last_completed_boundary="prepared",
+    )
+    journal = FilesystemIncrementalJournal(index_dir)
+    journal.prepare(prepared)
+    journal.transition(build_id, IncrementalJournalState.CLONED, boundary="clone")
+
+    reconstructed = FilesystemIncrementalJournal(index_dir).load(build_id)
+    assert reconstructed is not None
+    assert reconstructed.state is IncrementalJournalState.CLONED
+    assert reconstructed.last_completed_boundary == "clone"
+    with pytest.raises(ValueError, match="illegal incremental journal transition"):
+        journal.transition(build_id, IncrementalJournalState.VALIDATED, boundary="skip")
+
+    path = index_dir / "incremental_journal" / f"{build_id}.json"
+    path.write_text('{"foreign": true}', encoding="utf-8")
+    assert FilesystemIncrementalJournal(index_dir).load(build_id) is None
+
+
+def test_journal_resume_after_sparse_mutation_preserves_active_query_state(tmp_path, monkeypatch):
+    """A restart resumes the same staged build after its recorded sparse boundary."""
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_embed, sparse_chunks=_chunks(text="old restart payload"))
+    old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    old_rows = _active_rows(index_dir)
+    changed = _chunks(text="new restart payload")
+    real_checkpoint = FilesystemIncrementalJournal.checkpoint
+    failed = False
+
+    def _interrupt_after_sparse(self, build_id, *, boundary):
+        nonlocal failed
+        result = real_checkpoint(self, build_id, boundary=boundary)
+        if boundary == "sparse_mutated" and not failed:
+            failed = True
+            raise KeyboardInterrupt("interrupt after sparse mutation")
+        return result
+
+    monkeypatch.setattr(FilesystemIncrementalJournal, "checkpoint", _interrupt_after_sparse)
+    with pytest.raises(KeyboardInterrupt, match="interrupt after sparse mutation"):
+        IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=changed, embed=_embed)
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == old_pointer
+    assert _active_rows(index_dir) == old_rows
+    record = FilesystemIncrementalJournal(index_dir).nonterminal()[0]
+    assert record.last_completed_boundary == "sparse_mutated"
+
+    monkeypatch.setattr(FilesystemIncrementalJournal, "checkpoint", real_checkpoint)
+    result = IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=changed, embed=_embed)
+    assert result.artifact.build_id == record.build_id
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() != old_pointer
+    assert any(row["text"] == "new restart payload" for row in _active_rows(index_dir))
+    assert FilesystemIncrementalJournal(index_dir).load(record.build_id).state.value == "published"
+
+
+def test_journal_identity_mismatch_aborts_candidate_and_requires_snapshot(tmp_path, monkeypatch):
+    """A changed canonical plan cannot resume foreign staged state or alter ACTIVE_INDEX."""
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_embed, sparse_chunks=_chunks(text="identity source payload"))
+    old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    real_checkpoint = FilesystemIncrementalJournal.checkpoint
+
+    def _crash_after_checkpoint(self, build_id, *, boundary):
+        real_checkpoint(self, build_id, boundary=boundary)
+        raise KeyboardInterrupt("simulated process exit")
+
+    monkeypatch.setattr(FilesystemIncrementalJournal, "checkpoint", _crash_after_checkpoint)
+    with pytest.raises(KeyboardInterrupt, match="process exit"):
+        IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=_chunks(text="first candidate"), embed=_embed)
+    pending = FilesystemIncrementalJournal(index_dir).nonterminal()[0]
+    monkeypatch.setattr(FilesystemIncrementalJournal, "checkpoint", real_checkpoint)
+
+    with pytest.raises(RuntimeError, match="snapshot required"):
+        IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=_chunks(text="different candidate"), embed=_embed)
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == old_pointer
+    assert FilesystemIncrementalJournal(index_dir).load(pending.build_id).state.value == "aborted"
+
+
+@pytest.mark.parametrize("seam", ["clone", "sparse", "dense", "catch_up", "validation", "manifest"])
+def test_fault_before_pointer_preserves_old_active_generation(tmp_path, monkeypatch, seam):
+    """Every pre-pointer production seam aborts staging without exposing mixed tables."""
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    import obsidian_wiki.application.incremental_index_service as service_module
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_embed, sparse_chunks=_chunks(text="old fault payload"))
+    old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    old_rows = _active_rows(index_dir)
+
+    if seam == "clone":
+        monkeypatch.setattr(LanceDbIndexRepository, "clone_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("clone fault")))
+    elif seam in {"sparse", "dense"}:
+        real_apply = LanceDbIndexRepository.apply_delta
+        monkeypatch.setattr(
+            LanceDbIndexRepository, "apply_delta",
+            lambda self, table_name, **kwargs: (_ for _ in ()).throw(OSError(f"{seam} fault"))
+            if table_name == f"{seam}_chunks" else real_apply(self, table_name, **kwargs),
+        )
+    elif seam == "catch_up":
+        monkeypatch.setattr(LanceDbIndexRepository, "catch_up", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("catch_up fault")))
+    elif seam == "validation":
+        monkeypatch.setattr(LanceDbIndexRepository, "validate_reopened", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("validation fault")))
+    else:
+        monkeypatch.setattr(service_module.FilesystemIndexManifest, "write", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("manifest fault")))
+
+    with pytest.raises(OSError, match="fault"):
+        IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=_chunks(text="new fault payload"), embed=_embed)
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == old_pointer
+    assert _active_rows(index_dir) == old_rows
+    assert FilesystemIncrementalJournal(index_dir).nonterminal() == ()
+
+
+def test_zero_coverage_blocks_validated_and_pointer_publication(tmp_path, monkeypatch):
+    """Unavailable/zero FTS coverage is never promoted to VALIDATED or PUBLISHED."""
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    from obsidian_wiki.domain.incremental_models import CoverageObservation
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_embed, sparse_chunks=_chunks(text="coverage source payload"))
+    old_pointer = (index_dir / "ACTIVE_INDEX").read_bytes()
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "catch_up",
+        lambda *_args, **_kwargs: CoverageObservation("sparse_chunks", 1, 0, 0),
+    )
+
+    with pytest.raises(RuntimeError, match="coverage is incomplete"):
+        IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=_chunks(text="coverage candidate"), embed=_embed)
+    assert (index_dir / "ACTIVE_INDEX").read_bytes() == old_pointer
+    assert FilesystemIncrementalJournal(index_dir).nonterminal() == ()
+
+
+def test_commit_uncertainty_reconciles_published_journal_on_restart(tmp_path, monkeypatch):
+    """A pointer replace that may have committed is reconciled, never called rollback."""
+    from obsidian_wiki.application.durable_filesystem import CommitUncertainError
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    import obsidian_wiki.application.incremental_index_service as service_module
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_embed, sparse_chunks=_chunks(text="old uncertain payload"))
+    real_publish = service_module.publish_pointer
+
+    def _uncertain_after_replace(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        raise CommitUncertainError("simulated post-replace uncertainty")
+
+    monkeypatch.setattr(service_module, "publish_pointer", _uncertain_after_replace)
+    with pytest.raises(CommitUncertainError, match="post-replace uncertainty"):
+        IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=_chunks(text="new uncertain payload"), embed=_embed)
+    journal = FilesystemIncrementalJournal(index_dir)
+    pending = journal.nonterminal()[0]
+    assert pending.state.value == "validated"
+
+    monkeypatch.setattr(service_module, "publish_pointer", real_publish)
+    assert IncrementalIndexService().recover(index_dir) == (pending.build_id,)
+    assert journal.load(pending.build_id).state.value == "published"
+
+
+def test_lineage_retention_guard_blocks_source_cleanup_after_real_shallow_clone(tmp_path):
+    """A shallow descendant keeps its source generation reopenable and queryable."""
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    build_storage_contract(wiki_dir, index_dir, embed=_embed, sparse_chunks=_chunks(text="lineage source payload"))
+    source_build_id = str(_pointer(index_dir)["build_id"])
+    source_lance = index_dir / str(_pointer(index_dir)["active_lance"])
+    result = IncrementalIndexService().build(
+        wiki_dir, index_dir, canonical_chunks=_chunks(text="lineage descendant payload"), embed=_embed,
+    )
+
+    assert source_build_id in IncrementalIndexService.required_ancestor_build_ids(index_dir)
+    with pytest.raises(RuntimeError, match="lineage retention guard"):
+        IncrementalIndexService.assert_cleanup_allowed(index_dir, source_build_id, probe_verified=True)
+    with pytest.raises(RuntimeError, match="probe evidence is missing"):
+        IncrementalIndexService.assert_cleanup_allowed(index_dir, "unrelated", probe_verified=False)
+    assert LanceDbIndexRepository(source_lance).context_rows("page_id = 'concepts/online.md'")
+    assert LanceDbIndexRepository(result.artifact.lance_dir).context_rows("page_id = 'concepts/online.md'")
