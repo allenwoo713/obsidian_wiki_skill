@@ -75,7 +75,6 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
         "tests/test_online_incremental.py",
         "tests/test_online_incremental_policy.py",
         "tests/test_online_incremental_cli.py",
-        "tests/test_online_incremental_eval.py",
     ):
         assert suite in architecture
 
@@ -101,6 +100,7 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     assert "if: success()" in phase04_artifact
     assert "phase04-build-mode-evidence" in phase04_artifact
     assert ".review-tmp/phase04-modes/equivalence.json" in phase04_artifact
+    assert ".review-tmp/phase04-modes/acceptance.json" in phase04_artifact
     assert "if-no-files-found: error" in phase04_artifact
     assert "--max-seconds 60" in workflow
     assert "static_cap_seconds" in workflow

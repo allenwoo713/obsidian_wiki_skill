@@ -124,6 +124,10 @@ jobs:
       # #43 citation contract: ContextItem.path must be Wiki-relative posix on every
       # platform — this suite is the OS-sensitive gate (Windows separators/abs paths),
       # canonical spelling, and Global Search's text/JSON report renderers.
+      # #22 online incremental: these model-free real-LanceDB suites exercise
+      # staged clone/delta/catch-up, journal recovery, telemetry, policy fallback,
+      # and public CLI dispatch on both operating systems.  The model-backed
+      # public retrieval-equivalence artifact belongs in eval.yml after its cache.
       # All named suites are model-free and must pass on Windows + Linux.
       - name: Run storage, publication, chunking, and ANN benchmark acceptance gates
         run: >
@@ -142,6 +146,9 @@ jobs:
           tests/test_sparse_structure_contract.py
           tests/test_fusion.py
           tests/test_community_reports.py
+          tests/test_online_incremental.py
+          tests/test_online_incremental_policy.py
+          tests/test_online_incremental_cli.py
           tests/test_eval_workflow.py
           tests/test_query_result.py -q
 

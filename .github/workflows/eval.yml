@@ -64,6 +64,23 @@ jobs:
       - name: Bootstrap local embedding model
         run: |
           python scripts/download_embedding_model.py
+      # #22 must use the real storage/public facade after the existing local-model
+      # bootstrap.  No baseline initialization or policy mutation is accepted.
+      - name: Run #22 storage, recovery, telemetry, and public-route gates
+        run: >
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/phase04-online-incremental
+          tests/test_online_incremental.py
+          tests/test_online_incremental_policy.py
+          tests/test_online_incremental_cli.py
+          tests/test_online_incremental_eval.py -q
+      - name: Run #22 public build-mode equivalence gate
+        run: |
+          set -euo pipefail
+          python eval/compare_build_modes.py \
+            --work-dir .review-tmp/phase04-modes \
+            --output .review-tmp/phase04-modes/equivalence.json
+          test -s .review-tmp/phase04-modes/equivalence.json
       - name: Run #39 production CLI real-model tail-recall gate
         run: >
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
@@ -120,6 +137,24 @@ jobs:
       - name: Retrieval eval (regression check)
         run: |
           python eval/run_eval.py --work-dir .review-tmp/eval
+      - name: Bind #22 evidence to the accepted workflow inputs
+        run: >
+          python -c "import json, pathlib; root=pathlib.Path('.review-tmp/phase04-modes');
+          evidence=json.loads((root/'equivalence.json').read_text(encoding='utf-8'));
+          assert evidence['verdict'] == 'pass' and evidence['artifact_sha256'];
+          (root/'acceptance.json').write_text(json.dumps({'head_sha':'${{ github.sha }}',
+          'pr_head_sha':'${{ github.event.pull_request.head.sha }}',
+          'run_id':'${{ github.run_id }}','artifact_sha256':evidence['artifact_sha256']},
+          sort_keys=True) + '\\n', encoding='utf-8')"
+      - name: Upload #22 equivalence and telemetry evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase04-build-mode-evidence
+          path: |
+            .review-tmp/phase04-modes/equivalence.json
+            .review-tmp/phase04-modes/acceptance.json
+          if-no-files-found: error
       - name: Upload eval results
         if: always()
         uses: actions/upload-artifact@v4
