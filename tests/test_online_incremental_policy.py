@@ -259,3 +259,44 @@ def test_telemetry_in_snapshot_and_incremental_manifests_reconciles_physical_row
     assert incremental_telemetry["mode_selected"] == "incremental"
     assert incremental_telemetry["sparse_rows"]["physically_written"] == incremental.sparse_mutation.physically_written
     assert incremental_telemetry["dense_rows"]["physically_written"] == incremental.dense_mutation.physically_written
+
+
+@pytest.mark.parametrize(
+    ("mutate", "label"),
+    [
+        (lambda manifest: manifest.__setitem__("sparse_chunk_schema_version", 999), "chunk schema"),
+        (lambda manifest: manifest["fts_config"].__setitem__("column", "other"), "fts config"),
+        (lambda manifest: manifest["vector_config"].__setitem__("metric", "l2"), "vector config"),
+        (lambda manifest: manifest["ann_policy"].__setitem__("policy_sha256", "0" * 64), "ann policy"),
+        (lambda manifest: manifest["sdk_versions"].__setitem__("lancedb", "0.0.0"), "sdk version"),
+    ],
+)
+def test_configuration_drift_rejects_incremental_before_clone(tmp_path, mutate, label):
+    from build_index import build_storage_contract
+    from obsidian_wiki.application.incremental_index_service import (
+        IncrementalFallbackEligible,
+        IncrementalIndexService,
+    )
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    snapshot = build_storage_contract(wiki_dir, index_dir, embed=_tiny_embed, sparse_chunks=_tiny_plan("contract"))
+    manifest_path = snapshot.artifact.manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(IncrementalFallbackEligible, match="incompatible_active_contract") as caught:
+        IncrementalIndexService()._assert_current_manifest(snapshot.artifact.lance_dir)
+    assert caught.value.reason == "incompatible_active_contract", label
+
+
+def test_policy_compatibility_mismatch_selects_snapshot(tmp_path):
+    compatibility_digest = _digest(_compatibility())
+    _write_policy(tmp_path, _policy("f" * 64, ["snapshot-a"]))
+
+    selection = _select(tmp_path, [_observation(compatibility_digest=compatibility_digest)])
+
+    assert selection.selected_mode == "snapshot"
+    assert selection.reason == "policy_compatibility_mismatch"
