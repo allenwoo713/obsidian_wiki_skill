@@ -14,6 +14,7 @@ sys.path.insert(0, str(SKILL_ROOT / "eval"))
 
 from compare_build_modes import (  # noqa: E402
     REQUIRED_SCENARIOS,
+    _artifact_digest,
     run_mode_comparison,
     validate_comparison_artifact,
 )
@@ -30,6 +31,21 @@ def _run(tmp_path: Path, *, scenarios: tuple[str, ...]) -> dict:
     assert output.exists()
     assert json.loads(output.read_text(encoding="utf-8")) == artifact
     return artifact
+
+
+def _refresh_digest(artifact: dict) -> dict:
+    """Return a digest-valid mutation so validation reaches scenario integrity."""
+    artifact["artifact_sha256"] = _artifact_digest(artifact)
+    return artifact
+
+
+@pytest.fixture(scope="module")
+def full_acceptance_artifact(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    """Build the complete public facade/query artifact once for mutation cases."""
+    return _run(
+        tmp_path_factory.mktemp("full-comparison"),
+        scenarios=REQUIRED_SCENARIOS,
+    )
 
 
 def test_public_snapshot_incremental_retrieval_equivalence(tmp_path: Path) -> None:
@@ -51,11 +67,11 @@ def test_public_snapshot_incremental_retrieval_equivalence(tmp_path: Path) -> No
     assert scenario["equivalence"]["dense"]
 
 
-def test_scenario_matrix_and_artifact_fail_closed(tmp_path: Path) -> None:
+def test_scenario_matrix_and_artifact_fail_closed(full_acceptance_artifact: dict) -> None:
     """Every logical mutation and public fallback leaves complete evidence."""
     baseline = (SKILL_ROOT / "eval" / "baselines.json").read_bytes()
     ann_policy = (SKILL_ROOT / "eval" / "ann-policy.json").read_bytes()
-    artifact = _run(tmp_path, scenarios=REQUIRED_SCENARIOS)
+    artifact = full_acceptance_artifact
 
     validate_comparison_artifact(artifact)
     assert artifact["verdict"] == "pass"
@@ -85,6 +101,52 @@ def test_scenario_matrix_and_artifact_fail_closed(tmp_path: Path) -> None:
         mutate(invalid)
         with pytest.raises(ValueError):
             validate_comparison_artifact(invalid)
+
+
+@pytest.mark.parametrize("missing", REQUIRED_SCENARIOS)
+def test_acceptance_validator_rejects_every_digest_valid_missing_scenario(
+    full_acceptance_artifact: dict, missing: str,
+) -> None:
+    """D-09: each canonical scenario is independently required for acceptance."""
+    artifact = copy.deepcopy(full_acceptance_artifact)
+    # Keep an explicit declaration before mutating so old artifacts cannot fail
+    # only because the new field is absent.
+    artifact.setdefault("scenario_names", list(REQUIRED_SCENARIOS))
+    artifact["scenario_names"].remove(missing)
+    artifact["scenarios"].pop(missing)
+    _refresh_digest(artifact)
+
+    with pytest.raises(ValueError, match=f"comparison acceptance scenarios missing: {missing}"):
+        validate_comparison_artifact(artifact)
+
+
+def test_acceptance_validator_rejects_digest_valid_duplicate_unexpected_and_disagreement(
+    full_acceptance_artifact: dict,
+) -> None:
+    """The ordered declaration and scenario records are one exact matrix."""
+    duplicate = copy.deepcopy(full_acceptance_artifact)
+    duplicate.setdefault("scenario_names", list(REQUIRED_SCENARIOS))
+    duplicate["scenario_names"].append("page_edit")
+    _refresh_digest(duplicate)
+    with pytest.raises(ValueError, match="comparison acceptance scenarios duplicated: page_edit"):
+        validate_comparison_artifact(duplicate)
+
+    unexpected = copy.deepcopy(full_acceptance_artifact)
+    unexpected.setdefault("scenario_names", list(REQUIRED_SCENARIOS))
+    unexpected["scenario_names"].append("unexpected_scenario")
+    unexpected["scenarios"]["unexpected_scenario"] = copy.deepcopy(
+        unexpected["scenarios"]["page_edit"]
+    )
+    _refresh_digest(unexpected)
+    with pytest.raises(ValueError, match="comparison acceptance scenarios unexpected: unexpected_scenario"):
+        validate_comparison_artifact(unexpected)
+
+    disagreement = copy.deepcopy(full_acceptance_artifact)
+    disagreement.setdefault("scenario_names", list(REQUIRED_SCENARIOS))
+    disagreement["scenarios"].pop("page_edit")
+    _refresh_digest(disagreement)
+    with pytest.raises(ValueError, match="comparison acceptance scenarios declaration mismatch"):
+        validate_comparison_artifact(disagreement)
 
 
 def test_v1_policy_contract_extension_keeps_legacy_policy_and_rejects_bad_digest(tmp_path: Path) -> None:
