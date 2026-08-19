@@ -16,6 +16,54 @@ import run_eval  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
 
 
+def _build_mode_contract(document: Path) -> str:
+    """Return the user-visible storage-mode contract, refusing partial copies."""
+    start = "<!-- build-mode-contract:start -->"
+    end = "<!-- build-mode-contract:end -->"
+    text = document.read_text(encoding="utf-8")
+    assert start in text and end in text, f"{document.name} is missing its build-mode contract"
+    return text.split(start, 1)[1].split(end, 1)[0].strip()
+
+
+def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> None:
+    """D-01/D-02/D-06/D-07: agent and user docs must not relabel cache reuse."""
+    readme_contract = _build_mode_contract(SKILL_ROOT / "README.md")
+    skill_contract = _build_mode_contract(SKILL_ROOT / "SKILL.md")
+
+    assert readme_contract == skill_contract
+    for required in (
+        "`--build-mode snapshot|incremental|auto`",
+        "`snapshot`",
+        "`incremental`",
+        "`auto`",
+        "`.index/build-mode-policy.json`",
+        "embedding cache",
+        "stable-ID delete/upsert/catch-up",
+        "safe snapshot fallback",
+        "mode_requested",
+        "mode_selected",
+        "selection_reason",
+        "build_mode_policy_sha256",
+        "scan_parse_ms",
+        "physically_written",
+        "journal recovery",
+        "commit uncertainty",
+        "zero-unindexed publication gate",
+        "configuration change",
+        "ACTIVE_INDEX",
+        "only sparse+dense commit boundary",
+        "IVF_HNSW_SQ",
+        "ef=100",
+        "Recall@10 ≥ 0.19",
+        "Recall@20 ≥ 0.17",
+        "citation/context/graph",
+        "manifest",
+        "no exact fallback",
+        "do not invent thresholds",
+    ):
+        assert required in readme_contract
+
+
 def _candidate_comparator() -> dict:
     return {
         "evidence_schema_version": run_eval.EVIDENCE_SCHEMA_VERSION,
