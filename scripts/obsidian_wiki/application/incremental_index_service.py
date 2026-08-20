@@ -8,7 +8,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, ClassVar, Mapping, Sequence
 
 import chunking
 
@@ -18,7 +18,7 @@ from obsidian_wiki.application.active_index_pointer import (
 )
 from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 from obsidian_wiki.application.durable_filesystem import CommitUncertainError
-from obsidian_wiki.application.index_build_service import IndexBuildService
+from obsidian_wiki.application.index_publication_service import IndexPublicationService
 from obsidian_wiki.domain.incremental_models import (
     BuildModeContractDriftCode, BuildTelemetry, BuildTiming, CoverageObservation, IncrementalBuildResult,
     IncrementalJournalRecord, IncrementalJournalState, MutationResult,
@@ -29,40 +29,80 @@ from obsidian_wiki.domain.index_models import (
     PostCommitTask, PostCommitTaskState, SparseChunk, VectorIndexConfig,
 )
 from obsidian_wiki.domain.index_publication_models import GenerationState
-from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
-from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
-from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
-from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
 from obsidian_wiki.domain.index_policy import load_ann_policy_file, production_policy_sha256
+from obsidian_wiki.ports.chunk_repository import ChunkRepository
+from obsidian_wiki.ports.incremental_index import (
+    ChunkRepositoryFactory,
+    IncrementalFallbackEligible,
+    IncrementalJournalFactory,
+)
+from obsidian_wiki.ports.index_manifest import IndexManifestStore
+from obsidian_wiki.ports.post_commit import PostCommitJournal
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 
 
-class IncrementalFallbackEligible(RuntimeError):
-    """A pre-clone contract failure that the public dispatcher must snapshot."""
-
-    def __init__(
-        self, reason: str, *, contract_drift: BuildModeContractDriftCode | None = None,
-    ) -> None:
-        self.reason = reason
-        self.contract_drift = contract_drift
-        super().__init__(reason)
-
-    @property
-    def selection_reason(self) -> str:
-        """Stable public reason without inferring a subtype from error text."""
-        if self.contract_drift is None:
-            return self.reason
-        return f"{self.reason}:{self.contract_drift.value}"
-
-
 class IncrementalIndexService:
     """Clone a verified active generation, mutate only staging, then publish once."""
 
-    def __init__(self, *, fts_config: FtsIndexConfig | None = None) -> None:
+    _legacy_dependencies: ClassVar[tuple[
+        ChunkRepositoryFactory,
+        IncrementalJournalFactory,
+        IndexManifestStore,
+        Callable[[Path], PostCommitJournal],
+        IndexPublicationService,
+    ] | None] = None
+
+    @classmethod
+    def configure_legacy_dependencies(
+        cls,
+        *,
+        repository_factory: ChunkRepositoryFactory,
+        journal_factory: IncrementalJournalFactory,
+        manifest_store: IndexManifestStore,
+        post_commit_journal_factory: Callable[[Path], PostCommitJournal],
+        publication_service: IndexPublicationService,
+    ) -> None:
+        """Compatibility bridge configured only by the composition root.
+
+        It keeps existing direct real-storage fault fixtures working without an
+        application-to-infrastructure import; normal production dispatch always
+        receives the explicit factory from ``build_index``.
+        """
+        cls._legacy_dependencies = (
+            repository_factory, journal_factory, manifest_store,
+            post_commit_journal_factory, publication_service,
+        )
+
+    def __init__(
+        self,
+        *,
+        repository_factory: ChunkRepositoryFactory | None = None,
+        journal_factory: IncrementalJournalFactory | None = None,
+        manifest_store: IndexManifestStore | None = None,
+        post_commit_journal_factory: Callable[[Path], PostCommitJournal] | None = None,
+        publication_service: IndexPublicationService | None = None,
+        fts_config: FtsIndexConfig | None = None,
+    ) -> None:
+        if any(value is None for value in (
+            repository_factory, journal_factory, manifest_store,
+            post_commit_journal_factory, publication_service,
+        )):
+            if self._legacy_dependencies is None:
+                raise RuntimeError("incremental_executor_unavailable")
+            (
+                repository_factory, journal_factory, manifest_store,
+                post_commit_journal_factory, publication_service,
+            ) = self._legacy_dependencies
         self._fts_config = fts_config or FtsIndexConfig()
+        assert repository_factory and journal_factory and manifest_store and post_commit_journal_factory and publication_service
+        self._repository_factory = repository_factory
+        self._journal_factory = journal_factory
+        self._manifest_store = manifest_store
+        self._post_commit_journal_factory = post_commit_journal_factory
+        self._publication_service = publication_service
 
     @staticmethod
     def _fingerprint(row: Mapping[str, object]) -> str:
@@ -206,7 +246,7 @@ class IncrementalIndexService:
         lock = BuildLock(index_dir, ctx=ctx)
         lock.acquire()
         try:
-            journal = FilesystemIncrementalJournal(index_dir)
+            journal = self._journal_factory(index_dir)
             reconciled: list[str] = []
             for record in journal.nonterminal():
                 if record.state is not IncrementalJournalState.VALIDATED:
@@ -231,8 +271,7 @@ class IncrementalIndexService:
         finally:
             lock.release()
 
-    @staticmethod
-    def required_ancestor_build_ids(index_dir: Path) -> frozenset[str]:
+    def required_ancestor_build_ids(self, index_dir: Path) -> frozenset[str]:
         """Return source generations reachable from ACTIVE_INDEX or unfinished staging.
 
         Absence/corruption is intentionally handled by ``assert_cleanup_allowed`` as a
@@ -243,7 +282,7 @@ class IncrementalIndexService:
             active_build = str(pointer["build_id"])
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
             return frozenset()
-        journal = FilesystemIncrementalJournal(index_dir)
+        journal = self._journal_factory(index_dir)
         edges = {record.build_id: record.source_build_id for record in journal.records()}
         roots = [active_build, *(record.build_id for record in journal.nonterminal())]
         required: set[str] = set()
@@ -258,12 +297,11 @@ class IncrementalIndexService:
                 required.add(current)
         return frozenset(required)
 
-    @classmethod
-    def assert_cleanup_allowed(cls, index_dir: Path, build_id: str, *, probe_verified: bool = False) -> None:
+    def assert_cleanup_allowed(self, index_dir: Path, build_id: str, *, probe_verified: bool = False) -> None:
         """Fail closed: Phase 4 records retention evidence but enables no pruning."""
         if not probe_verified:
             raise RuntimeError("lineage cleanup probe evidence is missing; retain generation")
-        required = cls.required_ancestor_build_ids(index_dir)
+        required = self.required_ancestor_build_ids(index_dir)
         if not required or build_id in required:
             raise RuntimeError("lineage retention guard blocks reachable or unproven generation cleanup")
 
@@ -314,7 +352,7 @@ class IncrementalIndexService:
             if {chunk.chunk_id for chunk in lexical} & {chunk.chunk_id for chunk in dense}:
                 raise ValueError("cross-kind stable chunk IDs are forbidden")
 
-            source = LanceDbIndexRepository(active_lance)
+            source = self._repository_factory(active_lance)
             source_tables = source.source_table_identities()
             pointer_payload = (index_dir / "ACTIVE_INDEX").read_bytes()
             pointer_digest = self._digest(pointer_payload)
@@ -322,7 +360,7 @@ class IncrementalIndexService:
             plan_digest = self._plan_digest(lexical, dense)
             config_digest = self._digest(source_manifest)
             policy_digest = build_mode_policy_sha256 or self._digest(source_manifest["ann_policy"])
-            journal = FilesystemIncrementalJournal(index_dir)
+            journal = self._journal_factory(index_dir)
             if journal.has_invalid_records():
                 raise RuntimeError("incremental recovery journal is malformed; snapshot required")
             pending = journal.nonterminal()
@@ -343,7 +381,7 @@ class IncrementalIndexService:
                 build_dir = index_dir / record.target_build
             else:
                 build_id = ctx.build_id
-                generation = IndexBuildService._next_generation(index_dir)
+                generation = self._publication_service.allocate_generation(index_dir)
                 build_dir = index_dir / "builds" / build_id
                 build_dir.mkdir(parents=True, exist_ok=False)
                 record_building(build_dir, build_id=build_id, generation=generation)
@@ -374,7 +412,7 @@ class IncrementalIndexService:
                     if cloned != source_tables:
                         raise IncrementalFallbackEligible("shallow_clone_unavailable")
                     record = journal.transition(build_id, IncrementalJournalState.CLONED, boundary="clone")
-                staging = LanceDbIndexRepository(lance_dir)
+                staging = self._repository_factory(lance_dir)
                 write_started = time.perf_counter()
                 if record.state is IncrementalJournalState.CLONED and record.last_completed_boundary != "sparse_mutated":
                     sparse_result = staging.apply_delta("sparse_chunks", added=sparse_added, updated=sparse_updated, deleted_ids=sparse_delta.deleted_ids)
@@ -422,24 +460,18 @@ class IncrementalIndexService:
                     or dense_coverage.indexed_rows != len(dense)):
                     raise RuntimeError("staged index coverage is incomplete")
                 validation_started = time.perf_counter()
-                reopened = LanceDbIndexRepository(lance_dir)
+                reopened = self._repository_factory(lance_dir)
                 counts, vector_stats, fts_stats = reopened.validate_reopened(
-                    dimension=len(dense[0].vector), exact_term=IndexBuildService._exact_term(lexical),
+                    dimension=len(dense[0].vector), exact_term=self._publication_service.canonical_exact_term(lexical),
                     vector_index_name=vector_config.index_name,
                 )
-                publisher = IndexBuildService(
-                    staging, reopen_storage=LanceDbIndexRepository,
-                    manifest_store=FilesystemIndexManifest(),
-                    post_commit_journal=FilesystemPostCommitJournal(index_dir),
-                    fts_config=self._fts_config,
-                )
                 index_build_started = time.perf_counter()
-                publication_evidence, benchmark = publisher._publication_validation(
+                publication_evidence, benchmark = self._publication_service.validate_candidate(
                     reopened, dense, vector_stats=vector_stats,
                     actual_dense_rows=counts.dense_chunks_count,
                     unindexed_dense_rows=vector_stats.unindexed_dense_rows,
                     build_time_ms=(time.perf_counter() - index_build_started) * 1000,
-                    disk_bytes=publisher._disk_bytes(build_dir),
+                    disk_bytes=self._publication_service.staged_disk_bytes(build_dir),
                 )
                 validation_ms = (time.perf_counter() - validation_started) * 1000
                 if record.state is IncrementalJournalState.CAUGHT_UP:
@@ -449,10 +481,10 @@ class IncrementalIndexService:
                         vector_config=vector_config, benchmark=benchmark.to_json(),
                         policy={"selected_mode": "ann", "reason": "approved fixed ann policy validated by held-out publication evidence", "benchmark": benchmark.to_json(), "index_stats": vector_stats.to_json(), "benchmark_scope": "held_out", "benchmark_probe_count": publication_evidence.validation_query_count, "benchmark_probe_total": counts.dense_chunks_count},
                         sparse_chunks=canonical_chunks, generation=generation, build_id=build_id,
-                        page_metadata=page_metadata, ann_policy=publisher._ann_policy,
+                        page_metadata=page_metadata, ann_policy=self._publication_service.ann_policy,
                         publication_evidence=publication_evidence,
                     )
-                    manifest = publisher._manifest(**manifest_kwargs)
+                    manifest = self._publication_service.construct_manifest(**manifest_kwargs)
                     telemetry = BuildTelemetry(
                         schema_version=1, observation_id=build_id,
                         mode_requested=mode_requested, mode_selected="incremental",
@@ -479,18 +511,18 @@ class IncrementalIndexService:
                             physically_written=dense_result.physically_written,
                         ),
                         embedding_cache_hits=0, embedding_cache_misses=len(dense),
-                        peak_staged_disk_bytes=publisher._disk_bytes(build_dir), completed=True,
+                        peak_staged_disk_bytes=self._publication_service.staged_disk_bytes(build_dir), completed=True,
                         build_mode_policy_sha256=build_mode_policy_sha256,
                     )
-                    manifest = publisher._manifest(**manifest_kwargs, build_telemetry=telemetry)
+                    manifest = self._publication_service.construct_manifest(**manifest_kwargs, build_telemetry=telemetry)
                     manifest_path = build_dir / "manifest.json"
-                    FilesystemIndexManifest().write(manifest_path, manifest)
+                    self._manifest_store.write(manifest_path, manifest)
                     record_validated(build_dir, generation=generation, build_id=build_id,
                                      manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest())
                     record = journal.transition(build_id, IncrementalJournalState.VALIDATED, boundary="manifest_validated")
                 else:
                     manifest_path = build_dir / "manifest.json"
-                FilesystemPostCommitJournal(index_dir).prepare(PostCommitTask(
+                self._post_commit_journal_factory(index_dir).prepare(PostCommitTask(
                     task_id=uuid.uuid4().hex, task_type="community_report_invalidation",
                     build_id=build_id, generation=generation, state=PostCommitTaskState.PREPARED,
                     prepared_at=datetime.now(timezone.utc).isoformat(),

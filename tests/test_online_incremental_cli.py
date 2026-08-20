@@ -48,6 +48,19 @@ def _write_page(wiki_dir: Path, text: str) -> None:
     )
 
 
+def _tiny_chunks(text: str):
+    from obsidian_wiki.domain.index_models import SparseChunk
+
+    common = dict(
+        page_id="online.md", path="online.md", title="Online", text=text,
+        content_hash=text, end_char=len(text),
+    )
+    return (
+        SparseChunk(**common, chunk_id="online::sparse", fts_text=text, chunk_kind="sparse"),
+        SparseChunk(**common, chunk_id="online::dense", fts_text=text, chunk_kind="dense"),
+    )
+
+
 def _enable_auto_incremental(index_dir: Path, manifest_path: Path) -> str:
     from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
 
@@ -256,3 +269,108 @@ def test_auto_does_not_swallow_commit_uncertainty(tmp_path, monkeypatch) -> None
 
     with pytest.raises(CommitUncertainError, match="pointer uncertain"):
         WikiIndex(index_dir).build(wiki_dir, build_mode="auto")
+
+
+def test_snapshot_direct_service_does_not_require_incremental_executor_factory(tmp_path) -> None:
+    from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    service = IndexBuildService(
+        LanceDbIndexRepository(index_dir), reopen_storage=LanceDbIndexRepository,
+        manifest_store=FilesystemIndexManifest(),
+        post_commit_journal=FilesystemPostCommitJournal(index_dir),
+    )
+    artifact = service.build(
+        wiki_dir, index_dir, embed=_Embedder().encode,
+        sparse_chunks=_tiny_chunks("direct snapshot"), build_mode="snapshot",
+    )
+    assert artifact.lance_dir.is_dir()
+
+
+def test_explicit_incremental_without_executor_factory_fails_before_mutation(tmp_path, monkeypatch) -> None:
+    from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    storage = LanceDbIndexRepository(index_dir)
+    calls: list[str] = []
+    monkeypatch.setattr(storage, "persist", lambda *_args, **_kwargs: calls.append("persist"))
+    service = IndexBuildService(
+        storage, reopen_storage=LanceDbIndexRepository,
+        manifest_store=FilesystemIndexManifest(),
+        post_commit_journal=FilesystemPostCommitJournal(index_dir),
+    )
+    with pytest.raises(RuntimeError, match="^incremental_executor_unavailable$"):
+        service.build(
+            wiki_dir, index_dir, embed=_Embedder().encode,
+            sparse_chunks=_tiny_chunks("explicit unavailable"), build_mode="incremental",
+        )
+    assert calls == []
+    assert not (index_dir / "ACTIVE_INDEX").exists()
+
+
+def test_auto_incremental_without_executor_factory_persists_snapshot_reason(tmp_path, monkeypatch) -> None:
+    from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.domain.incremental_models import BuildModeSelection
+    from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    service = IndexBuildService(
+        LanceDbIndexRepository(index_dir), reopen_storage=LanceDbIndexRepository,
+        manifest_store=FilesystemIndexManifest(),
+        post_commit_journal=FilesystemPostCommitJournal(index_dir),
+    )
+    selection = BuildModeSelection("incremental", "policy: measured", "a" * 64, "b" * 64, ("snapshot-a",))
+    monkeypatch.setattr(service, "_select_build_mode", lambda *_args, **_kwargs: selection)
+    artifact = service.build(
+        wiki_dir, index_dir, embed=_Embedder().encode,
+        sparse_chunks=_tiny_chunks("auto unavailable"), build_mode="auto",
+    )
+    telemetry = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))["build_telemetry"]
+    assert telemetry["mode_requested"] == "auto"
+    assert telemetry["mode_selected"] == "snapshot"
+    assert telemetry["selection_reason"] == "incremental_executor_unavailable"
+    assert telemetry["build_mode_policy_sha256"] == "a" * 64
+
+
+def test_public_snapshot_and_incremental_share_one_publication_collaborator_per_composition(tmp_path, monkeypatch) -> None:
+    import build_index as module
+
+    wiki_dir = tmp_path / "Wiki"
+    wiki_dir.mkdir()
+    index_dir = tmp_path / ".index"
+    composed = module._compose_storage_services(index_dir)
+    executor = composed.incremental_executor_factory()
+    assert composed.service._publication_service is composed.publication_service
+    assert executor._publication_service is composed.publication_service
+    calls: list[str] = []
+    for name in ("allocate_generation", "validate_candidate", "construct_manifest"):
+        original = getattr(composed.publication_service, name)
+        monkeypatch.setattr(
+            composed.publication_service, name,
+            lambda *args, _name=name, _original=original, **kwargs: (
+                calls.append(_name), _original(*args, **kwargs)
+            )[1],
+        )
+    monkeypatch.setattr(module, "_compose_storage_services", lambda *_args, **_kwargs: composed)
+    module.build_storage_contract(wiki_dir, index_dir, embed=_Embedder().encode, sparse_chunks=_tiny_chunks("first"))
+    module.build_storage_contract(
+        wiki_dir, index_dir, embed=_Embedder().encode,
+        sparse_chunks=_tiny_chunks("second"), build_mode="incremental",
+    )
+    assert calls.count("allocate_generation") == 2
+    assert calls.count("validate_candidate") == 2
+    assert calls.count("construct_manifest") >= 4

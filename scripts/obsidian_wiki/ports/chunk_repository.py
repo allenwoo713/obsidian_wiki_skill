@@ -9,6 +9,7 @@ from obsidian_wiki.domain.index_models import (
     ExactBatchResult,
     FtsIndexConfig,
     FtsIndexStats,
+    IndexSchemaCounts,
     IndexStats,
     SparseChunk,
     VectorIndexConfig,
@@ -78,6 +79,10 @@ class ChunkRepository(Protocol):
     ) -> MutationResult: ...
 
     def catch_up(self, fts_config: FtsIndexConfig) -> CoverageObservation: ...
+
+    def validate_reopened(
+        self, *, dimension: int, exact_term: str, vector_index_name: str,
+    ) -> tuple[IndexSchemaCounts, IndexStats, FtsIndexStats]: ...
 
     def seal(self, lance_dir: Path) -> None:
         """#36：建立「数据已可耐久读取」的发布前边界——关闭写入 connection、

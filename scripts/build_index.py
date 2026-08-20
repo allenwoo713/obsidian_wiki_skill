@@ -21,6 +21,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
+from types import SimpleNamespace
 
 
 # The embedding model is an asset of this skill.  Keep it beside the skill
@@ -70,6 +71,63 @@ from vector_scoring import apply_vector_metric, normalize_vector_score
 from obsidian_wiki.application.index_build_service import CandidateQueryPolicy
 
 
+def _compose_storage_services(
+    index_dir: Path,
+    *,
+    candidate_query_policy: CandidateQueryPolicy | None = None,
+):
+    """Compose real storage adapters once per public build request.
+
+    This is deliberately the only production seam that knows the concrete LanceDB
+    repository and filesystem journal implementations used by online indexing.
+    """
+    from obsidian_wiki.application.index_build_service import IndexBuildService
+    from obsidian_wiki.application.index_publication_service import IndexPublicationService
+    from obsidian_wiki.application.incremental_index_service import IncrementalIndexService
+    from obsidian_wiki.infrastructure.filesystem_incremental_journal import FilesystemIncrementalJournal
+    from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
+    repository_kwargs = (
+        {"eval_candidate_policy": candidate_query_policy}
+        if candidate_query_policy is not None else {}
+    )
+    repository_factory = lambda lance_dir: LanceDbIndexRepository(lance_dir, **repository_kwargs)
+    journal = FilesystemPostCommitJournal(Path(index_dir))
+    publication_service = IndexPublicationService()
+    manifest_store = FilesystemIndexManifest()
+    incremental_executor_factory = lambda: IncrementalIndexService(
+        repository_factory=repository_factory,
+        journal_factory=FilesystemIncrementalJournal,
+        manifest_store=manifest_store,
+        post_commit_journal_factory=FilesystemPostCommitJournal,
+        publication_service=publication_service,
+    )
+    IncrementalIndexService.configure_legacy_dependencies(
+        repository_factory=repository_factory,
+        journal_factory=FilesystemIncrementalJournal,
+        manifest_store=manifest_store,
+        post_commit_journal_factory=FilesystemPostCommitJournal,
+        publication_service=publication_service,
+    )
+    service = IndexBuildService(
+        repository_factory(index_dir),
+        reopen_storage=repository_factory,
+        manifest_store=manifest_store,
+        post_commit_journal=journal,
+        candidate_query_policy=candidate_query_policy,
+        publication_service=publication_service,
+        incremental_executor_factory=incremental_executor_factory,
+    )
+    return SimpleNamespace(
+        service=service,
+        journal=journal,
+        publication_service=publication_service,
+        incremental_executor_factory=incremental_executor_factory,
+    )
+
+
 def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chunks=None,
                            page_metadata=None, image_metadata=None, ctx=None,
                            tokenizer=None, lexicon=None,
@@ -112,11 +170,7 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
     不会把已发布的 build 伪装成失败。
     """
     from obsidian_wiki.application.build_lock import new_build_context
-    from obsidian_wiki.application.index_build_service import IndexBuildService
     from obsidian_wiki.domain.index_models import IndexBuildOutcome
-    from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
-    from obsidian_wiki.infrastructure.filesystem_post_commit_journal import FilesystemPostCommitJournal
-    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
     # #34：ctx 贯穿 lock metadata、build 目录、manifest、ACTIVE_INDEX pointer 与
     # 返回 artifact；service 不再独立生成 ID。
@@ -141,26 +195,16 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
             pages = _self.scan_wiki(Path(wiki_snapshot), project_root)
             return chunks, page_metadata_from_pages(pages)
 
-    journal = FilesystemPostCommitJournal(Path(index_dir))
-    # Phase 06（issue #49）：candidate_query_policy 仅存在于显式 eval comparator
-    # 构建——repository 绑定 eval candidate；生产构建绑定批准策略（默认加载）。
-    repository_kwargs = (
-        {"eval_candidate_policy": candidate_query_policy}
-        if candidate_query_policy is not None else {}
+    composed = _compose_storage_services(
+        Path(index_dir), candidate_query_policy=candidate_query_policy,
     )
-    artifact = IndexBuildService(
-        LanceDbIndexRepository(index_dir, **repository_kwargs),
-        reopen_storage=lambda lance_dir: LanceDbIndexRepository(lance_dir, **repository_kwargs),
-        manifest_store=FilesystemIndexManifest(),
-        post_commit_journal=journal,
-        candidate_query_policy=candidate_query_policy,
-    ).build(
+    artifact = composed.service.build(
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
         page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx,
         plan_provider=plan_provider, build_mode=build_mode,
         build_mode_policy=build_mode_policy, outer_lock_held=outer_lock_held)
     # #37：pointer commit 之后执行 post-commit（可观察、可重试；失败保留 PREPARED）。
-    post_commit_status, warnings = _run_post_commit(Path(index_dir), journal, artifact)
+    post_commit_status, warnings = _run_post_commit(Path(index_dir), composed.journal, artifact)
     # #34：outcome 的 build_id/generation 必须来自 artifact（单一事实来源），
     # 不再从 manifest 二次解析。
     return IndexBuildOutcome(

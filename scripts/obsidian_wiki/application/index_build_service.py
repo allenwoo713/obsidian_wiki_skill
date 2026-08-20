@@ -54,7 +54,12 @@ from obsidian_wiki.ports.index_manifest import IndexManifestStore
 from obsidian_wiki.ports.post_commit import PostCommitJournal
 from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
 from obsidian_wiki.application.incremental_policy import select_auto_build_mode
+from obsidian_wiki.application.index_publication_service import IndexPublicationService
 from obsidian_wiki.domain.incremental_models import BuildModePolicyLoad, BuildModeSelection
+from obsidian_wiki.ports.incremental_index import (
+    IncrementalExecutorFactory,
+    IncrementalFallbackEligible,
+)
 
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
@@ -91,6 +96,8 @@ class IndexBuildService:
         benchmark_max_probes: int = BENCHMARK_MAX_PROBES,
         candidate_query_policy: CandidateQueryPolicy | None = None,
         ann_policy: ProductionAnnPolicy | None = None,
+        publication_service: IndexPublicationService | None = None,
+        incremental_executor_factory: IncrementalExecutorFactory | None = None,
     ):
         """#37：``post_commit_journal`` 为必填依赖——每个发布路径都必须在 pointer
         commit 前 durable prepare 失效 intent；不需要 invalidation 的调用方必须显式
@@ -121,6 +128,16 @@ class IndexBuildService:
         self._benchmark_max_probes = benchmark_max_probes
         self._candidate_query_policy = candidate_query_policy
         self._ann_policy = ann_policy if ann_policy is not None else load_ann_policy_file()
+        self._publication_service = publication_service or IndexPublicationService()
+        self._publication_service.bind(
+            next_generation=self._next_generation,
+            exact_term=self._exact_term,
+            disk_bytes=self._disk_bytes,
+            candidate_validation=self._publication_validation,
+            manifest=self._manifest,
+            ann_policy=self._ann_policy,
+        )
+        self._incremental_executor_factory = incremental_executor_factory
 
     def build(
         self, wiki_dir: Path, index_dir: Path, *, embed: Embedder,
@@ -158,39 +175,43 @@ class IndexBuildService:
                 index_dir, build_mode=build_mode, policy_load=build_mode_policy,
             )
             if selection.selected_mode == "incremental":
-                from obsidian_wiki.application.incremental_index_service import (
-                    IncrementalFallbackEligible,
-                    IncrementalIndexService,
-                )
-                try:
-                    result = IncrementalIndexService(fts_config=self._fts_config).build_staged(
-                        wiki_dir, index_dir, canonical_chunks=sparse_chunks, embed=embed,
-                        page_metadata=page_metadata, ctx=ctx,
-                        mode_requested=build_mode, selection_reason=selection.reason,
-                        build_mode_policy_sha256=selection.policy_sha256,
-                        outer_lock_held=True,
-                    )
-                    return result.artifact
-                except IncrementalFallbackEligible as exc:
-                    if build_mode != "auto" or exc.reason not in {
-                        "incompatible_active_contract", "shallow_clone_unavailable",
-                        "index_catch_up_unproven",
-                    }:
-                        raise
-                    selection_reason = (
-                        exc.selection_reason
-                        if exc.contract_drift is not None
-                        else f"incremental_runtime_fallback:{exc.reason}"
-                    )
+                if self._incremental_executor_factory is None:
+                    if build_mode == "incremental":
+                        raise RuntimeError("incremental_executor_unavailable")
                     selection = BuildModeSelection(
-                        "snapshot", selection_reason,
+                        "snapshot", "incremental_executor_unavailable",
                         selection.policy_sha256, selection.compatibility_digest,
                         selection.evidence_observation_ids, selection.calculated_values,
                     )
-                    # A staged candidate may already occupy ctx.build_id.  Keep the same
-                    # request owner/timestamp while allocating a fresh unpublished target.
-                    replacement = new_build_context()
-                    ctx = BuildContext(replacement.build_id, ctx.started_at, ctx.owner_nonce)
+                else:
+                    executor = self._incremental_executor_factory()
+                    try:
+                        result = executor.build_staged(
+                            wiki_dir, index_dir, canonical_chunks=sparse_chunks, embed=embed,
+                            page_metadata=page_metadata, ctx=ctx,
+                            mode_requested=build_mode, selection_reason=selection.reason,
+                            build_mode_policy_sha256=selection.policy_sha256,
+                            outer_lock_held=True,
+                        )
+                        return result.artifact
+                    except IncrementalFallbackEligible as exc:
+                        if build_mode != "auto" or exc.reason not in {
+                            "incompatible_active_contract", "shallow_clone_unavailable",
+                            "index_catch_up_unproven",
+                        }:
+                            raise
+                        selection_reason = (
+                            exc.selection_reason
+                            if exc.contract_drift is not None
+                            else f"incremental_runtime_fallback:{exc.reason}"
+                        )
+                        selection = BuildModeSelection(
+                            "snapshot", selection_reason,
+                            selection.policy_sha256, selection.compatibility_digest,
+                            selection.evidence_observation_ids, selection.calculated_values,
+                        )
+                        replacement = new_build_context()
+                        ctx = BuildContext(replacement.build_id, ctx.started_at, ctx.owner_nonce)
             return self._build(
                 wiki_dir, index_dir, embed=embed,
                 sparse_chunks=sparse_chunks, ctx=ctx,
@@ -261,7 +282,7 @@ class IndexBuildService:
         if not all(chunk.vector for chunk in dense_chunks):
             raise RuntimeError("Dense chunks require non-empty vectors")
 
-        generation = self._next_generation(index_dir)
+        generation = self._publication_service.allocate_generation(index_dir)
         build_dir = index_dir / "builds" / ctx.build_id
         lance_dir = build_dir / "lance_db"
         build_dir.mkdir(parents=True, exist_ok=False)
@@ -304,7 +325,7 @@ class IndexBuildService:
             # issue #47: the exact-term validation probes the FTS (sparse) table,
             # so the sampled term must come from the lexical corpus that is
             # actually indexed there — not from a dense chunk that never enters FTS.
-            exact_term = self._exact_term(lexical_chunks)
+            exact_term = self._publication_service.canonical_exact_term(lexical_chunks)
             validation_started = time.perf_counter()
             counts, vector_stats, fts_stats = reopened.validate_reopened(
                 dimension=dimension, exact_term=exact_term,
@@ -339,14 +360,14 @@ class IndexBuildService:
                 # Phase 06：发布门禁——真实 staged candidate 的 held-out
                 # CandidatePublicationEvidence 验证（fail-closed，任何失败都不
                 # publish、不改写旧 ACTIVE_INDEX）。使用重开连接（HNSW 可见性）。
-                publication_evidence, benchmark = self._publication_validation(
+                publication_evidence, benchmark = self._publication_service.validate_candidate(
                     self._reopen_storage(lance_dir),
                     dense_chunks,
                     vector_stats=vector_stats,
                     actual_dense_rows=counts.dense_chunks_count,
                     unindexed_dense_rows=vector_stats.unindexed_dense_rows,
                     build_time_ms=index_build_ms,
-                    disk_bytes=self._disk_bytes(build_dir),
+                    disk_bytes=self._publication_service.staged_disk_bytes(build_dir),
                 )
                 policy_decision = VectorPolicyDecision(
                     selected_mode="ann",
@@ -374,7 +395,7 @@ class IndexBuildService:
                 ann_policy=self._ann_policy,
                 publication_evidence=publication_evidence,
             )
-            manifest = self._manifest(**manifest_kwargs)
+            manifest = self._publication_service.construct_manifest(**manifest_kwargs)
             telemetry = BuildTelemetry(
                 schema_version=1, observation_id=ctx.build_id,
                 mode_requested=mode_requested, mode_selected="snapshot",
@@ -402,10 +423,10 @@ class IndexBuildService:
                     physically_written=len(dense_chunks),
                 ),
                 embedding_cache_hits=0, embedding_cache_misses=len(dense_chunks),
-                peak_staged_disk_bytes=self._disk_bytes(build_dir), completed=True,
+                peak_staged_disk_bytes=self._publication_service.staged_disk_bytes(build_dir), completed=True,
                 build_mode_policy_sha256=build_mode_policy_sha256,
             )
-            manifest = self._manifest(**manifest_kwargs, build_telemetry=telemetry)
+            manifest = self._publication_service.construct_manifest(**manifest_kwargs, build_telemetry=telemetry)
             # #34：发布前身份断言——build 目录、manifest、ctx 必须同一 build_id。
             if build_dir.name != ctx.build_id or manifest.get("build_id") != ctx.build_id:
                 raise RuntimeError(
