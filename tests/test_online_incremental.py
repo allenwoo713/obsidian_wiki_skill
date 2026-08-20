@@ -315,7 +315,8 @@ def test_fault_before_pointer_preserves_old_active_generation(tmp_path, monkeypa
     elif seam == "validation":
         monkeypatch.setattr(LanceDbIndexRepository, "validate_reopened", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("validation fault")))
     else:
-        monkeypatch.setattr(service_module.FilesystemIndexManifest, "write", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("manifest fault")))
+        from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemIndexManifest
+        monkeypatch.setattr(FilesystemIndexManifest, "write", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("manifest fault")))
 
     with pytest.raises(OSError, match="fault"):
         IncrementalIndexService().build(wiki_dir, index_dir, canonical_chunks=_chunks(text="new fault payload"), embed=_embed)
@@ -391,10 +392,11 @@ def test_lineage_retention_guard_blocks_source_cleanup_after_real_shallow_clone(
         wiki_dir, index_dir, canonical_chunks=_chunks(text="lineage descendant payload"), embed=_embed,
     )
 
-    assert source_build_id in IncrementalIndexService.required_ancestor_build_ids(index_dir)
+    service = IncrementalIndexService()
+    assert source_build_id in service.required_ancestor_build_ids(index_dir)
     with pytest.raises(RuntimeError, match="lineage retention guard"):
-        IncrementalIndexService.assert_cleanup_allowed(index_dir, source_build_id, probe_verified=True)
+        service.assert_cleanup_allowed(index_dir, source_build_id, probe_verified=True)
     with pytest.raises(RuntimeError, match="probe evidence is missing"):
-        IncrementalIndexService.assert_cleanup_allowed(index_dir, "unrelated", probe_verified=False)
+        service.assert_cleanup_allowed(index_dir, "unrelated", probe_verified=False)
     assert LanceDbIndexRepository(source_lance).context_rows("page_id = 'concepts/online.md'")
     assert LanceDbIndexRepository(result.artifact.lance_dir).context_rows("page_id = 'concepts/online.md'")
