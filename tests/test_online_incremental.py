@@ -97,8 +97,11 @@ def test_single_page_edit_uses_staged_shallow_clone_and_atomic_pointer(tmp_path,
 
     assert len(publish_calls) == 1
     assert outcome.artifact.lance_dir != old_lance
-    active = _pointer(index_dir)
-    assert active["active_lance"] == str(outcome.artifact.lance_dir.relative_to(index_dir))
+    from obsidian_wiki.domain.index_publication_models import ActiveIndexPointerV4
+
+    pointer = ActiveIndexPointerV4.from_json(_pointer(index_dir))
+    assert pointer.active_lance == outcome.artifact.lance_dir.relative_to(index_dir).as_posix()
+    assert "\\" not in pointer.active_lance
     manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
     assert manifest["ann_policy"]["selected_index_type"] == "ivf-hnsw-sq"
