@@ -130,11 +130,13 @@ class IndexBuildService:
         self._ann_policy = ann_policy if ann_policy is not None else load_ann_policy_file()
         self._publication_service = publication_service or IndexPublicationService()
         self._publication_service.bind(
-            next_generation=self._next_generation,
-            exact_term=self._exact_term,
-            disk_bytes=self._disk_bytes,
-            candidate_validation=self._publication_validation,
-            manifest=self._manifest,
+            # Compatibility seams are resolved at call time so existing real
+            # storage fault tests can still patch them after construction.
+            next_generation=lambda index_dir: self._next_generation(index_dir),
+            exact_term=lambda chunks: self._exact_term(chunks),
+            disk_bytes=lambda build_dir: self._disk_bytes(build_dir),
+            candidate_validation=lambda *args, **kwargs: self._publication_validation(*args, **kwargs),
+            manifest=lambda **kwargs: self._manifest(**kwargs),
             ann_policy=self._ann_policy,
         )
         self._incremental_executor_factory = incremental_executor_factory
