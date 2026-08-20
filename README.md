@@ -317,6 +317,37 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_graph.py <proj
 # 用 Obsidian 打开 Wiki/ 目录（必须指向 Wiki/，不是 project_root）
 ```
 
+### 索引存储构建模式（Issue #22）
+
+<!-- build-mode-contract:start -->
+`--build-mode snapshot|incremental|auto` controls storage publication, not embedding reuse.
+
+- `snapshot` is the default and safe fallback: it creates fresh sparse/dense LanceDB tables and indexes in staging, validates them, and publishes the completed snapshot.
+- `incremental` is real online storage maintenance: it uses stable-ID delete/upsert/catch-up against a staged clone, never mutates the active tables, and fails closed when its current-storage contract cannot be proven.
+- `auto` may select incremental only from compatible measured evidence in the versioned project-local `.index/build-mode-policy.json`; missing, malformed, stale, incompatible, or unsafe evidence selects snapshot. This is a safe snapshot fallback, not a guessed performance choice: do not invent thresholds.
+
+The legacy `--incremental` flag means embedding cache reuse only. It reuses page-level vectors when valid, but still publishes a fresh snapshot of sparse/dense tables and indexes; it is not storage-level incremental indexing and conflicts with `--build-mode incremental` or `auto`. `--full-rebuild` bypasses that cache without changing the selected storage mode.
+
+Examples (the CLI prints `requested=… selected=… reason=… policy_digest=…`):
+
+```bash
+# Default safe storage behavior: selected=snapshot, reason=explicit_snapshot
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root>
+
+# Explicit real staged storage maintenance; no cache flag can relabel it.
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root> --build-mode incremental
+
+# Evidence-gated selection; pass only a project-contained policy path when needed.
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root> --build-mode auto --build-mode-policy .index/build-mode-policy.json
+```
+
+Every published manifest records `mode_requested`, `mode_selected`, `selection_reason`, and `build_mode_policy_sha256`, together with phase timings (`scan_parse_ms`, chunking, embedding cache hit/miss, serialization/write, FTS/vector catch-up, validation, and publication) and per-table sparse/dense logical insert/update/delete/unchanged plus `physically_written` counts. A configuration change is an incompatible storage contract: explicit incremental fails closed and auto returns to snapshot before clone/delta/catch-up.
+
+The staged candidate keeps source/clone lineage until journal recovery is complete. Its durable journal records recovery state; commit uncertainty is never silently treated as success. `ACTIVE_INDEX` is the only sparse+dense commit boundary: no candidate becomes query-visible until journal recovery, catch-up, validation, and the zero-unindexed publication gate all succeed. Failed or uncertain work preserves the previously active index.
+
+The fixed production ANN contract remains `IVF_HNSW_SQ`, `ef=100`, Recall@10 ≥ 0.19, and Recall@20 ≥ 0.17. It preserves citation/context/graph behavior and the sealed manifest contract; there is no runtime ANN selection and no exact fallback. Do not reset evaluation baselines, change model/dependency policy, or treat model downloads as normal build-mode acceptance.
+<!-- build-mode-contract:end -->
+
 ### 增量更新
 
 ```bash

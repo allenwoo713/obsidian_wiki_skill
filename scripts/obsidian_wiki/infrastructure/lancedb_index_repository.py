@@ -29,6 +29,11 @@ from obsidian_wiki.domain.index_models import (
     SparseChunk,
     VectorIndexConfig,
 )
+from obsidian_wiki.domain.incremental_models import (
+    CoverageObservation,
+    MutationResult,
+    SourceTableIdentity,
+)
 from obsidian_wiki.domain.index_policy import load_ann_policy_file
 
 # eval candidate 名 → LanceDB 索引类型（仅供显式 eval seam 使用）。
@@ -259,7 +264,97 @@ class LanceDbIndexRepository:
         stats = self._sparse_table().index_stats(index_name)
         if stats is None:
             raise RuntimeError(f"FTS index statistics unavailable for {index_name}")
-        return FtsIndexStats(index_name=index_name, indexed_rows=stats.num_indexed_rows)
+        unindexed = getattr(stats, "num_unindexed_rows", None)
+        if unindexed is not None and (not isinstance(unindexed, int) or unindexed < 0):
+            raise RuntimeError(f"FTS unindexed-row statistics are invalid for {index_name}")
+        return FtsIndexStats(
+            index_name=index_name, indexed_rows=stats.num_indexed_rows,
+            unindexed_rows=unindexed,
+        )
+
+    def clone_tables(self, target_lance_dir: Path) -> tuple[SourceTableIdentity, ...]:
+        """Shallow-clone both validated physical tables into unpublished staging."""
+        source = lancedb.connect(str(self._lance_dir))
+        if set(source.table_names()) != {"sparse_chunks", "dense_chunks"}:
+            raise RuntimeError("incremental clone source must be the exact two-table layout")
+        target_path = Path(target_lance_dir)
+        if target_path.exists():
+            raise RuntimeError(f"incremental clone target already exists: {target_path}")
+        target = lancedb.connect(str(target_path))
+        identities = self.source_table_identities()
+        for name in ("sparse_chunks", "dense_chunks"):
+            table = source.open_table(name)
+            identity = next(item for item in identities if item.table_name == name)
+            target.clone_table(
+                name, str(self._lance_dir / f"{name}.lance"),
+                source_version=identity.version, is_shallow=True,
+            )
+        return identities
+
+    def source_table_identities(self) -> tuple[SourceTableIdentity, ...]:
+        """Read the exact two-table source lineage before any staged clone is created."""
+        source = lancedb.connect(str(self._lance_dir))
+        if set(source.table_names()) != {"sparse_chunks", "dense_chunks"}:
+            raise RuntimeError("incremental clone source must be the exact two-table layout")
+        return tuple(
+            SourceTableIdentity(name, int(source.open_table(name).version), int(source.open_table(name).count_rows()))
+            for name in ("sparse_chunks", "dense_chunks")
+        )
+
+    def table_rows(self, table_name: str) -> tuple[Mapping[str, object], ...]:
+        if table_name not in {"sparse_chunks", "dense_chunks"}:
+            raise ValueError("table_rows accepts only canonical chunk tables")
+        table = lancedb.connect(str(self._lance_dir)).open_table(table_name)
+        return tuple(dict(row) for row in table.to_arrow().to_pylist())
+
+    @staticmethod
+    def _id_predicate(ids: Sequence[str]) -> str:
+        if not ids:
+            raise ValueError("delete predicate requires at least one id")
+        return "chunk_id IN ({})".format(
+            ", ".join("'{}'".format(chunk_id.replace("'", "''")) for chunk_id in ids)
+        )
+
+    def apply_delta(
+        self, table_name: str, *, added: Sequence[Mapping[str, object]],
+        updated: Sequence[Mapping[str, object]], deleted_ids: Sequence[str],
+    ) -> MutationResult:
+        """Apply only explicitly planned rows to this unpublished table."""
+        if table_name not in {"sparse_chunks", "dense_chunks"}:
+            raise ValueError("delta applies only to canonical chunk tables")
+        ids = [str(row.get("chunk_id", "")) for row in (*added, *updated)]
+        if not all(ids) or len(ids) != len(set(ids)):
+            raise ValueError("delta upserts require unique non-empty chunk IDs")
+        if set(ids) & set(deleted_ids) or len(set(deleted_ids)) != len(deleted_ids):
+            raise ValueError("delta IDs must be disjoint and deletes unique")
+        table = lancedb.connect(str(self._lance_dir)).open_table(table_name)
+        upserts = [dict(row) for row in (*added, *updated)]
+        if upserts:
+            arrow_rows = pa.Table.from_pylist(upserts, schema=table.schema)
+            table.merge_insert("chunk_id").when_matched_update_all().when_not_matched_insert_all().execute(arrow_rows)
+        # Keep SQL predicates bounded and centralized; IDs are internal but still
+        # treated as untrusted across the canonical-plan/storage boundary.
+        for offset in range(0, len(deleted_ids), 128):
+            table.delete(self._id_predicate(deleted_ids[offset:offset + 128]))
+        self._dense_table_handle = None
+        return MutationResult(table_name, len(added), len(updated), len(deleted_ids))
+
+    def catch_up(self, fts_config: FtsIndexConfig) -> CoverageObservation:
+        """Compact then rebuild native FTS coverage on an unpublished clone."""
+        sparse = self._sparse_table()
+        sparse.optimize()
+        sparse.create_fts_index(
+            fts_config.column, replace=True, base_tokenizer=fts_config.base_tokenizer,
+            lower_case=fts_config.lower_case, stem=fts_config.stem,
+            remove_stop_words=fts_config.remove_stop_words,
+            ascii_folding=fts_config.ascii_folding,
+            max_token_length=fts_config.max_token_length,
+        )
+        stats = self.fts_index_stats()
+        return CoverageObservation(
+            table_name="sparse_chunks", row_count=int(sparse.count_rows()),
+            indexed_rows=stats.indexed_rows, unindexed_rows=stats.unindexed_rows,
+        )
 
     def validate_reopened(
         self, *, dimension: int, exact_term: str, vector_index_name: str | None = "dense_hnsw"
@@ -304,7 +399,9 @@ class LanceDbIndexRepository:
         if "fts_text_idx" not in fts_names:
             raise RuntimeError("Persisted sparse table is missing the native FTS index")
         fts_stats = self.fts_index_stats()
-        if fts_stats.indexed_rows < len(sparse_rows):
+        if fts_stats.unindexed_rows is None:
+            raise RuntimeError("Native FTS unindexed-row statistics unavailable")
+        if fts_stats.indexed_rows < len(sparse_rows) or fts_stats.unindexed_rows != 0:
             raise RuntimeError("Native FTS statistics show unindexed sparse rows")
         if not self.search_sparse(exact_term, limit=1):
             raise RuntimeError("Native FTS exact-term validation failed")

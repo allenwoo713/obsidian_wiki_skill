@@ -127,10 +127,7 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<用
    - **source-summary 全文区**（`## 全文内容` + `## 文档内嵌图片`）：`update_wiki.py` 步骤 1 已自动落盘 `ParsedDoc.text` 到 `<!-- BEGIN AUTO-GENERATED -->` 标记区，**不经 LLM**，保证数据完整性
    - **source-summary 的 frontmatter/摘要/related** + **entities/concepts/comparisons 衍生页**：agent 生成/更新。衍生页数值必须从 source-summary 全文区提取，不得凭摘要臆测
 3. 对 deleted 文档：agent 清理关联 `Wiki/*.md`（`index.md` 由脚本自动重建，见步骤 7，无需手改）
-4. 重建索引（默认增量）：`<venv_python> <skill_dir>/scripts/build_index.py <project_root>`
-   - **默认增量**：未变更的 Wiki 页命中页级向量缓存（`.index/vec_cache/`），跳过 CPU 向量编码——编辑单页只重编码该页，不再整库重 encode（大库耗时从分钟级降到秒级）。删除页因每次都构建全新 `builds/<id>/lance_db` 自然不入表，向量/FTS 无残留。
-   - 模型或分块配置变更会自动作废旧缓存（走新命名空间全量重编码），无需手动清理。
-   - 疑似缓存损坏或需强制全量重编码时加 `--full-rebuild`。
+4. 重建索引：`<venv_python> <skill_dir>/scripts/build_index.py <project_root>`（默认安全 snapshot；存储模式契约见下）。
 5. 重建图谱：`<venv_python> <skill_dir>/scripts/build_graph.py <project_root>`
 6. 更新 `Wiki/log.md`（append 操作记录）
 7. 重建 Wiki 索引 MOC（`index.md`）：由 `build_index_md.py` 扫描 `Wiki/**/*.md`、按页面 `type` 分组自动生成 `[[slug|title]]` 列表。
@@ -140,7 +137,36 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<用
      `<venv_python> <skill_dir>/scripts/build_index_md.py <project_root>`
    - 该文件为自动生成，**禁止手改**（下次重建会被覆盖）。
 
-**增量原理：** 两层增量。①源文档层：`manifest.json` 记录每个源文件 SHA256，未变更文件零开销跳过解析。②索引层（#7）：`build_index.py` 按页内 dense chunk 内容哈希做页级向量缓存，未变页复用缓存向量跳过 torch 编码；索引经 `ACTIVE_INDEX` 指针原子发布（#11），构建崩溃不影响活动索引。
+**增量原理：** 源文档层仍由 `manifest.json` 的 SHA256 跟踪，未变更文件零开销跳过解析。不要把这个或向量缓存混同为存储级 online incremental；下面是唯一可向用户陈述的存储模式与恢复契约。
+
+<!-- build-mode-contract:start -->
+`--build-mode snapshot|incremental|auto` controls storage publication, not embedding reuse.
+
+- `snapshot` is the default and safe fallback: it creates fresh sparse/dense LanceDB tables and indexes in staging, validates them, and publishes the completed snapshot.
+- `incremental` is real online storage maintenance: it uses stable-ID delete/upsert/catch-up against a staged clone, never mutates the active tables, and fails closed when its current-storage contract cannot be proven.
+- `auto` may select incremental only from compatible measured evidence in the versioned project-local `.index/build-mode-policy.json`; missing, malformed, stale, incompatible, or unsafe evidence selects snapshot. This is a safe snapshot fallback, not a guessed performance choice: do not invent thresholds.
+
+The legacy `--incremental` flag means embedding cache reuse only. It reuses page-level vectors when valid, but still publishes a fresh snapshot of sparse/dense tables and indexes; it is not storage-level incremental indexing and conflicts with `--build-mode incremental` or `auto`. `--full-rebuild` bypasses that cache without changing the selected storage mode.
+
+Examples (the CLI prints `requested=… selected=… reason=… policy_digest=…`):
+
+```bash
+# Default safe storage behavior: selected=snapshot, reason=explicit_snapshot
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root>
+
+# Explicit real staged storage maintenance; no cache flag can relabel it.
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root> --build-mode incremental
+
+# Evidence-gated selection; pass only a project-contained policy path when needed.
+PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/build_index.py <project_root> --build-mode auto --build-mode-policy .index/build-mode-policy.json
+```
+
+Every published manifest records `mode_requested`, `mode_selected`, `selection_reason`, and `build_mode_policy_sha256`, together with phase timings (`scan_parse_ms`, chunking, embedding cache hit/miss, serialization/write, FTS/vector catch-up, validation, and publication) and per-table sparse/dense logical insert/update/delete/unchanged plus `physically_written` counts. A configuration change is an incompatible storage contract: explicit incremental fails closed and auto returns to snapshot before clone/delta/catch-up.
+
+The staged candidate keeps source/clone lineage until journal recovery is complete. Its durable journal records recovery state; commit uncertainty is never silently treated as success. `ACTIVE_INDEX` is the only sparse+dense commit boundary: no candidate becomes query-visible until journal recovery, catch-up, validation, and the zero-unindexed publication gate all succeed. Failed or uncertain work preserves the previously active index.
+
+The fixed production ANN contract remains `IVF_HNSW_SQ`, `ef=100`, Recall@10 ≥ 0.19, and Recall@20 ≥ 0.17. It preserves citation/context/graph behavior and the sealed manifest contract; there is no runtime ANN selection and no exact fallback. Do not reset evaluation baselines, change model/dependency policy, or treat model downloads as normal build-mode acceptance.
+<!-- build-mode-contract:end -->
 
 **固定向量索引契约（Phase 06 / issue #49）：** 生产 dense 检索固定为源码控制 `eval/ann-policy.json` 的唯一批准策略——`IVF_HNSW_SQ`（cosine、`num_partitions=1`、`ef_construction=300`）+ 查询 `ef=100`，held-out floors Recall@10 ≥ 0.19 / Recall@20 ≥ 0.17。**没有运行时类型/ef/exact 选择，也没有 exact 回退**：exact 仅为诊断 API。每次构建在发布前用确定性 held-out 验证 query（数量 = `min(BENCHMARK_MAX_PROBES, dense_rows)`）对照 batch-exact 真值校验 recall，不达标即拒绝发布并保留旧 `ACTIVE_INDEX`。旧 format-5 mode-ambiguous 索引加载即报 `RebuildRequiredError`，需全量重建（`--vector-index` 参数已废弃，传入即 exit 2）。策略校验：`python eval/run_eval.py --validate-ann-policy`。
 

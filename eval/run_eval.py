@@ -693,6 +693,33 @@ def _stage_project(project_root: Path, wiki_src: Path):
     return wiki
 
 
+def write_graph_artifact(wiki: Path, index_dir: Path) -> None:
+    """Build the production graph sidecar used by both evaluation entry points."""
+    try:
+        graph = _bg.build_graph(wiki)
+        stats = _bg.compute_4_signals(graph)
+        communities = _bg.detect_communities(graph)
+        graph_json = {
+            "nodes": [{"id": node, **{key: value for key, value in data.items()
+                                        if key != "signals"}}
+                      for node, data in graph.nodes(data=True)],
+            "edges": [{"source": source, "target": target,
+                       "weight": round(data.get("weight", 1.0), 4),
+                       "signal": sorted(data.get("signals", set()))[0]
+                       if data.get("signals") else "unknown",
+                       "signals": sorted(data.get("signals", set()))}
+                      for source, target, data in graph.edges(data=True)],
+            "signals": stats,
+            "communities": communities,
+        }
+        (index_dir / "graph.json").write_text(
+            json.dumps(graph_json, ensure_ascii=False, indent=2, default=list),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] 图谱生成失败（不影响主评测）: {exc}", file=sys.stderr)
+
+
 def _build(project_root: Path, wiki_src: Path, full_rebuild: bool,
            *, candidate_query_policy: CandidateQueryPolicy | None = None):
     # Phase 06：普通评测构建走固定生产路径（批准 SQ/ef）；eval candidate
@@ -708,25 +735,7 @@ def _build(project_root: Path, wiki_src: Path, full_rebuild: bool,
     dt = time.perf_counter() - t0
     wi.load()
     # 生成图谱（供 hybrid_search 的 relations 扩展通道使用）
-    try:
-        G = _bg.build_graph(wiki)
-        stats = _bg.compute_4_signals(G)
-        comms = _bg.detect_communities(G)
-        graph_json = {
-            "nodes": [{"id": n, **{k: v for k, v in d.items() if k != "signals"}}
-                      for n, d in G.nodes(data=True)],
-            "edges": [{"source": u, "target": v,
-                       "weight": round(d.get("weight", 1.0), 4),
-                       "signal": sorted(d.get("signals", set()))[0] if d.get("signals") else "unknown",
-                       "signals": sorted(d.get("signals", set()))}
-                      for u, v, d in G.edges(data=True)],
-            "signals": stats,
-            "communities": comms,
-        }
-        (idx / "graph.json").write_text(
-            json.dumps(graph_json, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] 图谱生成失败（不影响主评测）: {e}", file=sys.stderr)
+    write_graph_artifact(wiki, idx)
     return wi, wiki, dt
 
 

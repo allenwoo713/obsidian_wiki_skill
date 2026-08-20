@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import subprocess
 import unittest
+import ast
 from pathlib import Path
 from typing import Protocol
 
@@ -61,6 +62,41 @@ STORAGE_SDK_CONSTRAINTS = (
 
 
 class ArchitectureFoundationTests(unittest.TestCase):
+    def test_online_incremental_application_services_depend_only_inward(self):
+        """The online services must not hide adapter imports behind a service cycle."""
+        root = Path(__file__).resolve().parents[1]
+        services = {
+            "index_build_service": root / "scripts/obsidian_wiki/application/index_build_service.py",
+            "incremental_index_service": root / "scripts/obsidian_wiki/application/incremental_index_service.py",
+        }
+        imports: dict[str, set[str]] = {}
+        for name, path in services.items():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            imports[name] = {
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            } | {
+                node.module or ""
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+            }
+
+        for service, modules in imports.items():
+            self.assertFalse(
+                any(module.startswith("obsidian_wiki.infrastructure") for module in modules),
+                f"{service} imports a concrete infrastructure adapter: {sorted(modules)}",
+            )
+        self.assertNotIn(
+            "obsidian_wiki.application.incremental_index_service",
+            imports["index_build_service"],
+        )
+        self.assertNotIn(
+            "obsidian_wiki.application.index_build_service",
+            imports["incremental_index_service"],
+        )
+
     def test_legacy_exports_are_canonical_package_objects(self):
         self.assertIs(QueryIntent, PackageQueryIntent)
         self.assertIs(PlannerContext, PackagePlannerContext)
