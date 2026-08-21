@@ -84,6 +84,20 @@ def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_clos
     assert hasattr(reconcile_ann_gate, "validate_feature_worktree_preflight")
 
 
+def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> None:
+    """D-06..D-10/D-18: workflow must validate, never hydrate around, identities."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    for required in (
+        "personal-wiki-corpus-manifest",
+        "model-manifest.json",
+        "validate-model-tree",
+        "public-distractor-v1",
+        "exact-truth",
+        "no-download-fallback",
+    ):
+        assert required in workflow
+
+
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
     """D-06/D-08/D-09/D-10: a green workflow must exercise production paths."""
     ci = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
