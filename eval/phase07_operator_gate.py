@@ -64,6 +64,14 @@ def _confirmation_binding(*, slot: dict[str, int]) -> dict[str, Any]:
     }
 
 
+def confirmation_input_membership_digest(record: dict[str, Any]) -> str:
+    """Stable member identity deliberately excludes the request/self digest cycle."""
+    value = dict(record)
+    value.pop("record_self_sha256", None)
+    value.pop("confirmation_request_sha256", None)
+    return canonical_digest(value)
+
+
 def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dict[str, Any]:
     """Derive all confirmation dispatch authority from the immutable Stage 1 ledger."""
     if not SHA.fullmatch(post_task0_head):
@@ -73,6 +81,14 @@ def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dic
         raise ValueError("unrecognized immutable Stage 1 ledger")
     if ledger.get("artifact_reported_nominated_m") != [16, 20] or ledger.get("nominated_m") != [32, 20] or ledger.get("head_sha") != STAGE1_NUMERIC_HEAD:
         raise ValueError("immutable Stage 1 nominee/head provenance")
+    seed_records = []
+    for m, ordinal in CONFIRMATION_SLOTS:
+        slot = {"m": m, "ordinal": ordinal}
+        binding = _confirmation_binding(slot=slot)
+        seed_records.append({"schema_version": 1, "campaign_stage": "confirmation", "slot": slot,
+                             "post_task0_head": post_task0_head, "continuation_binding": binding,
+                             "continuation_binding_sha256": canonical_digest(binding),
+                             "dispatch_identity": f"phase07-confirmation/{m}/{ordinal}"})
     request = _sealed({
         "schema_version": 1, "campaign_stage": "confirmation",
         "stage1_ledger_path": str(stage1_ledger), "stage1_ledger_sha256": STAGE1_LEDGER_DIGEST,
@@ -80,18 +96,11 @@ def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dic
         "authoritative_nominated_m": [32, 20], "stage1_numeric_head": STAGE1_NUMERIC_HEAD,
         "confirmation_implementation_base": CONFIRMATION_IMPLEMENTATION_BASE,
         "post_task0_head": post_task0_head,
+        "workflow_input_membership_sha256": [confirmation_input_membership_digest(record) for record in seed_records],
     })
     inputs = []
-    for m, ordinal in CONFIRMATION_SLOTS:
-        slot = {"m": m, "ordinal": ordinal}
-        binding = _confirmation_binding(slot=slot)
-        inputs.append(_sealed({
-            "schema_version": 1, "campaign_stage": "confirmation",
-            "confirmation_request_sha256": request["record_self_sha256"], "slot": slot,
-            "post_task0_head": post_task0_head, "continuation_binding": binding,
-            "continuation_binding_sha256": canonical_digest(binding),
-            "dispatch_identity": f"phase07-confirmation/{m}/{ordinal}",
-        }))
+    for record in seed_records:
+        inputs.append(_sealed({**record, "confirmation_request_sha256": request["record_self_sha256"]}))
     return _sealed({
         "schema_version": 1, "confirmation_request": request, "workflow_inputs": inputs,
         "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20],
@@ -104,7 +113,7 @@ def validate_confirmation_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if plan.get("record_self_sha256") != canonical_digest(plan):
         raise ValueError("confirmation plan self-digest")
     request = plan["confirmation_request"]
-    required_request = {"schema_version", "campaign_stage", "stage1_ledger_path", "stage1_ledger_sha256", "artifact_reported_nominated_m", "reconciled_nominated_m", "authoritative_nominated_m", "stage1_numeric_head", "confirmation_implementation_base", "post_task0_head", "record_self_sha256"}
+    required_request = {"schema_version", "campaign_stage", "stage1_ledger_path", "stage1_ledger_sha256", "artifact_reported_nominated_m", "reconciled_nominated_m", "authoritative_nominated_m", "stage1_numeric_head", "confirmation_implementation_base", "post_task0_head", "workflow_input_membership_sha256", "record_self_sha256"}
     if not isinstance(request, dict) or set(request) != required_request or request.get("record_self_sha256") != canonical_digest(request):
         raise ValueError("sealed confirmation request")
     if request["campaign_stage"] != "confirmation" or request["stage1_ledger_sha256"] != STAGE1_LEDGER_DIGEST or request["stage1_numeric_head"] != STAGE1_NUMERIC_HEAD or request["confirmation_implementation_base"] != CONFIRMATION_IMPLEMENTATION_BASE or not SHA.fullmatch(request["post_task0_head"]):
@@ -127,7 +136,27 @@ def validate_confirmation_plan(plan: dict[str, Any]) -> dict[str, Any]:
         slots.append((slot["m"], slot["ordinal"]))
     if slots != list(CONFIRMATION_SLOTS):
         raise ValueError("duplicate, missing, or replayed confirmation slot")
+    if request["workflow_input_membership_sha256"] != [confirmation_input_membership_digest(record) for record in inputs] or len(set(request["workflow_input_membership_sha256"])) != 6:
+        raise ValueError("confirmation request bundle membership")
     return plan
+
+
+def validate_confirmation_dispatch_bundle(bundle: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
+    """Require an input to carry the sealed request that proves bundle membership."""
+    if not isinstance(bundle, dict) or set(bundle) != {"confirmation_request", "workflow_input"}:
+        raise ValueError("typed confirmation dispatch bundle")
+    request, record = bundle["confirmation_request"], bundle["workflow_input"]
+    probe = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": [record],
+             "artifact_reported_nominated_m": request.get("artifact_reported_nominated_m") if isinstance(request, dict) else None,
+             "authoritative_nominated_m": request.get("authoritative_nominated_m") if isinstance(request, dict) else None}
+    # Validate the request shape and the one member directly; the six-member plan
+    # is reconstructed only for deterministic membership validation.
+    if not isinstance(request, dict) or request.get("record_self_sha256") != canonical_digest(request):
+        raise ValueError("sealed confirmation request")
+    validate_confirmation_workflow_input(record, expected_head=expected_head)
+    if record.get("confirmation_request_sha256") != request["record_self_sha256"] or confirmation_input_membership_digest(record) not in request.get("workflow_input_membership_sha256", []):
+        raise ValueError("confirmation input is not a generated request member")
+    return record
 
 
 def validate_confirmation_workflow_input(record: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
@@ -192,7 +221,7 @@ def seal_confirmation_allocation(*, workflow_inputs: dict[str, Any], output: Pat
     """Seal lookup/entropy rejection before a workflow is permitted to build."""
     record: dict[str, Any] = {"schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": workflow_inputs.get("record_self_sha256")}
     try:
-        validate_confirmation_workflow_input(workflow_inputs, expected_head=head_sha)
+        workflow_inputs = validate_confirmation_dispatch_bundle(workflow_inputs, expected_head=head_sha)
         allocation = allocate_confirmation_job(client or GitHubActionsClient(), repository=repository, run_id=run_id,
                                                 run_attempt=run_attempt, job_key=job_key, token=token)
         record.update(status="success", allocation=allocation)
@@ -461,7 +490,7 @@ def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_i
     for record in plan["workflow_inputs"]:
         slot = record["slot"]
         (workflow_inputs_dir / f"confirmation-m{slot['m']}-ordinal{slot['ordinal']}.json").write_text(
-            json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            json.dumps({"confirmation_request": plan["confirmation_request"], "workflow_input": record}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     preflight = {
         "repository": _read_object(stage1_ledger)["repository"], "branch": _git("branch", "--show-current"),
         "worktree_root": str(root), "head_sha": head, "allowed_dirty_paths": [],

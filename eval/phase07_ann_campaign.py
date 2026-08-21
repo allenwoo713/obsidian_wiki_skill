@@ -329,12 +329,29 @@ class Phase07AnnCampaignRunner:
         result["record_self_sha256"] = canonical_digest(result)
         return result
 
+    @staticmethod
+    def _confirmation_d20_member_statistics(baseline: dict[str, Any], primary: dict[str, Any]) -> dict[str, Any]:
+        """Two paired rows from this packet; reconciliation joins both m values per ordinal."""
+        baseline_group = next(group for group in baseline["queries"] if group["query_ef"] == 100)
+        primary_group = next(group for group in primary["queries"] if group["query_ef"] == 300)
+        comparisons = []
+        for metric in ("recall_at_10", "recall_at_20"):
+            comparison = {"family": "d20_current_baseline", "metric": metric,
+                          "baseline_m": 16, "baseline_ef": 100,
+                          "candidate_m": primary["build"]["m"], "candidate_ef": 300,
+                          "baseline_build_id": baseline["build_id"], "candidate_build_id": primary["build_id"]}
+            pairs = [[left[metric], right[metric]] for left, right in zip(baseline_group["queries"], primary_group["queries"], strict=True)]
+            comparisons.append({"comparison": comparison, **paired_basic_effect(pairs, comparison=comparison),
+                                "raw_permutation_p": paired_permutation_p(pairs, comparison=comparison), "paired_rows": pairs})
+        return {"schema_version": 1, "family_name": "d20_current_baseline_member", "family_size": 2,
+                "comparisons": comparisons, "authorization": "none"}
+
     def confirmation(self, request: dict[str, Any]) -> dict[str, Any]:
         slot = request["workflow_inputs"]["slot"]
         def operation(root, exact, exact_ms):
             builds = [self._build(root, m=m, ef_construction=300, query_ef=(100, 200, 300) if m == 16 else (200, 300), exact_ids=exact, exact_ms=exact_ms) for m in (16, 20, 32)]
             baseline, primary = next(build for build in builds if build["build"]["m"] == 16), next(build for build in builds if build["build"]["m"] == slot["m"])
-            return {"slot": slot, "run_identity": request["run_identity"], "workflow_inputs_sha256": request["workflow_inputs"]["record_self_sha256"], "build_count": 3, "builds": builds, "primary_build_id": primary["build_id"], "d04_statistics": self._screening_statistics(builds), "d20_baseline_build_id": baseline["build_id"], "d20_baseline_query_ef": 100, "authorization": "none"}
+            return {"slot": slot, "run_identity": request["run_identity"], "workflow_inputs_sha256": request["workflow_inputs"]["record_self_sha256"], "build_count": 3, "builds": builds, "primary_build_id": primary["build_id"], "d04_statistics": self._screening_statistics(builds), "d20_member_statistics": self._confirmation_d20_member_statistics(baseline, primary), "d20_baseline_build_id": baseline["build_id"], "d20_baseline_query_ef": 100, "authorization": "none"}
         return self._with_truth(operation)
 
     def continuation(self, request: dict[str, Any]) -> dict[str, Any]:

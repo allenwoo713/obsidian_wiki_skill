@@ -155,5 +155,5 @@ def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> No
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
     pristine = {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}
     with pytest.raises(ValueError, match="mismatch"): operator.validate_confirmation_dispatch_bundle(pristine, expected_head="e" * 40)
-    other = _plan(); pristine["confirmation_request"] = other["confirmation_request"]
+    other = operator.build_confirmation_plan(LEDGER, post_task0_head="d" * 40); pristine["confirmation_request"] = other["confirmation_request"]
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(pristine, expected_head=HEAD)
