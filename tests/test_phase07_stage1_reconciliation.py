@@ -293,6 +293,33 @@ def test_stage1_tiny_three_build_artifact_reconciles_without_rep_manifest_truth(
     assert output.exists()
 
 
+def test_stage1_reconciler_accepts_runner_bound_corpus_digest_not_locally_regenerated(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
+) -> None:
+    """Hosted numerical identities remain bound to the sealed runner artifact, not macOS BLAS."""
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    extracted = artifact_dir / "extracted"
+    payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
+    # A different, sealed hosted floating-point reduction is valid only when all
+    # of the outer API/archive/content and inner exact-query evidence agree.
+    payload["result"]["stress_identity"]["corpus_sha256"] = "d" * 64
+    _seal(payload)
+    (extracted / "screening-result.json").write_text(json.dumps(payload), encoding="utf-8")
+    request = _reseal_bundle(artifact_dir, result)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    ledger = reconcile_stage1_screening(
+        stage1_request=request_path, artifact_dir=artifact_dir,
+        output=tmp_path / "stage1-ledger.json", mode="screening", expected_shape=(48, 384, 8),
+    )
+
+    assert ledger["stress_identity"]["corpus_sha256"] == "d" * 64
+    assert len({build["build_id"] for build in ledger["builds"]}) == 3
+
+
 def test_stage1_reconciler_allows_large_index_bytes_when_build_stays_bounded(
     tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
 ) -> None:
@@ -319,7 +346,7 @@ def test_stage1_reconciler_allows_large_index_bytes_when_build_stays_bounded(
 @pytest.mark.parametrize(
     "tamper",
     ["one-build", "symlink", "secret", "stale-head", "extra-file", "archive", "content-tree",
-     "job", "artifact", "rejection", "recall", "statistics", "self-digest", "corpus-digest",
+     "job", "artifact", "rejection", "recall", "statistics", "self-digest", "cross-build-truth",
      "corpus-seed", "algorithm"],
 )
 def test_stage1_reconciler_rejects_tampered_or_incomplete_evidence(
@@ -356,14 +383,21 @@ def test_stage1_reconciler_rejects_tampered_or_incomplete_evidence(
         _seal(request)
     elif tamper == "rejection":
         (extracted / "screening-rejection.json").write_text('{"status":"reject-evidence"}', encoding="utf-8")
-    elif tamper in {"recall", "statistics", "self-digest", "corpus-digest", "corpus-seed", "algorithm"}:
+    elif tamper in {"recall", "statistics", "self-digest", "cross-build-truth", "corpus-seed", "algorithm"}:
         payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
         if tamper == "recall":
             payload["result"]["builds"][0]["queries"][0]["queries"][0]["recall_at_10"] = 0.123
         elif tamper == "statistics":
             payload["result"]["d04_statistics"]["comparisons"][0]["holm_adjusted_p"] = 0.0
-        elif tamper == "corpus-digest":
-            payload["result"]["stress_identity"]["corpus_sha256"] = "f" * 64
+        elif tamper == "cross-build-truth":
+            sample = payload["result"]["builds"][1]["queries"][0]["queries"][0]
+            sample["exact_top_10"][0] = "substituted-exact-id"
+            sample["exact_top_20"][0] = "substituted-exact-id"
+            sample["recall_at_10"] = len(set(sample["exact_top_10"]) & set(sample["candidate_top_10"][:10])) / 10
+            sample["recall_at_20"] = len(set(sample["exact_top_20"]) & set(sample["candidate_top_20"][:20])) / 20
+            group = payload["result"]["builds"][1]["queries"][0]
+            group["recall_at_10"] = sum(item["recall_at_10"] for item in group["queries"]) / len(group["queries"])
+            group["recall_at_20"] = sum(item["recall_at_20"] for item in group["queries"]) / len(group["queries"])
         elif tamper == "corpus-seed":
             payload["result"]["stress_identity"]["corpus_seed"] = 0
         elif tamper == "algorithm":

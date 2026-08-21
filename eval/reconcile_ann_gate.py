@@ -11,6 +11,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    # Direct-file entry points start with ``eval/`` on sys.path, whereas
+    # run_eval imports the repository ``eval`` package.
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
 import benchmark_ann_build as benchmark
 from benchmark_ann_build import validate_evidence
 from run_eval import validate_candidate_decision_records
@@ -39,7 +45,20 @@ _STAGE1_REQUEST_FIELDS = frozenset({
     "job_id", "job_key", "job_allocation_nonce", "runtime", "model_manifest_sha256",
     "corpus_manifest_sha256", "workflow_name", "event", "status", "conclusion", "runner",
     "lock_identity", "retry_lineage", "artifact", "campaign_result_sha256",
-    "campaign_request_sha256", "campaign_ledger_sha256", "record_self_sha256",
+    "campaign_request_sha256", "campaign_ledger_sha256", "run_created_at",
+    "api_provenance", "workflow_retention_days", "record_self_sha256",
+})
+_STAGE1_API_PROVENANCE_FIELDS = frozenset({"workflow_run", "job", "artifact"})
+_STAGE1_API_WORKFLOW_RUN_FIELDS = frozenset({
+    "run_id", "run_attempt", "head_branch", "head_sha", "event", "status",
+    "conclusion", "created_at",
+})
+_STAGE1_API_JOB_FIELDS = frozenset({
+    "job_id", "run_id", "job_key", "status", "conclusion",
+})
+_STAGE1_API_ARTIFACT_FIELDS = frozenset({
+    "artifact_id", "job_id", "job_key", "run_id", "name", "created_at",
+    "expires_at", "expired",
 })
 
 
@@ -127,6 +146,67 @@ def _stage1_stress_digest(exact_ids: list[list[str]]) -> str:
     return hashlib.sha256(json.dumps(exact_ids, separators=(",", ":")).encode()).hexdigest()
 
 
+def _stage1_timestamp(value: Any, *, label: str) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"Stage 1 {label} timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"Stage 1 {label} timestamp timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _validate_stage1_workflow_retention(request: dict[str, Any]) -> None:
+    """Tie the claimed API retention to the exact screening workflow contract."""
+    if request["workflow_retention_days"] != 90:
+        raise ValueError("Stage 1 workflow retention must be exactly 90 days")
+    workflow = (REPOSITORY_ROOT / request["workflow_path"]).resolve()
+    if workflow.parent != (REPOSITORY_ROOT / ".github" / "workflows").resolve():
+        raise ValueError("Stage 1 workflow path containment")
+    try:
+        section = workflow.read_text(encoding="utf-8").split("  phase07-screening:", 1)[1].split(
+            "  phase07-confirmation:", 1
+        )[0]
+    except (OSError, IndexError) as exc:
+        raise ValueError("Stage 1 screening workflow unavailable") from exc
+    if "retention-days: 90" not in section:
+        raise ValueError("Stage 1 screening workflow retention declaration")
+
+
+def _validate_stage1_api_provenance(request: dict[str, Any]) -> dt.datetime:
+    provenance = request["api_provenance"]
+    if not isinstance(provenance, dict) or set(provenance) != _STAGE1_API_PROVENANCE_FIELDS:
+        raise ValueError("strict Stage 1 API provenance schema")
+    workflow_run, job, artifact = (
+        provenance["workflow_run"], provenance["job"], provenance["artifact"],
+    )
+    if not isinstance(workflow_run, dict) or set(workflow_run) != _STAGE1_API_WORKFLOW_RUN_FIELDS \
+            or not isinstance(job, dict) or set(job) != _STAGE1_API_JOB_FIELDS \
+            or not isinstance(artifact, dict) or set(artifact) != _STAGE1_API_ARTIFACT_FIELDS:
+        raise ValueError("strict Stage 1 API provenance members")
+    if workflow_run != {
+        "run_id": request["run_id"], "run_attempt": request["run_attempt"],
+        "head_branch": request["branch"], "head_sha": request["head_sha"],
+        "event": request["event"], "status": request["status"],
+        "conclusion": request["conclusion"], "created_at": request["run_created_at"],
+    }:
+        raise ValueError("Stage 1 workflow API provenance binding")
+    if job != {
+        "job_id": request["job_id"], "run_id": request["run_id"],
+        "job_key": request["job_key"], "status": "completed", "conclusion": "success",
+    }:
+        raise ValueError("Stage 1 job API provenance binding")
+    request_artifact = request["artifact"]
+    if artifact != {
+        "artifact_id": request_artifact["artifact_id"], "job_id": request["job_id"],
+        "job_key": request["job_key"], "run_id": request["run_id"],
+        "name": request_artifact["name"], "created_at": request_artifact["created_at"],
+        "expires_at": request_artifact["expires_at"], "expired": request_artifact["expired"],
+    }:
+        raise ValueError("Stage 1 artifact API provenance binding")
+    return _stage1_timestamp(workflow_run["created_at"], label="workflow-run creation")
+
+
 def _validate_stage1_request(request: dict[str, Any], artifact_dir: Path) -> None:
     _stage1_reject_secrets(request)
     if set(request) != _STAGE1_REQUEST_FIELDS or request["schema_version"] != 1 or request["mode"] != "screening" or request["authorization"] != "none":
@@ -143,6 +223,8 @@ def _validate_stage1_request(request: dict[str, Any], artifact_dir: Path) -> Non
         raise ValueError("Stage 1 job allocation binding")
     if request["runtime"] != {"python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0", "omp_num_threads": 2}:
         raise ValueError("Stage 1 locked runtime/OMP identity")
+    run_created = _validate_stage1_api_provenance(request)
+    _validate_stage1_workflow_retention(request)
     if not all(isinstance(request[name], str) and _HEX64.fullmatch(request[name]) for name in ("model_manifest_sha256", "corpus_manifest_sha256", "lock_identity", "campaign_result_sha256", "campaign_request_sha256", "campaign_ledger_sha256")):
         raise ValueError("Stage 1 digest identity")
     runner = request["runner"]
@@ -155,12 +237,9 @@ def _validate_stage1_request(request: dict[str, Any], artifact_dir: Path) -> Non
     required_artifact = {"artifact_id", "name", "job_id", "job_key", "retention_days_requested", "retention_days_accepted", "created_at", "expires_at", "expired", "api_archive_sha256", "local_archive_path", "local_archive_sha256", "content_tree_sha256"}
     if not isinstance(artifact, dict) or set(artifact) != required_artifact or not isinstance(artifact["artifact_id"], int) or artifact["artifact_id"] <= 0 or artifact["job_id"] != request["job_id"] or artifact["job_key"] != request["job_key"] or not isinstance(artifact["name"], str) or not artifact["name"] or artifact["retention_days_requested"] != 90 or artifact["retention_days_accepted"] != 90 or artifact["expired"] is not False:
         raise ValueError("Stage 1 artifact identity/retention")
-    try:
-        created = dt.datetime.fromisoformat(artifact["created_at"].replace("Z", "+00:00"))
-        expires = dt.datetime.fromisoformat(artifact["expires_at"].replace("Z", "+00:00"))
-    except (AttributeError, ValueError) as exc:
-        raise ValueError("Stage 1 artifact timestamps") from exc
-    if not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) <= expires - created <= dt.timedelta(days=90):
+    created = _stage1_timestamp(artifact["created_at"], label="artifact creation")
+    expires = _stage1_timestamp(artifact["expires_at"], label="artifact expiry")
+    if created < run_created or not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) <= expires - run_created <= dt.timedelta(days=90, seconds=30):
         raise ValueError("Stage 1 artifact retention interval")
     if not isinstance(artifact["local_archive_path"], str) or Path(artifact["local_archive_path"]).name != artifact["local_archive_path"]:
         raise ValueError("Stage 1 local archive path")
@@ -187,9 +266,13 @@ def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[
         "vectors": "benchmark_ann_build._vectors/v1",
         "exact_truth": "LanceDbIndexRepository.search_dense_exact_batch/cosine/limit20",
     }
-    expected_corpus = benchmark._matrix_digest(benchmark._vectors(expected_shape[0], expected_shape[1], benchmark.CORPUS_SEED))
-    expected_queries = benchmark._matrix_digest(benchmark._vectors(expected_shape[2], expected_shape[1], benchmark.QUERY_SEED))
-    if not isinstance(stress, dict) or set(stress) != {"schema_version", "corpus_sha256", "query_sha256", "exact_truth_sha256", "corpus_seed", "query_seed", "shape", "algorithm"} or stress.get("schema_version") != 1 or stress.get("corpus_seed") != benchmark.CORPUS_SEED or stress.get("query_seed") != benchmark.QUERY_SEED or stress.get("shape") != expected_stress_shape or stress.get("algorithm") != expected_algorithm or stress.get("corpus_sha256") != expected_corpus or stress.get("query_sha256") != expected_queries or not isinstance(stress.get("exact_truth_sha256"), str) or not _HEX64.fullmatch(stress["exact_truth_sha256"]):
+    # The generator is pinned by source head, seed, shape, algorithm, locked
+    # runtime, OMP setting, hosted runner and sealed artifact.  Re-generating
+    # normalized float32 vectors on a different BLAS/OS is not a trustworthy
+    # equality oracle: it can change bytes despite identical locked inputs.
+    # The runner-produced corpus/query digests are therefore immutable artifact
+    # identities; the exact IDs and recalls below are independently recomputed.
+    if not isinstance(stress, dict) or set(stress) != {"schema_version", "corpus_sha256", "query_sha256", "exact_truth_sha256", "corpus_seed", "query_seed", "shape", "algorithm"} or stress.get("schema_version") != 1 or stress.get("corpus_seed") != benchmark.CORPUS_SEED or stress.get("query_seed") != benchmark.QUERY_SEED or stress.get("shape") != expected_stress_shape or stress.get("algorithm") != expected_algorithm or not all(isinstance(stress.get(name), str) and _HEX64.fullmatch(stress[name]) for name in ("corpus_sha256", "query_sha256", "exact_truth_sha256")) or stress["corpus_sha256"] == stress["query_sha256"]:
         raise ValueError("Stage 1 stress identity")
     if plan.get("corpus") != {"rows": expected_shape[0], "dimensions": expected_shape[1], "queries": expected_shape[2], "truth": "seeded_vector_exact"}:
         raise ValueError("Stage 1 plan/stress shape binding")
