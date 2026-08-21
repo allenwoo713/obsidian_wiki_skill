@@ -755,6 +755,9 @@ def test_stage1_screening_request_seals_actual_hosted_runtime_identity() -> None
         "job_allocation_nonce",
         "'omp_num_threads':2",
         "'lock_identity':h('requirements.txt')",
+        "Assert actual locked Stage 1 runtime and OMP settings",
+        "expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'}",
+        "OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'",
         "retention-days: 90",
     ):
         assert required in screening

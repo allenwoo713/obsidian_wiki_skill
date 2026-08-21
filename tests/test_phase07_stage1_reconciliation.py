@@ -207,10 +207,34 @@ def test_stage1_tiny_three_build_artifact_reconciles_without_rep_manifest_truth(
     assert output.exists()
 
 
+def test_stage1_reconciler_allows_large_index_bytes_when_build_stays_bounded(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
+) -> None:
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    extracted = artifact_dir / "extracted"
+    payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
+    for build in payload["result"]["builds"]:
+        build["build"]["index_bytes"] = 180_001
+    (extracted / "screening-result.json").write_text(json.dumps(payload), encoding="utf-8")
+    request = _reseal_bundle(artifact_dir, result)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    ledger = reconcile_stage1_screening(
+        stage1_request=request_path, artifact_dir=artifact_dir, output=tmp_path / "ledger.json",
+        mode="screening", expected_shape=(48, 384, 8),
+    )
+
+    assert all(build["build"]["index_bytes"] > 180_000 for build in ledger["builds"])
+
+
 @pytest.mark.parametrize(
     "tamper",
     ["one-build", "symlink", "secret", "stale-head", "extra-file", "archive", "content-tree",
-     "job", "artifact", "rejection", "recall", "statistics", "self-digest"],
+     "job", "artifact", "rejection", "recall", "statistics", "self-digest", "corpus-digest",
+     "corpus-seed", "algorithm"],
 )
 def test_stage1_reconciler_rejects_tampered_or_incomplete_evidence(
     tmp_path: Path, tamper: str, tiny_stage1_artifact: tuple[Path, dict[str, object]],
@@ -246,12 +270,18 @@ def test_stage1_reconciler_rejects_tampered_or_incomplete_evidence(
         _seal(request)
     elif tamper == "rejection":
         (extracted / "screening-rejection.json").write_text('{"status":"reject-evidence"}', encoding="utf-8")
-    elif tamper in {"recall", "statistics", "self-digest"}:
+    elif tamper in {"recall", "statistics", "self-digest", "corpus-digest", "corpus-seed", "algorithm"}:
         payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
         if tamper == "recall":
             payload["result"]["builds"][0]["queries"][0]["queries"][0]["recall_at_10"] = 0.123
         elif tamper == "statistics":
             payload["result"]["d04_statistics"]["comparisons"][0]["holm_adjusted_p"] = 0.0
+        elif tamper == "corpus-digest":
+            payload["result"]["stress_identity"]["corpus_sha256"] = "f" * 64
+        elif tamper == "corpus-seed":
+            payload["result"]["stress_identity"]["corpus_seed"] = 0
+        elif tamper == "algorithm":
+            payload["result"]["stress_identity"]["algorithm"]["vectors"] = "untrusted"
         else:
             payload["record_self_sha256"] = "0" * 64
         (extracted / "screening-result.json").write_text(json.dumps(payload), encoding="utf-8")

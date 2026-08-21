@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import benchmark_ann_build as benchmark
 from benchmark_ann_build import validate_evidence
 from run_eval import validate_candidate_decision_records
 from eval.phase07_ann_campaign import Phase07AnnCampaignRunner, canonical_digest as campaign_digest
@@ -181,7 +182,14 @@ def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[
     if not isinstance(plan, dict) or plan.get("index") != {"type": "hnsw_sq", "m": [16, 20, 32], "ef_construction": 300} or plan.get("query_ef") != [100, 150, 200, 300] or plan.get("per_build_max_seconds") != 180:
         raise ValueError("Stage 1 SQ-first plan")
     stress = result.get("stress_identity")
-    if not isinstance(stress, dict) or set(stress) != {"schema_version", "corpus_sha256", "query_sha256", "exact_truth_sha256", "corpus_seed", "query_seed", "shape", "algorithm"} or not all(isinstance(stress[name], str) and _HEX64.fullmatch(stress[name]) for name in ("corpus_sha256", "query_sha256", "exact_truth_sha256")) or stress.get("shape") != {"rows": expected_shape[0], "dimensions": expected_shape[1], "queries": expected_shape[2]}:
+    expected_stress_shape = {"rows": expected_shape[0], "dimensions": expected_shape[1], "queries": expected_shape[2]}
+    expected_algorithm = {
+        "vectors": "benchmark_ann_build._vectors/v1",
+        "exact_truth": "LanceDbIndexRepository.search_dense_exact_batch/cosine/limit20",
+    }
+    expected_corpus = benchmark._matrix_digest(benchmark._vectors(expected_shape[0], expected_shape[1], benchmark.CORPUS_SEED))
+    expected_queries = benchmark._matrix_digest(benchmark._vectors(expected_shape[2], expected_shape[1], benchmark.QUERY_SEED))
+    if not isinstance(stress, dict) or set(stress) != {"schema_version", "corpus_sha256", "query_sha256", "exact_truth_sha256", "corpus_seed", "query_seed", "shape", "algorithm"} or stress.get("schema_version") != 1 or stress.get("corpus_seed") != benchmark.CORPUS_SEED or stress.get("query_seed") != benchmark.QUERY_SEED or stress.get("shape") != expected_stress_shape or stress.get("algorithm") != expected_algorithm or stress.get("corpus_sha256") != expected_corpus or stress.get("query_sha256") != expected_queries or not isinstance(stress.get("exact_truth_sha256"), str) or not _HEX64.fullmatch(stress["exact_truth_sha256"]):
         raise ValueError("Stage 1 stress identity")
     if plan.get("corpus") != {"rows": expected_shape[0], "dimensions": expected_shape[1], "queries": expected_shape[2], "truth": "seeded_vector_exact"}:
         raise ValueError("Stage 1 plan/stress shape binding")
@@ -195,7 +203,7 @@ def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[
         build_ids.add(build["build_id"])
         card = build["build"]
         watchdog = card.get("watchdog", {}) if isinstance(card, dict) else {}
-        if not isinstance(card, dict) or card.get("candidate") != "ivf-hnsw-sq" or card.get("m") not in {16, 20, 32} or card.get("ef_construction") != 300 or card.get("normal_ann_request_count") != 4 * stress["shape"]["queries"] or watchdog.get("cap_seconds") != 180 or watchdog.get("owner") != "parent" or watchdog.get("child_exitcode") != 0 or card.get("reopen_verified") is not True or card.get("unindexed_dense_rows") != 0 or not all(isinstance(card.get(name), (int, float)) and math.isfinite(card[name]) and 0 <= card[name] <= 180_000 for name in ("index_build_ms", "index_bytes")):
+        if not isinstance(card, dict) or card.get("candidate") != "ivf-hnsw-sq" or card.get("m") not in {16, 20, 32} or card.get("ef_construction") != 300 or card.get("normal_ann_request_count") != 4 * stress["shape"]["queries"] or watchdog.get("cap_seconds") != 180 or watchdog.get("owner") != "parent" or watchdog.get("child_exitcode") != 0 or card.get("reopen_verified") is not True or card.get("unindexed_dense_rows") != 0 or not isinstance(card.get("index_build_ms"), (int, float)) or not math.isfinite(card["index_build_ms"]) or not 0 <= card["index_build_ms"] <= 180_000 or not isinstance(card.get("index_bytes"), (int, float)) or not math.isfinite(card["index_bytes"]) or card["index_bytes"] <= 0:
             raise ValueError("Stage 1 build card/watchdog")
         observed_m.add(card["m"])
         groups = build["queries"]

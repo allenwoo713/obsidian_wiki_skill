@@ -552,6 +552,14 @@ jobs:
         run: python scripts/download_embedding_model.py
       - name: Validate immutable cached model tree before campaign import
         run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Assert actual locked Stage 1 runtime and OMP settings
+        run: >
+          python -c "import importlib.metadata as metadata, os, sys;
+          expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'python':f'{sys.version_info.major}.{sys.version_info.minor}', 'lancedb':metadata.version('lancedb'), 'numpy':metadata.version('numpy'), 'pyarrow':metadata.version('pyarrow')};
+          threads={key:os.environ.get(key) for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')};
+          print({'runtime':actual, 'threads':threads});
+          assert actual == expected and threads == {'OMP_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'2', 'MKL_NUM_THREADS':'2'}, (actual, threads)"
       - name: Construct finite screening request in this job
         env:
           RUN_ID: ${{ github.run_id }}
