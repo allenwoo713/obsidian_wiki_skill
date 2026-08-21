@@ -52,6 +52,7 @@ from build_index import CandidateQueryPolicy, WikiIndex  # noqa: E402
 from obsidian_wiki.domain.index_models import CandidateBuildPolicy  # noqa: E402
 from eval.ann_corpus_manifest import (  # noqa: E402
     canonical_content_tree_sha256,
+    PHASE07_CURRENT_BASELINE,
     validate_indexed_query_digest_separation,
 )
 from query_planner import DefaultQueryPlanner  # noqa: E402
@@ -496,7 +497,7 @@ def run_phase07_representative_campaign(
         target = expanded_wiki / "phase07_distractors" / f"public-{ordinal:05d}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(source + f"\n\npublic distractor ordinal {ordinal}\n", encoding="utf-8")
-    baseline = baseline or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 100, "refine_factor": None}
+    baseline = baseline or dict(PHASE07_CURRENT_BASELINE)
     finalist = finalist or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
     def build_candidate(name, config, wiki):
         index_dir = root / name / ".index"

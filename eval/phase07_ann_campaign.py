@@ -21,6 +21,7 @@ from eval.ann_frontier_statistics import (
     paired_permutation_p,
     validate_declared_family,
 )
+from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_", "github_pat_")
@@ -75,6 +76,8 @@ def _validate_continuation_config(mode: str, config: dict[str, Any]) -> None:
             candidate = config[name]
             if not isinstance(candidate, dict) or set(candidate) != {"candidate", "m", "ef_construction", "query_ef", "refine_factor"} or candidate["candidate"] != "ivf-hnsw-sq" or candidate["m"] not in (16, 20, 32) or candidate["ef_construction"] not in (300, 500) or candidate["query_ef"] not in (100, 150, 200, 300, 500) or candidate["refine_factor"] not in (None, 2, 5, 10): raise ValueError("immutable representative candidate configuration")
             if canonical_digest(candidate) != config[f"{name}_sha256"]: raise ValueError("representative candidate digest mismatch")
+        if config["baseline"] != PHASE07_CURRENT_BASELINE or config["baseline_sha256"] != phase07_current_baseline_sha256():
+            raise ValueError("representative baseline must equal current Phase 6 identity")
 
 
 def validate_request(request: dict[str, Any]) -> dict[str, Any]:

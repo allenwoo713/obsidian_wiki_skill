@@ -11,6 +11,14 @@ from pathlib import Path, PurePosixPath
 
 _SHA256 = set("0123456789abcdef")
 _MODEL_RUNTIME = {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"}
+PHASE07_CURRENT_BASELINE = {
+    "candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300,
+    "query_ef": 100, "refine_factor": None,
+}
+
+
+def phase07_current_baseline_sha256() -> str:
+    return canonical_sha256(PHASE07_CURRENT_BASELINE)
 
 
 def canonical_sha256(value: Mapping[str, object]) -> str:
@@ -96,8 +104,10 @@ def canonical_content_tree_sha256(root: Path) -> str:
 def validate_indexed_query_digest_separation(*, indexed_row_digests: Iterable[str], query_row_digests: Iterable[str]) -> dict[str, object]:
     """Fail closed on actual indexed/query digest overlap and return sealed identities."""
     indexed, queries = set(indexed_row_digests), set(query_row_digests)
-    if not indexed or not queries or any(not isinstance(value, str) or len(value) != 64 for value in indexed | queries):
+    if not indexed or not queries:
         raise ValueError("indexed/query digest identities")
+    for value in indexed | queries:
+        _digest("indexed/query digest", value)
     overlap = indexed & queries
     if overlap:
         raise ValueError("query/corpus overlap")

@@ -11,6 +11,7 @@ import pytest
 from eval.phase07_ann_campaign import CampaignConfig, Phase07AnnCampaignRunner, canonical_digest, execute, validate_request
 from eval.run_eval import _representative_indexed_query_separation, run_phase07_representative_campaign
 from eval.ann_corpus_manifest import canonical_content_tree_sha256
+from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256, validate_indexed_query_digest_separation
 
 
 def _digest(letter: str) -> str:
@@ -38,10 +39,10 @@ def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
 
 
 def _representative_config():
-    baseline = {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 100, "refine_factor": None}
+    baseline = dict(PHASE07_CURRENT_BASELINE)
     finalist = {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
     return {"size": 1000, "baseline": baseline, "finalist": finalist,
-            "baseline_sha256": canonical_digest(baseline), "finalist_sha256": canonical_digest(finalist)}
+            "baseline_sha256": phase07_current_baseline_sha256(), "finalist_sha256": canonical_digest(finalist)}
 
 
 def _tiny_runner(tmp_path: Path) -> Phase07AnnCampaignRunner:
@@ -78,6 +79,22 @@ def test_request_schema_seals_success_and_rejection_artifacts(tmp_path: Path) ->
         execute(_request(), tmp_path / "watchdog", runner=timeout.run)
     rejected = json.loads((tmp_path / "watchdog" / "screening-rejection.json").read_text())
     assert rejected["status"] == "reject-evidence" and rejected["record_self_sha256"]
+
+
+def test_representative_request_rejects_noncurrent_baseline_before_artifacts(tmp_path: Path) -> None:
+    for key, value in (("candidate", "ivf-hnsw-flat"), ("m", 20), ("ef_construction", 500), ("query_ef", 300), ("refine_factor", 2)):
+        request = _request("continuation", mode="representative_ann")
+        request["config"]["baseline"][key] = value
+        request["config"]["baseline_sha256"] = canonical_digest(request["config"]["baseline"])
+        with pytest.raises(ValueError):
+            execute(request, tmp_path / key)
+        assert not (tmp_path / key).exists()
+    stale = _request("continuation", mode="representative_ann")
+    stale["config"]["baseline_sha256"] = "0" * 64
+    with pytest.raises(ValueError):
+        validate_request(stale)
+    with pytest.raises(ValueError):
+        validate_indexed_query_digest_separation(indexed_row_digests=["z" * 64], query_row_digests=["a" * 64])
 
 
 def test_tiny_screening_uses_real_lancedb_reopen_and_ann_grid(tmp_path: Path) -> None:
