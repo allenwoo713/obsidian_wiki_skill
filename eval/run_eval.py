@@ -527,7 +527,19 @@ def run_phase07_representative_campaign(
     # written to the corpus and use normal candidate ANN calls only.
     ann_queries = load_phase07_personal_wiki_ann_queries(HERE / "personal-wiki-ann-queries.jsonl")
     ann_queries = ann_queries[:query_limit] if query_limit is not None else ann_queries
-    ann_rows = [{"query_id": item["query_id"], "baseline_hits": len(baseline_wi.search_vector(item["query"], k=20)), "finalist_hits": len(finalist_wi.search_vector(item["query"], k=20))} for item in ann_queries]
+    ann_rows = []
+    for item in ann_queries:
+        query_text = item["query"]
+        baseline_vector = baseline_wi._get_embedder().encode([query_text])[0]
+        finalist_vector = finalist_wi._get_embedder().encode([query_text])[0]
+        baseline_repo, finalist_repo = baseline_wi._get_repository(), finalist_wi._get_repository()
+        exact_ids = [str(row.get("chunk_id", "")) for row in baseline_repo.search_dense_exact(baseline_vector, metric="cosine", limit=20)]
+        baseline_ids = [str(row.get("chunk_id", "")) for row in baseline_repo.search_dense_eval(baseline_vector, metric="cosine", limit=20, ef=baseline["query_ef"])]
+        finalist_ids = [str(row.get("chunk_id", "")) for row in finalist_repo.search_dense_eval(finalist_vector, metric="cosine", limit=20, ef=finalist["query_ef"])]
+        ann_rows.append({"query_id": item["query_id"], "exact_top_20": exact_ids, "baseline_top_20": baseline_ids,
+                         "finalist_top_20": finalist_ids,
+                         "baseline_recall_at_20": len(set(exact_ids) & set(baseline_ids)) / 20,
+                         "finalist_recall_at_20": len(set(exact_ids) & set(finalist_ids)) / 20})
     return {
         "mode": mode, "scale": size, "candidate_configs": {"baseline": baseline, "finalist": finalist},
         "original_fixture": {"query_count": len(queries), "absolute_baseline": [row["baseline"] for row in observations], "absolute_finalist": [row["finalist"] for row in observations], "paired_observations": observations},
