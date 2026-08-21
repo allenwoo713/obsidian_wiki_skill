@@ -34,7 +34,9 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
         "builds": builds,
         "d04": {"family_name": "d04_ef_300_vs_200", "family_size": 6,
                 "raw_p_values": [0.01] * 6, "holm_adjusted_p_values": [0.06] * 6,
-                "basic_ci_95": [[0.01, 0.02]] * 6},
+                "basic_ci_95": [[0.01, 0.02]] * 6,
+                "comparisons": [{"raw_permutation_p": 0.01, "holm_adjusted_p": 0.06,
+                                 "basic_ci_95": [0.01, 0.02], "paired_rows": [[0.1, 0.2]]} for _ in range(6)]},
         "d20": {"family_name": "d20_current_baseline_member", "family_size": 2,
                 "baseline_build_id": builds[0]["build_id"], "raw_p_values": [0.01] * 2,
                 "basic_ci_95": [[0.01, 0.02]] * 2,
@@ -112,6 +114,17 @@ def test_confirmation_packet_rejects_missing_pairs_nonfinite_and_wrong_m16_basel
     packet["d20"]["baseline_build_id"] = "0" * 64
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="m=16"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+
+
+def test_confirmation_packet_requires_all_six_d04_members_and_declared_values() -> None:
+    plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d04"]["comparisons"] = packet["d04"]["comparisons"][:-1]
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="cardinality"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+    packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d04"]["raw_p_values"][0] = 0.02
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="declared"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
 
 
 class _FakeActions:
