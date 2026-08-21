@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from eval.phase07_ann_campaign import CampaignConfig, Phase07AnnCampaignRunner, canonical_digest, execute, validate_request
+from eval.phase07_ann_campaign import (
+    CampaignConfig,
+    Phase07AnnCampaignRunner,
+    canonical_digest,
+    execute,
+    select_stage1_nominees,
+    validate_request,
+)
 from eval.run_eval import _representative_indexed_query_separation, run_phase07_representative_campaign
 from eval.ann_corpus_manifest import canonical_content_tree_sha256
 from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256, validate_indexed_query_digest_separation
@@ -62,6 +69,24 @@ def _representative_config():
 def _tiny_runner(tmp_path: Path) -> Phase07AnnCampaignRunner:
     # Explicit trusted Python seam: request JSON has no rows/probes/dimensions fields.
     return Phase07AnnCampaignRunner(CampaignConfig(rows=64, dimensions=8, probes=4, per_build_max_seconds=30, work_dir=tmp_path))
+
+
+def _nomination_build(m: int, *, r10: float, r20: float, p95: float, index_bytes: int) -> dict:
+    return {
+        "build": {"m": m, "index_bytes": index_bytes},
+        "queries": [
+            {"query_ef": 300, "recall_at_10": r10, "recall_at_20": r20, "latency_p95_ms": p95},
+        ],
+    }
+
+
+def _nomination_stat(m: int, metric: str, effect: float, *, significant: bool = True) -> dict:
+    return {
+        "comparison": {"m": m, "metric": metric, "baseline_ef": 200, "candidate_ef": 300},
+        "mean_effect": effect,
+        "basic_ci_95": [0.01, 0.02] if significant else [-0.02, -0.01],
+        "holm_adjusted_p": 0.01 if significant else 0.5,
+    }
 
 
 def _embed384():
@@ -150,6 +175,53 @@ def test_tiny_screening_uses_real_lancedb_reopen_and_ann_grid(tmp_path: Path) ->
         assert [group["query_ef"] for group in build["queries"]] == [100, 150, 200, 300]
         assert build["build"]["dense_table_open_count"] >= 1
         assert build["build"]["watchdog"]["owner"] == "parent"
+
+
+@pytest.mark.parametrize(
+    ("builds", "statistics", "expected"),
+    [
+        (
+            [
+                _nomination_build(16, r10=0.8, r20=0.8, p95=4, index_bytes=100),
+                _nomination_build(20, r10=0.7, r20=0.7, p95=5, index_bytes=200),
+                _nomination_build(32, r10=0.9, r20=0.9, p95=6, index_bytes=300),
+            ],
+            {"comparisons": [
+                _nomination_stat(16, "recall_at_10", 0.1), _nomination_stat(16, "recall_at_20", -0.1, significant=False),
+                _nomination_stat(20, "recall_at_10", 0.1), _nomination_stat(20, "recall_at_20", 0.0, significant=False),
+                _nomination_stat(32, "recall_at_10", 0.0, significant=False), _nomination_stat(32, "recall_at_20", 0.1),
+            ]},
+            [32, 20],
+        ),
+        (
+            [
+                _nomination_build(16, r10=0.8, r20=0.8, p95=9, index_bytes=100),
+                _nomination_build(20, r10=0.8, r20=0.8, p95=8, index_bytes=200),
+                _nomination_build(32, r10=0.8, r20=0.8, p95=8, index_bytes=150),
+            ],
+            {"comparisons": [
+                *[_nomination_stat(m, metric, 0.1) for m in (16, 20, 32) for metric in ("recall_at_10", "recall_at_20")],
+            ]},
+            [32, 20],
+        ),
+        (
+            [
+                _nomination_build(16, r10=0.8, r20=0.8, p95=8, index_bytes=100),
+                _nomination_build(20, r10=0.8, r20=0.8, p95=8, index_bytes=100),
+                _nomination_build(32, r10=0.8, r20=0.8, p95=8, index_bytes=150),
+            ],
+            {"comparisons": [
+                *[_nomination_stat(m, metric, 0.1) for m in (16, 20, 32) for metric in ("recall_at_10", "recall_at_20")],
+            ]},
+            [16, 20],
+        ),
+    ],
+    ids=["filter-negative-other-metric-and-rank-joint-recall", "tie-p95-then-index", "tie-index-then-lower-m"],
+)
+def test_stage1_nominee_selection_is_qualified_and_deterministically_ranked(
+    builds: list[dict], statistics: dict, expected: list[int],
+) -> None:
+    assert select_stage1_nominees(builds, statistics) == expected
 
 
 def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_path: Path) -> None:
