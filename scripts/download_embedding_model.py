@@ -6,7 +6,6 @@ pollutes a user-wide Hugging Face/ModelScope cache.
 """
 from __future__ import annotations
 
-import os
 import shutil
 import argparse
 import json
@@ -16,7 +15,7 @@ from pathlib import Path
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 MODEL_DIR = SKILL_ROOT / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
-CACHE_DIR = SKILL_ROOT / ".cache" / "modelscope"
+CACHE_DIR = SKILL_ROOT / ".cache" / "huggingface"
 
 
 def _model_is_complete(path: Path) -> bool:
@@ -27,6 +26,34 @@ def validate_model_tree_only() -> None:
     """Validate the pinned tree without a network or filesystem hydration path."""
     from eval.ann_corpus_manifest import load_manifest, validate_model_tree
     lock = load_manifest(SKILL_ROOT / "eval" / "model-manifest.json")
+    validate_model_tree(MODEL_DIR, lock, allow_download=False)
+
+
+def hydrate_exact_manifest_model(*, snapshot_download=None) -> None:
+    """Hydrate only the manifest's immutable HF revision, then verify every file."""
+    from eval.ann_corpus_manifest import load_manifest, validate_model_tree
+    lock = load_manifest(SKILL_ROOT / "eval" / "model-manifest.json")
+    revision = lock["revision"]
+    allow_patterns = [item["path"] for item in lock["files"]]
+    if snapshot_download is None:
+        from huggingface_hub import snapshot_download as download
+    else:
+        download = snapshot_download
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    downloaded = Path(download(
+        repo_id=MODEL_ID, revision=revision, allow_patterns=allow_patterns,
+        cache_dir=str(CACHE_DIR), local_files_only=False,
+    ))
+    MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+    if MODEL_DIR.exists():
+        shutil.rmtree(MODEL_DIR)
+    MODEL_DIR.mkdir()
+    for relative in allow_patterns:
+        source, target = downloaded / relative, MODEL_DIR / relative
+        if not source.is_file():
+            raise RuntimeError(f"immutable provider snapshot omitted {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
     validate_model_tree(MODEL_DIR, lock, allow_download=False)
 
 
@@ -42,47 +69,7 @@ def main() -> None:
         print(f"embedding model already available: {MODEL_DIR}")
         return
 
-    try:
-        from modelscope import snapshot_download
-    except ImportError as exc:
-        raise SystemExit(
-            "ModelScope is required for this bootstrap. Install requirements.txt "
-            "or run `uv run --with modelscope python scripts/download_embedding_model.py`."
-        ) from exc
-
-    MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    # Keep every ModelScope intermediate under this skill as well.  `local_dir`
-    # is supported by the pinned ModelScope release and puts usable model files
-    # directly at MODEL_DIR.
-    os.environ.setdefault("MODELSCOPE_CACHE", str(CACHE_DIR))
-    downloaded = Path(snapshot_download(
-        MODEL_ID,
-        local_dir=str(MODEL_DIR),
-        cache_dir=str(CACHE_DIR),
-        # SentenceTransformer needs PyTorch weights plus tokenizer/config files;
-        # do not pull the optional ONNX export variants (~1.4 GB) into a skill
-        # that indexes with sentence-transformers.
-        allow_file_pattern=[
-            "*.json",
-            "*.safetensors",
-            "*.txt",
-            "*.model",
-            "tokenizer*",
-            "vocab*",
-            "merges*",
-        ],
-    ))
-
-    if downloaded != MODEL_DIR and not _model_is_complete(MODEL_DIR):
-        # Defensive compatibility path for ModelScope versions that return a
-        # cache path despite local_dir.  Copy only into the skill-local target.
-        shutil.copytree(downloaded, MODEL_DIR, dirs_exist_ok=True)
-
-    if not _model_is_complete(MODEL_DIR):
-        raise RuntimeError(
-            f"ModelScope returned without model.safetensors in {MODEL_DIR}"
-        )
+    hydrate_exact_manifest_model()
     print(f"embedding model deployed: {MODEL_DIR}")
 
 

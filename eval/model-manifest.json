@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-  "revision": "0000000000000000000000000000000000000000",
+  "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
   "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
   "files": [
     {"path":".gitattributes","sha256":"fd3e5d862331ec272410eb6312742550c3149899ee61827169b78fd0d5889f2e"},
@@ -18,5 +18,5 @@
     {"path":"tokenizer_config.json","sha256":"5036ea374ffedd706e3bef33e2e0d6953cb868ef8a490e76e32ba0faa37a6b9b"},
     {"path":"unigram.json","sha256":"71b44701d7efd054205115acfa6ef126c5d2f84bd3affe0c59e48163674d19a6"}
   ],
-  "record_self_sha256": "d01c06582670e66603b640d57c20ebd85bf98166821a2826dd55321aee051a6a"
+  "record_self_sha256": "fc47388665067ddf7dfda116fddfe1d896a8ef595e823aa4247ac649ad311fc2"
 }

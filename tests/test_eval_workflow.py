@@ -1,6 +1,7 @@
 """Static safety assertions for the fail-closed PR baseline workflow guard."""
 import hashlib
 import inspect
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -73,8 +74,8 @@ def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_clos
         "phase07-entitlement-preflight",
         "per-build-cap-seconds",
         "run_attempt",
-            "retention_days_requested",
-        "record_self_sha256",
+            "hosted-preflight",
+            "phase07_operator_gate.py finalize",
         "workflow_dispatch",
     ):
         assert required in workflow
@@ -177,8 +178,8 @@ def test_phase07_workflow_commands_are_real_and_do_not_consume_review_tmp_reques
         assert "continuation-request.json" not in section
         assert "retention-days: 90" in section
         assert "permissions: {contents: read, actions: read}" in section
-    assert "retention_days_requested':90" in workflow
-    assert "retention_days_accepted':90" in workflow
+    assert "hosted-preflight" in workflow
+    assert "retention_days_accepted" not in workflow
 
 
 def test_phase07_windows_gate_is_reduced_real_production_path_in_ci() -> None:
@@ -208,6 +209,48 @@ def test_phase07_cross_run_reconciliation_rejects_reused_allocation_and_build() 
     duplicate["record_self_sha256"] = phase07_operator_gate.canonical_digest(duplicate)
     with pytest.raises(ValueError, match="reused"):
         phase07_operator_gate.validate_phase07_evidence_set([packet, duplicate], expected_repository=packet["repository"], expected_head=packet["head_sha"])
+
+
+def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> None:
+    import phase07_operator_gate
+    root = tmp_path
+    (root / "eval").mkdir()
+    (root / "requirements.txt").write_text("lancedb==0.34.0\n")
+    manifest = {"schema_version": 1, "model_id": "x", "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42", "runtime": {}, "files": [{"path": "x", "sha256": "a" * 64}]}
+    manifest["record_self_sha256"] = phase07_operator_gate.canonical_digest(manifest)
+    (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    out = root / "proof.json"
+    assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 0
+    assert json.loads(out.read_text())["status"] == "success"
+    manifest["revision"] = "0" * 40
+    (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 1
+    rejection = json.loads(out.read_text())
+    assert rejection["status"] == "reject-evidence" and "retention_days_accepted" not in rejection
+
+
+def test_phase07_finalizer_creates_rejection_when_campaign_output_is_missing(tmp_path: Path) -> None:
+    import phase07_operator_gate
+    assert phase07_operator_gate.finalize_pipeline_artifact(output_dir=tmp_path, stage="screening", head_sha="a" * 40, run_id=1, run_attempt=1, job_key="screening", job_status="failure") == 0
+    assert json.loads((tmp_path / "screening-pipeline-rejection.json").read_text())["status"] == "reject-evidence"
+
+
+def test_exact_hf_hydration_uses_manifest_revision_and_allowlist(monkeypatch, tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
+    module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
+    manifest = json.loads((SKILL_ROOT / "eval/model-manifest.json").read_text())
+    assert manifest["revision"] == "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+    calls = {}
+    monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
+    (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    source = tmp_path / "source"; source.mkdir()
+    for item in manifest["files"]:
+        path = source / item["path"]; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"x")
+    def fake_download(**kwargs): calls.update(kwargs); return str(source)
+    monkeypatch.setattr(module, "validate_model_tree_only", lambda: None)
+    with pytest.raises(ValueError):
+        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert calls["revision"] == manifest["revision"] and calls["allow_patterns"] == [item["path"] for item in manifest["files"]]
 
 
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
@@ -388,7 +431,8 @@ def test_baseline_pr_guard_fetches_history_and_fails_closed():
     assert "git cat-file -e \"$base^{commit}\"" in workflow
     assert "git cat-file -e \"$head^{commit}\"" in workflow
     assert 'changed_files="$(git diff --name-only "$base" "$head")"' in workflow
-    assert "git diff --name-only" not in workflow.split('changed_files="$(git diff --name-only "$base" "$head")"', 1)[1]
+    baseline_guard = workflow.split("Protect evaluation baseline on pull requests", 1)[1].split("Retrieval eval", 1)[0]
+    assert baseline_guard.count("git diff --name-only") == 1
 
 
 def _bundle(path, *, reason="rrf", context_text=None):

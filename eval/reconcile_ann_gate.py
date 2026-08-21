@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import sys
+import re
 from pathlib import Path
 
 from benchmark_ann_build import validate_evidence
@@ -20,6 +21,21 @@ PHASE07_PACKET_FIELDS = frozenset({
 PHASE07_INFRA_FAILURES = frozenset({
     "github_infrastructure", "hosted_runner_unavailable", "artifact_service",
 })
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_")
+
+
+def _reject_secrets(value, location="packet") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if any(marker in str(key).lower() for marker in _SECRET_MARKERS):
+                raise ValueError(f"secret-like packet field: {location}.{key}")
+            _reject_secrets(item, f"{location}.{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _reject_secrets(item, location)
+    elif isinstance(value, str) and any(marker in value.lower() for marker in ("ghp_", "github_pat_", "bearer ")):
+        raise ValueError("secret-like packet value")
 
 
 ARCHITECTURE_REQUIRED_CHECKS = (
@@ -72,12 +88,13 @@ def validate_phase07_evidence_packet(packet: dict) -> dict:
     """Validate remote artifact identity, retention, digest, and retry lineage."""
     if not isinstance(packet, dict) or set(packet) != PHASE07_PACKET_FIELDS:
         raise ValueError("incomplete or unknown Phase 07 artifact fields")
+    _reject_secrets(packet)
     for key in ("run_id", "run_attempt", "job_id", "artifact_id", "retention_days_requested", "retention_days_accepted"):
         if not isinstance(packet[key], int) or packet[key] <= 0:
             raise ValueError(f"invalid {key}")
     if packet["retention_days_requested"] != 90 or packet["retention_days_accepted"] != 90:
         raise ValueError("requested and accepted retention must be exactly 90 days")
-    if not all(isinstance(packet[key], str) and len(packet[key]) == 64 for key in ("archive_sha256", "content_sha256", "record_self_sha256", "build_id")):
+    if not all(isinstance(packet[key], str) and _HEX64.fullmatch(packet[key]) for key in ("archive_sha256", "content_sha256", "record_self_sha256", "build_id")):
         raise ValueError("invalid artifact digest")
     if not isinstance(packet["head_sha"], str) or len(packet["head_sha"]) != 40:
         raise ValueError("invalid artifact head")
