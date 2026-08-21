@@ -64,6 +64,26 @@ def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> N
         assert required in readme_contract
 
 
+def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_closed() -> None:
+    """D-12/D-14/D-15/D-17 require typed, immutable hosted evidence bindings."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    for required in (
+        "retention-days: 90",
+        "phase07-entitlement-preflight",
+        "per-build-cap-seconds",
+        "run_attempt",
+        "retry_lineage",
+        "record_self_sha256",
+        "workflow_dispatch",
+    ):
+        assert required in workflow
+
+    import reconcile_ann_gate
+
+    assert hasattr(reconcile_ann_gate, "validate_phase07_evidence_packet")
+    assert hasattr(reconcile_ann_gate, "validate_feature_worktree_preflight")
+
+
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
     """D-06/D-08/D-09/D-10: a green workflow must exercise production paths."""
     ci = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

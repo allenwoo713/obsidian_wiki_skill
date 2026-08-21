@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "authoritative_generation": "locked-ci-only",
+  "method": {
+    "ci": "paired_basic_bootstrap_two_sided_95",
+    "permutation": "paired_two_sided",
+    "holm": "step_down",
+    "resamples": 10000,
+    "seed": "phase07-ann-statistics-v1",
+    "scipy_version": "1.15.3"
+  },
+  "paired_samples": {
+    "recall_at_10": [[0.18, 0.21], [0.19, 0.23], [0.22, 0.23], [0.20, 0.24]],
+    "recall_at_20": [[0.17, 0.20], [0.18, 0.21], [0.20, 0.21], [0.19, 0.22]]
+  },
+  "expected_results": "generated-and-sealed-by-locked-scipy-ci",
+  "record_self_sha256": "locked-ci-populates-canonical-payload-digest"
+}

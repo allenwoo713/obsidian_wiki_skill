@@ -96,6 +96,32 @@ def test_issue41_scale_gate_separates_exact_slo_from_coarse_wall_ceiling() -> No
     assert "--max-seconds 60" in scale_job
 
 
+def test_phase07_d16_reduced_real_sq_build_has_a_parent_owned_per_build_watchdog(
+    tmp_path: Path,
+) -> None:
+    """D-16/D-17/D-19: one real SQ create/reopen/query build is independently bounded.
+
+    This intentionally targets the production comparator seam, rather than a
+    fake worker.  Query-only ef values must reuse that one accepted build;
+    timeout, crash, malformed output, or partial indexes must be rejection-only.
+    """
+    runner = benchmark_ann_build.run_reduced_sq_build_watchdog
+    result = runner(
+        work_dir=tmp_path,
+        rows=64,
+        dimensions=8,
+        probes=4,
+        query_ef=(200, 300),
+        per_build_cap_seconds=30,
+    )
+    assert result["status"] == "complete"
+    assert result["per_build_cap_seconds"] == 30
+    assert result["build_count"] == 1
+    assert result["reopen_verified"] is True
+    assert result["query_ef"] == [200, 300]
+    assert result["normal_ann_request_count"] == 8
+
+
 def _stats(total: int) -> IndexStats:
     return IndexStats(index_name="dense_hnsw", indexed_rows=total, unindexed_dense_rows=0)
 
