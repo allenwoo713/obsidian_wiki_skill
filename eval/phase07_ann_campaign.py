@@ -404,6 +404,135 @@ def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: 
     return packet
 
 
+_CONFIRMATION_RAW_FILES = frozenset({
+    "confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json",
+    "dispatch-bundle.json", "allocation.json",
+})
+_CONFIRMATION_ARTIFACT_FILES = _CONFIRMATION_RAW_FILES | {"confirmation-packet.json"}
+
+
+def confirmation_raw_tree_sha256(root: Path) -> str:
+    """Digest the finite confirmation evidence tree without the self-referential wrapper."""
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("confirmation artifact directory")
+    names = set()
+    digest = hashlib.sha256()
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if path.is_symlink() or not path.is_file() or path.name not in _CONFIRMATION_RAW_FILES:
+            raise ValueError("strict confirmation artifact allowlist")
+        names.add(path.name)
+        digest.update(path.name.encode("utf-8")); digest.update(b"\0")
+        digest.update(path.read_bytes()); digest.update(b"\0")
+    if names != _CONFIRMATION_RAW_FILES:
+        raise ValueError("missing confirmation artifact evidence")
+    return digest.hexdigest()
+
+
+def _sealed_confirmation_json(path: Path, *, expected: str) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError("symlinked confirmation source")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {expected}") from exc
+    if not isinstance(value, dict) or value.get("record_self_sha256") != canonical_digest(value):
+        raise ValueError(f"unsealed {expected}")
+    return value
+
+
+def export_confirmation_packet(*, campaign_output_dir: Path, dispatch_bundle: Path,
+                               allocation_ledger: Path, artifact_dir: Path) -> None:
+    """Create the sole uploadable confirmation evidence tree from real campaign output."""
+    from eval.phase07_operator_gate import validate_confirmation_dispatch_bundle
+
+    if campaign_output_dir.is_symlink() or not campaign_output_dir.is_dir():
+        raise ValueError("confirmation campaign output directory")
+    source_names = {path.name for path in campaign_output_dir.iterdir()}
+    required_source = {"confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json"}
+    if source_names != required_source:
+        raise ValueError("strict confirmation campaign output allowlist")
+    request = _sealed_confirmation_json(campaign_output_dir / "confirmation-request.json", expected="confirmation request")
+    ledger = _sealed_confirmation_json(campaign_output_dir / "confirmation-ledger.json", expected="confirmation ledger")
+    result_record = _sealed_confirmation_json(campaign_output_dir / "confirmation-result.json", expected="confirmation result")
+    if request.get("stage") != "confirmation" or ledger.get("stage") != "confirmation" or result_record.get("stage") != "confirmation":
+        raise ValueError("confirmation campaign stage")
+    if result_record.get("request_sha256") != canonical_digest(request) or not isinstance(result_record.get("result"), dict):
+        raise ValueError("confirmation campaign request/result binding")
+    if dispatch_bundle.is_symlink() or allocation_ledger.is_symlink():
+        raise ValueError("symlinked confirmation binding")
+    try:
+        bundle = json.loads(dispatch_bundle.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid confirmation dispatch bundle") from exc
+    if not isinstance(bundle, dict) or set(bundle) != {"confirmation_request", "workflow_input"}:
+        raise ValueError("strict confirmation dispatch bundle")
+    workflow_inputs = validate_confirmation_dispatch_bundle(bundle, expected_head=request.get("environment", {}).get("head_sha", ""))
+    if bundle["workflow_input"] != request.get("workflow_inputs"):
+        raise ValueError("confirmation dispatch/request mismatch")
+    allocation = _sealed_confirmation_json(allocation_ledger, expected="confirmation allocation")
+    if set(allocation) != {"schema_version", "campaign_stage", "workflow_inputs_sha256", "status", "allocation", "record_self_sha256"} \
+            or allocation.get("schema_version") != 1 or allocation.get("campaign_stage") != "confirmation" \
+            or allocation.get("status") != "success" or allocation.get("workflow_inputs_sha256") != workflow_inputs["record_self_sha256"] \
+            or not isinstance(allocation.get("allocation"), dict):
+        raise ValueError("strict confirmation allocation ledger")
+    identity = allocation["allocation"]
+    if set(identity) != {"run_id", "run_attempt", "job_id", "job_key", "job_allocation_nonce"} \
+            or not all(isinstance(identity[key], int) and identity[key] > 0 for key in ("run_id", "run_attempt", "job_id")) \
+            or identity.get("job_key") != "phase07-confirmation" \
+            or not isinstance(identity.get("job_allocation_nonce"), str) or len(identity["job_allocation_nonce"]) < 32:
+        raise ValueError("confirmation allocation identity")
+    result = result_record["result"]
+    expected_run_identity = {name: identity[name] for name in ("run_id", "run_attempt", "job_id", "job_allocation_nonce")}
+    if result.get("workflow_inputs_sha256") != workflow_inputs["record_self_sha256"] \
+            or result.get("slot") != workflow_inputs["slot"] or result.get("run_identity") != expected_run_identity:
+        raise ValueError("confirmation result slot/allocation binding")
+    if artifact_dir.exists():
+        if artifact_dir.is_symlink() or any(artifact_dir.iterdir()):
+            raise ValueError("confirmation artifact destination must be empty")
+    else:
+        artifact_dir.mkdir(parents=True)
+    for name, source in (
+        ("confirmation-request.json", campaign_output_dir / "confirmation-request.json"),
+        ("confirmation-ledger.json", campaign_output_dir / "confirmation-ledger.json"),
+        ("confirmation-result.json", campaign_output_dir / "confirmation-result.json"),
+        ("dispatch-bundle.json", dispatch_bundle),
+        ("allocation.json", allocation_ledger),
+    ):
+        (artifact_dir / name).write_bytes(source.read_bytes())
+    raw_tree_sha256 = confirmation_raw_tree_sha256(artifact_dir)
+    packet = confirmation_packet_from_result(
+        result=result, workflow_inputs=workflow_inputs,
+        run_id=identity["run_id"], run_attempt=identity["run_attempt"], job_id=identity["job_id"],
+        job_key=identity["job_key"], job_allocation_nonce=identity["job_allocation_nonce"],
+        raw_tree_sha256=raw_tree_sha256,
+    )
+    file_digests = {name: hashlib.sha256((artifact_dir / name).read_bytes()).hexdigest() for name in sorted(_CONFIRMATION_RAW_FILES)}
+    wrapper = {"schema_version": 1, "kind": "phase07-confirmation-packet/v1", "packet": packet,
+               "raw_tree_sha256": raw_tree_sha256, "files": file_digests}
+    wrapper["record_self_sha256"] = canonical_digest(wrapper)
+    (artifact_dir / "confirmation-packet.json").write_text(json.dumps(wrapper, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    if {path.name for path in artifact_dir.iterdir()} != _CONFIRMATION_ARTIFACT_FILES:
+        raise ValueError("strict exported confirmation artifact allowlist")
+
+
+def _trusted_test_config(value: str | None) -> CampaignConfig | None:
+    """A pytest-only finite seam; ordinary CLI invocations retain immutable production scale."""
+    if value is None:
+        return None
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        raise ValueError("trusted test config is pytest-only")
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("trusted test config JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != {"rows", "dimensions", "probes", "work_dir"} \
+            or not all(isinstance(payload[key], int) and not isinstance(payload[key], bool) for key in ("rows", "dimensions", "probes")) \
+            or payload["dimensions"] != 384 or not 2 <= payload["probes"] < payload["rows"] <= 128 \
+            or not isinstance(payload["work_dir"], str) or not payload["work_dir"]:
+        raise ValueError("trusted test config")
+    return CampaignConfig(rows=payload["rows"], dimensions=payload["dimensions"], probes=payload["probes"], work_dir=Path(payload["work_dir"]))
+
+
 def execute(request: dict[str, Any], output_dir: Path, *, runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
     request = validate_request(request); output_dir.mkdir(parents=True, exist_ok=True); _write(output_dir / f"{request['stage']}-request.json", request); _write(output_dir / f"{request['stage']}-ledger.json", {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "authorization": "none"})
     try:
@@ -415,8 +544,27 @@ def execute(request: dict[str, Any], output_dir: Path, *, runner: Callable[[dict
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(); parser.add_argument("--request-file", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); args = parser.parse_args()
-    try: execute(json.loads(args.request_file.read_text(encoding="utf-8")), args.output_dir); return 0
+    if len(sys.argv) > 1 and sys.argv[1] == "export-confirmation-packet":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("command")
+        parser.add_argument("--campaign-output-dir", type=Path, required=True)
+        parser.add_argument("--dispatch-bundle", type=Path, required=True)
+        parser.add_argument("--allocation-ledger", type=Path, required=True)
+        parser.add_argument("--artifact-dir", type=Path, required=True)
+        args = parser.parse_args()
+        try:
+            export_confirmation_packet(campaign_output_dir=args.campaign_output_dir, dispatch_bundle=args.dispatch_bundle,
+                                       allocation_ledger=args.allocation_ledger, artifact_dir=args.artifact_dir)
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[FAIL] confirmation packet export: {exc}", file=os.sys.stderr)
+            return 1
+    parser = argparse.ArgumentParser(); parser.add_argument("--request-file", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); parser.add_argument("--trusted-test-config"); args = parser.parse_args()
+    try:
+        config = _trusted_test_config(args.trusted_test_config)
+        execute(json.loads(args.request_file.read_text(encoding="utf-8")), args.output_dir,
+                runner=Phase07AnnCampaignRunner(config).run if config else None)
+        return 0
     except (OSError, ValueError, json.JSONDecodeError) as exc: print(f"[FAIL] Phase 7 campaign: {exc}", file=os.sys.stderr); return 1
 
 

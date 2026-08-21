@@ -265,7 +265,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
             "schema_version": 1, "stage": "confirmation", "request_id": f"tiny-{index}",
             "environment": {"head_sha": HEAD}, "model_manifest_sha256": "a" * 64,
             "corpus_manifest_sha256": "b" * 64, "workflow_inputs": slot,
-            "run_identity": allocation["allocation"],
+            "run_identity": {name: allocation["allocation"][name] for name in ("run_id", "run_attempt", "job_id", "job_allocation_nonce")},
         }
         campaign_request_path = slot_root / "campaign-request.json"
         campaign_request_path.write_text(json.dumps(campaign_request), encoding="utf-8")
@@ -311,7 +311,9 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         # Keep a per-slot manifest rather than a packet fixture; the reconciler consumes it below.
         (slot_root / "evidence.json").write_text(json.dumps({"artifact_dir": str(extracted), "provenance": str(provenance_path)}), encoding="utf-8")
     evidence_manifest = tmp_path / "evidence-manifest.json"
-    evidence_manifest.write_text(json.dumps({"schema_version": 1, "evidence": [json.loads((path.parent / "evidence.json").read_text()) for path in artifact_dirs]}), encoding="utf-8")
+    manifest_payload = {"schema_version": 1, "evidence": [json.loads((path.parent / "evidence.json").read_text()) for path in artifact_dirs]}
+    manifest_payload["record_self_sha256"] = reconcile.canonical_digest(manifest_payload)
+    evidence_manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
     reconciled = tmp_path / "reconciled-ledger.json"
     result = subprocess.run([
         sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
@@ -321,3 +323,32 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
     ledger = json.loads(reconciled.read_text())
     assert len(ledger["eligible_evidence_runs"]) == 6
     assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
+
+    first = artifact_dirs[0]
+    provenance_path = first.parent / "provenance.json"
+    archive_path = first.parent / "archive.zip"
+    originals = {path: path.read_bytes() for path in (
+        archive_path, provenance_path, first / "confirmation-result.json", first / "dispatch-bundle.json",
+        first / "allocation.json", first / "confirmation-packet.json",
+    )}
+
+    def assert_rejected(mutator) -> None:
+        mutator()
+        rejected = subprocess.run([
+            sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
+            "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
+        ], cwd=root, capture_output=True, text=True, check=False)
+        assert rejected.returncode == 1
+        for path, content in originals.items():
+            path.write_bytes(content)
+
+    assert_rejected(lambda: archive_path.write_bytes(originals[archive_path] + b"tamper"))
+    def tamper_api_metadata() -> None:
+        value = json.loads(originals[provenance_path])
+        value["evidence"][0]["api_archive_sha256"] = "0" * 64
+        value["record_self_sha256"] = reconcile.canonical_digest(value)
+        provenance_path.write_text(json.dumps(value), encoding="utf-8")
+    assert_rejected(tamper_api_metadata)
+    for target in (first / "confirmation-result.json", first / "dispatch-bundle.json", first / "allocation.json"):
+        assert_rejected(lambda target=target: target.write_bytes(originals[target] + b"tamper"))
+    assert_rejected(lambda: (first / "confirmation-packet.json").write_text("{}", encoding="utf-8"))

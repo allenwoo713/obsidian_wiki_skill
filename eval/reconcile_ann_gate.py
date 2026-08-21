@@ -8,6 +8,7 @@ import json
 import math
 import sys
 import re
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -265,6 +266,174 @@ def reconcile_confirmation_request(request: dict, source: dict) -> dict:
         raise ValueError("exact six downloaded confirmation inputs")
     plan = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": sorted(inputs, key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
             "artifact_reported_nominated_m": request["artifact_reported_nominated_m"], "authoritative_nominated_m": request["authoritative_nominated_m"]}
+    plan["record_self_sha256"] = operator_digest(plan)
+    return reconcile_confirmation(plan, packets)
+
+
+_CONFIRMATION_RAW_FILES = frozenset({
+    "confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json",
+    "dispatch-bundle.json", "allocation.json",
+})
+_CONFIRMATION_ARTIFACT_FILES = _CONFIRMATION_RAW_FILES | {"confirmation-packet.json"}
+_CONFIRMATION_PROVENANCE_FIELDS = frozenset({
+    "run_id", "run_attempt", "job_id", "artifact_id", "artifact_name", "status", "conclusion",
+    "runner", "run_created_at", "artifact_expires_at", "api_archive_sha256", "local_archive_sha256",
+    "archive", "extracted_dir",
+})
+
+
+def _confirmation_tree_sha256(root: Path) -> str:
+    """Recompute the raw tree digest from the downloaded finite allowlist."""
+    if root.is_symlink() or not root.is_dir() or {path.name for path in root.iterdir()} != _CONFIRMATION_ARTIFACT_FILES:
+        raise ValueError("strict extracted confirmation allowlist")
+    # Do not create a helper directory in downloaded evidence.  Compute the same
+    # canonical name/NUL/content/NUL stream as the exporter directly.
+    digest = hashlib.sha256()
+    for name in sorted(_CONFIRMATION_RAW_FILES):
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("symlinked or missing confirmation evidence")
+        digest.update(name.encode("utf-8")); digest.update(b"\0")
+        digest.update(path.read_bytes()); digest.update(b"\0")
+    wrapper = root / "confirmation-packet.json"
+    if wrapper.is_symlink() or not wrapper.is_file():
+        raise ValueError("missing confirmation wrapper")
+    return digest.hexdigest()
+
+
+def _confirmation_timestamp(value: Any, label: str) -> dt.datetime:
+    parsed = _stage1_timestamp(value, label=f"confirmation {label}")
+    return parsed
+
+
+def _validate_confirmation_provenance(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _CONFIRMATION_PROVENANCE_FIELDS:
+        raise ValueError("strict confirmation API provenance schema")
+    if not all(isinstance(value[name], int) and value[name] > 0 for name in ("run_id", "run_attempt", "job_id", "artifact_id")) \
+            or not isinstance(value["artifact_name"], str) or not value["artifact_name"] \
+            or value["status"] != "completed" or value["conclusion"] != "success":
+        raise ValueError("confirmation API run/job/artifact status")
+    runner = value["runner"]
+    if not isinstance(runner, dict) or set(runner) != {"name", "group", "labels", "os", "image", "architecture"} \
+            or not isinstance(runner["name"], str) or not runner["name"] \
+            or not isinstance(runner["group"], str) or not runner["group"] \
+            or not isinstance(runner["labels"], list) or not runner["labels"] \
+            or runner["os"] != "Linux" or runner["architecture"] != "X64" \
+            or not isinstance(runner["image"], str) or not runner["image"]:
+        raise ValueError("confirmation runner identity")
+    created, expires = _confirmation_timestamp(value["run_created_at"], "created"), _confirmation_timestamp(value["artifact_expires_at"], "expiry")
+    if expires - created < dt.timedelta(days=90):
+        raise ValueError("confirmation artifact retention below 90 days")
+    for name in ("api_archive_sha256", "local_archive_sha256"):
+        if not isinstance(value[name], str) or not _HEX64.fullmatch(value[name]):
+            raise ValueError("confirmation archive digest schema")
+    archive, extracted = Path(value["archive"]), Path(value["extracted_dir"])
+    if archive.is_symlink() or not archive.is_file() or extracted.is_symlink() or not extracted.is_dir():
+        raise ValueError("confirmation downloaded archive/extraction unavailable")
+    local = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if value["api_archive_sha256"] != local or value["local_archive_sha256"] != local:
+        raise ValueError("confirmation API/local archive digest mismatch")
+    try:
+        with zipfile.ZipFile(archive) as compressed:
+            names = set(compressed.namelist())
+            if names != _CONFIRMATION_ARTIFACT_FILES:
+                raise ValueError("strict confirmation archive allowlist")
+            for name in _CONFIRMATION_ARTIFACT_FILES:
+                if compressed.read(name) != (extracted / name).read_bytes():
+                    raise ValueError("confirmation archive/extracted content mismatch")
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise ValueError("invalid confirmation downloaded archive") from exc
+    return value
+
+
+def _read_confirmation_artifact(root: Path, provenance: dict[str, Any], request: dict[str, Any]) -> tuple[dict, dict]:
+    """Validate one post-download packet and return its generated input plus packet."""
+    from eval.phase07_operator_gate import canonical_digest as operator_digest, validate_confirmation_dispatch_bundle
+
+    raw_tree = _confirmation_tree_sha256(root)
+    raw_files = {name: _read_json(root / name) for name in _CONFIRMATION_RAW_FILES}
+    for name in ("confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json", "allocation.json"):
+        payload = raw_files[name]
+        if payload.get("record_self_sha256") != campaign_digest(payload):
+            raise ValueError(f"confirmation artifact self digest: {name}")
+    wrapper = _read_json(root / "confirmation-packet.json")
+    if set(wrapper) != {"schema_version", "kind", "packet", "raw_tree_sha256", "files", "record_self_sha256"} \
+            or wrapper.get("schema_version") != 1 or wrapper.get("kind") != "phase07-confirmation-packet/v1" \
+            or wrapper.get("record_self_sha256") != campaign_digest(wrapper) \
+            or wrapper.get("raw_tree_sha256") != raw_tree or not isinstance(wrapper.get("files"), dict) \
+            or set(wrapper["files"]) != _CONFIRMATION_RAW_FILES:
+        raise ValueError("sealed confirmation packet wrapper")
+    if any(wrapper["files"][name] != hashlib.sha256((root / name).read_bytes()).hexdigest() for name in _CONFIRMATION_RAW_FILES):
+        raise ValueError("confirmation wrapper file digest mismatch")
+    bundle = raw_files["dispatch-bundle.json"]
+    generated = validate_confirmation_dispatch_bundle(bundle, expected_head=request.get("post_task0_head", ""))
+    if bundle.get("confirmation_request") != request:
+        raise ValueError("confirmation artifact request mismatch")
+    campaign_request, campaign_ledger, campaign_result = (raw_files[name] for name in ("confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json"))
+    if campaign_request.get("stage") != "confirmation" or campaign_ledger.get("stage") != "confirmation" \
+            or campaign_result.get("stage") != "confirmation" or campaign_request.get("workflow_inputs") != generated \
+            or campaign_result.get("request_sha256") != campaign_digest(campaign_request):
+        raise ValueError("confirmation campaign file binding")
+    allocation = raw_files["allocation.json"]
+    if set(allocation) != {"schema_version", "campaign_stage", "workflow_inputs_sha256", "status", "allocation", "record_self_sha256"} \
+            or allocation.get("status") != "success" or allocation.get("campaign_stage") != "confirmation" \
+            or allocation.get("workflow_inputs_sha256") != generated["record_self_sha256"]:
+        raise ValueError("confirmation allocation artifact binding")
+    identity = allocation.get("allocation")
+    if not isinstance(identity, dict) or set(identity) != {"run_id", "run_attempt", "job_id", "job_key", "job_allocation_nonce"}:
+        raise ValueError("confirmation allocation artifact identity")
+    if any(identity[name] != provenance[name] for name in ("run_id", "run_attempt", "job_id")) \
+            or identity.get("job_key") != "phase07-confirmation":
+        raise ValueError("confirmation API/allocation identity mismatch")
+    packet = wrapper.get("packet")
+    expected_run_identity = {name: identity[name] for name in ("run_id", "run_attempt", "job_id", "job_allocation_nonce")}
+    if not isinstance(packet, dict) or packet.get("raw_tree_sha256") != raw_tree \
+            or not isinstance(campaign_result.get("result"), dict) \
+            or campaign_result["result"].get("run_identity") != expected_run_identity \
+            or campaign_result["result"].get("slot") != generated["slot"] \
+            or campaign_result["result"].get("workflow_inputs_sha256") != generated["record_self_sha256"]:
+        raise ValueError("confirmation packet raw tree/result binding")
+    validate_confirmation_packet(packet, generated)
+    if packet["run_id"] != provenance["run_id"] or packet["run_attempt"] != provenance["run_attempt"] \
+            or packet["job_id"] != provenance["job_id"] or packet["job_allocation_nonce"] != identity["job_allocation_nonce"]:
+        raise ValueError("confirmation packet provenance identity mismatch")
+    return generated, packet
+
+
+def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
+    """Reconcile six downloaded, API-provenanced confirmation artifacts fail-closed."""
+    from eval.phase07_operator_gate import canonical_digest as operator_digest
+
+    if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
+        raise ValueError("sealed confirmation request")
+    if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "evidence", "record_self_sha256"} \
+            or manifest.get("schema_version") != 1 or manifest.get("record_self_sha256") != canonical_digest(manifest) \
+            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) != 6:
+        raise ValueError("strict six-record confirmation provenance manifest")
+    inputs, packets, seen_archives = [], [], set()
+    for row in manifest["evidence"]:
+        if not isinstance(row, dict) or set(row) != {"artifact_dir", "provenance"}:
+            raise ValueError("strict confirmation evidence record")
+        provenance_document = _read_json(Path(row["provenance"]))
+        if set(provenance_document) != {"schema_version", "evidence", "record_self_sha256"} \
+                or provenance_document.get("schema_version") != 1 \
+                or provenance_document.get("record_self_sha256") != canonical_digest(provenance_document) \
+                or not isinstance(provenance_document.get("evidence"), list) or len(provenance_document["evidence"]) != 1:
+            raise ValueError("strict per-artifact API provenance document")
+        provenance = _validate_confirmation_provenance(provenance_document["evidence"][0])
+        if provenance["archive"] in seen_archives:
+            raise ValueError("replayed confirmation archive")
+        seen_archives.add(provenance["archive"])
+        if Path(row["artifact_dir"]).resolve() != Path(provenance["extracted_dir"]).resolve():
+            raise ValueError("manifest/extracted artifact mismatch")
+        generated, packet = _read_confirmation_artifact(Path(row["artifact_dir"]), provenance, request)
+        inputs.append(generated); packets.append(packet)
+    if len({item["record_self_sha256"] for item in inputs}) != 6:
+        raise ValueError("duplicate confirmation input provenance")
+    plan = {"schema_version": 1, "confirmation_request": request,
+            "workflow_inputs": sorted(inputs, key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
+            "artifact_reported_nominated_m": request["artifact_reported_nominated_m"],
+            "authoritative_nominated_m": request["authoritative_nominated_m"]}
     plan["record_self_sha256"] = operator_digest(plan)
     return reconcile_confirmation(plan, packets)
 
@@ -701,8 +870,19 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--confirmation-request", type=Path)
     parser.add_argument("--confirmation-ledger", type=Path)
+    parser.add_argument("--confirmation-evidence-manifest", type=Path)
     args = parser.parse_args()
     try:
+        if args.confirmation_evidence_manifest is not None:
+            if args.confirmation_request is None or args.output is None or args.mode != "confirmation-postdownload":
+                raise ValueError("post-download confirmation reconciliation requires request, manifest, output, and mode")
+            result = reconcile_confirmation_postdownload(
+                _read_json(args.confirmation_request), _read_json(args.confirmation_evidence_manifest),
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print("[PASS] post-download confirmation ANN reconciliation", file=sys.stderr)
+            return 0
         if args.confirmation_request is not None or args.confirmation_ledger is not None:
             if args.confirmation_request is None or args.confirmation_ledger is None or args.mode != "confirmation":
                 raise ValueError("confirmation reconciliation requires request, downloaded ledger, and confirmation mode")
