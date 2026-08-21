@@ -13,6 +13,10 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
+import lancedb
+from eval import benchmark_ann_build as benchmark
+from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+
 from eval.ann_frontier_statistics import validate_declared_family
 
 STAGES = frozenset({"screening", "confirmation", "continuation"})
@@ -67,6 +71,48 @@ def screening_plan() -> dict[str, Any]:
     return {"corpus": {"rows": 77348, "dimensions": 384, "queries": 256, "truth": "seeded_vector_exact"}, "index": {"type": "hnsw_sq", "m": [16,20,32], "ef_construction": 300}, "query_ef": [100,150,200,300], "replicates": 3, "per_build_max_seconds": 180, "authorization": "none"}
 
 
+class Phase07AnnCampaignRunner:
+    """Production LanceDB campaign seam; tests only shrink its numeric inputs."""
+    def __init__(self, *, rows: int = 77_348, dimensions: int = 384, probes: int = 256,
+                 work_dir: Path | None = None, per_build_max_seconds: float = 180.0) -> None:
+        self.rows, self.dimensions, self.probes = rows, dimensions, probes
+        self.work_dir = work_dir or Path(".review-tmp/phase07-builds")
+        self.per_build_max_seconds = per_build_max_seconds
+
+    def _truth(self, root: Path) -> tuple[tuple[tuple[str, ...], ...], float]:
+        corpus = benchmark._vectors(self.rows, self.dimensions, benchmark.CORPUS_SEED)
+        queries = benchmark._vectors(self.probes, self.dimensions, benchmark.QUERY_SEED)
+        if benchmark._row_hashes(corpus) & benchmark._row_hashes(queries): raise ValueError("query/corpus overlap")
+        truth_dir = root / "truth"; lancedb.connect(str(truth_dir)).create_table("dense_chunks", data=benchmark._arrow_table(corpus, [f"synthetic::{i:016x}" for i in range(self.rows)]))
+        import time
+        started = time.perf_counter(); exact = LanceDbIndexRepository(truth_dir).search_dense_exact_batch(queries.tolist(), metric="cosine", limit=20, row_batch_size=8192, query_batch_size=32)
+        return exact.result_ids, (time.perf_counter() - started) * 1000
+
+    def _build(self, root: Path, *, m: int, ef_construction: int, query_ef: tuple[int, ...], exact_ids: tuple[tuple[str, ...], ...], exact_ms: float) -> dict[str, Any]:
+        run, records = benchmark._candidate_worker("ivf-hnsw-sq", str(root / f"m{m}-efc{ef_construction}"), self.rows, self.dimensions, self.probes, query_ef, exact_ids, exact_ms, m=m, ef_construction=ef_construction)
+        if run["index_build_ms"] / 1000 > self.per_build_max_seconds: raise RuntimeError("reject-evidence: per-build watchdog")
+        return {"build": run, "queries": records}
+
+    def screening(self) -> dict[str, Any]:
+        import tempfile
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="phase07-campaign-", dir=self.work_dir) as raw:
+            root=Path(raw); exact, exact_ms=self._truth(root)
+            builds=[self._build(root, m=m, ef_construction=300, query_ef=(100,150,200,300), exact_ids=exact, exact_ms=exact_ms) for m in (16,20,32)]
+        return {"plan": screening_plan(), "exact_truth_computed_once": True, "build_count": 3, "builds": builds, "authorization": "none"}
+
+    def confirmation(self, request: dict[str, Any]) -> dict[str, Any]:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="phase07-confirm-", dir=self.work_dir) as raw:
+            root=Path(raw); exact, exact_ms=self._truth(root); build=self._build(root, m=request["nominated_m"][0], ef_construction=300, query_ef=(200,300), exact_ids=exact, exact_ms=exact_ms)
+        return {"replicate": build, "run_identity": request["run_identity"], "run_ordinal": request["run_ordinal"], "authorization":"none"}
+
+    def continuation(self, request: dict[str, Any]) -> dict[str, Any]:
+        mode=request["mode"]
+        if mode not in {"stage2_sq", "flat_diagnostic", "refinement"}: raise ValueError("model-backed continuation requires run_eval production facade binding")
+        return {"mode": mode, "prior_evidence_sha256": request["prior_evidence_sha256"], "authorization":"none"}
+
+
 def _write(path: Path, value: dict[str, Any]) -> None:
     value["record_self_sha256"] = canonical_digest(value)
     path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -78,8 +124,11 @@ def execute(request: dict[str, Any], output_dir: Path, *, runner: Callable[[dict
     ledger = {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "authorization": "none"}
     _write(output_dir / f"{request['stage']}-ledger.json", ledger)
     try:
-        payload = screening_plan() if request["stage"] == "screening" else {"mode": request.get("mode", "confirmation"), "authorization": "none"}
-        result = runner(payload) if runner else payload
+        if runner:
+            result = runner(screening_plan() if request["stage"] == "screening" else {"mode": request.get("mode", "confirmation"), "authorization": "none"})
+        else:
+            production = Phase07AnnCampaignRunner()
+            result = production.screening() if request["stage"] == "screening" else production.confirmation(request) if request["stage"] == "confirmation" else production.continuation(request)
         if not isinstance(result, dict) or result.get("authorization") != "none": raise ValueError("campaign results are evidence only")
         record = {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "result": result, "authorization": "none"}
         _write(output_dir / f"{request['stage']}-result.json", record); return record

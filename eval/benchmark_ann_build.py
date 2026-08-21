@@ -447,6 +447,8 @@ def _candidate_worker(
     ef_grid: tuple[int, ...],
     exact_ids: tuple[tuple[str, ...], ...],
     exact_time_ms: float,
+    m: int = 16,
+    ef_construction: int = 300,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build and query one isolated candidate in a bounded worker process.
 
@@ -475,7 +477,7 @@ def _candidate_worker(
     index_build_start = time.perf_counter()
     stats = repository.create_vector_index(VectorIndexConfig(
         index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
-        m=16, ef_construction=300, dense_chunks_count=rows,
+        m=m, ef_construction=ef_construction, dense_chunks_count=rows,
     ))
     index_build_end = time.perf_counter()
     total_bytes = _directory_bytes(lance_dir)
@@ -524,6 +526,7 @@ def _candidate_worker(
     candidate_end = time.perf_counter()
     return {
         "candidate": candidate, "candidate_run_id": run_id,
+        "m": m, "ef_construction": ef_construction,
         "candidate_start_monotonic": candidate_start,
         "table_create_start_monotonic": table_create_start, "table_create_end_monotonic": table_create_end,
         "index_build_start_monotonic": index_build_start, "index_build_end_monotonic": index_build_end,
