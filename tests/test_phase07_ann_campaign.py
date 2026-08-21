@@ -4,6 +4,8 @@ import json
 import math
 import random
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -91,6 +93,33 @@ def test_request_schema_seals_success_and_rejection_artifacts(tmp_path: Path) ->
         execute(_request(), tmp_path / "watchdog", runner=timeout.run)
     rejected = json.loads((tmp_path / "watchdog" / "screening-rejection.json").read_text())
     assert rejected["status"] == "reject-evidence" and rejected["record_self_sha256"]
+
+
+def test_direct_campaign_script_cli_reaches_request_validation_without_running_stress_matrix(
+    tmp_path: Path,
+) -> None:
+    """The hosted workflow invokes the script path, not ``python -m``."""
+    request = tmp_path / "invalid-request.json"
+    request.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "eval/phase07_ann_campaign.py",
+            "--request-file",
+            str(request),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "[FAIL] Phase 7 campaign: typed Phase 7 request" in result.stderr
+    assert not (tmp_path / "output").exists()
 
 
 def test_representative_request_rejects_noncurrent_baseline_before_artifacts(tmp_path: Path) -> None:
