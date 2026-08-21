@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -139,6 +140,37 @@ def _post_download_request(artifact_dir: Path, result: dict[str, object]) -> dic
         **identity,
         "branch": "feature/issue-50-dense-ann-recall",
         "workflow_path": ".github/workflows/eval.yml",
+        "run_created_at": "2026-08-21T00:00:00Z",
+        "api_provenance": {
+            "workflow_run": {
+                "run_id": 991,
+                "run_attempt": 1,
+                "head_branch": "feature/issue-50-dense-ann-recall",
+                "head_sha": "a" * 40,
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-08-21T00:00:00Z",
+            },
+            "job": {
+                "job_id": 881,
+                "run_id": 991,
+                "job_key": "phase07-screening",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            "artifact": {
+                "artifact_id": 771,
+                "job_id": 881,
+                "job_key": "phase07-screening",
+                "run_id": 991,
+                "name": "phase07-screening-991-1",
+                "created_at": "2026-08-21T00:00:00Z",
+                "expires_at": "2026-11-19T00:00:00Z",
+                "expired": False,
+            },
+        },
+        "workflow_retention_days": 90,
         "artifact": {
             "artifact_id": 771,
             "name": "phase07-screening-991-1",
@@ -167,6 +199,60 @@ def _post_download_request(artifact_dir: Path, result: dict[str, object]) -> dic
     }
     _seal(request)
     return request
+
+
+def test_stage1_reconciler_direct_script_cli_bootstraps_package_imports() -> None:
+    """The production ``python eval/reconcile_ann_gate.py`` entry point imports cleanly."""
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "eval" / "reconcile_ann_gate.py"), "--help"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--stage1-request" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    ["missing-anchor", "too-short", "too-long", "api-anchor-mismatch", "api-artifact-mismatch", "workflow-retention"],
+)
+def test_stage1_retention_uses_trusted_workflow_run_creation_anchor(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]], mutate: str,
+) -> None:
+    """GitHub expiry is 90 days from run creation, never artifact upload completion."""
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    request = _post_download_request(artifact_dir, result)
+    artifact = request["artifact"]
+    api = request["api_provenance"]
+    assert isinstance(artifact, dict) and isinstance(api, dict)
+    if mutate == "missing-anchor":
+        request.pop("run_created_at")
+    elif mutate == "too-short":
+        artifact["expires_at"] = "2026-11-18T23:59:29Z"
+        api["artifact"]["expires_at"] = artifact["expires_at"]
+    elif mutate == "too-long":
+        artifact["expires_at"] = "2026-11-19T00:00:31Z"
+        api["artifact"]["expires_at"] = artifact["expires_at"]
+    elif mutate == "api-anchor-mismatch":
+        api["workflow_run"]["created_at"] = "2026-08-21T00:05:00Z"
+    elif mutate == "api-artifact-mismatch":
+        api["artifact"]["job_id"] = 999
+    else:
+        request["workflow_retention_days"] = 89
+    _seal(request)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        reconcile_stage1_screening(
+            stage1_request=request_path, artifact_dir=artifact_dir,
+            output=tmp_path / "stage1-ledger.json", mode="screening", expected_shape=(48, 384, 8),
+        )
 
 
 def _reseal_bundle(bundle: Path, result: dict[str, object]) -> dict[str, object]:
