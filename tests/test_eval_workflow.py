@@ -274,6 +274,12 @@ def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key()
     assert "/attempts/{run_attempt}/jobs" in (SKILL_ROOT / "eval/phase07_operator_gate.py").read_text()
 
 
+def test_confirmation_workflow_exports_a_sealed_packet_wrapper_from_campaign_output() -> None:
+    workflow = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
+    assert "confirmation_packet_from_result" in workflow
+    assert "confirmation-packet-wrapper.json" in workflow
+
+
 def test_reconcile_hosted_seals_success_and_rejection(tmp_path: Path) -> None:
     import phase07_operator_gate as gate
     packet = {"repository":"owner/repo","run_id":1,"run_attempt":1,"job_id":2,"job_allocation_nonce":"0123456789abcdef","artifact_id":3,"artifact_name":"x","archive_sha256":"a"*64,"content_sha256":"b"*64,"record_self_sha256":"","retention_days_requested":90,"retention_days_accepted":90,"head_sha":"c"*40,"runner":{"os":"Linux","image":"ubuntu","architecture":"X64"},"lock_identity":"locked","build_id":"d"*64,"retry_lineage":{"failure_class":"github_infrastructure","original_run_id":None,"replacement_run_id":None}}
