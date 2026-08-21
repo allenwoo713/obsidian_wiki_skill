@@ -60,7 +60,7 @@ def _git(*args: str) -> str:
 
 def validate_feature_worktree_preflight(request: dict[str, Any], *, root: Path | None = None) -> dict[str, Any]:
     """Validate exact feature worktree identity and its explicit dirty policy."""
-    allowed = {"repository", "branch", "worktree_root", "head_sha", "allowed_dirty_paths", "workflow_name", "campaign_stage", "continuation_binding", "require_upstream_head"}
+    allowed = {"repository", "branch", "worktree_root", "head_sha", "allowed_dirty_paths", "workflow_name", "campaign_stage", "continuation_binding", "require_upstream_head", "ledger_path"}
     unknown = set(request) - allowed
     if unknown:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
@@ -127,6 +127,8 @@ def _write_ledger(path: Path, record: dict[str, Any]) -> None:
 def run_preflight(request_file: Path, ledger_file: Path) -> int:
     request = _read_object(request_file)
     _reject_secrets(request)
+    if request.get("ledger_path") != str(ledger_file.resolve()):
+        raise ValueError("request must bind the exact ledger output path")
     evidence = validate_feature_worktree_preflight(request)
     record = {"schema_version": 1, "mode": "preflight", "request": request, "branch_head_status": evidence, "asvs_l1": {"input_validation": "pass", "access_control": "pending-hosted-proof", "secret_handling": "pass", "artifact_trust_boundary": "pending-hosted-proof"}}
     _write_ledger(ledger_file, record)
