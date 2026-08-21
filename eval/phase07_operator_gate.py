@@ -60,7 +60,7 @@ def _git(*args: str) -> str:
 
 def validate_feature_worktree_preflight(request: dict[str, Any], *, root: Path | None = None) -> dict[str, Any]:
     """Validate exact feature worktree identity and its explicit dirty policy."""
-    allowed = {"repository", "branch", "worktree_root", "head_sha", "allowed_dirty_paths", "workflow_name", "campaign_stage", "continuation_binding", "require_upstream_head", "ledger_path"}
+    allowed = {"repository", "branch", "worktree_root", "head_sha", "allowed_dirty_paths", "workflow_name", "campaign_stage", "continuation_binding", "require_upstream_head", "ledger_path", "evidence_packet"}
     unknown = set(request) - allowed
     if unknown:
         raise ValueError(f"unknown request fields: {sorted(unknown)}")
