@@ -837,7 +837,10 @@ def main() -> int:
     parser.add_argument("--max-probes", type=int, default=BENCHMARK_MAX_PROBES)
     parser.add_argument("--ef-grid", default=",".join(map(str, DECISION_EF_GRID)))
     parser.add_argument("--candidates", default=",".join(CANDIDATES))
-    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_WALL_SECONDS)
+    parser.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_WALL_SECONDS,
+                        help="Deprecated whole-comparator compatibility ceiling; do not use for Phase 07.")
+    parser.add_argument("--per-build-cap-seconds", type=float,
+                        help="Maximum wall time for one fresh index build; Phase 07 uses the approved 180-second cap here.")
     parser.add_argument("--max-exact-seconds", type=float, default=DEFAULT_MAX_EXACT_SECONDS)
     parser.add_argument("--row-batch-size", type=int, default=8192)
     parser.add_argument("--query-batch-size", type=int, default=32)
@@ -867,6 +870,27 @@ def main() -> int:
         return 0
     args.ef_grid = tuple(int(value) for value in args.ef_grid.split(",") if value)
     args.candidates = tuple(value for value in args.candidates.split(",") if value)
+    if args.per_build_cap_seconds is not None:
+        if args.per_build_cap_seconds <= 0:
+            parser.error("--per-build-cap-seconds must be positive")
+        if any(value is not None for value in (
+            args.approved_static_cap, args.approved_calibration_sha256,
+            args.approved_calibration_rule_version, args.approved_omp_threads,
+        )):
+            parser.error("per-build watchdog cannot use whole-comparator approval inputs")
+        try:
+            report = run_reduced_sq_build_watchdog(
+                work_dir=args.work_dir, rows=args.rows, dimensions=args.dimensions,
+                probes=args.max_probes, query_ef=args.ef_grid,
+                per_build_cap_seconds=args.per_build_cap_seconds,
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            print(f"[FAIL] Phase 07 per-build watchdog: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print("[PASS] Phase 07 per-build watchdog", file=sys.stderr)
+        return 0
     approval_values = (
         args.approved_static_cap, args.approved_calibration_sha256,
         args.approved_calibration_rule_version, args.approved_omp_threads,

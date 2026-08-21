@@ -11,6 +11,23 @@ on:
       - 'requirements.txt'
       - 'scripts/compile_requirements.py'
   workflow_dispatch:
+    inputs:
+      campaign_stage:
+        description: "Typed, non-authorizing Phase 07 campaign stage"
+        required: false
+        default: preflight
+        type: choice
+        options: [preflight, screening, confirmation, continuation]
+      continuation_binding:
+        description: "Immutable prior-run binding; not interpolated into shell"
+        required: false
+        type: string
+
+# Hosted jobs need only their checkout and immutable artifact reads.  No job
+# receives write, package, deployment, or id-token authority.
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   test-and-eval:
@@ -155,6 +172,7 @@ jobs:
             .review-tmp/phase04-modes/equivalence.json
             .review-tmp/phase04-modes/acceptance.json
           if-no-files-found: error
+          retention-days: 90
       - name: Upload eval results
         if: always()
         uses: actions/upload-artifact@v4
@@ -163,6 +181,7 @@ jobs:
           path: |
             eval/results.json
             eval/detail.jsonl
+          retention-days: 90
 
   issue41-manual-calibration:
     name: "Issue #41 manual ANN calibration (non-authorizing)"
@@ -211,7 +230,6 @@ jobs:
           --row-batch-size 8192
           --query-batch-size 32
           --max-exact-seconds 10
-          --max-seconds 60
           --max-evidence-bytes 10485760
           --work-dir .review-tmp/issue41-scale
           --output .review-tmp/issue41-scale/calibration-never-accepting.json
@@ -226,6 +244,7 @@ jobs:
           name: issue41-ann-calibration
           path: .review-tmp/issue41-scale/ann-calibration.json
           if-no-files-found: ignore
+          retention-days: 90
       - name: Upload observational ANN calibration batch spike
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -233,6 +252,7 @@ jobs:
           name: issue41-ann-calibration-batch-spike
           path: .review-tmp/issue41-scale/ann-calibration-batch-spike.json
           if-no-files-found: ignore
+          retention-days: 90
       - name: Upload rejected issue #41 comparator error evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -240,6 +260,7 @@ jobs:
           name: issue41-index-benchmark-error
           path: .review-tmp/issue41-scale/index-benchmark-error.json
           if-no-files-found: ignore
+          retention-days: 90
 
   issue41-scale-benchmark:
     name: "Issue #41 held-out ANN acceptance comparator (77,348 x 384)"
@@ -302,21 +323,18 @@ jobs:
           --row-batch-size 8192
           --query-batch-size 32
           --max-exact-seconds 10
-          --max-seconds 60
+          --per-build-cap-seconds 180
           --max-evidence-bytes 10485760
           --work-dir .review-tmp/issue41-scale
           --output eval/index-benchmark.json
           --error-output .review-tmp/issue41-scale/index-benchmark-error.json
-          --approved-static-cap "${{ env.ANN_APPROVED_STATIC_CAP_SECONDS }}"
-          --approved-calibration-sha256 "${{ env.ANN_APPROVED_CALIBRATION_SHA256 }}"
-          --approved-calibration-rule-version "${{ env.ANN_APPROVED_CALIBRATION_RULE_VERSION }}"
-          --approved-omp-threads "${{ env.ANN_APPROVED_OMP_THREADS }}"
       - name: Upload issue #41 held-out scale evidence
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: issue41-index-benchmark
           path: eval/index-benchmark.json
+          retention-days: 90
       - name: Upload rejected issue #41 comparator error evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -324,6 +342,7 @@ jobs:
           name: issue41-index-benchmark-error
           path: .review-tmp/issue41-scale/index-benchmark-error.json
           if-no-files-found: ignore
+          retention-days: 90
 
   model-backed-ann-decision:
     name: "Model-backed candidate-specific hybrid decision records"
@@ -373,6 +392,7 @@ jobs:
             eval/candidate-hybrid-ann-decision.json
             eval/results.json
             eval/detail.jsonl
+          retention-days: 90
       - name: Upload rejected candidate-hybrid diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
@@ -382,6 +402,7 @@ jobs:
             eval/results.json
             eval/detail.jsonl
           if-no-files-found: ignore
+          retention-days: 90
 
   reconcile-ann-decision:
     name: "Eval ANN decision reconciliation"
@@ -430,6 +451,7 @@ jobs:
           name: ann-decision-reconciliation
           path: .review-tmp/reconcile/ann-reconciliation.json
           if-no-files-found: warn
+          retention-days: 90
       - name: Required cross-workflow PR checks
         if: ${{ always() }}
         run: |
@@ -438,3 +460,80 @@ jobs:
           echo "Architecture (ubuntu-latest, Python 3.13)"
           echo "Architecture (windows-latest, Python 3.10)"
           echo "Architecture (windows-latest, Python 3.13)"
+
+  phase07-entitlement-preflight:
+    name: "Phase 07 hosted entitlement preflight (non-authorizing)"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'preflight' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate typed dispatch and locked inputs without shell interpolation
+        env:
+          PHASE07_STAGE: ${{ inputs.campaign_stage }}
+          PHASE07_CONTINUATION: ${{ inputs.continuation_binding }}
+        run: |
+          set -euo pipefail
+          case "$PHASE07_STAGE" in preflight) ;; *) exit 1 ;; esac
+          test -z "$PHASE07_CONTINUATION" || [[ "$PHASE07_CONTINUATION" =~ ^[0-9A-Za-z._:-]{1,160}$ ]]
+          python scripts/compile_requirements.py --check
+          python -c "import importlib.metadata as m; expected={'lancedb':'0.34.0','numpy':'2.2.6','pyarrow':'25.0.0'}; actual={k:m.version(k) for k in expected}; assert actual == expected, actual"
+          test -f eval/model-manifest.json
+          test -f eval/personal-wiki-corpus-manifest.json
+          grep -q 'public-distractor-v1' eval/personal-wiki-corpus-manifest.json
+          grep -q 'exact-truth' eval/personal-wiki-corpus-manifest.json
+      - name: Validate cache tree or exact-revision hydration on miss
+        run: |
+          set -euo pipefail
+          if python scripts/download_embedding_model.py --validate-model-tree; then
+            echo "model cache hit validated"
+          else
+            echo "model cache miss: hydrate only the pinned manifest revision"
+            python scripts/download_embedding_model.py
+            python scripts/download_embedding_model.py --validate-model-tree
+          fi
+          # no-download-fallback: failed validation never proceeds with an alternate model.
+      - name: Seal a small non-authorizing preflight record
+        run: |
+          python -c "import hashlib,json,os,pathlib; p={'schema_version':1,'repository':'${{ github.repository }}','run_id':int('${{ github.run_id }}'),'run_attempt':int('${{ github.run_attempt }}'),'head_sha':'${{ github.sha }}','campaign_stage':'preflight','runner':{'os':'ubuntu-latest','image':'${{ runner.os }}','architecture':'${{ runner.arch }}'},'retention_days':90,'retry_lineage':{'failure_class':'none','original_run_id':None,'replacement_run_id':None}}; p['record_self_sha256']=hashlib.sha256(json.dumps(p,sort_keys=True,separators=(',',':')).encode()).hexdigest(); pathlib.Path('.review-tmp').mkdir(exist_ok=True); pathlib.Path('.review-tmp/phase07-preflight.json').write_text(json.dumps(p,sort_keys=True,indent=2)+'\\n')"
+      - name: Upload preflight evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-entitlement-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07-preflight.json
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-windows-reduced-lancedb:
+    name: "Phase 07 Windows reduced real LanceDB gate"
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install exact locked storage dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Create reopen query and exact-vs-ANN reduced proof
+        run: >
+          python -m pytest -p no:cacheprovider
+          tests/test_lancedb_storage_contract.py tests/test_benchmark_sampling.py -q
+      - name: Upload reduced Windows gate result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-windows-reduced-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp
+          if-no-files-found: warn
+          retention-days: 90

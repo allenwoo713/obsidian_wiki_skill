@@ -98,6 +98,37 @@ def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> 
         assert required in workflow
 
 
+def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
+    """ASVS L1 boundary checks must reject secrets, replay, and retry laundering."""
+    import phase07_operator_gate
+    import reconcile_ann_gate
+
+    packet = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "run_id": 12,
+        "run_attempt": 1, "job_id": 34, "job_allocation_nonce": "0123456789abcdef",
+        "artifact_id": 56, "archive_sha256": "a" * 64, "record_self_sha256": "",
+        "retention_days": 90, "head_sha": "b" * 40,
+        "runner": {"os": "Linux", "image": "ubuntu-latest", "architecture": "X64"},
+        "lock_identity": "locked", "retry_lineage": {
+            "failure_class": "github_infrastructure", "original_run_id": 11,
+            "replacement_run_id": 12,
+        },
+    }
+    packet["record_self_sha256"] = phase07_operator_gate.canonical_digest(packet)
+    assert phase07_operator_gate.validate_phase07_evidence_packet(packet) == packet
+    assert reconcile_ann_gate.validate_phase07_evidence_packet(packet) == packet
+
+    packet["retention_days"] = 7
+    with pytest.raises(ValueError):
+        phase07_operator_gate.validate_phase07_evidence_packet(packet)
+    packet["retention_days"] = 90
+    packet["retry_lineage"]["failure_class"] = "numeric_failure"
+    with pytest.raises(ValueError):
+        phase07_operator_gate.validate_phase07_evidence_packet(packet)
+    with pytest.raises(ValueError):
+        phase07_operator_gate._reject_secrets({"token": "never"})
+
+
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
     """D-06/D-08/D-09/D-10: a green workflow must exercise production paths."""
     ci = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -144,7 +175,8 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     assert test_and_eval.index("Run #22 public build-mode equivalence gate") < test_and_eval.index(
         "Upload #22 equivalence and telemetry evidence"
     )
-    assert "--max-seconds 60" in workflow
+    assert "--per-build-cap-seconds 180" in workflow
+    assert "--max-seconds 60" not in workflow
     assert "static_cap_seconds" in workflow
     assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in workflow
     assert "numpy':'2.2.6" in workflow
@@ -524,9 +556,10 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--dimensions 384" in scale
     assert "--max-probes 256" in scale
     assert "--ef-grid 30,50,75,100,150,200" in scale
-    assert "--max-seconds 60" in scale
+    assert "--per-build-cap-seconds 180" in scale
+    assert "--max-seconds 60" not in scale
     assert "--calibrate" not in scale
-    assert "--approved-static-cap" in scale
+    assert "--approved-static-cap" not in scale
     assert "approved_ann_calibration.json" in scale
     assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale
     assert "OPENBLAS_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale

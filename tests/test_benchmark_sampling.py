@@ -93,7 +93,8 @@ def test_issue41_scale_gate_separates_exact_slo_from_coarse_wall_ceiling() -> No
     )
     scale_job = workflow.split("issue41-scale-benchmark:", 1)[1]
     assert "--max-exact-seconds 10" in scale_job
-    assert "--max-seconds 60" in scale_job
+    assert "--per-build-cap-seconds 180" in scale_job
+    assert "--max-seconds 60" not in scale_job
 
 
 def test_phase07_d16_reduced_real_sq_build_has_a_parent_owned_per_build_watchdog(

@@ -11,6 +11,16 @@ from benchmark_ann_build import validate_evidence
 from run_eval import validate_candidate_decision_records
 
 
+PHASE07_PACKET_FIELDS = frozenset({
+    "repository", "run_id", "run_attempt", "job_id", "job_allocation_nonce",
+    "artifact_id", "archive_sha256", "record_self_sha256", "retention_days",
+    "head_sha", "runner", "lock_identity", "retry_lineage",
+})
+PHASE07_INFRA_FAILURES = frozenset({
+    "github_infrastructure", "hosted_runner_unavailable", "artifact_service",
+})
+
+
 ARCHITECTURE_REQUIRED_CHECKS = (
     "Architecture (ubuntu-latest, Python 3.10)",
     "Architecture (ubuntu-latest, Python 3.13)",
@@ -33,6 +43,58 @@ def _canonical_sha256(payload: dict) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def validate_feature_worktree_preflight(record: dict) -> dict:
+    """Reject an operator ledger that does not seal a non-default feature checkout."""
+    if not isinstance(record, dict):
+        raise ValueError("feature worktree preflight must be an object")
+    branch_state = record.get("branch_head_status")
+    if not isinstance(branch_state, dict):
+        raise ValueError("missing branch/head/status evidence")
+    branch = branch_state.get("branch")
+    head = branch_state.get("head_sha")
+    root = branch_state.get("worktree_root")
+    status = branch_state.get("status")
+    if not isinstance(branch, str) or branch in {"master", "main"}:
+        raise ValueError("unsafe feature branch evidence")
+    if not isinstance(head, str) or len(head) != 40:
+        raise ValueError("invalid feature head evidence")
+    if not isinstance(root, str) or not root:
+        raise ValueError("missing worktree root evidence")
+    if not isinstance(status, list) or not all(isinstance(item, str) for item in status):
+        raise ValueError("invalid worktree status evidence")
+    return branch_state
+
+
+def validate_phase07_evidence_packet(packet: dict) -> dict:
+    """Validate remote artifact identity, retention, digest, and retry lineage."""
+    if not isinstance(packet, dict) or set(packet) != PHASE07_PACKET_FIELDS:
+        raise ValueError("incomplete or unknown Phase 07 artifact fields")
+    for key in ("run_id", "run_attempt", "job_id", "artifact_id", "retention_days"):
+        if not isinstance(packet[key], int) or packet[key] <= 0:
+            raise ValueError(f"invalid {key}")
+    if packet["retention_days"] != 90:
+        raise ValueError("artifact retention must be 90 days")
+    if not all(isinstance(packet[key], str) and len(packet[key]) == 64 for key in ("archive_sha256", "record_self_sha256")):
+        raise ValueError("invalid artifact digest")
+    if not isinstance(packet["head_sha"], str) or len(packet["head_sha"]) != 40:
+        raise ValueError("invalid artifact head")
+    if not isinstance(packet["job_allocation_nonce"], str) or len(packet["job_allocation_nonce"]) < 16:
+        raise ValueError("invalid job allocation nonce")
+    runner = packet["runner"]
+    if not isinstance(runner, dict) or not {"os", "image", "architecture"} <= set(runner):
+        raise ValueError("incomplete runner variance metadata")
+    retry = packet["retry_lineage"]
+    if not isinstance(retry, dict) or set(retry) != {"failure_class", "original_run_id", "replacement_run_id"}:
+        raise ValueError("invalid retry lineage")
+    if retry["replacement_run_id"] is not None and retry["failure_class"] not in PHASE07_INFRA_FAILURES:
+        raise ValueError("non-infrastructure failures cannot be retried")
+    expected = dict(packet)
+    expected.pop("record_self_sha256")
+    if packet["record_self_sha256"] != _canonical_sha256(expected):
+        raise ValueError("artifact self-digest mismatch")
+    return packet
 
 
 def reconcile(
