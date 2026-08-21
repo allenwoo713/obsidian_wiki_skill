@@ -5,7 +5,8 @@
     "ci": "paired_basic_bootstrap_two_sided_95",
     "permutation": "paired_two_sided",
     "holm": "step_down",
-    "resamples": 10000,
+    "resamples": 99999,
+    "batch_size": 4096,
     "seed": "phase07-ann-statistics-v1",
     "scipy_version": "1.15.3"
   },
