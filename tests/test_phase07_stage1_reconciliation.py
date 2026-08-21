@@ -48,7 +48,7 @@ def _hosted_identity() -> dict[str, object]:
         "runner": {
             "name": "GitHub Actions 42",
             "group": "GitHub Actions",
-            "labels": ["ubuntu-latest", "X64"],
+            "labels": ["ubuntu-latest"],
             "os": "Linux",
             "image": "ubuntu-24.04",
             "architecture": "X64",
@@ -158,6 +158,9 @@ def _post_download_request(artifact_dir: Path, result: dict[str, object]) -> dic
                 "job_key": "phase07-screening",
                 "status": "completed",
                 "conclusion": "success",
+                "runner_name": "GitHub Actions 42",
+                "runner_group_name": "GitHub Actions",
+                "labels": ["ubuntu-latest"],
             },
             "artifact": {
                 "artifact_id": 771,
@@ -255,6 +258,50 @@ def test_stage1_retention_uses_trusted_workflow_run_creation_anchor(
         )
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    ["os", "architecture", "labels", "group", "name", "api-name", "api-group", "api-labels"],
+)
+def test_stage1_hosted_runner_identity_and_api_job_provenance_are_exact(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]], mutate: str,
+) -> None:
+    """Stage 1 accepts only the API-bound ubuntu-latest hosted Linux/X64 allocation."""
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    request = _post_download_request(artifact_dir, result)
+    runner = request["runner"]
+    api = request["api_provenance"]
+    assert isinstance(runner, dict) and isinstance(api, dict)
+    job = api["job"]
+    assert isinstance(job, dict)
+    if mutate == "os":
+        runner["os"] = "Windows"
+    elif mutate == "architecture":
+        runner["architecture"] = "ARM64"
+    elif mutate == "labels":
+        runner["labels"] = ["self-hosted"]
+    elif mutate == "group":
+        runner["group"] = "Default"
+    elif mutate == "name":
+        runner["name"] = "self-hosted"
+    elif mutate == "api-name":
+        job["runner_name"] = "GitHub Actions 99"
+    elif mutate == "api-group":
+        job["runner_group_name"] = "Default"
+    else:
+        job["labels"] = ["self-hosted"]
+    _seal(request)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        reconcile_stage1_screening(
+            stage1_request=request_path, artifact_dir=artifact_dir,
+            output=tmp_path / "stage1-ledger.json", mode="screening", expected_shape=(48, 384, 8),
+        )
+
+
 def _reseal_bundle(bundle: Path, result: dict[str, object]) -> dict[str, object]:
     extracted = bundle / "extracted"
     for name in ("screening-request.json", "screening-ledger.json", "screening-result.json"):
@@ -318,6 +365,52 @@ def test_stage1_reconciler_accepts_runner_bound_corpus_digest_not_locally_regene
 
     assert ledger["stress_identity"]["corpus_sha256"] == "d" * 64
     assert len({build["build_id"] for build in ledger["builds"]}) == 3
+
+
+def test_stage1_reconciler_rejects_unsealed_outer_corpus_digest_substitution(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
+) -> None:
+    """Runner-bound portability never permits changing a downloaded artifact in place."""
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    extracted = artifact_dir / "extracted"
+    payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
+    payload["result"]["stress_identity"]["corpus_sha256"] = "d" * 64
+    _seal(payload)
+    (extracted / "screening-result.json").write_text(json.dumps(payload), encoding="utf-8")
+    request = _post_download_request(artifact_dir, result)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        reconcile_stage1_screening(
+            stage1_request=request_path, artifact_dir=artifact_dir,
+            output=tmp_path / "stage1-ledger.json", mode="screening", expected_shape=(48, 384, 8),
+        )
+
+
+def test_stage1_reconciler_rejects_resealed_ledger_with_substituted_request_binding(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
+) -> None:
+    """The inner ledger must bind exactly to the sealed screening request record."""
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    extracted = artifact_dir / "extracted"
+    ledger = json.loads((extracted / "screening-ledger.json").read_text(encoding="utf-8"))
+    ledger["request_sha256"] = "f" * 64
+    _seal(ledger)
+    (extracted / "screening-ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+    request = _reseal_bundle(artifact_dir, result)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        reconcile_stage1_screening(
+            stage1_request=request_path, artifact_dir=artifact_dir,
+            output=tmp_path / "stage1-ledger.json", mode="screening", expected_shape=(48, 384, 8),
+        )
 
 
 def test_stage1_reconciler_allows_large_index_bytes_when_build_stays_bounded(
