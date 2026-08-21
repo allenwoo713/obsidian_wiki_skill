@@ -138,6 +138,17 @@ def test_confirmation_packet_requires_all_six_d04_members_and_declared_values() 
     with pytest.raises(ValueError, match="declared"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
 
 
+def test_numeric_packet_rejects_omitted_or_duplicate_canonical_members() -> None:
+    plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d04"].pop("comparisons")
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="members"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+    packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d04"]["comparisons"][1]["comparison"] = dict(packet["d04"]["comparisons"][0]["comparison"])
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="canonical"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+
+
 class _FakeActions:
     def __init__(self, jobs: list[dict]) -> None: self.jobs = jobs; self.urls: list[str] = []
     def get_json(self, url: str, token: str) -> dict:
