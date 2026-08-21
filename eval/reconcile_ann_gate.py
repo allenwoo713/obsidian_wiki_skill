@@ -17,9 +17,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
     # run_eval imports the repository ``eval`` package.
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-import benchmark_ann_build as benchmark
-from benchmark_ann_build import validate_evidence
-from run_eval import validate_candidate_decision_records
+from eval import benchmark_ann_build as benchmark
+from eval.benchmark_ann_build import validate_evidence
+from eval.run_eval import validate_candidate_decision_records
 from eval.phase07_ann_campaign import Phase07AnnCampaignRunner, canonical_digest as campaign_digest
 
 
