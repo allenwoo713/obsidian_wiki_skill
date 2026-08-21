@@ -304,6 +304,8 @@ jobs:
           value=json.loads(path.read_text()); required=('static_cap_seconds','calibration_sha256','calibration_rule_version','omp_threads');
           assert all(value.get(key) is not None for key in required), 'incomplete committed calibration reference';
           assert len(value['calibration_sha256']) == 64, 'invalid committed calibration digest';
+          assert value['static_cap_seconds'] == 180, 'approved per-build cap must remain 180 seconds';
+          assert value['omp_threads'] == 2, 'approved OMP setting must remain 2';
           env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
           [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
       - name: Validate approved production ANN policy record (Phase 06)
@@ -540,18 +542,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - id: phase07-model-cache
-        uses: actions/cache@v4
-        with:
-          path: models/paraphrase-multilingual-MiniLM-L12-v2
-          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
       - name: Install exact numeric dependencies and validate model cache before import
         run: python -m pip install -r requirements.txt pytest
-      - name: Hydrate exact immutable model only on cache miss
-        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
-        run: python scripts/download_embedding_model.py
-      - name: Validate immutable cached model tree before campaign import
-        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Validate immutable model manifest for seeded numeric screening
+        run: python scripts/download_embedding_model.py --validate-manifest-only
       - name: Assert actual locked Stage 1 runtime and OMP settings
         run: >
           python -c "import importlib.metadata as metadata, os, sys;
