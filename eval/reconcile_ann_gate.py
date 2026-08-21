@@ -267,7 +267,16 @@ def _validate_stage1_request(request: dict[str, Any], artifact_dir: Path) -> Non
         raise ValueError("Stage 1 content-tree digest binding")
 
 
-def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[str, Any], *, expected_shape: tuple[int, int, int]) -> dict[str, Any]:
+def _validate_stage1_nominee_list(value: Any, *, label: str) -> list[int]:
+    """Accept only the small, explicit Stage 1 nominee domain."""
+    if not isinstance(value, list) or len(value) > 2 \
+            or len(set(value)) != len(value) \
+            or any(not isinstance(m, int) or isinstance(m, bool) or m not in {16, 20, 32} for m in value):
+        raise ValueError(f"Stage 1 {label} nomination boundary")
+    return list(value)
+
+
+def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[str, Any], *, expected_shape: tuple[int, int, int]) -> tuple[dict[str, Any], list[int]]:
     if set(result_record) != {"schema_version", "stage", "request_sha256", "result", "authorization", "record_self_sha256"} or result_record["schema_version"] != 1 or result_record["stage"] != "screening" or result_record["authorization"] != "none" or result_record["request_sha256"] != campaign_digest(request_record):
         raise ValueError("Stage 1 result/request binding")
     result = result_record["result"]
@@ -339,17 +348,17 @@ def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[
     statistics = result.get("d04_statistics")
     if statistics != Phase07AnnCampaignRunner._screening_statistics(builds):
         raise ValueError("Stage 1 D-04 six-member statistics recomputation")
-    reported_nominees = result.get("nominated_m")
-    if not isinstance(reported_nominees, list) or len(reported_nominees) > 2 \
-            or len(set(reported_nominees)) != len(reported_nominees) \
-            or any(m not in {16, 20, 32} for m in reported_nominees):
-        raise ValueError("Stage 1 nomination boundary")
+    reported_nominees = _validate_stage1_nominee_list(
+        result.get("nominated_m"), label="artifact-reported",
+    )
     # The screening artifact records the campaign's own provisional list, but
     # the reconciler is its authority: recompute the D-04-qualified ranking
     # from sealed numeric observations before publishing any nominee.
     reconciled = dict(result)
-    reconciled["nominated_m"] = select_stage1_nominees(builds, statistics)
-    return reconciled
+    reconciled["nominated_m"] = _validate_stage1_nominee_list(
+        select_stage1_nominees(builds, statistics), label="reconciled",
+    )
+    return reconciled, reported_nominees
 
 
 def reconcile_stage1_screening(*, stage1_request: Path, artifact_dir: Path, output: Path, mode: str, expected_shape: tuple[int, int, int] = (77_348, 384, 256)) -> dict[str, Any]:
@@ -380,7 +389,9 @@ def reconcile_stage1_screening(*, stage1_request: Path, artifact_dir: Path, outp
             or ledger_record.get("authorization") != "none" \
             or ledger_record.get("request_sha256") != campaign_digest(request_record):
         raise ValueError("Stage 1 campaign ledger")
-    result = _validate_stage1_result(result_record, request_record, expected_shape=expected_shape)
+    result, artifact_reported_nominees = _validate_stage1_result(
+        result_record, request_record, expected_shape=expected_shape,
+    )
     ledger = {
         "schema_version": 1, "mode": "screening", "status": "success", "authorization": "none",
         "repository": request["repository"], "branch": request["branch"], "workflow_path": request["workflow_path"], "head_sha": request["head_sha"],
@@ -389,7 +400,9 @@ def reconcile_stage1_screening(*, stage1_request: Path, artifact_dir: Path, outp
         "model_manifest_sha256": request["model_manifest_sha256"], "corpus_manifest_sha256": request["corpus_manifest_sha256"], "lock_identity": request["lock_identity"],
         "stress_identity": result["stress_identity"],
         "builds": result["builds"],
-        "d04_statistics": result["d04_statistics"], "nominated_m": result["nominated_m"],
+        "d04_statistics": result["d04_statistics"],
+        "artifact_reported_nominated_m": artifact_reported_nominees,
+        "nominated_m": result["nominated_m"],
         "source_digests": {"post_download_request": request["record_self_sha256"], "campaign_result": request["campaign_result_sha256"], "campaign_request": request["campaign_request_sha256"], "campaign_ledger": request["campaign_ledger_sha256"]},
     }
     ledger["record_self_sha256"] = _canonical_sha256(ledger)
