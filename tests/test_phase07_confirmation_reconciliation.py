@@ -99,6 +99,21 @@ def test_packet_proves_three_fresh_builds_and_distinct_d04_d20_families() -> Non
     with pytest.raises(ValueError, match="three"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
 
 
+def test_confirmation_packet_rejects_missing_pairs_nonfinite_and_wrong_m16_baseline() -> None:
+    plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d20"]["comparisons"][0]["paired_rows"] = []
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="paired"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+    packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d20"]["raw_p_values"][0] = float("nan")
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="non-finite"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+    packet = _packet(plan["workflow_inputs"][0], run_id=1)
+    packet["d20"]["baseline_build_id"] = "0" * 64
+    packet["record_self_sha256"] = reconcile.canonical_digest(packet)
+    with pytest.raises(ValueError, match="m=16"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+
+
 class _FakeActions:
     def __init__(self, jobs: list[dict]) -> None: self.jobs = jobs; self.urls: list[str] = []
     def get_json(self, url: str, token: str) -> dict:
