@@ -278,6 +278,7 @@ def test_confirmation_workflow_exports_a_sealed_packet_wrapper_from_campaign_out
     workflow = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
     assert "confirmation_packet_from_result" in workflow
     assert "confirmation-packet-wrapper.json" in workflow
+    assert "archive_sha256=content,content_sha256=content" not in workflow
 
 
 def test_reconcile_hosted_seals_success_and_rejection(tmp_path: Path) -> None:
