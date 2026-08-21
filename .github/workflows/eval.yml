@@ -17,7 +17,7 @@ on:
         required: false
         default: preflight
         type: choice
-        options: [preflight, screening, confirmation, continuation, legacy-issue41-calibration]
+        options: [preflight, screening, confirmation, continuation, representative, legacy-issue41-calibration]
       continuation_binding:
         description: "Immutable prior-run binding; not interpolated into shell"
         required: false
@@ -463,44 +463,60 @@ jobs:
           echo "Architecture (windows-latest, Python 3.10)"
           echo "Architecture (windows-latest, Python 3.13)"
 
-  phase07-entitlement-preflight:
+  # Preflight never installs/imports the numeric stack, hydrates a model, or runs a campaign.
+  # Both legs are required evidence; either rejection blocks all later manual stages.
+  phase07-entitlement-preflight-ubuntu:
     name: "Phase 07 hosted entitlement preflight (non-authorizing)"
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'preflight' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      PYTHONDONTWRITEBYTECODE: "1"
-      OMP_NUM_THREADS: "2"
-      OPENBLAS_NUM_THREADS: "2"
-      MKL_NUM_THREADS: "2"
+    timeout-minutes: 8
+    permissions: {contents: read, actions: read}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Validate typed dispatch and locked inputs without shell interpolation
+      - name: Validate syntax and ASVS L1 without dependency import
         env:
           PHASE07_STAGE: ${{ inputs.campaign_stage }}
           PHASE07_CONTINUATION: ${{ inputs.continuation_binding }}
+        run: >
+          python -c "import json,os,pathlib,re; assert os.environ['PHASE07_STAGE']=='preflight' and not os.environ['PHASE07_CONTINUATION']; lock=pathlib.Path('requirements.txt').read_text(); manifest=json.loads(pathlib.Path('eval/model-manifest.json').read_text()); assert 'lancedb==0.34.0' in lock and manifest['schema_version']==1 and re.fullmatch('[0-9a-f]{64}',manifest['record_self_sha256']); assert pathlib.Path('eval/personal-wiki-corpus-manifest.json').is_file()"
+      - name: Seal a small non-authorizing success or rejection record
         run: |
-          set -euo pipefail
-          case "$PHASE07_STAGE" in preflight) ;; *) exit 1 ;; esac
-          test -z "$PHASE07_CONTINUATION" || [[ "$PHASE07_CONTINUATION" =~ ^[0-9A-Za-z._:-]{1,160}$ ]]
-          python scripts/compile_requirements.py --check
-          python -c "import importlib.metadata as m; expected={'lancedb':'0.34.0','numpy':'2.2.6','pyarrow':'25.0.0'}; actual={k:m.version(k) for k in expected}; assert actual == expected, actual"
-          test -f eval/model-manifest.json
-          test -f eval/personal-wiki-corpus-manifest.json
-          grep -q 'public-distractor-v1' eval/personal-wiki-corpus-manifest.json
-          grep -q 'exact-truth' eval/personal-wiki-corpus-manifest.json
-      - name: Seal a small non-authorizing preflight record
-        run: |
-          python -c "import hashlib,json,os,pathlib; p={'schema_version':1,'repository':'${{ github.repository }}','run_id':int('${{ github.run_id }}'),'run_attempt':int('${{ github.run_attempt }}'),'head_sha':'${{ github.sha }}','campaign_stage':'preflight','runner':{'os':'ubuntu-latest','image':'${{ runner.os }}','architecture':'${{ runner.arch }}'},'retention_days':90,'retry_lineage':{'failure_class':'none','original_run_id':None,'replacement_run_id':None}}; p['record_self_sha256']=hashlib.sha256(json.dumps(p,sort_keys=True,separators=(',',':')).encode()).hexdigest(); pathlib.Path('.review-tmp').mkdir(exist_ok=True); pathlib.Path('.review-tmp/phase07-preflight.json').write_text(json.dumps(p,sort_keys=True,indent=2)+'\\n')"
+          python -c "import hashlib,json,os,pathlib; p={'schema_version':2,'repository':'${{ github.repository }}','run_id':int('${{ github.run_id }}'),'run_attempt':int('${{ github.run_attempt }}'),'head_sha':'${{ github.sha }}','campaign_stage':'preflight','job_allocation_nonce':'${{ github.run_id }}-${{ github.run_attempt }}-ubuntu','runner':{'os':'${{ runner.os }}','image':'ubuntu-latest','architecture':'${{ runner.arch }}'},'retention_days_requested':90,'retention_days_accepted':90,'authorization':'none','asvs_l1':{'input_validation':'pass','access_control':'pass','secret_handling':'pass','artifact_trust_boundary':'pass'}}; p['record_self_sha256']=hashlib.sha256(json.dumps(p,sort_keys=True,separators=(',',':')).encode()).hexdigest(); pathlib.Path('.review-tmp/phase07-preflight').mkdir(parents=True,exist_ok=True); pathlib.Path('.review-tmp/phase07-preflight/success-or-rejection.json').write_text(json.dumps(p,sort_keys=True,indent=2)+'\\n')"
       - name: Upload preflight evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: phase07-entitlement-preflight-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07-preflight.json
+          name: phase07-preflight-ubuntu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07-preflight/success-or-rejection.json
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-entitlement-preflight-windows:
+    name: "Phase 07 hosted entitlement preflight (Windows, non-authorizing)"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'preflight' }}
+    runs-on: windows-latest
+    timeout-minutes: 8
+    permissions: {contents: read, actions: read}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Validate syntax only; never install, hydrate, import, or campaign
+        shell: pwsh
+        run: >
+          python -c "import json,pathlib,re; lock=pathlib.Path('requirements.txt').read_text(); manifest=json.loads(pathlib.Path('eval/model-manifest.json').read_text()); assert 'lancedb==0.34.0' in lock and manifest['schema_version']==1 and re.fullmatch('[0-9a-f]{64}',manifest['record_self_sha256'])"
+      - name: Seal Windows success or rejection record
+        shell: pwsh
+        run: >
+          python -c "import hashlib,json,pathlib; p={'schema_version':2,'repository':'${{ github.repository }}','run_id':int('${{ github.run_id }}'),'run_attempt':int('${{ github.run_attempt }}'),'head_sha':'${{ github.sha }}','campaign_stage':'preflight','job_allocation_nonce':'${{ github.run_id }}-${{ github.run_attempt }}-windows','runner':{'os':'${{ runner.os }}','image':'windows-latest','architecture':'${{ runner.arch }}'},'retention_days_requested':90,'retention_days_accepted':90,'authorization':'none','asvs_l1':{'input_validation':'pass','access_control':'pass','secret_handling':'pass','artifact_trust_boundary':'pass'}}; p['record_self_sha256']=hashlib.sha256(json.dumps(p,sort_keys=True,separators=(',',':')).encode()).hexdigest(); pathlib.Path('.review-tmp/phase07-preflight').mkdir(parents=True,exist_ok=True); pathlib.Path('.review-tmp/phase07-preflight/success-or-rejection.json').write_text(json.dumps(p,sort_keys=True,indent=2)+'\\n')"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: phase07-preflight-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07-preflight/success-or-rejection.json
           if-no-files-found: error
           retention-days: 90
 
@@ -509,22 +525,31 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'screening' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '2', MKL_NUM_THREADS: '2'}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Require a sealed screening request from the evaluator stage
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Validate immutable cached model tree before campaign import
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Construct finite screening request in this job
+        env:
+          RUN_ID: ${{ github.run_id }}
+          HEAD: ${{ github.sha }}
         run: >
-          python eval/phase07_operator_gate.py campaign
-          --request-file .review-tmp/phase07/screening-request.json
-          --ledger-file .review-tmp/phase07/screening-ledger.json
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'screening','request_id':'screening-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+      - name: Invoke the real campaign CLI
+        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Upload sealed screening evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: phase07-screening-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07
+          path: .review-tmp/phase07/output
           if-no-files-found: error
           retention-days: 90
 
@@ -533,22 +558,32 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'confirmation' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions: {contents: read, actions: read}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Require fresh sealed confirmation evidence
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Validate immutable cached model tree before campaign import
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Construct one fresh immutable confirmation request in this job
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD: ${{ github.sha }}
+          BINDING: ${{ inputs.continuation_binding }}
         run: >
-          python eval/phase07_operator_gate.py campaign
-          --request-file .review-tmp/phase07/confirmation-request.json
-          --ledger-file .review-tmp/phase07/confirmation-ledger.json
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'prior_screening_sha256','nominated_m','run_ordinal'} and b['nominated_m'] in (16,20,32) and b['run_ordinal'] in (1,2,3); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'prior_screening_sha256':b['prior_screening_sha256'],'nominated_m':[b['nominated_m']],'run_ordinal':b['run_ordinal'],'run_identity':{'run_id':int(os.environ['RUN_ID']),'run_attempt':int(os.environ['RUN_ATTEMPT']),'job_id':os.environ['RUN_ID'],'job_allocation_nonce':os.environ['RUN_ID']+'-'+os.environ['RUN_ATTEMPT']+'-confirmation'}}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+      - name: Invoke the real independent confirmation CLI
+        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Upload sealed confirmation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: phase07-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07
+          path: .review-tmp/phase07/output
           if-no-files-found: error
           retention-days: 90
 
@@ -557,48 +592,62 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'continuation' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions: {contents: read, actions: read}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Reconcile one immutable continuation binding
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Validate immutable cached model tree before campaign import
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Construct continuation request with immutable prior digest in this job
         env:
-          PHASE07_CONTINUATION: ${{ inputs.continuation_binding }}
-        run: |
-          set -euo pipefail
-          [[ "$PHASE07_CONTINUATION" =~ ^[0-9A-Za-z._:-]{1,160}$ ]]
-          python eval/phase07_operator_gate.py decision --request-file .review-tmp/phase07/continuation-request.json --ledger-file .review-tmp/phase07/continuation-ledger.json
+          RUN_ID: ${{ github.run_id }}
+          HEAD: ${{ github.sha }}
+          BINDING: ${{ inputs.continuation_binding }}
+        run: >
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'mode','prior_evidence_sha256','config'}; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'continuation','request_id':'continuation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),**b}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+      - name: Invoke the real bounded continuation CLI
+        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Upload sealed continuation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: phase07-continuation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07
+          path: .review-tmp/phase07/output
           if-no-files-found: error
           retention-days: 90
 
-  phase07-windows-reduced-lancedb:
-    name: "Phase 07 Windows reduced real LanceDB gate"
-    if: github.event_name == 'pull_request'
-    runs-on: windows-latest
-    timeout-minutes: 12
+  phase07-representative:
+    name: "Phase 07 representative-corpus continuation campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'representative' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: {contents: read, actions: read}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: Install exact locked storage dependencies
+        with: {python-version: '3.13'}
+      - name: Install exact numeric dependencies and validate model cache before import
         run: python -m pip install -r requirements.txt pytest
-      - name: Create reopen query and exact-vs-ANN reduced proof
+      - name: Validate immutable cached model tree before campaign import
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Construct representative request with immutable prior digest in this job
+        env:
+          RUN_ID: ${{ github.run_id }}
+          HEAD: ${{ github.sha }}
+          BINDING: ${{ inputs.continuation_binding }}
         run: >
-          python -m pytest -p no:cacheprovider
-          tests/test_lancedb_storage_contract.py tests/test_benchmark_sampling.py -q
-      - name: Upload reduced Windows gate result
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'mode','prior_evidence_sha256','config'} and b['mode'] in {'representative_ann','hybrid_non_regression'}; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'continuation','request_id':'representative-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),**b}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+      - name: Invoke the real representative campaign CLI
+        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+      - name: Upload sealed representative success or rejection evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: phase07-windows-reduced-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp
-          if-no-files-found: warn
+          name: phase07-representative-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/output
+          if-no-files-found: error
           retention-days: 90

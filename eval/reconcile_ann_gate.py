@@ -13,8 +13,9 @@ from run_eval import validate_candidate_decision_records
 
 PHASE07_PACKET_FIELDS = frozenset({
     "repository", "run_id", "run_attempt", "job_id", "job_allocation_nonce",
-    "artifact_id", "archive_sha256", "record_self_sha256", "retention_days",
-    "head_sha", "runner", "lock_identity", "retry_lineage",
+    "artifact_id", "artifact_name", "archive_sha256", "content_sha256",
+    "record_self_sha256", "retention_days_requested", "retention_days_accepted",
+    "head_sha", "runner", "lock_identity", "build_id", "retry_lineage",
 })
 PHASE07_INFRA_FAILURES = frozenset({
     "github_infrastructure", "hosted_runner_unavailable", "artifact_service",
@@ -71,12 +72,12 @@ def validate_phase07_evidence_packet(packet: dict) -> dict:
     """Validate remote artifact identity, retention, digest, and retry lineage."""
     if not isinstance(packet, dict) or set(packet) != PHASE07_PACKET_FIELDS:
         raise ValueError("incomplete or unknown Phase 07 artifact fields")
-    for key in ("run_id", "run_attempt", "job_id", "artifact_id", "retention_days"):
+    for key in ("run_id", "run_attempt", "job_id", "artifact_id", "retention_days_requested", "retention_days_accepted"):
         if not isinstance(packet[key], int) or packet[key] <= 0:
             raise ValueError(f"invalid {key}")
-    if packet["retention_days"] != 90:
-        raise ValueError("artifact retention must be 90 days")
-    if not all(isinstance(packet[key], str) and len(packet[key]) == 64 for key in ("archive_sha256", "record_self_sha256")):
+    if packet["retention_days_requested"] != 90 or packet["retention_days_accepted"] != 90:
+        raise ValueError("requested and accepted retention must be exactly 90 days")
+    if not all(isinstance(packet[key], str) and len(packet[key]) == 64 for key in ("archive_sha256", "content_sha256", "record_self_sha256", "build_id")):
         raise ValueError("invalid artifact digest")
     if not isinstance(packet["head_sha"], str) or len(packet["head_sha"]) != 40:
         raise ValueError("invalid artifact head")
@@ -95,6 +96,20 @@ def validate_phase07_evidence_packet(packet: dict) -> dict:
     if packet["record_self_sha256"] != _canonical_sha256(expected):
         raise ValueError("artifact self-digest mismatch")
     return packet
+
+
+def validate_phase07_evidence_set(packets: list[dict], *, expected_repository: str, expected_head: str) -> list[dict]:
+    """Cross-run reconciliation rejects stale identity, allocation reuse, and fresh-build reuse."""
+    allocations, builds = set(), set()
+    for packet in packets:
+        validate_phase07_evidence_packet(packet)
+        if packet["repository"] != expected_repository or packet["head_sha"] != expected_head:
+            raise ValueError("repository/head identity")
+        allocation = tuple(packet[key] for key in ("run_id", "run_attempt", "job_id", "job_allocation_nonce"))
+        if allocation in allocations or packet["build_id"] in builds:
+            raise ValueError("reused allocation or build identity")
+        allocations.add(allocation); builds.add(packet["build_id"])
+    return packets
 
 
 def reconcile(

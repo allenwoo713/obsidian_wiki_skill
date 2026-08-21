@@ -21,6 +21,7 @@ SHA = re.compile(r"^[0-9a-f]{40}$")
 STAGES = frozenset({"preflight", "screening", "confirmation", "continuation", "pr-acceptance"})
 INFRA_FAILURES = frozenset({"github_infrastructure", "hosted_runner_unavailable", "artifact_service"})
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -91,21 +92,23 @@ def validate_feature_worktree_preflight(request: dict[str, Any], *, root: Path |
 
 def validate_phase07_evidence_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Validate untrusted hosted-artifact metadata at the local trust boundary."""
-    required = {"repository", "run_id", "run_attempt", "job_id", "job_allocation_nonce", "artifact_id", "archive_sha256", "record_self_sha256", "retention_days", "head_sha", "runner", "lock_identity", "retry_lineage"}
+    required = {"repository", "run_id", "run_attempt", "job_id", "job_allocation_nonce", "artifact_id", "artifact_name", "archive_sha256", "content_sha256", "record_self_sha256", "retention_days_requested", "retention_days_accepted", "head_sha", "runner", "lock_identity", "build_id", "retry_lineage"}
     if set(packet) != required:
         raise ValueError("untrusted artifact packet fields")
     _reject_secrets(packet)
     if not isinstance(packet["repository"], str) or not packet["repository"]:
         raise ValueError("repository binding")
-    for key in ("run_id", "run_attempt", "job_id", "artifact_id", "retention_days"):
+    for key in ("run_id", "run_attempt", "job_id", "artifact_id", "retention_days_requested", "retention_days_accepted"):
         if not isinstance(packet[key], int) or packet[key] <= 0:
             raise ValueError(f"invalid {key}")
     if not isinstance(packet["job_allocation_nonce"], str) or len(packet["job_allocation_nonce"]) < 16:
         raise ValueError("job allocation nonce")
-    if not SHA.fullmatch(packet["head_sha"]) or not isinstance(packet["archive_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", packet["archive_sha256"]):
+    if not SHA.fullmatch(packet["head_sha"]) or not all(isinstance(packet[key], str) and HEX64.fullmatch(packet[key]) for key in ("archive_sha256", "content_sha256")):
         raise ValueError("immutable digest or head binding")
-    if packet["retention_days"] != 90:
-        raise ValueError("90-day retention is mandatory")
+    if packet["retention_days_requested"] != 90 or packet["retention_days_accepted"] != 90:
+        raise ValueError("exact 90-day requested and accepted retention is mandatory")
+    if not isinstance(packet["artifact_name"], str) or not packet["artifact_name"]:
+        raise ValueError("artifact name binding")
     if not isinstance(packet["runner"], dict) or not {"os", "image", "architecture"} <= set(packet["runner"]):
         raise ValueError("runner variance metadata")
     retry = packet["retry_lineage"]
@@ -116,6 +119,27 @@ def validate_phase07_evidence_packet(packet: dict[str, Any]) -> dict[str, Any]:
     if packet["record_self_sha256"] != canonical_digest(packet):
         raise ValueError("artifact self-digest")
     return packet
+
+
+def validate_phase07_evidence_set(packets: list[dict[str, Any]], *, expected_repository: str, expected_head: str) -> list[dict[str, Any]]:
+    """Require distinct hosted allocations and fresh builds; runner variance is data, not equality."""
+    if not packets:
+        raise ValueError("hosted evidence set is empty")
+    tuples: set[tuple[int, int, int, str]] = set()
+    builds: set[str] = set()
+    for packet in packets:
+        validate_phase07_evidence_packet(packet)
+        if packet["repository"] != expected_repository or packet["head_sha"] != expected_head:
+            raise ValueError("repository or head binding")
+        allocation = (packet["run_id"], packet["run_attempt"], packet["job_id"], packet["job_allocation_nonce"])
+        if allocation in tuples:
+            raise ValueError("reused hosted allocation tuple")
+        tuples.add(allocation)
+        build_id = packet["build_id"]
+        if not isinstance(build_id, str) or not HEX64.fullmatch(build_id) or build_id in builds:
+            raise ValueError("fresh build identity")
+        builds.add(build_id)
+    return packets
 
 
 def _write_ledger(path: Path, record: dict[str, Any]) -> None:

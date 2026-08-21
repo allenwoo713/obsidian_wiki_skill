@@ -73,7 +73,7 @@ def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_clos
         "phase07-entitlement-preflight",
         "per-build-cap-seconds",
         "run_attempt",
-        "retry_lineage",
+            "retention_days_requested",
         "record_self_sha256",
         "workflow_dispatch",
     ):
@@ -91,8 +91,8 @@ def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> 
     for required in (
         "personal-wiki-corpus-manifest",
         "model-manifest.json",
-        "public-distractor-v1",
-        "exact-truth",
+        "corpus_manifest_sha256",
+        "model_manifest_sha256",
     ):
         assert required in workflow
 
@@ -105,10 +105,11 @@ def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -
     )
     jobs = workflow["jobs"]
     expected = {
-        "preflight": {"phase07-entitlement-preflight"},
+        "preflight": {"phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"},
         "screening": {"phase07-screening"},
         "confirmation": {"phase07-confirmation"},
         "continuation": {"phase07-continuation"},
+        "representative": {"phase07-representative"},
     }
     for stage, allowed in expected.items():
         selected = {
@@ -123,11 +124,13 @@ def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -
         "inputs.campaign_stage == 'unknown'" not in spec.get("if", "")
         for spec in jobs.values()
     )
-    preflight = jobs["phase07-entitlement-preflight"]
-    serialized = json.dumps(preflight, sort_keys=True)
-    assert "download_embedding_model.py" not in serialized
-    assert "benchmark_ann_build.py" not in serialized
-    assert "run_eval.py" not in serialized
+    for name in expected["preflight"]:
+        serialized = json.dumps(jobs[name], sort_keys=True)
+        assert "python -m pip install" not in serialized
+        assert "download_embedding_model.py" not in serialized
+        assert "phase07_ann_campaign.py" not in serialized
+        assert '"retention-days": "90"' in serialized
+        assert '"actions": "read"' in serialized
 
 
 def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
@@ -138,10 +141,11 @@ def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
     packet = {
         "repository": "allenwoo713/obsidian_wiki_skill", "run_id": 12,
         "run_attempt": 1, "job_id": 34, "job_allocation_nonce": "0123456789abcdef",
-        "artifact_id": 56, "archive_sha256": "a" * 64, "record_self_sha256": "",
-        "retention_days": 90, "head_sha": "b" * 40,
+        "artifact_id": 56, "artifact_name": "phase07-proof", "archive_sha256": "a" * 64,
+        "content_sha256": "c" * 64, "record_self_sha256": "",
+        "retention_days_requested": 90, "retention_days_accepted": 90, "head_sha": "b" * 40,
         "runner": {"os": "Linux", "image": "ubuntu-latest", "architecture": "X64"},
-        "lock_identity": "locked", "retry_lineage": {
+        "lock_identity": "locked", "build_id": "d" * 64, "retry_lineage": {
             "failure_class": "github_infrastructure", "original_run_id": 11,
             "replacement_run_id": 12,
         },
@@ -150,15 +154,60 @@ def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
     assert phase07_operator_gate.validate_phase07_evidence_packet(packet) == packet
     assert reconcile_ann_gate.validate_phase07_evidence_packet(packet) == packet
 
-    packet["retention_days"] = 7
+    packet["retention_days_accepted"] = 7
     with pytest.raises(ValueError):
         phase07_operator_gate.validate_phase07_evidence_packet(packet)
-    packet["retention_days"] = 90
+    packet["retention_days_accepted"] = 90
     packet["retry_lineage"]["failure_class"] = "numeric_failure"
     with pytest.raises(ValueError):
         phase07_operator_gate.validate_phase07_evidence_packet(packet)
     with pytest.raises(ValueError):
         phase07_operator_gate._reject_secrets({"token": "never"})
+
+
+def test_phase07_workflow_commands_are_real_and_do_not_consume_review_tmp_requests() -> None:
+    """Regression gate for the rejected Plan 03 placeholder workflow topology."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    for job in ("phase07-screening:", "phase07-confirmation:", "phase07-continuation:", "phase07-representative:"):
+        section = workflow.split(job, 1)[1].split("\n  phase07-", 1)[0]
+        assert "Construct" in section
+        assert "phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json" in section
+        assert "screening-request.json" not in section
+        assert "confirmation-request.json" not in section
+        assert "continuation-request.json" not in section
+        assert "retention-days: 90" in section
+        assert "permissions: {contents: read, actions: read}" in section
+    assert "retention_days_requested':90" in workflow
+    assert "retention_days_accepted':90" in workflow
+
+
+def test_phase07_windows_gate_is_reduced_real_production_path_in_ci() -> None:
+    ci = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    section = ci.split("phase07-windows-reduced-real-lancedb:", 1)[1]
+    assert "runs-on: windows-latest" in section
+    assert "python-version: '3.13'" in section
+    assert "test_lancedb_storage_contract.py" in section
+    assert "test_benchmark_sampling.py" in section
+    assert "77348" not in section
+    assert "phase07_ann_campaign.py" not in section
+
+
+def test_phase07_cross_run_reconciliation_rejects_reused_allocation_and_build() -> None:
+    import phase07_operator_gate
+    packet = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "run_id": 12, "run_attempt": 1,
+        "job_id": 34, "job_allocation_nonce": "0123456789abcdef", "artifact_id": 56,
+        "artifact_name": "proof", "archive_sha256": "a" * 64, "content_sha256": "c" * 64,
+        "record_self_sha256": "", "retention_days_requested": 90, "retention_days_accepted": 90,
+        "head_sha": "b" * 40, "runner": {"os": "Linux", "image": "ubuntu-latest", "architecture": "X64"},
+        "lock_identity": "locked", "build_id": "d" * 64,
+        "retry_lineage": {"failure_class": "github_infrastructure", "original_run_id": 11, "replacement_run_id": 12},
+    }
+    packet["record_self_sha256"] = phase07_operator_gate.canonical_digest(packet)
+    duplicate = {**packet, "record_self_sha256": ""}
+    duplicate["record_self_sha256"] = phase07_operator_gate.canonical_digest(duplicate)
+    with pytest.raises(ValueError, match="reused"):
+        phase07_operator_gate.validate_phase07_evidence_set([packet, duplicate], expected_repository=packet["repository"], expected_head=packet["head_sha"])
 
 
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
