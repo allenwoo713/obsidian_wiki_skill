@@ -54,7 +54,8 @@ _STAGE1_API_WORKFLOW_RUN_FIELDS = frozenset({
     "conclusion", "created_at",
 })
 _STAGE1_API_JOB_FIELDS = frozenset({
-    "job_id", "run_id", "job_key", "status", "conclusion",
+    "job_id", "run_id", "name", "status", "conclusion", "runner_name",
+    "runner_group_name", "labels",
 })
 _STAGE1_API_ARTIFACT_FIELDS = frozenset({
     "artifact_id", "job_id", "job_key", "run_id", "name", "created_at",
@@ -173,7 +174,18 @@ def _validate_stage1_workflow_retention(request: dict[str, Any]) -> None:
         raise ValueError("Stage 1 screening workflow retention declaration")
 
 
-def _validate_stage1_api_provenance(request: dict[str, Any]) -> dt.datetime:
+def _validate_stage1_runner(runner: Any) -> dict[str, Any]:
+    if not isinstance(runner, dict) or set(runner) != {"name", "group", "labels", "os", "image", "architecture"}:
+        raise ValueError("Stage 1 runner identity schema")
+    if not isinstance(runner["name"], str) or not runner["name"].startswith("GitHub Actions ") \
+            or runner["group"] != "GitHub Actions" or runner["labels"] != ["ubuntu-latest"] \
+            or runner["os"] != "Linux" or runner["architecture"] != "X64" \
+            or not isinstance(runner["image"], str) or not runner["image"]:
+        raise ValueError("Stage 1 must use hosted ubuntu-latest Linux/X64")
+    return runner
+
+
+def _validate_stage1_api_provenance(request: dict[str, Any], runner: dict[str, Any]) -> dt.datetime:
     provenance = request["api_provenance"]
     if not isinstance(provenance, dict) or set(provenance) != _STAGE1_API_PROVENANCE_FIELDS:
         raise ValueError("strict Stage 1 API provenance schema")
@@ -193,7 +205,9 @@ def _validate_stage1_api_provenance(request: dict[str, Any]) -> dt.datetime:
         raise ValueError("Stage 1 workflow API provenance binding")
     if job != {
         "job_id": request["job_id"], "run_id": request["run_id"],
-        "job_key": request["job_key"], "status": "completed", "conclusion": "success",
+        "name": "Phase 07 bounded SQ screening campaign", "status": "completed",
+        "conclusion": "success", "runner_name": runner["name"],
+        "runner_group_name": runner["group"], "labels": runner["labels"],
     }:
         raise ValueError("Stage 1 job API provenance binding")
     request_artifact = request["artifact"]
@@ -223,13 +237,11 @@ def _validate_stage1_request(request: dict[str, Any], artifact_dir: Path) -> Non
         raise ValueError("Stage 1 job allocation binding")
     if request["runtime"] != {"python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0", "omp_num_threads": 2}:
         raise ValueError("Stage 1 locked runtime/OMP identity")
-    run_created = _validate_stage1_api_provenance(request)
+    runner = _validate_stage1_runner(request["runner"])
+    run_created = _validate_stage1_api_provenance(request, runner)
     _validate_stage1_workflow_retention(request)
     if not all(isinstance(request[name], str) and _HEX64.fullmatch(request[name]) for name in ("model_manifest_sha256", "corpus_manifest_sha256", "lock_identity", "campaign_result_sha256", "campaign_request_sha256", "campaign_ledger_sha256")):
         raise ValueError("Stage 1 digest identity")
-    runner = request["runner"]
-    if not isinstance(runner, dict) or set(runner) != {"name", "group", "labels", "os", "image", "architecture"} or not all(isinstance(runner[name], str) and runner[name] for name in ("name", "group", "os", "image", "architecture")) or not isinstance(runner["labels"], list) or not runner["labels"]:
-        raise ValueError("Stage 1 runner identity")
     retry = request["retry_lineage"]
     if not isinstance(retry, dict) or set(retry) != {"failure_class", "original_run_id", "replacement_run_id"} or retry != {"failure_class": None, "original_run_id": None, "replacement_run_id": None}:
         raise ValueError("Stage 1 retry lineage")
@@ -352,7 +364,10 @@ def reconcile_stage1_screening(*, stage1_request: Path, artifact_dir: Path, outp
     environment = request_record.get("environment", {})
     if environment.get("branch") != request["branch"] or environment.get("workflow_path") != request["workflow_path"] or environment.get("head_sha") != request["head_sha"] or environment.get("run_id") != request["run_id"] or environment.get("run_attempt") != request["run_attempt"] or environment.get("job_key") != request["job_key"] or environment.get("job_allocation_nonce") != request["job_allocation_nonce"] or environment.get("runtime") != request["runtime"] or request_record.get("model_manifest_sha256") != request["model_manifest_sha256"] or request_record.get("corpus_manifest_sha256") != request["corpus_manifest_sha256"] or request_record.get("lock_identity") != request["lock_identity"]:
         raise ValueError("Stage 1 campaign/API provenance binding")
-    if ledger_record.get("stage") != "screening" or ledger_record.get("authorization") != "none":
+    if set(ledger_record) != {"schema_version", "stage", "authorization", "request_sha256", "record_self_sha256"} \
+            or ledger_record.get("schema_version") != 1 or ledger_record.get("stage") != "screening" \
+            or ledger_record.get("authorization") != "none" \
+            or ledger_record.get("request_sha256") != campaign_digest(request_record):
         raise ValueError("Stage 1 campaign ledger")
     result = _validate_stage1_result(result_record, request_record, expected_shape=expected_shape)
     ledger = {

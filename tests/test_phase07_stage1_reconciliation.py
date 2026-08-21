@@ -155,7 +155,7 @@ def _post_download_request(artifact_dir: Path, result: dict[str, object]) -> dic
             "job": {
                 "job_id": 881,
                 "run_id": 991,
-                "job_key": "phase07-screening",
+                "name": "Phase 07 bounded SQ screening campaign",
                 "status": "completed",
                 "conclusion": "success",
                 "runner_name": "GitHub Actions 42",
@@ -347,6 +347,7 @@ def test_stage1_reconciler_accepts_runner_bound_corpus_digest_not_locally_regene
     source, result = tiny_stage1_artifact
     artifact_dir = tmp_path / "artifact"
     shutil.copytree(source, artifact_dir)
+    request = _post_download_request(artifact_dir, result)
     extracted = artifact_dir / "extracted"
     payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
     # A different, sealed hosted floating-point reduction is valid only when all
@@ -374,12 +375,12 @@ def test_stage1_reconciler_rejects_unsealed_outer_corpus_digest_substitution(
     source, result = tiny_stage1_artifact
     artifact_dir = tmp_path / "artifact"
     shutil.copytree(source, artifact_dir)
+    request = _post_download_request(artifact_dir, result)
     extracted = artifact_dir / "extracted"
     payload = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
     payload["result"]["stress_identity"]["corpus_sha256"] = "d" * 64
     _seal(payload)
     (extracted / "screening-result.json").write_text(json.dumps(payload), encoding="utf-8")
-    request = _post_download_request(artifact_dir, result)
     request_path = tmp_path / "stage1-request.json"
     request_path.write_text(json.dumps(request), encoding="utf-8")
 
