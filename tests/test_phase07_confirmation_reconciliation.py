@@ -12,7 +12,7 @@ from eval import reconcile_ann_gate as reconcile
 
 
 LEDGER = Path("/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json")
-HEAD = "f" * 40
+HEAD = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
 
 def _plan() -> dict:
@@ -175,6 +175,13 @@ def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> No
     with pytest.raises(ValueError, match="mismatch"): operator.validate_confirmation_dispatch_bundle(pristine, expected_head="e" * 40)
     other = operator.build_confirmation_plan(LEDGER, post_task0_head="d" * 40); pristine["confirmation_request"] = other["confirmation_request"]
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(pristine, expected_head=HEAD)
+
+
+def test_dispatch_bundle_rejects_fully_resigned_noncanonical_authority() -> None:
+    forged = operator.build_confirmation_plan(LEDGER, post_task0_head="e" * 40)
+    bundle = {"confirmation_request": forged["confirmation_request"], "workflow_input": forged["workflow_inputs"][0]}
+    with pytest.raises(ValueError, match="feature head|canonical"):
+        operator.validate_confirmation_dispatch_bundle(bundle, expected_head="e" * 40)
 
 
 def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(tmp_path: Path) -> None:
