@@ -308,6 +308,7 @@ class IndexBuildService:
                     "ivf-hnsw-sq": "hnsw_sq",
                 }
                 candidate_index_type = eval_types[self._candidate_query_policy.candidate]
+                candidate_build = self._candidate_query_policy.build_policy
             else:
                 if dimension != self._ann_policy.dimensions:
                     raise RuntimeError(
@@ -315,10 +316,12 @@ class IndexBuildService:
                         f"ann policy dimension {self._ann_policy.dimensions}"
                     )
                 candidate_index_type = self._ann_policy.lancedb_index_type
+                candidate_build = None
             vector_config = VectorIndexConfig(
                 index_type=candidate_index_type,
                 metric="cosine", num_partitions=1,
-                m=16, ef_construction=300,
+                m=candidate_build.m if candidate_build is not None else 16,
+                ef_construction=candidate_build.ef_construction if candidate_build is not None else 300,
                 dense_chunks_count=len(dense_chunks),
             )
             index_started = time.perf_counter()

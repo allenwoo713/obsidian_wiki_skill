@@ -49,6 +49,7 @@ GRAPH_CONTRACT_QUERIES = HERE / "graph_queries.jsonl"
 sys.path.insert(0, str(SCRIPTS))
 
 from build_index import CandidateQueryPolicy, WikiIndex  # noqa: E402
+from obsidian_wiki.domain.index_models import CandidateBuildPolicy  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
@@ -493,7 +494,10 @@ def run_phase07_representative_campaign(
     finalist = finalist or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
     def build_candidate(name, config):
         index_dir = root / name / ".index"
-        policy = CandidateQueryPolicy(candidate=config["candidate"], query_ef=config["query_ef"])
+        policy = CandidateQueryPolicy(
+            candidate=config["candidate"], query_ef=config["query_ef"],
+            build_policy=CandidateBuildPolicy(candidate=config["candidate"], m=config["m"], ef_construction=config["ef_construction"]),
+        )
         if embed is None:
             wi = WikiIndex(index_dir); wi.build(wiki, full_rebuild=True, candidate_query_policy=policy)
         else:
