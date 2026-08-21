@@ -25,6 +25,7 @@ from eval.phase07_ann_campaign import (
     canonical_digest as campaign_digest,
     select_stage1_nominees,
 )
+from eval.ann_frontier_statistics import holm_adjust
 
 
 PHASE07_PACKET_FIELDS = frozenset({
@@ -147,10 +148,15 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
         raise ValueError("D-04/D-20 build query allocation")
     for name, size in (("d04", 6), ("d20", 4)):
         family = packet[name]
-        if not isinstance(family, dict) or family.get("family_size") != size or not isinstance(family.get("raw_p_values"), list) or len(family["raw_p_values"]) != size or not isinstance(family.get("holm_adjusted_p_values"), list) or len(family["holm_adjusted_p_values"]) != size or not isinstance(family.get("basic_ci_95"), list) or len(family["basic_ci_95"]) != size:
+        member_d20 = name == "d20" and isinstance(family, dict) and family.get("family_name") == "d20_current_baseline_member" and family.get("family_size") == 2
+        if not isinstance(family, dict) or (not member_d20 and (family.get("family_size") != size or not isinstance(family.get("holm_adjusted_p_values"), list) or len(family["holm_adjusted_p_values"]) != size)) or not isinstance(family.get("raw_p_values"), list) or len(family["raw_p_values"]) != (2 if member_d20 else size) or not isinstance(family.get("basic_ci_95"), list) or len(family["basic_ci_95"]) != (2 if member_d20 else size):
             raise ValueError("separate confirmation statistical family")
-    if packet["d04"].get("family_name") != "d04_ef_300_vs_200" or packet["d20"].get("family_name") != "d20_current_baseline" or packet["d20"].get("baseline_build_id") != by_m[16]["build_id"]:
+    if packet["d04"].get("family_name") != "d04_ef_300_vs_200" or packet["d20"].get("family_name") not in {"d20_current_baseline", "d20_current_baseline_member"} or packet["d20"].get("baseline_build_id") != by_m[16]["build_id"]:
         raise ValueError("D-20 must reference this packet m=16 baseline")
+    for family in (packet["d04"], packet["d20"]):
+        for value in [*family["raw_p_values"], *(family.get("holm_adjusted_p_values") or []), *(item for interval in family["basic_ci_95"] for item in interval)]:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError("non-finite confirmation statistic")
     return packet
 
 
@@ -188,9 +194,45 @@ def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
         eligible.append(success[0])
     if len(eligible) != 6 or len({record["workflow_inputs_sha256"] for record in eligible}) != 6:
         raise ValueError("exact six eligible confirmation records")
-    ledger = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_plan_sha256": plan["record_self_sha256"], "eligible_evidence_runs": eligible, "all_physical_workflow_runs": physical}
+    ordinal_families = []
+    for ordinal in (1, 2, 3):
+        pair = [record for record in eligible if record["slot"]["ordinal"] == ordinal]
+        if {record["slot"]["m"] for record in pair} != {20, 32}:
+            raise ValueError("D-20 requires both primary m values per ordinal")
+        members = [comparison for record in pair for comparison in record["d20"].get("comparisons", [])]
+        if members:
+            if len(members) != 4:
+                raise ValueError("D-20 ordinal family must contain four paired members")
+            raw = [member["raw_permutation_p"] for member in members]
+            ordinal_families.append({"ordinal": ordinal, "family_name": "d20_current_baseline", "family_size": 4, "comparisons": members, "raw_p_values": raw, "holm_adjusted_p_values": holm_adjust(raw), "basic_ci_95": [member["basic_ci_95"] for member in members], "baseline_build_ids": [record["d20"]["baseline_build_id"] for record in pair]})
+    ledger = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_plan_sha256": plan["record_self_sha256"], "eligible_evidence_runs": eligible, "all_physical_workflow_runs": physical, "d20_ordinal_families": ordinal_families}
     ledger["record_self_sha256"] = canonical_digest(ledger)
     return ledger
+
+
+def reconcile_confirmation_request(request: dict, source: dict) -> dict:
+    """Consume downloaded packet wrappers and recompute the six-slot cross-run ledger."""
+    from eval.phase07_operator_gate import canonical_digest as operator_digest, validate_confirmation_dispatch_bundle
+    if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
+        raise ValueError("sealed confirmation request")
+    wrappers = source.get("packets") if isinstance(source, dict) else None
+    if not isinstance(wrappers, list) or not wrappers:
+        raise ValueError("downloaded confirmation packets required")
+    inputs, packets = [], []
+    for wrapper in wrappers:
+        if not isinstance(wrapper, dict) or set(wrapper) != {"dispatch_bundle", "packet"}:
+            raise ValueError("downloaded packet wrapper schema")
+        bundle = wrapper["dispatch_bundle"]
+        record = validate_confirmation_dispatch_bundle(bundle, expected_head=request.get("post_task0_head", ""))
+        if bundle["confirmation_request"] != request:
+            raise ValueError("cross-request confirmation replay")
+        inputs.append(record); packets.append(wrapper["packet"])
+    if len(inputs) != 6:
+        raise ValueError("exact six downloaded confirmation inputs")
+    plan = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": sorted(inputs, key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
+            "artifact_reported_nominated_m": request["artifact_reported_nominated_m"], "authoritative_nominated_m": request["authoritative_nominated_m"]}
+    plan["record_self_sha256"] = operator_digest(plan)
+    return reconcile_confirmation(plan, packets)
 
 
 def _stage1_reject_secrets(value: Any, location: str = "request") -> None:
@@ -623,8 +665,17 @@ def main() -> int:
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument("--mode")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--confirmation-request", type=Path)
+    parser.add_argument("--confirmation-ledger", type=Path)
     args = parser.parse_args()
     try:
+        if args.confirmation_request is not None or args.confirmation_ledger is not None:
+            if args.confirmation_request is None or args.confirmation_ledger is None or args.mode != "confirmation":
+                raise ValueError("confirmation reconciliation requires request, downloaded ledger, and confirmation mode")
+            result = reconcile_confirmation_request(_read_json(args.confirmation_request), _read_json(args.confirmation_ledger))
+            args.confirmation_ledger.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print("[PASS] confirmation ANN reconciliation", file=sys.stderr)
+            return 0
         if args.stage1_request is not None or args.artifact_dir is not None or args.mode is not None:
             if args.stage1_request is None or args.artifact_dir is None or args.output is None:
                 raise ValueError("Stage 1 reconciliation requires request, artifact directory, and output")

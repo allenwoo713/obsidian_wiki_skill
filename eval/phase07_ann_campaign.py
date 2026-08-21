@@ -383,6 +383,28 @@ def _write(path: Path, value: dict[str, Any]) -> None:
     sealed = dict(value); sealed["record_self_sha256"] = canonical_digest(sealed); path.write_text(json.dumps(sealed, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
+def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: dict[str, Any],
+                                    run_id: int, run_attempt: int, job_id: int, job_key: str,
+                                    job_allocation_nonce: str, archive_sha256: str,
+                                    content_sha256: str) -> dict[str, Any]:
+    """Convert production campaign output to the strict, self-sealed packet shape."""
+    if result.get("build_count") != 3 or result.get("workflow_inputs_sha256") != workflow_inputs.get("record_self_sha256"):
+        raise ValueError("confirmation campaign result binding")
+    d04, d20 = result.get("d04_statistics"), result.get("d20_member_statistics")
+    if not isinstance(d04, dict) or not isinstance(d20, dict):
+        raise ValueError("missing computed confirmation families")
+    packet = {"schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": workflow_inputs["record_self_sha256"],
+              "slot": workflow_inputs["slot"], "run_id": run_id, "run_attempt": run_attempt, "job_id": job_id,
+              "job_key": job_key, "job_allocation_nonce": job_allocation_nonce, "status": "numeric-success",
+              "failure_class": None, "replacement_for_run_id": None,
+              "builds": [{"build_id": build["build_id"], "m": build["build"]["m"], "ef_construction": build["build"]["ef_construction"], "query_ef": [group["query_ef"] for group in build["queries"]]} for build in result["builds"]],
+              "d04": {"family_name": d04["family_name"], "family_size": d04["family_size"], "comparisons": d04["comparisons"], "raw_p_values": [row["raw_permutation_p"] for row in d04["comparisons"]], "holm_adjusted_p_values": [row["holm_adjusted_p"] for row in d04["comparisons"]], "basic_ci_95": [row["basic_ci_95"] for row in d04["comparisons"]]},
+              "d20": {"family_name": d20["family_name"], "family_size": d20["family_size"], "baseline_build_id": result["d20_baseline_build_id"], "comparisons": d20["comparisons"], "raw_p_values": [row["raw_permutation_p"] for row in d20["comparisons"]], "basic_ci_95": [row["basic_ci_95"] for row in d20["comparisons"]]},
+              "archive_sha256": archive_sha256, "content_sha256": content_sha256, "retention_days": 90}
+    packet["record_self_sha256"] = canonical_digest(packet)
+    return packet
+
+
 def execute(request: dict[str, Any], output_dir: Path, *, runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
     request = validate_request(request); output_dir.mkdir(parents=True, exist_ok=True); _write(output_dir / f"{request['stage']}-request.json", request); _write(output_dir / f"{request['stage']}-ledger.json", {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "authorization": "none"})
     try:

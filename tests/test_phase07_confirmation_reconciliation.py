@@ -157,3 +157,17 @@ def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> No
     with pytest.raises(ValueError, match="mismatch"): operator.validate_confirmation_dispatch_bundle(pristine, expected_head="e" * 40)
     other = operator.build_confirmation_plan(LEDGER, post_task0_head="d" * 40); pristine["confirmation_request"] = other["confirmation_request"]
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(pristine, expected_head=HEAD)
+
+
+def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(tmp_path: Path) -> None:
+    plan = _plan(); request, ledger = tmp_path / "request.json", tmp_path / "ledger.json"
+    request.write_text(json.dumps(plan["confirmation_request"]), encoding="utf-8")
+    wrappers = [{"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot},
+                 "packet": _packet(slot, run_id=index + 1)} for index, slot in enumerate(plan["workflow_inputs"])]
+    ledger.write_text(json.dumps({"packets": wrappers}), encoding="utf-8")
+    result = subprocess.run([sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
+                             "--confirmation-ledger", str(ledger), "--mode", "confirmation"],
+                            cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    sealed = json.loads(ledger.read_text())
+    assert len(sealed["eligible_evidence_runs"]) == 6 and sealed["record_self_sha256"] == reconcile.canonical_digest(sealed)
