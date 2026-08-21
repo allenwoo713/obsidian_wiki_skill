@@ -41,6 +41,7 @@ CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
     "slot", "post_task0_head", "continuation_binding",
     "continuation_binding_sha256", "dispatch_identity", "record_self_sha256",
 })
+JOB_DISPLAY_NAMES = {"phase07-confirmation": "Phase 07 independent confirmation campaign"}
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -150,7 +151,8 @@ def allocate_confirmation_job(client: Any, *, repository: str, run_id: int, run_
     try:
         response = client.get_json(f"/repos/{repository}/actions/runs/{run_id}/attempts/{run_attempt}/jobs", token)
         jobs = response.get("jobs") if isinstance(response, dict) else None
-        matches = [job for job in jobs if isinstance(job, dict) and job.get("name") == job_key and job.get("run_id") == run_id and job.get("run_attempt") == run_attempt] if isinstance(jobs, list) else []
+        expected_name = JOB_DISPLAY_NAMES.get(job_key, job_key)
+        matches = [job for job in jobs if isinstance(job, dict) and job.get("name") == expected_name and job.get("run_id") == run_id and job.get("run_attempt") == run_attempt] if isinstance(jobs, list) else []
         if len(matches) != 1 or not isinstance(matches[0].get("id"), int) or matches[0]["id"] <= 0:
             raise ValueError("attempt-scoped job must match exactly once")
     except ValueError:
@@ -446,9 +448,34 @@ def run_pr_gates(request_file: Path, ledger_file: Path) -> int:
     return run_campaign(request_file, ledger_file)
 
 
+def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_inputs_dir: Path,
+                          preflight_request: Path) -> int:
+    """Materialize the only six dispatchable records from the exact feature head."""
+    root = Path(_git("rev-parse", "--show-toplevel"))
+    head = _git("rev-parse", "HEAD")
+    plan = build_confirmation_plan(stage1_ledger, post_task0_head=head)
+    validate_confirmation_plan(plan)
+    request_file.parent.mkdir(parents=True, exist_ok=True)
+    request_file.write_text(json.dumps(plan["confirmation_request"], sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    workflow_inputs_dir.mkdir(parents=True, exist_ok=True)
+    for record in plan["workflow_inputs"]:
+        slot = record["slot"]
+        (workflow_inputs_dir / f"confirmation-m{slot['m']}-ordinal{slot['ordinal']}.json").write_text(
+            json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    preflight = {
+        "repository": _read_object(stage1_ledger)["repository"], "branch": _git("branch", "--show-current"),
+        "worktree_root": str(root), "head_sha": head, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "confirmation", "continuation_binding": "",
+        "require_upstream_head": True, "ledger_path": str(preflight_request.with_name("07-05-confirmations-preflight-ledger.json")),
+    }
+    preflight_request.parent.mkdir(parents=True, exist_ok=True)
+    preflight_request.write_text(json.dumps(preflight, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -462,6 +489,9 @@ def main() -> int:
     parser.add_argument("--runner-os", default="")
     parser.add_argument("--runner-architecture", default="")
     parser.add_argument("--job-status", default="unknown")
+    parser.add_argument("--stage1-ledger", type=Path)
+    parser.add_argument("--workflow-inputs-dir", type=Path)
+    parser.add_argument("--preflight-request", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "hosted-preflight":
@@ -486,6 +516,11 @@ def main() -> int:
             return seal_confirmation_allocation(workflow_inputs=_read_object(args.request_file), output=args.ledger_file,
                                                 repository=args.repository or "", run_id=args.run_id or 0,
                                                 run_attempt=args.run_attempt or 0, job_key=args.job_key or "", head_sha=args.head_sha or "", token=token)
+        if args.command == "confirmation-plan":
+            if None in (args.stage1_ledger, args.request_file, args.workflow_inputs_dir, args.preflight_request):
+                raise ValueError("confirmation-plan requires immutable ledger and all generated output paths")
+            return run_confirmation_plan(stage1_ledger=args.stage1_ledger, request_file=args.request_file,
+                                         workflow_inputs_dir=args.workflow_inputs_dir, preflight_request=args.preflight_request)
         if args.request_file is None or args.ledger_file is None:
             raise ValueError("operator command requires request and ledger files")
         return {"preflight": run_preflight, "campaign": run_campaign, "decision": run_decision, "pr-gates": run_pr_gates}[args.command](args.request_file, args.ledger_file)

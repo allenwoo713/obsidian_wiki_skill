@@ -103,13 +103,13 @@ class _FakeActions:
 
 
 def test_attempt_scoped_job_allocation_is_unique_and_never_serializes_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = _FakeActions([{"id": 41, "name": "phase07-confirmation", "run_id": 9, "run_attempt": 2}])
+    client = _FakeActions([{"id": 41, "name": "Phase 07 independent confirmation campaign", "run_id": 9, "run_attempt": 2}])
     allocation = operator.allocate_confirmation_job(client, repository="owner/repo", run_id=9, run_attempt=2,
                                                      job_key="phase07-confirmation", token="ghp_private_token")
     assert allocation["job_id"] == 41 and len(allocation["job_allocation_nonce"]) == 32
     assert client.urls == ["/repos/owner/repo/actions/runs/9/attempts/2/jobs"]
     assert "ghp_" not in json.dumps(allocation)
-    for jobs in ([], client.jobs * 2, [{"id": 41, "name": "phase07-confirmation", "run_id": 9, "run_attempt": 1}]):
+    for jobs in ([], client.jobs * 2, [{"id": 41, "name": "Phase 07 independent confirmation campaign", "run_id": 9, "run_attempt": 1}]):
         with pytest.raises(ValueError):
             operator.allocate_confirmation_job(_FakeActions(jobs), repository="owner/repo", run_id=9,
                                                             run_attempt=2, job_key="phase07-confirmation", token="x")
@@ -127,7 +127,7 @@ def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp
     ], cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     generated = json.loads(request.read_text())
-    records = [json.loads(path.read_text()) for path in sorted(inputs.glob("*.json"))]
+    records = sorted((json.loads(path.read_text()) for path in inputs.glob("*.json")), key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"]))
     assert len(records) == 6 and generated["post_task0_head"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     assert preflight.exists()
     plan = {"schema_version": 1, "confirmation_request": generated, "workflow_inputs": records,
