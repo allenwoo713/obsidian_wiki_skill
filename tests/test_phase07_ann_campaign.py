@@ -241,7 +241,7 @@ def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_p
     assert confirmation["d20_member_statistics"]["family_size"] == 2
     packet = confirmation_packet_from_result(result=confirmation, workflow_inputs=_request("confirmation")["workflow_inputs"],
                                              run_id=1, run_attempt=1, job_id=2, job_key="phase07-confirmation",
-                                             job_allocation_nonce="f" * 32, archive_sha256="a" * 64, content_sha256="b" * 64)
+                                             job_allocation_nonce="f" * 32, raw_tree_sha256="a" * 64)
     assert packet["d04"]["family_size"] == 6 and packet["d20"]["family_size"] == 2
     stage2 = execute(_request("continuation", mode="stage2_sq"), tmp_path / "stage2", runner=runner.run)["result"]
     assert [group["query_ef"] for group in stage2["stage2"]["queries"]] == [300, 500]

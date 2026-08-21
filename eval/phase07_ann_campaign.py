@@ -385,8 +385,7 @@ def _write(path: Path, value: dict[str, Any]) -> None:
 
 def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: dict[str, Any],
                                     run_id: int, run_attempt: int, job_id: int, job_key: str,
-                                    job_allocation_nonce: str, archive_sha256: str,
-                                    content_sha256: str) -> dict[str, Any]:
+                                    job_allocation_nonce: str, raw_tree_sha256: str) -> dict[str, Any]:
     """Convert production campaign output to the strict, self-sealed packet shape."""
     if result.get("build_count") != 3 or result.get("workflow_inputs_sha256") != workflow_inputs.get("record_self_sha256"):
         raise ValueError("confirmation campaign result binding")
@@ -400,7 +399,7 @@ def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: 
               "builds": [{"build_id": build["build_id"], "m": build["build"]["m"], "ef_construction": build["build"]["ef_construction"], "query_ef": [group["query_ef"] for group in build["queries"]]} for build in result["builds"]],
               "d04": {"family_name": d04["family_name"], "family_size": d04["family_size"], "comparisons": d04["comparisons"], "raw_p_values": [row["raw_permutation_p"] for row in d04["comparisons"]], "holm_adjusted_p_values": [row["holm_adjusted_p"] for row in d04["comparisons"]], "basic_ci_95": [row["basic_ci_95"] for row in d04["comparisons"]]},
               "d20": {"family_name": d20["family_name"], "family_size": d20["family_size"], "baseline_build_id": result["d20_baseline_build_id"], "comparisons": d20["comparisons"], "raw_p_values": [row["raw_permutation_p"] for row in d20["comparisons"]], "basic_ci_95": [row["basic_ci_95"] for row in d20["comparisons"]]},
-              "archive_sha256": archive_sha256, "content_sha256": content_sha256, "retention_days": 90}
+              "raw_tree_sha256": raw_tree_sha256, "retention_days": 90}
     packet["record_self_sha256"] = canonical_digest(packet)
     return packet
 

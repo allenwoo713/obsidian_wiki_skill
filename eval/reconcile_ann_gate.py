@@ -117,7 +117,7 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
     required = {
         "schema_version", "campaign_stage", "workflow_inputs_sha256", "slot", "run_id", "run_attempt",
         "job_id", "job_key", "job_allocation_nonce", "status", "failure_class", "replacement_for_run_id",
-        "builds", "d04", "d20", "archive_sha256", "content_sha256", "retention_days", "record_self_sha256",
+        "builds", "d04", "d20", "raw_tree_sha256", "retention_days", "record_self_sha256",
     }
     if not isinstance(packet, dict) or set(packet) != required or packet.get("record_self_sha256") != canonical_digest(packet):
         raise ValueError("sealed confirmation packet")
@@ -125,7 +125,7 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
         raise ValueError("confirmation input/request binding")
     if not all(isinstance(packet[key], int) and packet[key] > 0 for key in ("run_id", "run_attempt", "job_id")) or not isinstance(packet["job_key"], str) or not packet["job_key"] or not isinstance(packet["job_allocation_nonce"], str) or len(packet["job_allocation_nonce"]) < 32:
         raise ValueError("confirmation allocation identity")
-    if packet["retention_days"] != 90 or not all(isinstance(packet[key], str) and _HEX64.fullmatch(packet[key]) for key in ("archive_sha256", "content_sha256")):
+    if packet["retention_days"] != 90 or not isinstance(packet["raw_tree_sha256"], str) or not _HEX64.fullmatch(packet["raw_tree_sha256"]):
         raise ValueError("confirmation artifact retention/digest")
     failure = packet["failure_class"]
     if packet["status"] == "numeric-success":

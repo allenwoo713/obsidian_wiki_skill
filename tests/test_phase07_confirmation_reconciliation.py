@@ -53,7 +53,7 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
         "d20": {"family_name": "d20_current_baseline_member", "family_size": 2,
                 "baseline_build_id": builds[0]["build_id"], "raw_p_values": [row["raw_permutation_p"] for row in d20_comparisons],
                 "basic_ci_95": [row["basic_ci_95"] for row in d20_comparisons], "comparisons": d20_comparisons},
-        "archive_sha256": "a" * 64, "content_sha256": "b" * 64, "retention_days": 90,
+        "raw_tree_sha256": "a" * 64, "retention_days": 90,
     }
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     return packet
