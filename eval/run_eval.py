@@ -1045,6 +1045,26 @@ def load_queries(path: Path):
     return out
 
 
+def load_phase07_personal_wiki_ann_queries(path: Path) -> list[dict]:
+    """Load the separately pinned 256 natural-language ANN truth queries.
+
+    These records are intentionally only an evaluation input; passing them to
+    ``hybrid_search`` or indexing their text is not part of this boundary.
+    """
+    queries = load_queries(path)
+    if len(queries) != 256 or any(
+        item.get("schema_version") != 1
+        or item.get("stratum") != "natural_language_ann_exact"
+        or not isinstance(item.get("query_id"), str)
+        or not isinstance(item.get("query"), str)
+        for item in queries
+    ):
+        raise ValueError("Phase 7 natural-language ANN query manifest")
+    if len({item["query_id"] for item in queries}) != 256:
+        raise ValueError("duplicate Phase 7 ANN query ID")
+    return queries
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wiki", type=Path, default=FIXTURES_WIKI)

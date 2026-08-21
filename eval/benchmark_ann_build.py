@@ -48,6 +48,13 @@ CORPUS_SEED = 41001
 QUERY_SEED = 41002
 _LOCKED_PACKAGES = {"lancedb", "numpy", "pyarrow"}
 CALIBRATION_RULE_VERSION = "omp-median-mad-v1"
+PHASE07_STAGE1_M = (16, 20, 32)
+PHASE07_STAGE1_EF_CONSTRUCTION = 300
+PHASE07_STAGE1_QUERY_EF = (100, 150, 200, 300)
+PHASE07_STAGE2_EF_CONSTRUCTION = 500
+PHASE07_STAGE2_QUERY_EF = (300, 500)
+PHASE07_REFINE_FACTORS = (2, 5, 10)
+DEFAULT_PER_BUILD_MAX_SECONDS = 180.0
 
 
 def _vectors(rows: int, dimensions: int, seed: int) -> np.ndarray:
@@ -536,6 +543,63 @@ def _candidate_worker(
         },
         "concurrency": _spawn_worker_schedule(),
     }, records
+
+
+def run_reduced_sq_build_watchdog(*, work_dir: Path, rows: int, dimensions: int,
+                                  probes: int, query_ef: tuple[int, ...],
+                                  per_build_cap_seconds: float) -> dict[str, Any]:
+    """Run one SQ build with a build-only parent watchdog and reusable query grid.
+
+    The parent measures only ``create_vector_index``; table creation, exact
+    truth, and every query are deliberately outside the 180-second KPI.
+    """
+    if not 0 < per_build_cap_seconds <= DEFAULT_PER_BUILD_MAX_SECONDS:
+        raise ValueError("per-build watchdog cap")
+    if not query_ef or any(not isinstance(value, int) or value <= 0 for value in query_ef):
+        raise ValueError("query ef grid")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    corpus = _vectors(rows, dimensions, CORPUS_SEED)
+    queries = _vectors(probes, dimensions, QUERY_SEED)
+    if _row_hashes(corpus) & _row_hashes(queries):
+        raise ValueError("exact truth queries overlap corpus")
+    with tempfile.TemporaryDirectory(prefix="phase07-sq-build-", dir=work_dir) as directory:
+        root = Path(directory)
+        chunk_ids = [f"synthetic::{index:016x}" for index in range(rows)]
+        lance_dir = root / "sq"
+        lancedb.connect(str(lance_dir)).create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
+        truth = LanceDbIndexRepository(lance_dir).search_dense_exact_batch(
+            queries.tolist(), metric="cosine", limit=20, row_batch_size=8192, query_batch_size=32,
+        )
+        from obsidian_wiki.domain.index_models import CandidateQueryPolicy
+        repository = LanceDbIndexRepository(lance_dir, eval_candidate_policy=CandidateQueryPolicy(
+            candidate="ivf-hnsw-sq", query_ef=query_ef[0],
+        ))
+        build_started = time.monotonic()
+        stats = repository.create_vector_index(VectorIndexConfig(
+            index_type="hnsw_sq", metric="cosine", num_partitions=1,
+            m=16, ef_construction=PHASE07_STAGE1_EF_CONSTRUCTION, dense_chunks_count=rows,
+        ))
+        build_elapsed = time.monotonic() - build_started
+        if build_elapsed > per_build_cap_seconds:
+            raise RuntimeError("reject-evidence: per-build watchdog timed out")
+        reopened = LanceDbIndexRepository(lance_dir, eval_candidate_policy=CandidateQueryPolicy(
+            candidate="ivf-hnsw-sq", query_ef=query_ef[0],
+        ))
+        # Each ef is query-only reuse of the one sealed SQ index; exact truth is
+        # computed once above and is never used as a fallback request.
+        requests = 0
+        for ef in query_ef:
+            for vector in queries:
+                reopened.search_dense_eval(vector.tolist(), metric="cosine", limit=20, ef=ef)
+                requests += 1
+        return {
+            "schema_version": 1, "status": "complete", "lifecycle": "completed",
+            "per_build_cap_seconds": per_build_cap_seconds, "build_elapsed_seconds": build_elapsed,
+            "build_count": 1, "build_id": hashlib.sha256(f"{lance_dir}:{build_started}".encode()).hexdigest(),
+            "index_type": "hnsw_sq", "m": 16, "ef_construction": PHASE07_STAGE1_EF_CONSTRUCTION,
+            "query_ef": list(query_ef), "exact_truth_computed_once": len(truth.result_ids) == probes,
+            "reopen_verified": stats.unindexed_dense_rows == 0, "normal_ann_request_count": requests,
+        }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:

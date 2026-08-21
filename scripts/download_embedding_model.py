@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import argparse
+import json
 from pathlib import Path
 
 
@@ -21,7 +23,21 @@ def _model_is_complete(path: Path) -> bool:
     return (path / "model.safetensors").is_file()
 
 
+def validate_model_tree_only() -> None:
+    """Validate the pinned tree without a network or filesystem hydration path."""
+    from eval.ann_corpus_manifest import load_manifest, validate_model_tree
+    lock = load_manifest(SKILL_ROOT / "eval" / "model-manifest.json")
+    validate_model_tree(MODEL_DIR, lock, allow_download=False)
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-model-tree", action="store_true")
+    args = parser.parse_args()
+    if args.validate_model_tree:
+        validate_model_tree_only()
+        print(json.dumps({"valid": True, "model_dir": str(MODEL_DIR)}, sort_keys=True))
+        return
     if _model_is_complete(MODEL_DIR):
         print(f"embedding model already available: {MODEL_DIR}")
         return
