@@ -1,15 +1,22 @@
 """End-to-end fail-closed contracts for the Phase 07 Stage 1 handoff."""
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "eval") not in sys.path:
+    sys.path.insert(0, str(ROOT / "eval"))
+
 from eval.phase07_ann_campaign import (
     CampaignConfig,
-    create_stage1_screening_artifact,
-    create_stage1_screening_request,
+    Phase07AnnCampaignRunner,
+    execute,
 )
 from eval.reconcile_ann_gate import reconcile_stage1_screening
 
@@ -32,22 +39,108 @@ def _hosted_identity() -> dict[str, object]:
         },
         "model_manifest_sha256": "b" * 64,
         "corpus_manifest_sha256": "c" * 64,
+        "workflow_name": "eval.yml",
+        "event": "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "runner": {
+            "name": "GitHub Actions 42",
+            "group": "GitHub Actions",
+            "labels": ["ubuntu-latest", "X64"],
+            "os": "Linux",
+            "image": "ubuntu-24.04",
+            "architecture": "X64",
+        },
+        "lock_identity": "e" * 64,
+        "retry_lineage": {
+            "failure_class": None,
+            "original_run_id": None,
+            "replacement_run_id": None,
+        },
+    }
+
+
+def _tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _campaign_request() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "stage": "screening",
+        "request_id": "tiny-stage1",
+        "environment": {"head_sha": "a" * 40},
+        "model_manifest_sha256": "b" * 64,
+        # This tracks a repository input only; it is never Stage 1 stress truth.
+        "corpus_manifest_sha256": "c" * 64,
+    }
+
+
+@pytest.fixture(scope="session")
+def tiny_stage1_artifact(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, dict[str, object]]:
+    root = tmp_path_factory.mktemp("stage1-real-lancedb")
+    artifact_dir = root / "artifact"
+    runner = Phase07AnnCampaignRunner(
+        CampaignConfig(rows=48, dimensions=384, probes=8, work_dir=root / "builds"),
+    )
+    result = execute(_campaign_request(), artifact_dir, runner=runner.run)
+    # Stand-in for the one raw download preserved by the operator.  The post-download
+    # request below is constructed directly in the test, not by campaign code.
+    raw_archive = artifact_dir / "downloaded-stage1-artifact.bin"
+    raw_archive.write_bytes((artifact_dir / "screening-result.json").read_bytes())
+    return artifact_dir, result
+
+
+def _post_download_request(artifact_dir: Path, result: dict[str, object]) -> dict[str, object]:
+    identity = _hosted_identity()
+    raw_archive = artifact_dir / "downloaded-stage1-artifact.bin"
+    archive_sha256 = hashlib.sha256(raw_archive.read_bytes()).hexdigest()
+    return {
+        "schema_version": 1,
+        "mode": "screening",
         "authorization": "none",
+        **identity,
+        "artifact": {
+            "artifact_id": 771,
+            "name": "phase07-screening-991-1",
+            "retention_days_requested": 90,
+            "retention_days_accepted": 90,
+            "created_at": "2026-08-21T00:00:00Z",
+            "expires_at": "2026-11-19T00:00:00Z",
+            "expired": False,
+            "api_archive_sha256": archive_sha256,
+            "local_archive_path": raw_archive.name,
+            "local_archive_sha256": archive_sha256,
+            "content_tree_sha256": _tree_digest(artifact_dir),
+        },
+        "campaign_result_sha256": hashlib.sha256(
+            (artifact_dir / "screening-result.json").read_bytes()
+        ).hexdigest(),
+        "campaign_request_sha256": hashlib.sha256(
+            (artifact_dir / "screening-request.json").read_bytes()
+        ).hexdigest(),
+        "campaign_ledger_sha256": hashlib.sha256(
+            (artifact_dir / "screening-ledger.json").read_bytes()
+        ).hexdigest(),
+        "record_self_sha256": "",
     }
 
 
 def test_stage1_tiny_three_build_artifact_reconciles_without_rep_manifest_truth(
-    tmp_path: Path,
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
 ) -> None:
     """Three fresh SQ builds carry stress-derived truth, not representative placeholders."""
+    source, result = tiny_stage1_artifact
     artifact_dir = tmp_path / "artifact"
-    result = create_stage1_screening_artifact(
-        artifact_dir,
-        config=CampaignConfig(rows=48, dimensions=384, probes=8, work_dir=tmp_path / "builds"),
-    )
-    request = create_stage1_screening_request(
-        hosted_identity=_hosted_identity(), artifact_dir=artifact_dir, result=result,
-    )
+    shutil.copytree(source, artifact_dir)
+    request = _post_download_request(artifact_dir, result)
     request_path = tmp_path / "stage1-request.json"
     request_path.write_text(json.dumps(request), encoding="utf-8")
     output = tmp_path / "stage1-ledger.json"
@@ -65,18 +158,18 @@ def test_stage1_tiny_three_build_artifact_reconciles_without_rep_manifest_truth(
     assert output.exists()
 
 
-@pytest.mark.parametrize("tamper", ["one-build", "symlink", "secret", "stale-head", "extra-file"])
+@pytest.mark.parametrize(
+    "tamper",
+    ["one-build", "symlink", "secret", "stale-head", "extra-file", "archive", "content-tree",
+     "job", "artifact", "rejection", "recall", "statistics", "self-digest"],
+)
 def test_stage1_reconciler_rejects_tampered_or_incomplete_evidence(
-    tmp_path: Path, tamper: str,
+    tmp_path: Path, tamper: str, tiny_stage1_artifact: tuple[Path, dict[str, object]],
 ) -> None:
+    source, result = tiny_stage1_artifact
     artifact_dir = tmp_path / "artifact"
-    result = create_stage1_screening_artifact(
-        artifact_dir,
-        config=CampaignConfig(rows=48, dimensions=384, probes=8, work_dir=tmp_path / "builds"),
-    )
-    request = create_stage1_screening_request(
-        hosted_identity=_hosted_identity(), artifact_dir=artifact_dir, result=result,
-    )
+    shutil.copytree(source, artifact_dir)
+    request = _post_download_request(artifact_dir, result)
     if tamper == "one-build":
         payload = json.loads((artifact_dir / "stage1-screening-result.json").read_text(encoding="utf-8"))
         payload["builds"] = payload["builds"][:1]
@@ -87,6 +180,25 @@ def test_stage1_reconciler_rejects_tampered_or_incomplete_evidence(
         request["token"] = "must-reject"
     elif tamper == "stale-head":
         request["head_sha"] = "d" * 40
+    elif tamper == "archive":
+        request["artifact"]["local_archive_sha256"] = "f" * 64
+    elif tamper == "content-tree":
+        request["artifact"]["content_tree_sha256"] = "f" * 64
+    elif tamper == "job":
+        request["job_id"] = 999
+    elif tamper == "artifact":
+        request["artifact"]["retention_days_accepted"] = 7
+    elif tamper == "rejection":
+        (artifact_dir / "screening-rejection.json").write_text('{"status":"reject-evidence"}', encoding="utf-8")
+    elif tamper in {"recall", "statistics", "self-digest"}:
+        payload = json.loads((artifact_dir / "screening-result.json").read_text(encoding="utf-8"))
+        if tamper == "recall":
+            payload["result"]["builds"][0]["queries"][0]["queries"][0]["recall_at_10"] = 1.0
+        elif tamper == "statistics":
+            payload["result"]["d04_statistics"]["comparisons"][0]["holm_adjusted_p"] = 0.0
+        else:
+            payload["record_self_sha256"] = "0" * 64
+        (artifact_dir / "screening-result.json").write_text(json.dumps(payload), encoding="utf-8")
     else:
         (artifact_dir / "unexpected.txt").write_text("unexpected", encoding="utf-8")
     request_path = tmp_path / "stage1-request.json"
