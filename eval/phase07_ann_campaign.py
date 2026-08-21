@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -13,6 +14,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 import lancedb
+
+# GitHub Actions invokes this production entry point as a file.  In that mode
+# Python places ``eval/`` rather than the repository root on sys.path, so the
+# package imports below would otherwise fail before the campaign can seal a
+# rejection artifact.  Module execution and normal imports already include
+# the repository root and therefore remain unchanged.
+if __name__ == "__main__" and not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from eval import benchmark_ann_build as benchmark
 from eval.ann_frontier_statistics import (
