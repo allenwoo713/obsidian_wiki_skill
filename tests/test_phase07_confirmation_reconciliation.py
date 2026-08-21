@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -115,3 +117,28 @@ def test_attempt_scoped_job_allocation_is_unique_and_never_serializes_token(monk
     with pytest.raises(ValueError, match="nonce"):
         operator.allocate_confirmation_job(client, repository="owner/repo", run_id=9, run_attempt=2,
                                            job_key="phase07-confirmation", token="x")
+
+
+def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp_path: Path) -> None:
+    request, inputs, preflight = tmp_path / "request.json", tmp_path / "inputs", tmp_path / "preflight.json"
+    result = subprocess.run([
+        sys.executable, "eval/phase07_operator_gate.py", "confirmation-plan", "--stage1-ledger", str(LEDGER),
+        "--request-file", str(request), "--workflow-inputs-dir", str(inputs), "--preflight-request", str(preflight),
+    ], cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    generated = json.loads(request.read_text())
+    records = [json.loads(path.read_text()) for path in sorted(inputs.glob("*.json"))]
+    assert len(records) == 6 and generated["post_task0_head"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    assert preflight.exists()
+    plan = {"schema_version": 1, "confirmation_request": generated, "workflow_inputs": records,
+            "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20]}
+    plan["record_self_sha256"] = operator.canonical_digest(plan)
+    operator.validate_confirmation_plan(plan)
+
+
+def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across_six() -> None:
+    jobs = [{"id": 41, "name": "Phase 07 independent confirmation campaign", "run_id": 9, "run_attempt": 2}]
+    allocations = [operator.allocate_confirmation_job(_FakeActions(jobs), repository="owner/repo", run_id=9,
+                                                    run_attempt=2, job_key="phase07-confirmation", token="x")
+                   for _ in range(6)]
+    assert {row["job_allocation_nonce"] for row in allocations}.__len__() == 6
