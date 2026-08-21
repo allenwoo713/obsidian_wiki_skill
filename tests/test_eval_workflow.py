@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 APPROVED_CALIBRATION = SKILL_ROOT / "eval" / "approved_ann_calibration.json"
@@ -90,12 +91,43 @@ def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> 
     for required in (
         "personal-wiki-corpus-manifest",
         "model-manifest.json",
-        "validate-model-tree",
         "public-distractor-v1",
         "exact-truth",
-        "no-download-fallback",
     ):
         assert required in workflow
+
+
+def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -> None:
+    """A dispatch must never accidentally start legacy or full-evaluation jobs."""
+    workflow = yaml.load(
+        (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    jobs = workflow["jobs"]
+    expected = {
+        "preflight": {"phase07-entitlement-preflight"},
+        "screening": {"phase07-screening"},
+        "confirmation": {"phase07-confirmation"},
+        "continuation": {"phase07-continuation"},
+    }
+    for stage, allowed in expected.items():
+        selected = {
+            name for name, spec in jobs.items()
+            if f"inputs.campaign_stage == '{stage}'" in spec.get("if", "")
+        }
+        assert selected == allowed
+    for job in ("test-and-eval", "issue41-scale-benchmark", "model-backed-ann-decision", "reconcile-ann-decision"):
+        assert "github.event_name == 'pull_request'" in jobs[job].get("if", "")
+    assert "legacy-issue41-calibration" in jobs["issue41-manual-calibration"].get("if", "")
+    assert all(
+        "inputs.campaign_stage == 'unknown'" not in spec.get("if", "")
+        for spec in jobs.values()
+    )
+    preflight = jobs["phase07-entitlement-preflight"]
+    serialized = json.dumps(preflight, sort_keys=True)
+    assert "download_embedding_model.py" not in serialized
+    assert "benchmark_ann_build.py" not in serialized
+    assert "run_eval.py" not in serialized
 
 
 def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:

@@ -17,7 +17,7 @@ on:
         required: false
         default: preflight
         type: choice
-        options: [preflight, screening, confirmation, continuation]
+        options: [preflight, screening, confirmation, continuation, legacy-issue41-calibration]
       continuation_binding:
         description: "Immutable prior-run binding; not interpolated into shell"
         required: false
@@ -31,6 +31,7 @@ permissions:
 
 jobs:
   test-and-eval:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -185,7 +186,8 @@ jobs:
 
   issue41-manual-calibration:
     name: "Issue #41 manual ANN calibration (non-authorizing)"
-    if: github.event_name == 'workflow_dispatch'
+    # Kept as a legacy Issue #41 diagnostic; it is not a Phase 07 campaign.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'legacy-issue41-calibration' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -490,17 +492,6 @@ jobs:
           test -f eval/personal-wiki-corpus-manifest.json
           grep -q 'public-distractor-v1' eval/personal-wiki-corpus-manifest.json
           grep -q 'exact-truth' eval/personal-wiki-corpus-manifest.json
-      - name: Validate cache tree or exact-revision hydration on miss
-        run: |
-          set -euo pipefail
-          if python scripts/download_embedding_model.py --validate-model-tree; then
-            echo "model cache hit validated"
-          else
-            echo "model cache miss: hydrate only the pinned manifest revision"
-            python scripts/download_embedding_model.py
-            python scripts/download_embedding_model.py --validate-model-tree
-          fi
-          # no-download-fallback: failed validation never proceeds with an alternate model.
       - name: Seal a small non-authorizing preflight record
         run: |
           python -c "import hashlib,json,os,pathlib; p={'schema_version':1,'repository':'${{ github.repository }}','run_id':int('${{ github.run_id }}'),'run_attempt':int('${{ github.run_attempt }}'),'head_sha':'${{ github.sha }}','campaign_stage':'preflight','runner':{'os':'ubuntu-latest','image':'${{ runner.os }}','architecture':'${{ runner.arch }}'},'retention_days':90,'retry_lineage':{'failure_class':'none','original_run_id':None,'replacement_run_id':None}}; p['record_self_sha256']=hashlib.sha256(json.dumps(p,sort_keys=True,separators=(',',':')).encode()).hexdigest(); pathlib.Path('.review-tmp').mkdir(exist_ok=True); pathlib.Path('.review-tmp/phase07-preflight.json').write_text(json.dumps(p,sort_keys=True,indent=2)+'\\n')"
@@ -510,6 +501,80 @@ jobs:
         with:
           name: phase07-entitlement-preflight-${{ github.run_id }}-${{ github.run_attempt }}
           path: .review-tmp/phase07-preflight.json
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-screening:
+    name: "Phase 07 bounded SQ screening campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'screening' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Require a sealed screening request from the evaluator stage
+        run: >
+          python eval/phase07_operator_gate.py campaign
+          --request-file .review-tmp/phase07/screening-request.json
+          --ledger-file .review-tmp/phase07/screening-ledger.json
+      - name: Upload sealed screening evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-screening-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-confirmation:
+    name: "Phase 07 independent confirmation campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'confirmation' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Require fresh sealed confirmation evidence
+        run: >
+          python eval/phase07_operator_gate.py campaign
+          --request-file .review-tmp/phase07/confirmation-request.json
+          --ledger-file .review-tmp/phase07/confirmation-ledger.json
+      - name: Upload sealed confirmation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-continuation:
+    name: "Phase 07 bounded continuation campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'continuation' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Reconcile one immutable continuation binding
+        env:
+          PHASE07_CONTINUATION: ${{ inputs.continuation_binding }}
+        run: |
+          set -euo pipefail
+          [[ "$PHASE07_CONTINUATION" =~ ^[0-9A-Za-z._:-]{1,160}$ ]]
+          python eval/phase07_operator_gate.py decision --request-file .review-tmp/phase07/continuation-request.json --ledger-file .review-tmp/phase07/continuation-ledger.json
+      - name: Upload sealed continuation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-continuation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07
           if-no-files-found: error
           retention-days: 90
 
