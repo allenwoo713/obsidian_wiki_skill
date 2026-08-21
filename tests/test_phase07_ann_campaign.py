@@ -236,6 +236,8 @@ def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_p
     assert confirmation["build_count"] == 3
     assert {build["build"]["m"] for build in confirmation["builds"]} == {16, 20, 32}
     assert [group["query_ef"] for group in confirmation["builds"][0]["queries"]] == [100, 200, 300]
+    assert confirmation["d04_statistics"]["family_size"] == 6
+    assert confirmation["d20_member_statistics"]["family_size"] == 2
     stage2 = execute(_request("continuation", mode="stage2_sq"), tmp_path / "stage2", runner=runner.run)["result"]
     assert [group["query_ef"] for group in stage2["stage2"]["queries"]] == [300, 500]
     refined = execute(_request("continuation", mode="refinement"), tmp_path / "refine", runner=runner.run)["result"]

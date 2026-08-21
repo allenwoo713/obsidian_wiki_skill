@@ -127,13 +127,15 @@ def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp
     ], cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     generated = json.loads(request.read_text())
-    records = sorted((json.loads(path.read_text()) for path in inputs.glob("*.json")), key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"]))
+    bundles = [json.loads(path.read_text()) for path in inputs.glob("*.json")]
+    records = sorted((bundle["workflow_input"] for bundle in bundles), key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"]))
     assert len(records) == 6 and generated["post_task0_head"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     assert preflight.exists()
     plan = {"schema_version": 1, "confirmation_request": generated, "workflow_inputs": records,
             "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20]}
     plan["record_self_sha256"] = operator.canonical_digest(plan)
     operator.validate_confirmation_plan(plan)
+    assert all(operator.validate_confirmation_dispatch_bundle(bundle, expected_head=generated["post_task0_head"]) for bundle in bundles)
 
 
 def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across_six() -> None:
@@ -142,3 +144,16 @@ def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across
                                                     run_attempt=2, job_key="phase07-confirmation", token="x")
                    for _ in range(6)]
     assert {row["job_allocation_nonce"] for row in allocations}.__len__() == 6
+
+
+def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> None:
+    plan = _plan()
+    bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": dict(plan["workflow_inputs"][0])}
+    operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
+    bundle["workflow_input"]["slot"] = {"m": 20, "ordinal": 1}
+    bundle["workflow_input"]["record_self_sha256"] = operator.canonical_digest(bundle["workflow_input"])
+    with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
+    pristine = {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}
+    with pytest.raises(ValueError, match="mismatch"): operator.validate_confirmation_dispatch_bundle(pristine, expected_head="e" * 40)
+    other = _plan(); pristine["confirmation_request"] = other["confirmation_request"]
+    with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(pristine, expected_head=HEAD)
