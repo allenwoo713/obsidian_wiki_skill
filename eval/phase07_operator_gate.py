@@ -166,16 +166,23 @@ def seal_hosted_preflight(*, output: Path, stage: str, continuation: str, reposi
             raise ValueError("invalid immutable hosted identity")
         lock = (root / "requirements.txt").read_text(encoding="utf-8")
         manifest = json.loads((root / "eval" / "model-manifest.json").read_text(encoding="utf-8"))
-        if "lancedb==0.34.0" not in lock or set(manifest) != {"schema_version", "model_id", "revision", "runtime", "files", "record_self_sha256"}:
+        if not all(value in lock for value in ("lancedb==0.34.0", "numpy==2.2.6", "pyarrow==25.0.0")) or set(manifest) != {"schema_version", "model_id", "revision", "runtime", "files", "record_self_sha256"}:
             raise ValueError("lock or model manifest syntax")
+        if manifest["model_id"] != "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" or manifest["runtime"] != {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"}:
+            raise ValueError("model manifest identity/runtime")
         if not SHA.fullmatch(manifest["revision"]) or manifest["revision"] == "0" * 40:
             raise ValueError("immutable provider revision")
         if manifest["record_self_sha256"] != canonical_digest(manifest):
             raise ValueError("model manifest self digest")
         if not isinstance(manifest["files"], list) or not manifest["files"]:
             raise ValueError("model manifest file allowlist")
+        paths = set()
+        for item in manifest["files"]:
+            if not isinstance(item, dict) or set(item) != {"path", "sha256"} or not isinstance(item["path"], str) or not item["path"] or item["path"].startswith("/") or ".." in Path(item["path"]).parts or item["path"] in paths or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"]):
+                raise ValueError("model manifest file record")
+            paths.add(item["path"])
         record["status"] = "success"
-        record["asvs_l1"] = {key: "pass" for key in ("input_validation", "access_control", "secret_handling", "artifact_trust_boundary")}
+        record["asvs_l1"] = {"input_validation": "pass", "secret_handling": "pass", "access_control": "pending-artifact-upload", "artifact_trust_boundary": "pending-artifact-upload"}
         code = 0
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         record["status"] = "reject-evidence"
@@ -198,6 +205,20 @@ def finalize_pipeline_artifact(*, output_dir: Path, stage: str, head_sha: str,
         "job_key": job_key, "job_status": job_status, "authorization": "none",
     })
     return 0
+
+
+def reconcile_hosted(binding_file: Path, output: Path) -> int:
+    """Seal strict operator-supplied hosted evidence; no download or authorization occurs here."""
+    try:
+        binding = _read_object(binding_file); _reject_secrets(binding)
+        if set(binding) != {"repository", "head_sha", "packets"} or not isinstance(binding["packets"], list):
+            raise ValueError("strict reconciliation binding")
+        packets = validate_phase07_evidence_set(binding["packets"], expected_repository=binding["repository"], expected_head=binding["head_sha"])
+        _write_ledger(output, {"schema_version": 1, "status": "success", "authorization": "none", "repository": binding["repository"], "head_sha": binding["head_sha"], "packets": [{key: packet[key] for key in ("run_id", "run_attempt", "job_id", "artifact_id", "archive_sha256", "content_sha256", "build_id")} for packet in packets]})
+        return 0
+    except (ValueError, OSError, json.JSONDecodeError, KeyError) as exc:
+        _write_ledger(output, {"schema_version": 1, "status": "reject-evidence", "authorization": "none", "reason": f"{type(exc).__name__}: {exc}"})
+        return 1
 
 
 def run_preflight(request_file: Path, ledger_file: Path) -> int:
@@ -233,7 +254,7 @@ def run_pr_gates(request_file: Path, ledger_file: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -260,6 +281,10 @@ def main() -> int:
             return finalize_pipeline_artifact(output_dir=args.output_dir or Path("."), stage=args.stage or "",
                 head_sha=args.head_sha or "", run_id=args.run_id or 0, run_attempt=args.run_attempt or 0,
                 job_key=args.job_key or "", job_status=args.job_status)
+        if args.command == "reconcile-hosted":
+            if args.request_file is None or args.ledger_file is None:
+                raise ValueError("reconcile-hosted requires binding and output")
+            return reconcile_hosted(args.request_file, args.ledger_file)
         if args.request_file is None or args.ledger_file is None:
             raise ValueError("operator command requires request and ledger files")
         return {"preflight": run_preflight, "campaign": run_campaign, "decision": run_decision, "pr-gates": run_pr_gates}[args.command](args.request_file, args.ledger_file)

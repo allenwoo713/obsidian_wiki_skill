@@ -215,8 +215,8 @@ def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> N
     import phase07_operator_gate
     root = tmp_path
     (root / "eval").mkdir()
-    (root / "requirements.txt").write_text("lancedb==0.34.0\n")
-    manifest = {"schema_version": 1, "model_id": "x", "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42", "runtime": {}, "files": [{"path": "x", "sha256": "a" * 64}]}
+    (root / "requirements.txt").write_text("lancedb==0.34.0\nnumpy==2.2.6\npyarrow==25.0.0\n")
+    manifest = {"schema_version": 1, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42", "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "files": [{"path": "x", "sha256": "a" * 64}]}
     manifest["record_self_sha256"] = phase07_operator_gate.canonical_digest(manifest)
     (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
     out = root / "proof.json"
@@ -227,6 +227,24 @@ def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> N
     assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 1
     rejection = json.loads(out.read_text())
     assert rejection["status"] == "reject-evidence" and "retention_days_accepted" not in rejection
+
+
+def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key() -> None:
+    workflow = yaml.load((SKILL_ROOT / ".github/workflows/eval.yml").read_text(), Loader=yaml.BaseLoader)
+    for name in ("phase07-screening", "phase07-confirmation", "phase07-continuation", "phase07-representative"):
+        assert workflow["jobs"][name]["env"] == {"OMP_NUM_THREADS":"2", "OPENBLAS_NUM_THREADS":"2", "MKL_NUM_THREADS":"2"}
+    confirmation = json.dumps(workflow["jobs"]["phase07-confirmation"], sort_keys=True)
+    assert "JOB_KEY" in confirmation and "job_id':k" in (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
+
+
+def test_reconcile_hosted_seals_success_and_rejection(tmp_path: Path) -> None:
+    import phase07_operator_gate as gate
+    packet = {"repository":"owner/repo","run_id":1,"run_attempt":1,"job_id":2,"job_allocation_nonce":"0123456789abcdef","artifact_id":3,"artifact_name":"x","archive_sha256":"a"*64,"content_sha256":"b"*64,"record_self_sha256":"","retention_days_requested":90,"retention_days_accepted":90,"head_sha":"c"*40,"runner":{"os":"Linux","image":"ubuntu","architecture":"X64"},"lock_identity":"locked","build_id":"d"*64,"retry_lineage":{"failure_class":"github_infrastructure","original_run_id":None,"replacement_run_id":None}}
+    packet["record_self_sha256"] = gate.canonical_digest(packet)
+    binding = tmp_path / "binding.json"; output = tmp_path / "out.json"; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]}))
+    assert gate.reconcile_hosted(binding, output) == 0
+    packet["retention_days_accepted"] = 7; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]}))
+    assert gate.reconcile_hosted(binding, output) == 1 and json.loads(output.read_text())["status"] == "reject-evidence"
 
 
 def test_phase07_finalizer_creates_rejection_when_campaign_output_is_missing(tmp_path: Path) -> None:
