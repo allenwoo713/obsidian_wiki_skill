@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import sys
@@ -117,6 +118,58 @@ def screening_plan(config: "CampaignConfig | None" = None) -> dict[str, Any]:
     validate_declared_family(family, family_name="d04_ef_300_vs_200", expected_size=6)
     config = config or CampaignConfig()
     return {"corpus": {"rows": config.rows, "dimensions": config.dimensions, "queries": config.probes, "truth": "seeded_vector_exact"}, "index": {"type": "hnsw_sq", "m": [16, 20, 32], "ef_construction": 300}, "query_ef": [100, 150, 200, 300], "per_build_max_seconds": 180, "authorization": "none"}
+
+
+def select_stage1_nominees(builds: list[dict[str, Any]], statistics: dict[str, Any]) -> list[int]:
+    """Return up to two D-04-qualified screening candidates in canonical rank order."""
+    comparisons = statistics.get("comparisons") if isinstance(statistics, dict) else None
+    if not isinstance(comparisons, list):
+        raise ValueError("Stage 1 nomination statistics")
+    effect_by_m: dict[int, dict[str, dict[str, Any]]] = {}
+    for record in comparisons:
+        comparison = record.get("comparison") if isinstance(record, dict) else None
+        if not isinstance(comparison, dict) or comparison.get("m") not in (16, 20, 32) \
+                or comparison.get("metric") not in {"recall_at_10", "recall_at_20"}:
+            raise ValueError("Stage 1 nomination comparison")
+        m, metric = comparison["m"], comparison["metric"]
+        if metric in effect_by_m.setdefault(m, {}):
+            raise ValueError("Stage 1 duplicate nomination comparison")
+        mean, interval, holm = record.get("mean_effect"), record.get("basic_ci_95"), record.get("holm_adjusted_p")
+        if isinstance(mean, bool) or not isinstance(mean, (int, float)) or not math.isfinite(mean) \
+                or not isinstance(interval, list) or len(interval) != 2 \
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in interval) \
+                or isinstance(holm, bool) or not isinstance(holm, (int, float)) or not math.isfinite(holm):
+            raise ValueError("Stage 1 nomination statistic values")
+        effect_by_m[m][metric] = record
+
+    ranked: list[tuple[float, float, int, int]] = []
+    for build in builds:
+        card, groups = build.get("build"), build.get("queries")
+        if not isinstance(card, dict) or not isinstance(groups, list) or card.get("m") not in effect_by_m:
+            raise ValueError("Stage 1 nomination build")
+        m = card["m"]
+        metrics = effect_by_m[m]
+        if set(metrics) != {"recall_at_10", "recall_at_20"}:
+            raise ValueError("Stage 1 nomination metric completeness")
+        qualified = any(
+            record["mean_effect"] > 0 and record["basic_ci_95"][0] > 0 and record["holm_adjusted_p"] <= 0.05
+            for record in metrics.values()
+        ) and all(record["mean_effect"] >= 0 for record in metrics.values())
+        if not qualified:
+            continue
+        at_300 = [group for group in groups if isinstance(group, dict) and group.get("query_ef") == 300]
+        if len(at_300) != 1:
+            raise ValueError("Stage 1 nominee ef=300 measurement")
+        group = at_300[0]
+        r10, r20, p95, index_bytes = (
+            group.get("recall_at_10"), group.get("recall_at_20"),
+            group.get("latency_p95_ms"), card.get("index_bytes"),
+        )
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               for value in (r10, r20, p95, index_bytes)) or p95 < 0 or index_bytes <= 0:
+            raise ValueError("Stage 1 nominee measurement values")
+        ranked.append((-(r10 + r20) / 2, p95, int(index_bytes), m))
+    return [m for _, _, _, m in sorted(ranked)[:2]]
 
 
 def _vector_digest(vectors: Any) -> str:
@@ -246,8 +299,7 @@ class Phase07AnnCampaignRunner:
         def operation(root, exact, exact_ms):
             builds = [self._build(root, m=m, ef_construction=300, query_ef=(100, 150, 200, 300), exact_ids=exact, exact_ms=exact_ms) for m in (16, 20, 32)]
             statistics = self._screening_statistics(builds)
-            nominees = sorted({record["comparison"]["m"] for record in statistics["comparisons"]
-                               if record["mean_effect"] > 0 and record["basic_ci_95"][0] > 0 and record["holm_adjusted_p"] <= 0.05})[:2]
+            nominees = select_stage1_nominees(builds, statistics)
             return {"plan": screening_plan(self.config), "stress_identity": _stress_identity(config=self.config, exact_ids=exact), "exact_truth_computed_once": True, "build_count": 3,
                     "builds": builds, "d04_statistics": statistics, "nominated_m": nominees,
                     "authorization": "none"}

@@ -20,7 +20,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from eval import benchmark_ann_build as benchmark
 from eval.benchmark_ann_build import validate_evidence
 from eval.run_eval import validate_candidate_decision_records
-from eval.phase07_ann_campaign import Phase07AnnCampaignRunner, canonical_digest as campaign_digest
+from eval.phase07_ann_campaign import (
+    Phase07AnnCampaignRunner,
+    canonical_digest as campaign_digest,
+    select_stage1_nominees,
+)
 
 
 PHASE07_PACKET_FIELDS = frozenset({
@@ -335,10 +339,17 @@ def _validate_stage1_result(result_record: dict[str, Any], request_record: dict[
     statistics = result.get("d04_statistics")
     if statistics != Phase07AnnCampaignRunner._screening_statistics(builds):
         raise ValueError("Stage 1 D-04 six-member statistics recomputation")
-    expected_nominees = sorted({record["comparison"]["m"] for record in statistics["comparisons"] if record["mean_effect"] > 0 and record["basic_ci_95"][0] > 0 and record["holm_adjusted_p"] <= 0.05})[:2]
-    if result.get("nominated_m") != expected_nominees or len(expected_nominees) > 2:
+    reported_nominees = result.get("nominated_m")
+    if not isinstance(reported_nominees, list) or len(reported_nominees) > 2 \
+            or len(set(reported_nominees)) != len(reported_nominees) \
+            or any(m not in {16, 20, 32} for m in reported_nominees):
         raise ValueError("Stage 1 nomination boundary")
-    return result
+    # The screening artifact records the campaign's own provisional list, but
+    # the reconciler is its authority: recompute the D-04-qualified ranking
+    # from sealed numeric observations before publishing any nominee.
+    reconciled = dict(result)
+    reconciled["nominated_m"] = select_stage1_nominees(builds, statistics)
+    return reconciled
 
 
 def reconcile_stage1_screening(*, stage1_request: Path, artifact_dir: Path, output: Path, mode: str, expected_shape: tuple[int, int, int] = (77_348, 384, 256)) -> dict[str, Any]:
