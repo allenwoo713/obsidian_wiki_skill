@@ -77,6 +77,35 @@ def validate_query_corpus_separation(manifest: Mapping[str, object], *, indexed_
         raise ValueError("query/corpus overlap")
 
 
+def canonical_content_tree_sha256(root: Path) -> str:
+    """Digest a public corpus by canonical relative path and file bytes, never path root."""
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("unsafe corpus root")
+    digest = hashlib.sha256()
+    files = sorted((path for path in root.rglob("*") if path.is_file()), key=lambda path: path.relative_to(root).as_posix())
+    if not files:
+        raise ValueError("empty corpus")
+    for path in files:
+        if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+            raise ValueError("unsafe corpus entry")
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(relative); digest.update(b"\0"); digest.update(path.read_bytes()); digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def validate_indexed_query_digest_separation(*, indexed_row_digests: Iterable[str], query_row_digests: Iterable[str]) -> dict[str, object]:
+    """Fail closed on actual indexed/query digest overlap and return sealed identities."""
+    indexed, queries = set(indexed_row_digests), set(query_row_digests)
+    if not indexed or not queries or any(not isinstance(value, str) or len(value) != 64 for value in indexed | queries):
+        raise ValueError("indexed/query digest identities")
+    overlap = indexed & queries
+    if overlap:
+        raise ValueError("query/corpus overlap")
+    return {"indexed_digest_set_sha256": hashlib.sha256("\n".join(sorted(indexed)).encode()).hexdigest(),
+            "query_digest_set_sha256": hashlib.sha256("\n".join(sorted(queries)).encode()).hexdigest(),
+            "indexed_query_overlap_count": len(overlap)}
+
+
 def validate_lightweight_repository_inputs(paths: Iterable[str]) -> None:
     forbidden_suffixes = (".npy", ".npz", ".parquet", ".lance", ".safetensors", ".bin", ".arrow")
     for raw in paths:

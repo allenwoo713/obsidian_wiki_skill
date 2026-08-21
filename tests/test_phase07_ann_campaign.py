@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import math
 import random
+import shutil
 from pathlib import Path
 
 import pytest
 
 from eval.phase07_ann_campaign import CampaignConfig, Phase07AnnCampaignRunner, canonical_digest, execute, validate_request
-from eval.run_eval import run_phase07_representative_campaign
+from eval.run_eval import _representative_indexed_query_separation, run_phase07_representative_campaign
+from eval.ann_corpus_manifest import canonical_content_tree_sha256
 
 
 def _digest(letter: str) -> str:
@@ -115,8 +117,23 @@ def test_public_hybrid_facade_uses_real_build_service_and_lancedb(tmp_path: Path
     assert result["authorization"] == "none"
     assert result["hybrid_invocation"]["entrypoint"] == "query.hybrid_search"
     assert result["hybrid_invocation"] == {"entrypoint": "query.hybrid_search", "original_baseline_calls": 2, "baseline_calls": 2, "finalist_calls": 2}
-    assert result["original_fixture"]["corpus_identity"] != result["expanded"]["corpus_identity"]
+    assert result["original_fixture"]["corpus_sha256"] != result["expanded"]["corpus_sha256"]
     assert result["original_fixture"]["absolute_baseline"] is not result["expanded"]["paired_observations"]
     row = result["personal_wiki_ann_exact"]["rows"][0]
     assert {"baseline_recall_at_10", "baseline_recall_at_20", "finalist_recall_at_10", "finalist_recall_at_20"} <= set(row)
     assert result["personal_wiki_ann_exact"]["indexed_query_overlap_count"] == 0
+    from build_index import WikiIndex
+    wi = WikiIndex(tmp_path / "representative-representative_ann-1000" / "expanded-baseline" / ".index")
+    wi.load()
+    indexed_text = wi._get_repository()._dense_table().to_arrow().to_pylist()[0]["text"]
+    with pytest.raises(ValueError, match="query/corpus overlap"):
+        _representative_indexed_query_separation(wi._get_repository(), [indexed_text])
+
+
+def test_corpus_content_identity_is_root_independent_and_content_sensitive(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "wiki", first)
+    shutil.copytree(first, second)
+    assert canonical_content_tree_sha256(first) == canonical_content_tree_sha256(second)
+    (second / "distractor.md").write_text("public distractor changes corpus content", encoding="utf-8")
+    assert canonical_content_tree_sha256(first) != canonical_content_tree_sha256(second)

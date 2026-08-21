@@ -50,7 +50,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 from build_index import CandidateQueryPolicy, WikiIndex  # noqa: E402
 from obsidian_wiki.domain.index_models import CandidateBuildPolicy  # noqa: E402
-from eval.ann_corpus_manifest import validate_query_corpus_separation  # noqa: E402
+from eval.ann_corpus_manifest import (  # noqa: E402
+    canonical_content_tree_sha256,
+    validate_indexed_query_digest_separation,
+)
 from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
@@ -552,17 +555,22 @@ def run_phase07_representative_campaign(
                          "finalist_top_20": finalist_ids,
                          "baseline_recall_at_10": len(set(exact_ids[:10]) & set(baseline_ids[:10])) / 10, "baseline_recall_at_20": len(set(exact_ids) & set(baseline_ids)) / 20,
                          "finalist_recall_at_10": len(set(finalist_exact_ids[:10]) & set(finalist_ids[:10])) / 10, "finalist_recall_at_20": len(set(finalist_exact_ids) & set(finalist_ids)) / 20})
-    indexed_text_digests = {hashlib.sha256(str(row["text"]).encode()).hexdigest() for row in baseline_repo._dense_table().to_arrow().to_pylist()}
-    query_text_digests = [hashlib.sha256(item["query"].encode()).hexdigest() for item in ann_queries]
-    validate_query_corpus_separation({"schema_version": 1, "stress": {"kind": "seeded_vector_exact", "rows": 77348, "dimensions": 384, "corpus_seed": "x", "query_seed": "x", "corpus_sha256": "a" * 64, "query_sha256": "b" * 64, "exact_truth_sha256": "c" * 64}, "hybrid": {"kind": "labeled_natural_language_hybrid", "query_count": 105, "labels_sha256": "d" * 64, "query_sha256": "e" * 64}, "personal_wiki_ann": {"kind": "natural_language_ann_exact", "query_count": 256, "query_sha256": "f" * 64, "exact_truth_sha256": "0" * 64, "indexed_query_overlap_count": 0}, "generator": {"version": "public-distractor-v1", "seed": "x", "source_fixture_sha256": "1" * 64, "rules_sha256": "2" * 64}}, indexed_row_digests=indexed_text_digests, query_row_digests=query_text_digests)
+    separation = _representative_indexed_query_separation(baseline_repo, [item["query"] for item in ann_queries])
     return {
         "mode": mode, "scale": size, "candidate_configs": {"baseline": baseline, "finalist": finalist},
-        "original_fixture": {"query_count": len(queries), "corpus_identity": hashlib.sha256(str(original_wiki).encode()).hexdigest(), "absolute_baseline": original_observations},
-        "expanded": {"size": size, "corpus_identity": hashlib.sha256(str(expanded_wiki).encode()).hexdigest(), "paired_observations": expanded_observations},
-        "personal_wiki_ann_exact": {"query_count": len(ann_rows), "indexed_query_overlap_count": 0, "rows": ann_rows},
+        "original_fixture": {"query_count": len(queries), "corpus_sha256": canonical_content_tree_sha256(original_wiki), "absolute_baseline": original_observations},
+        "expanded": {"size": size, "corpus_sha256": canonical_content_tree_sha256(expanded_wiki), "paired_observations": expanded_observations},
+        "personal_wiki_ann_exact": {"query_count": len(ann_rows), **separation, "rows": ann_rows},
         "hybrid_invocation": {"entrypoint": "query.hybrid_search", "original_baseline_calls": len(original_observations), "baseline_calls": len(expanded_observations), "finalist_calls": len(expanded_observations)},
         "authorization": authorization,
     }
+
+
+def _representative_indexed_query_separation(repository, queries: list[str]) -> dict[str, object]:
+    """Validate actual dense-table text against unindexed representative queries."""
+    indexed = {hashlib.sha256(str(row["text"]).encode()).hexdigest() for row in repository._dense_table().to_arrow().to_pylist()}
+    query_digests = [hashlib.sha256(query.encode()).hexdigest() for query in queries]
+    return validate_indexed_query_digest_separation(indexed_row_digests=indexed, query_row_digests=query_digests)
 
 
 def _citation_violations(bundle):
