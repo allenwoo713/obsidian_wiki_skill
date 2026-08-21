@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import hashlib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -231,3 +233,91 @@ def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(t
     assert result.returncode == 0, result.stderr
     sealed = json.loads(ledger.read_text())
     assert len(sealed["eligible_evidence_runs"]) == 6 and sealed["record_self_sha256"] == reconcile.canonical_digest(sealed)
+
+
+def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp_path: Path) -> None:
+    """The success path is campaign CLI -> exporter -> zip/provenance -> reconciler.
+
+    Unlike the legacy unit fixtures above, this deliberately creates no hand-written
+    packet or wrapper.  The only numeric evidence comes from the production LanceDB
+    confirmation campaign invoked through its CLI with a tiny trusted test config.
+    """
+    root = Path(__file__).resolve().parent.parent
+    plan = _plan()
+    request = tmp_path / "confirmation-request.json"
+    request.write_text(json.dumps(plan["confirmation_request"]), encoding="utf-8")
+    artifact_dirs: list[Path] = []
+    for index, slot in enumerate(plan["workflow_inputs"], start=1):
+        slot_root = tmp_path / f"slot-{index}"
+        bundle = slot_root / "dispatch-bundle.json"
+        bundle.parent.mkdir()
+        bundle.write_text(json.dumps({"confirmation_request": plan["confirmation_request"], "workflow_input": slot}), encoding="utf-8")
+        allocation = {
+            "schema_version": 1, "campaign_stage": "confirmation",
+            "workflow_inputs_sha256": slot["record_self_sha256"], "status": "success",
+            "allocation": {"run_id": index, "run_attempt": 1, "job_id": 100 + index,
+                           "job_key": "phase07-confirmation", "job_allocation_nonce": f"{index:032x}"},
+        }
+        allocation["record_self_sha256"] = operator.canonical_digest(allocation)
+        allocation_path = slot_root / "allocation.json"
+        allocation_path.write_text(json.dumps(allocation), encoding="utf-8")
+        campaign_request = {
+            "schema_version": 1, "stage": "confirmation", "request_id": f"tiny-{index}",
+            "environment": {"head_sha": HEAD}, "model_manifest_sha256": "a" * 64,
+            "corpus_manifest_sha256": "b" * 64, "workflow_inputs": slot,
+            "run_identity": allocation["allocation"],
+        }
+        campaign_request_path = slot_root / "campaign-request.json"
+        campaign_request_path.write_text(json.dumps(campaign_request), encoding="utf-8")
+        output = slot_root / "campaign-output"
+        campaign = subprocess.run([
+            sys.executable, "eval/phase07_ann_campaign.py", "--request-file", str(campaign_request_path),
+            "--output-dir", str(output), "--trusted-test-config", json.dumps({"rows": 32, "dimensions": 384, "probes": 2, "work_dir": str(slot_root / "builds")}),
+        ], cwd=root, capture_output=True, text=True, check=False)
+        assert campaign.returncode == 0, campaign.stderr
+        artifact = slot_root / "artifact"
+        exported = subprocess.run([
+            sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
+            "--campaign-output-dir", str(output), "--dispatch-bundle", str(bundle),
+            "--allocation-ledger", str(allocation_path), "--artifact-dir", str(artifact),
+        ], cwd=root, capture_output=True, text=True, check=False)
+        assert exported.returncode == 0, exported.stderr
+        assert {path.name for path in artifact.iterdir()} == {
+            "confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json",
+            "dispatch-bundle.json", "allocation.json", "confirmation-packet.json",
+        }
+        archive = slot_root / "archive.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for path in artifact.iterdir():
+                zip_file.write(path, path.name)
+        archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+        extracted = slot_root / "extracted"
+        with zipfile.ZipFile(archive) as zip_file:
+            zip_file.extractall(extracted)
+        provenance = {
+            "schema_version": 1, "evidence": [
+                {"run_id": index, "run_attempt": 1, "job_id": 100 + index, "artifact_id": 1000 + index,
+                 "artifact_name": f"phase07-confirmation-{index}", "status": "completed", "conclusion": "success",
+                 "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"], "os": "Linux", "image": "ubuntu", "architecture": "X64"},
+                 "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": "2026-11-20T00:00:00Z",
+                 "api_archive_sha256": archive_sha256, "local_archive_sha256": archive_sha256,
+                 "archive": str(archive), "extracted_dir": str(extracted)}
+            ],
+        }
+        provenance["record_self_sha256"] = reconcile.canonical_digest(provenance)
+        provenance_path = slot_root / "provenance.json"
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+        artifact_dirs.append(extracted)
+        # Keep a per-slot manifest rather than a packet fixture; the reconciler consumes it below.
+        (slot_root / "evidence.json").write_text(json.dumps({"artifact_dir": str(extracted), "provenance": str(provenance_path)}), encoding="utf-8")
+    evidence_manifest = tmp_path / "evidence-manifest.json"
+    evidence_manifest.write_text(json.dumps({"schema_version": 1, "evidence": [json.loads((path.parent / "evidence.json").read_text()) for path in artifact_dirs]}), encoding="utf-8")
+    reconciled = tmp_path / "reconciled-ledger.json"
+    result = subprocess.run([
+        sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
+        "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
+    ], cwd=root, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    ledger = json.loads(reconciled.read_text())
+    assert len(ledger["eligible_evidence_runs"]) == 6
+    assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
