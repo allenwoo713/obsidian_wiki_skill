@@ -218,6 +218,20 @@ def test_stage1_reconciler_direct_script_cli_bootstraps_package_imports() -> Non
     assert "--stage1-request" in completed.stdout
 
 
+def test_stage1_reconciler_module_cli_uses_package_qualified_imports() -> None:
+    """``python -m`` starts from the repository package, without test path injection."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "eval.reconcile_ann_gate", "--help"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--stage1-request" in completed.stdout
+
+
 @pytest.mark.parametrize(
     "mutate",
     ["missing-anchor", "too-short", "too-long", "api-anchor-mismatch", "api-artifact-mismatch", "workflow-retention"],
