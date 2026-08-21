@@ -158,30 +158,39 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError("non-finite confirmation statistic")
         comparisons = family.get("comparisons")
-        if comparisons is not None:
-            if not isinstance(comparisons, list) or len(comparisons) != family["family_size"]:
-                raise ValueError("confirmation family member cardinality")
-            for comparison in comparisons:
-                rows = comparison.get("paired_rows") if isinstance(comparison, dict) else None
-                if not isinstance(rows, list) or not rows:
-                    raise ValueError("missing paired confirmation samples")
-                for row in rows:
-                    if not isinstance(row, list) or len(row) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in row):
-                        raise ValueError("invalid paired confirmation samples")
-            if any(comparison.get("raw_permutation_p") != declared for comparison, declared in zip(comparisons, family["raw_p_values"], strict=True)) or any(comparison.get("basic_ci_95") != declared for comparison, declared in zip(comparisons, family["basic_ci_95"], strict=True)):
-                raise ValueError("declared confirmation statistic mismatch")
-            if family.get("holm_adjusted_p_values") is not None and family["holm_adjusted_p_values"] != holm_adjust(family["raw_p_values"]):
-                raise ValueError("declared confirmation Holm mismatch")
-            for comparison in comparisons:
-                declared = comparison.get("comparison")
-                if not isinstance(declared, dict):
-                    raise ValueError("missing confirmation comparison binding")
-                if family["family_name"] == "d20_current_baseline_member" and (declared.get("baseline_build_id") != by_m[16]["build_id"] or declared.get("candidate_build_id") not in {by_m[20]["build_id"], by_m[32]["build_id"]}):
+        if not isinstance(comparisons, list) or len(comparisons) != family["family_size"]:
+            raise ValueError("missing numeric confirmation family members")
+        canonical_keys = set()
+        for comparison in comparisons:
+            rows = comparison.get("paired_rows") if isinstance(comparison, dict) else None
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("missing paired confirmation samples")
+            for row in rows:
+                if not isinstance(row, list) or len(row) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in row):
+                    raise ValueError("invalid paired confirmation samples")
+        if any(comparison.get("raw_permutation_p") != declared for comparison, declared in zip(comparisons, family["raw_p_values"], strict=True)) or any(comparison.get("basic_ci_95") != declared for comparison, declared in zip(comparisons, family["basic_ci_95"], strict=True)):
+            raise ValueError("declared confirmation statistic mismatch")
+        if family.get("holm_adjusted_p_values") is not None and family["holm_adjusted_p_values"] != holm_adjust(family["raw_p_values"]):
+            raise ValueError("declared confirmation Holm mismatch")
+        for comparison in comparisons:
+            declared = comparison.get("comparison")
+            if not isinstance(declared, dict):
+                raise ValueError("missing confirmation comparison binding")
+            if family["family_name"] == "d04_ef_300_vs_200":
+                key = (declared.get("m"), declared.get("metric"), declared.get("baseline_ef"), declared.get("candidate_ef"))
+                if key not in {(m, metric, 200, 300) for m in (16, 20, 32) for metric in ("recall_at_10", "recall_at_20")}:
+                    raise ValueError("noncanonical D-04 member")
+            else:
+                key = (declared.get("candidate_m"), declared.get("metric"), declared.get("baseline_ef"), declared.get("candidate_ef"))
+                if key not in {(workflow_inputs["slot"]["m"], metric, 100, 300) for metric in ("recall_at_10", "recall_at_20")} or declared.get("baseline_build_id") != by_m[16]["build_id"] or declared.get("candidate_build_id") != by_m[workflow_inputs["slot"]["m"]]["build_id"]:
                     raise ValueError("D-20 comparison cross-build identity")
-                expected_effect = paired_basic_effect(comparison["paired_rows"], comparison=declared)
-                expected_p = paired_permutation_p(comparison["paired_rows"], comparison=declared)
-                if comparison.get("mean_effect") != expected_effect["mean_effect"] or comparison.get("basic_ci_95") != expected_effect["basic_ci_95"] or comparison.get("raw_permutation_p") != expected_p:
-                    raise ValueError("recomputed confirmation statistic mismatch")
+            if key in canonical_keys:
+                raise ValueError("duplicate canonical confirmation member")
+            canonical_keys.add(key)
+            expected_effect = paired_basic_effect(comparison["paired_rows"], comparison=declared)
+            expected_p = paired_permutation_p(comparison["paired_rows"], comparison=declared)
+            if comparison.get("mean_effect") != expected_effect["mean_effect"] or comparison.get("basic_ci_95") != expected_effect["basic_ci_95"] or comparison.get("raw_permutation_p") != expected_p:
+                raise ValueError("recomputed confirmation statistic mismatch")
     return packet
 
 

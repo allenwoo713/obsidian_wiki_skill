@@ -131,7 +131,7 @@ def test_confirmation_packet_requires_all_six_d04_members_and_declared_values() 
     plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
     packet["d04"]["comparisons"] = packet["d04"]["comparisons"][:-1]
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
-    with pytest.raises(ValueError, match="cardinality"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
+    with pytest.raises(ValueError, match="members|cardinality"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
     packet = _packet(plan["workflow_inputs"][0], run_id=1)
     packet["d04"]["raw_p_values"][0] = 0.02
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
