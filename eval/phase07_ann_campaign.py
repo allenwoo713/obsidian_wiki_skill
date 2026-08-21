@@ -1,35 +1,37 @@
-"""Typed, non-authorizing request runner for the bounded Phase 7 ANN campaign.
-
-The CLI owns its output directory: callers never need a pre-created checkout
-artifact.  It intentionally has no GitHub, installer, downloader, or policy
-selection capability.
-"""
+"""Bounded, non-authorizing Phase 7 ANN campaign runner."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
+import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 import lancedb
+
 from eval import benchmark_ann_build as benchmark
+from eval.ann_frontier_statistics import validate_declared_family
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
-from eval.ann_frontier_statistics import validate_declared_family
-
-STAGES = frozenset({"screening", "confirmation", "continuation"})
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_", "github_pat_")
-SCREENING = {"schema_version", "stage", "request_id", "environment", "model_manifest_sha256", "corpus_manifest_sha256"}
-CONFIRMATION = SCREENING | {"prior_screening_sha256", "nominated_m", "run_ordinal", "run_identity"}
-CONTINUATION = SCREENING | {"mode", "prior_evidence_sha256"}
-CONTINUATION_MODES = frozenset({"stage2_sq", "flat_diagnostic", "refinement", "representative_ann", "hybrid_non_regression"})
+BASE = {"schema_version", "stage", "request_id", "environment", "model_manifest_sha256", "corpus_manifest_sha256"}
+STAGES = frozenset({"screening", "confirmation", "continuation"})
+MODES = frozenset({"stage2_sq", "flat_diagnostic", "refinement", "representative_ann", "hybrid_non_regression"})
 
 
 def canonical_digest(value: dict[str, Any]) -> str:
     payload = dict(value); payload.pop("record_self_sha256", None)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def _digest(name: str, value: object) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
 
 
 def _reject_secrets(value: Any) -> None:
@@ -43,105 +45,134 @@ def _reject_secrets(value: Any) -> None:
         raise ValueError("secret-like request value")
 
 
-def validate_request(request: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(request, dict) or request.get("schema_version") != 1 or request.get("stage") not in STAGES:
-        raise ValueError("typed Phase 7 request")
-    _reject_secrets(request)
-    allowed = SCREENING if request["stage"] == "screening" else CONFIRMATION if request["stage"] == "confirmation" else CONTINUATION
-    if set(request) != allowed: raise ValueError("unknown or missing request field")
-    if not isinstance(request["request_id"], str) or not request["request_id"]: raise ValueError("request identity")
-    for name in ("model_manifest_sha256", "corpus_manifest_sha256"):
-        if not isinstance(request[name], str) or len(request[name]) != 64: raise ValueError("manifest binding")
-    if request["stage"] == "screening":
-        return request
-    if not isinstance(request["prior_screening_sha256" if request["stage"] == "confirmation" else "prior_evidence_sha256"], str): raise ValueError("immutable prior evidence binding")
-    if request["stage"] == "confirmation":
-        nominated = request["nominated_m"]
-        if not isinstance(nominated, list) or not 1 <= len(nominated) <= 2 or any(value not in (16, 20, 32) for value in nominated): raise ValueError("at most two nominated m values")
-        if not isinstance(request["run_ordinal"], int) or request["run_ordinal"] not in (1, 2, 3): raise ValueError("deterministic run ordinal")
-        if not isinstance(request["run_identity"], dict) or not {"run_id", "run_attempt", "job_id", "job_allocation_nonce"} <= set(request["run_identity"]): raise ValueError("fresh hosted allocation identity")
+def _identity(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"run_id", "run_attempt", "job_id", "job_allocation_nonce"}:
+        raise ValueError("fresh hosted allocation identity")
+    if not all(isinstance(value[name], (str, int)) and not isinstance(value[name], bool) and str(value[name]) for name in value):
+        raise ValueError("fresh hosted allocation identity")
+    return value
+
+
+def _validate_continuation_config(mode: str, config: dict[str, Any]) -> None:
+    if mode == "stage2_sq":
+        if set(config) != {"approved_d04_sha256", "m"} or config["m"] not in (16, 20, 32): raise ValueError("stage2 requires D-04 approval and one nominated m")
+        _digest("approved_d04_sha256", config["approved_d04_sha256"])
+    elif mode == "flat_diagnostic":
+        if set(config) != {"no_confirmed_sq_sha256", "m", "query_ef"} or config["m"] not in (16, 20, 32) or config["query_ef"] not in (200, 300): raise ValueError("FLAT requires explicit no_confirmed_sq proof")
+        _digest("no_confirmed_sq_sha256", config["no_confirmed_sq_sha256"])
+    elif mode == "refinement":
+        if set(config) != {"ceiling_sha256", "m", "ef_construction", "query_ef"} or config["m"] not in (16, 20, 32) or config["ef_construction"] not in (300, 500) or config["query_ef"] not in (100, 150, 200, 300, 500): raise ValueError("refinement requires one bounded raw ceiling configuration")
+        _digest("ceiling_sha256", config["ceiling_sha256"])
     else:
-        if request["mode"] not in CONTINUATION_MODES: raise ValueError("unsupported bounded continuation mode")
+        if set(config) != {"size", "baseline_sha256", "finalist_sha256"} or config["size"] not in (1000, 10000, 30000): raise ValueError("representative runs allow only pinned 1k/10k/30k corpora")
+        _digest("baseline_sha256", config["baseline_sha256"]); _digest("finalist_sha256", config["finalist_sha256"])
+
+
+def validate_request(request: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(request, dict) or request.get("schema_version") != 1 or request.get("stage") not in STAGES: raise ValueError("typed Phase 7 request")
+    _reject_secrets(request); stage = request["stage"]
+    extra = set() if stage == "screening" else {"prior_screening_sha256", "nominated_m", "run_ordinal", "run_identity"} if stage == "confirmation" else {"mode", "prior_evidence_sha256", "config"}
+    if set(request) != BASE | extra: raise ValueError("unknown or missing request field")
+    if not isinstance(request["request_id"], str) or not request["request_id"] or not isinstance(request["environment"], dict): raise ValueError("request identity/environment")
+    for name in ("model_manifest_sha256", "corpus_manifest_sha256"): _digest(name, request[name])
+    if stage == "confirmation":
+        _digest("prior_screening_sha256", request["prior_screening_sha256"])
+        # Two nominees require two requests/jobs, never one reused allocation.
+        if not isinstance(request["nominated_m"], list) or len(request["nominated_m"]) != 1 or request["nominated_m"][0] not in (16, 20, 32): raise ValueError("confirmation requires exactly one separately allocated nominated m")
+        if request["run_ordinal"] not in (1, 2, 3) or isinstance(request["run_ordinal"], bool): raise ValueError("deterministic run ordinal")
+        _identity(request["run_identity"])
+    elif stage == "continuation":
+        if request["mode"] not in MODES or not isinstance(request["config"], dict): raise ValueError("unsupported bounded continuation mode")
+        _digest("prior_evidence_sha256", request["prior_evidence_sha256"]); _validate_continuation_config(request["mode"], request["config"])
     return request
 
 
 def screening_plan() -> dict[str, Any]:
-    family = [{"m": m, "metric": metric, "baseline_ef": 200, "candidate_ef": 300} for m in (16,20,32) for metric in ("recall_at_10","recall_at_20")]
+    family = [{"m": m, "metric": metric, "baseline_ef": 200, "candidate_ef": 300} for m in (16, 20, 32) for metric in ("recall_at_10", "recall_at_20")]
     validate_declared_family(family, family_name="d04_ef_300_vs_200", expected_size=6)
-    return {"corpus": {"rows": 77348, "dimensions": 384, "queries": 256, "truth": "seeded_vector_exact"}, "index": {"type": "hnsw_sq", "m": [16,20,32], "ef_construction": 300}, "query_ef": [100,150,200,300], "replicates": 3, "per_build_max_seconds": 180, "authorization": "none"}
+    return {"corpus": {"rows": 77348, "dimensions": 384, "queries": 256, "truth": "seeded_vector_exact"}, "index": {"type": "hnsw_sq", "m": [16, 20, 32], "ef_construction": 300}, "query_ef": [100, 150, 200, 300], "per_build_max_seconds": 180, "authorization": "none"}
+
+
+@dataclass(frozen=True)
+class CampaignConfig:
+    """Trusted Python dependency seam; the CLI/request cannot change it."""
+    rows: int = 77_348; dimensions: int = 384; probes: int = 256
+    per_build_max_seconds: float = 180.0; work_dir: Path = Path(".review-tmp/phase07-builds")
 
 
 class Phase07AnnCampaignRunner:
-    """Production LanceDB campaign seam; tests only shrink its numeric inputs."""
-    def __init__(self, *, rows: int = 77_348, dimensions: int = 384, probes: int = 256,
-                 work_dir: Path | None = None, per_build_max_seconds: float = 180.0) -> None:
-        self.rows, self.dimensions, self.probes = rows, dimensions, probes
-        self.work_dir = work_dir or Path(".review-tmp/phase07-builds")
-        self.per_build_max_seconds = per_build_max_seconds
+    def __init__(self, config: CampaignConfig = CampaignConfig()) -> None:
+        if config.rows <= config.probes or config.dimensions <= 0 or config.probes <= 0 or not 0 < config.per_build_max_seconds <= 180: raise ValueError("trusted campaign configuration")
+        self.config = config
 
     def _truth(self, root: Path) -> tuple[tuple[tuple[str, ...], ...], float]:
-        corpus = benchmark._vectors(self.rows, self.dimensions, benchmark.CORPUS_SEED)
-        queries = benchmark._vectors(self.probes, self.dimensions, benchmark.QUERY_SEED)
+        corpus = benchmark._vectors(self.config.rows, self.config.dimensions, benchmark.CORPUS_SEED); queries = benchmark._vectors(self.config.probes, self.config.dimensions, benchmark.QUERY_SEED)
         if benchmark._row_hashes(corpus) & benchmark._row_hashes(queries): raise ValueError("query/corpus overlap")
-        truth_dir = root / "truth"; lancedb.connect(str(truth_dir)).create_table("dense_chunks", data=benchmark._arrow_table(corpus, [f"synthetic::{i:016x}" for i in range(self.rows)]))
-        import time
+        truth_dir = root / "truth"; lancedb.connect(str(truth_dir)).create_table("dense_chunks", data=benchmark._arrow_table(corpus, [f"synthetic::{i:016x}" for i in range(self.config.rows)]))
         started = time.perf_counter(); exact = LanceDbIndexRepository(truth_dir).search_dense_exact_batch(queries.tolist(), metric="cosine", limit=20, row_batch_size=8192, query_batch_size=32)
         return exact.result_ids, (time.perf_counter() - started) * 1000
 
-    def _build(self, root: Path, *, m: int, ef_construction: int, query_ef: tuple[int, ...], exact_ids: tuple[tuple[str, ...], ...], exact_ms: float) -> dict[str, Any]:
-        run, records = benchmark._candidate_worker("ivf-hnsw-sq", str(root / f"m{m}-efc{ef_construction}"), self.rows, self.dimensions, self.probes, query_ef, exact_ids, exact_ms, m=m, ef_construction=ef_construction)
-        if run["index_build_ms"] / 1000 > self.per_build_max_seconds: raise RuntimeError("reject-evidence: per-build watchdog")
-        return {"build": run, "queries": records}
+    def _build(self, root: Path, *, candidate: str = "ivf-hnsw-sq", m: int, ef_construction: int, query_ef: tuple[int, ...], exact_ids: tuple[tuple[str, ...], ...], exact_ms: float) -> dict[str, Any]:
+        build_root = root / f"{candidate}-m{m}-efc{ef_construction}"
+        run, records = benchmark._candidate_worker(candidate, str(build_root), self.config.rows, self.config.dimensions, self.config.probes, query_ef, exact_ids, exact_ms, m=m, ef_construction=ef_construction)
+        if run["index_build_ms"] / 1000 > self.config.per_build_max_seconds: raise RuntimeError("reject-evidence: per-build watchdog")
+        return {"build_id": hashlib.sha256(f"{build_root}:{run['index_build_start_monotonic']}".encode()).hexdigest(), "build": run, "queries": records}
+
+    def _with_truth(self, operation: Callable[[Path, tuple[tuple[str, ...], ...], float], dict[str, Any]]) -> dict[str, Any]:
+        self.config.work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="phase07-campaign-", dir=self.config.work_dir) as raw:
+            root = Path(raw); exact, exact_ms = self._truth(root); return operation(root, exact, exact_ms)
 
     def screening(self) -> dict[str, Any]:
-        import tempfile
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="phase07-campaign-", dir=self.work_dir) as raw:
-            root=Path(raw); exact, exact_ms=self._truth(root)
-            builds=[self._build(root, m=m, ef_construction=300, query_ef=(100,150,200,300), exact_ids=exact, exact_ms=exact_ms) for m in (16,20,32)]
-        return {"plan": screening_plan(), "exact_truth_computed_once": True, "build_count": 3, "builds": builds, "authorization": "none"}
+        return self._with_truth(lambda root, exact, exact_ms: {"plan": screening_plan(), "exact_truth_computed_once": True, "build_count": 3, "builds": [self._build(root, m=m, ef_construction=300, query_ef=(100, 150, 200, 300), exact_ids=exact, exact_ms=exact_ms) for m in (16, 20, 32)], "authorization": "none"})
 
     def confirmation(self, request: dict[str, Any]) -> dict[str, Any]:
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix="phase07-confirm-", dir=self.work_dir) as raw:
-            root=Path(raw); exact, exact_ms=self._truth(root); build=self._build(root, m=request["nominated_m"][0], ef_construction=300, query_ef=(200,300), exact_ids=exact, exact_ms=exact_ms)
-        return {"replicate": build, "run_identity": request["run_identity"], "run_ordinal": request["run_ordinal"], "authorization":"none"}
+        m = request["nominated_m"][0]
+        return self._with_truth(lambda root, exact, exact_ms: {"run_ordinal": request["run_ordinal"], "run_identity": request["run_identity"], "build_count": 1, "replicate": self._build(root, m=m, ef_construction=300, query_ef=(200, 300), exact_ids=exact, exact_ms=exact_ms), "authorization": "none"})
 
     def continuation(self, request: dict[str, Any]) -> dict[str, Any]:
-        mode=request["mode"]
-        if mode not in {"stage2_sq", "flat_diagnostic", "refinement"}: raise ValueError("model-backed continuation requires run_eval production facade binding")
-        return {"mode": mode, "prior_evidence_sha256": request["prior_evidence_sha256"], "authorization":"none"}
+        mode, config = request["mode"], request["config"]
+        if mode == "stage2_sq": return self._with_truth(lambda root, exact, exact_ms: {"mode": mode, "build_count": 1, "stage2": self._build(root, m=config["m"], ef_construction=500, query_ef=(300, 500), exact_ids=exact, exact_ms=exact_ms), "ceiling_open_at_ef_500": True, "authorization": "none"})
+        if mode == "flat_diagnostic": return self._with_truth(lambda root, exact, exact_ms: {"mode": mode, "diagnostic_only": True, "build_count": 1, "flat": self._build(root, candidate="ivf-hnsw-flat", m=config["m"], ef_construction=300, query_ef=(config["query_ef"],), exact_ids=exact, exact_ms=exact_ms), "authorization": "none"})
+        if mode == "refinement": return self._refinement(config)
+        from eval.run_eval import run_phase07_representative_campaign
+        return run_phase07_representative_campaign(mode=mode, size=config["size"], work_dir=self.config.work_dir, authorization="none")
+
+    def _refinement(self, config: dict[str, Any]) -> dict[str, Any]:
+        def operation(root: Path, exact: tuple[tuple[str, ...], ...], exact_ms: float) -> dict[str, Any]:
+            built = self._build(root, m=config["m"], ef_construction=config["ef_construction"], query_ef=(config["query_ef"],), exact_ids=exact, exact_ms=exact_ms)
+            lance_dir = root / f"ivf-hnsw-sq-m{config['m']}-efc{config['ef_construction']}" / "ivf-hnsw-sq"; repository = LanceDbIndexRepository(lance_dir); queries = benchmark._vectors(self.config.probes, self.config.dimensions, benchmark.QUERY_SEED); observations = []
+            for factor in (2, 5, 10):
+                started = time.perf_counter(); rows = []
+                for ordinal, vector in enumerate(queries):
+                    result = repository._dense_table().search(vector.tolist()).distance_type("cosine").ef(config["query_ef"]).refine_factor(factor).limit(20).to_list()
+                    ids = [str(row.get("chunk_id", "")) for row in result]; rows.append({"query_index": ordinal, "recall_at_10": len(set(ids[:10]) & set(exact[ordinal][:10])) / 10, "recall_at_20": len(set(ids) & set(exact[ordinal])) / 20})
+                observations.append({"refine_factor": factor, "query_count": len(rows), "total_query_ms": (time.perf_counter() - started) * 1000, "queries": rows})
+            return {"mode": "refinement", "build_count": 1, "raw_build": built, "refinement": observations, "exact_fallback_used": False, "authorization": "none"}
+        return self._with_truth(operation)
+
+    def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self.screening() if request["stage"] == "screening" else self.confirmation(request) if request["stage"] == "confirmation" else self.continuation(request)
 
 
 def _write(path: Path, value: dict[str, Any]) -> None:
-    value["record_self_sha256"] = canonical_digest(value)
-    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    sealed = dict(value); sealed["record_self_sha256"] = canonical_digest(sealed); path.write_text(json.dumps(sealed, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
 def execute(request: dict[str, Any], output_dir: Path, *, runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
-    request = validate_request(request); output_dir.mkdir(parents=True, exist_ok=True)
-    _write(output_dir / f"{request['stage']}-request.json", dict(request))
-    ledger = {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "authorization": "none"}
-    _write(output_dir / f"{request['stage']}-ledger.json", ledger)
+    request = validate_request(request); output_dir.mkdir(parents=True, exist_ok=True); _write(output_dir / f"{request['stage']}-request.json", request); _write(output_dir / f"{request['stage']}-ledger.json", {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "authorization": "none"})
     try:
-        if runner:
-            result = runner(screening_plan() if request["stage"] == "screening" else {"mode": request.get("mode", "confirmation"), "authorization": "none"})
-        else:
-            production = Phase07AnnCampaignRunner()
-            result = production.screening() if request["stage"] == "screening" else production.confirmation(request) if request["stage"] == "confirmation" else production.continuation(request)
+        result = (runner or Phase07AnnCampaignRunner().run)(request)
         if not isinstance(result, dict) or result.get("authorization") != "none": raise ValueError("campaign results are evidence only")
-        record = {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "result": result, "authorization": "none"}
-        _write(output_dir / f"{request['stage']}-result.json", record); return record
+        record = {"schema_version": 1, "stage": request["stage"], "request_sha256": canonical_digest(request), "result": result, "authorization": "none"}; _write(output_dir / f"{request['stage']}-result.json", record); return record
     except Exception as exc:
-        rejected = {"schema_version": 1, "stage": request["stage"], "status": "reject-evidence", "reason": f"{type(exc).__name__}: {exc}", "authorization": "none"}
-        _write(output_dir / f"{request['stage']}-rejection.json", rejected); raise
+        _write(output_dir / f"{request['stage']}-rejection.json", {"schema_version": 1, "stage": request["stage"], "status": "reject-evidence", "reason": f"{type(exc).__name__}: {exc}", "authorization": "none"}); raise
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--request-file", type=Path, required=True); parser.add_argument("--output-dir", type=Path, required=True); args = parser.parse_args()
-    try:
-        request = json.loads(args.request_file.read_text(encoding="utf-8")); execute(request, args.output_dir); return 0
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[FAIL] Phase 7 campaign: {exc}", file=os.sys.stderr); return 1
+    try: execute(json.loads(args.request_file.read_text(encoding="utf-8")), args.output_dir); return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc: print(f"[FAIL] Phase 7 campaign: {exc}", file=os.sys.stderr); return 1
+
 
 if __name__ == "__main__": raise SystemExit(main())

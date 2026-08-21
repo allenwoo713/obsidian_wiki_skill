@@ -481,6 +481,16 @@ def _candidate_worker(
     ))
     index_build_end = time.perf_counter()
     total_bytes = _directory_bytes(lance_dir)
+    # A campaign observation is not complete until a fresh repository can open
+    # the just-built index.  Keep the reopened handle for every ordinary ANN
+    # query below; exact truth is deliberately owned by the separate truth
+    # repository and can never become a request fallback here.
+    repository = LanceDbIndexRepository(
+        lance_dir,
+        eval_candidate_policy=CandidateQueryPolicy(
+            candidate=candidate, query_ef=ef_grid[0] if ef_grid else 100
+        ),
+    )
     candidate_query_start = time.perf_counter()
     records: list[dict[str, Any]] = []
     run_id = f"candidate-run::{candidate}"

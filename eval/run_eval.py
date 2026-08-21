@@ -461,6 +461,66 @@ def run_candidate_hybrid_evaluation(
     return validate_candidate_decision_records(packet, comparator_evidence)
 
 
+def run_phase07_representative_campaign(
+    *, mode: str, size: int, work_dir: Path, authorization: str,
+    embed=None,
+) -> dict:
+    """Exercise the public build/load/``hybrid_search`` path for one pinned scale.
+
+    ``embed`` is an in-process dependency seam used only by tiny integration
+    tests.  Requests never reach it; normal campaign execution therefore uses
+    the established model-backed ``WikiIndex.build`` facade.  The generated
+    corpus stays in the temporary work directory and is never an artifact.
+    """
+    if mode not in {"representative_ann", "hybrid_non_regression"} or size not in {1000, 10000, 30000}:
+        raise ValueError("pinned representative campaign")
+    root = Path(work_dir) / f"representative-{mode}-{size}"
+    if root.exists():
+        shutil.rmtree(root)
+    wiki = root / "Wiki"
+    shutil.copytree(FIXTURES_WIKI, wiki)
+    # Public deterministic distractors preserve fixture-language structure;
+    # the query is never written into this corpus.
+    source_pages = sorted(wiki.rglob("*.md"))
+    if not source_pages:
+        raise ValueError("representative public fixture unavailable")
+    for ordinal in range(max(0, size - len(source_pages))):
+        source = source_pages[ordinal % len(source_pages)].read_text(encoding="utf-8")
+        target = wiki / "phase07_distractors" / f"public-{ordinal:05d}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source + f"\n\npublic distractor ordinal {ordinal}\n", encoding="utf-8")
+    index_dir = root / ".index"
+    if embed is None:
+        wi = WikiIndex(index_dir)
+        wi.build(wiki, full_rebuild=True)
+    else:
+        from build_index import build_storage_contract
+        build_storage_contract(wiki, index_dir, embed=embed)
+        wi = WikiIndex(index_dir)
+    wi.load()
+    if embed is not None:
+        # Query embedding is the matching half of the explicitly injected test
+        # encoder.  Storage, build, load, fusion and citation/context paths are
+        # still the public production implementations.
+        class _InjectedEncoder:
+            def encode(self, texts, **_kwargs):
+                return embed(texts)
+        wi._embedder = _InjectedEncoder()
+    planner = DefaultQueryPlanner(project_root=root)
+    query = "retrieval evidence public fixture"
+    started = time.perf_counter()
+    result = hybrid_search(wi, query, planner, k=10, max_tokens=4096, wiki_dir=wiki,
+                           intent_override="auto", allow_local_fallback=True)
+    return {
+        "mode": mode, "scale": size, "hybrid_invocation": {
+            "entrypoint": "query.hybrid_search", "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+        },
+        "result": _candidate_result_payload(result),
+        "duration_ms": (time.perf_counter() - started) * 1000,
+        "authorization": authorization,
+    }
+
+
 def _citation_violations(bundle):
     """Zero-tolerance check of the ``[来源: Wiki/xxx.md]`` citation contract.
 
