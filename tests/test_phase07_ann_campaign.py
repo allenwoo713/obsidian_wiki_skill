@@ -23,6 +23,18 @@ def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
         "schema_version": 1, "stage": stage, "request_id": "request-1", "environment": {},
         "model_manifest_sha256": _digest("a"), "corpus_manifest_sha256": _digest("b"),
     }
+    if stage == "screening":
+        request["environment"] = {
+            "branch": "feature/issue-50-dense-ann-recall",
+            "workflow_path": ".github/workflows/eval.yml",
+            "head_sha": "c" * 40,
+            "run_id": 1,
+            "run_attempt": 1,
+            "job_key": "phase07-screening",
+            "job_allocation_nonce": "1-1-phase07-screening",
+            "runtime": {"python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0", "omp_num_threads": 2},
+        }
+        request["lock_identity"] = _digest("d")
     if stage == "confirmation":
         request.update(prior_screening_sha256=_digest("c"), nominated_m=[16], run_ordinal=1,
                        run_identity={"run_id": "1", "run_attempt": 1, "job_id": "2", "job_allocation_nonce": "nonce-00000000001"})

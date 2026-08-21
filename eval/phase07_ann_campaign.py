@@ -22,6 +22,7 @@ from eval.ann_frontier_statistics import (
     validate_declared_family,
 )
 from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256
+from eval.phase07_operator_gate import validate_stage1_screening_runtime
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_", "github_pat_")
@@ -83,10 +84,13 @@ def _validate_continuation_config(mode: str, config: dict[str, Any]) -> None:
 def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(request, dict) or request.get("schema_version") != 1 or request.get("stage") not in STAGES: raise ValueError("typed Phase 7 request")
     _reject_secrets(request); stage = request["stage"]
-    extra = set() if stage == "screening" else {"prior_screening_sha256", "nominated_m", "run_ordinal", "run_identity"} if stage == "confirmation" else {"mode", "prior_evidence_sha256", "config"}
+    extra = {"lock_identity"} if stage == "screening" else {"prior_screening_sha256", "nominated_m", "run_ordinal", "run_identity"} if stage == "confirmation" else {"mode", "prior_evidence_sha256", "config"}
     if set(request) != BASE | extra: raise ValueError("unknown or missing request field")
     if not isinstance(request["request_id"], str) or not request["request_id"] or not isinstance(request["environment"], dict): raise ValueError("request identity/environment")
     for name in ("model_manifest_sha256", "corpus_manifest_sha256"): _digest(name, request[name])
+    if stage == "screening":
+        validate_stage1_screening_runtime(request["environment"])
+        _digest("lock_identity", request["lock_identity"])
     if stage == "confirmation":
         _digest("prior_screening_sha256", request["prior_screening_sha256"])
         # Two nominees require two requests/jobs, never one reused allocation.
@@ -99,10 +103,35 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     return request
 
 
-def screening_plan() -> dict[str, Any]:
+def screening_plan(config: "CampaignConfig | None" = None) -> dict[str, Any]:
     family = [{"m": m, "metric": metric, "baseline_ef": 200, "candidate_ef": 300} for m in (16, 20, 32) for metric in ("recall_at_10", "recall_at_20")]
     validate_declared_family(family, family_name="d04_ef_300_vs_200", expected_size=6)
-    return {"corpus": {"rows": 77348, "dimensions": 384, "queries": 256, "truth": "seeded_vector_exact"}, "index": {"type": "hnsw_sq", "m": [16, 20, 32], "ef_construction": 300}, "query_ef": [100, 150, 200, 300], "per_build_max_seconds": 180, "authorization": "none"}
+    config = config or CampaignConfig()
+    return {"corpus": {"rows": config.rows, "dimensions": config.dimensions, "queries": config.probes, "truth": "seeded_vector_exact"}, "index": {"type": "hnsw_sq", "m": [16, 20, 32], "ef_construction": 300}, "query_ef": [100, 150, 200, 300], "per_build_max_seconds": 180, "authorization": "none"}
+
+
+def _vector_digest(vectors: Any) -> str:
+    """Bind the actual seeded vector values, rather than a representative manifest label."""
+    return benchmark._matrix_digest(vectors)
+
+
+def _stress_identity(*, config: "CampaignConfig", exact_ids: tuple[tuple[str, ...], ...]) -> dict[str, Any]:
+    corpus = benchmark._vectors(config.rows, config.dimensions, benchmark.CORPUS_SEED)
+    queries = benchmark._vectors(config.probes, config.dimensions, benchmark.QUERY_SEED)
+    exact_digest = hashlib.sha256(json.dumps([list(ids) for ids in exact_ids], separators=(",", ":")).encode()).hexdigest()
+    return {
+        "schema_version": 1,
+        "corpus_sha256": _vector_digest(corpus),
+        "query_sha256": _vector_digest(queries),
+        "exact_truth_sha256": exact_digest,
+        "corpus_seed": benchmark.CORPUS_SEED,
+        "query_seed": benchmark.QUERY_SEED,
+        "shape": {"rows": config.rows, "dimensions": config.dimensions, "queries": config.probes},
+        "algorithm": {
+            "vectors": "benchmark_ann_build._vectors/v1",
+            "exact_truth": "LanceDbIndexRepository.search_dense_exact_batch/cosine/limit20",
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -210,7 +239,7 @@ class Phase07AnnCampaignRunner:
             statistics = self._screening_statistics(builds)
             nominees = sorted({record["comparison"]["m"] for record in statistics["comparisons"]
                                if record["mean_effect"] > 0 and record["basic_ci_95"][0] > 0 and record["holm_adjusted_p"] <= 0.05})[:2]
-            return {"plan": screening_plan(), "exact_truth_computed_once": True, "build_count": 3,
+            return {"plan": screening_plan(self.config), "stress_identity": _stress_identity(config=self.config, exact_ids=exact), "exact_truth_computed_once": True, "build_count": 3,
                     "builds": builds, "d04_statistics": statistics, "nominated_m": nominees,
                     "authorization": "none"}
         return self._with_truth(operation)

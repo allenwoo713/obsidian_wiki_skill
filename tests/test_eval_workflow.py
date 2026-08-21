@@ -743,6 +743,26 @@ def test_reconciliation_cli_is_fail_closed_for_missing_jobs_and_artifacts() -> N
     assert "!= \"success\"" in source
 
 
+def test_stage1_screening_request_seals_actual_hosted_runtime_identity() -> None:
+    """The Stage 1 runner receives its exact allocation/lock identity, never a generic request."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    screening = workflow.split("  phase07-screening:", 1)[1].split("  phase07-confirmation:", 1)[0]
+    for required in (
+        "RUN_ATTEMPT: ${{ github.run_attempt }}",
+        "JOB_KEY: ${{ github.job }}",
+        "BRANCH: ${{ github.ref_name }}",
+        "workflow_path':'.github/workflows/eval.yml'",
+        "job_allocation_nonce",
+        "'omp_num_threads':2",
+        "'lock_identity':h('requirements.txt')",
+        "retention-days: 90",
+    ):
+        assert required in screening
+    source = (SKILL_ROOT / "eval" / "reconcile_ann_gate.py").read_text(encoding="utf-8")
+    assert "--stage1-request" in source
+    assert "expected_shape: tuple[int, int, int] = (77_348, 384, 256)" in source
+
+
 @pytest.mark.parametrize("init_baseline", [False, True])
 def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tmp_path, init_baseline):
     """Unsafe evidence cannot become a new baseline or pass without one."""

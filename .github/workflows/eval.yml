@@ -555,9 +555,12 @@ jobs:
       - name: Construct finite screening request in this job
         env:
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_KEY: ${{ github.job }}
           HEAD: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
         run: >
-          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'screening','request_id':'screening-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); k=os.environ['JOB_KEY']; r={'schema_version':1,'stage':'screening','request_id':'screening-'+os.environ['RUN_ID'],'environment':{'branch':os.environ['BRANCH'],'workflow_path':'.github/workflows/eval.yml','head_sha':os.environ['HEAD'],'run_id':int(os.environ['RUN_ID']),'run_attempt':int(os.environ['RUN_ATTEMPT']),'job_key':k,'job_allocation_nonce':os.environ['RUN_ID']+'-'+os.environ['RUN_ATTEMPT']+'-'+k,'runtime':{'python':'3.13','lancedb':'0.34.0','numpy':'2.2.6','pyarrow':'25.0.0','omp_num_threads':2}},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'lock_identity':h('requirements.txt')}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real campaign CLI
         run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Seal missing numeric output as a pipeline rejection

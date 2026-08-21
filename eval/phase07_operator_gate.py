@@ -22,6 +22,13 @@ STAGES = frozenset({"preflight", "screening", "confirmation", "continuation", "p
 INFRA_FAILURES = frozenset({"github_infrastructure", "hosted_runner_unavailable", "artifact_service"})
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+STAGE1_RUNTIME_FIELDS = frozenset({
+    "branch", "workflow_path", "head_sha", "run_id", "run_attempt", "job_key", "job_allocation_nonce", "runtime",
+})
+STAGE1_RUNTIME_IDENTITY = {
+    "python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0",
+    "omp_num_threads": 2,
+}
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -53,6 +60,27 @@ def _reject_secrets(value: Any, *, location: str = "payload") -> None:
             _reject_secrets(item, location=f"{location}[{index}]")
     elif isinstance(value, str) and any(marker in value.lower() for marker in ("ghp_", "github_pat_", "bearer ")):
         raise ValueError(f"secret-like value is forbidden: {location}")
+
+
+def validate_stage1_screening_runtime(environment: object) -> dict[str, Any]:
+    """Reject a hosted Stage 1 request that is not bound to its allocation/runtime."""
+    if not isinstance(environment, dict) or set(environment) != STAGE1_RUNTIME_FIELDS:
+        raise ValueError("strict Stage 1 hosted runtime binding")
+    if not isinstance(environment["branch"], str) or environment["branch"] in {"", "main", "master"} or environment["workflow_path"] != ".github/workflows/eval.yml":
+        raise ValueError("Stage 1 branch/workflow path")
+    if not isinstance(environment["head_sha"], str) or not SHA.fullmatch(environment["head_sha"]):
+        raise ValueError("Stage 1 immutable head")
+    if not isinstance(environment["run_id"], int) or environment["run_id"] <= 0:
+        raise ValueError("Stage 1 run identity")
+    if not isinstance(environment["run_attempt"], int) or environment["run_attempt"] <= 0:
+        raise ValueError("Stage 1 run attempt")
+    if not isinstance(environment["job_key"], str) or not environment["job_key"]:
+        raise ValueError("Stage 1 job key")
+    if environment["job_allocation_nonce"] != f"{environment['run_id']}-{environment['run_attempt']}-{environment['job_key']}":
+        raise ValueError("Stage 1 job allocation nonce")
+    if environment["runtime"] != STAGE1_RUNTIME_IDENTITY:
+        raise ValueError("Stage 1 locked runtime/OMP identity")
+    return environment
 
 
 def _git(*args: str) -> str:
