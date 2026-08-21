@@ -35,9 +35,11 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
         "d04": {"family_name": "d04_ef_300_vs_200", "family_size": 6,
                 "raw_p_values": [0.01] * 6, "holm_adjusted_p_values": [0.06] * 6,
                 "basic_ci_95": [[0.01, 0.02]] * 6},
-        "d20": {"family_name": "d20_current_baseline", "family_size": 4,
-                "baseline_build_id": builds[0]["build_id"], "raw_p_values": [0.01] * 4,
-                "holm_adjusted_p_values": [0.04] * 4, "basic_ci_95": [[0.01, 0.02]] * 4},
+        "d20": {"family_name": "d20_current_baseline_member", "family_size": 2,
+                "baseline_build_id": builds[0]["build_id"], "raw_p_values": [0.01] * 2,
+                "basic_ci_95": [[0.01, 0.02]] * 2,
+                "comparisons": [{"raw_permutation_p": 0.01, "basic_ci_95": [0.01, 0.02], "paired_rows": [[0.1, 0.2]]},
+                                {"raw_permutation_p": 0.01, "basic_ci_95": [0.01, 0.02], "paired_rows": [[0.1, 0.2]]}]},
         "archive_sha256": "a" * 64, "content_sha256": "b" * 64, "retention_days": 90,
     }
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
@@ -77,6 +79,7 @@ def test_confirmation_reconciliation_requires_six_eligible_and_preserves_typed_i
     ledger = reconcile.reconcile_confirmation(plan, packets)
     assert len(ledger["eligible_evidence_runs"]) == 6
     assert len(ledger["all_physical_workflow_runs"]) == 6
+    assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
     origin = _packet(plan["workflow_inputs"][0], run_id=1, failure_class="github_infrastructure")
     replacement = _packet(plan["workflow_inputs"][0], run_id=7, replacement_for=1)
     retried = [origin, replacement, *packets[1:]]
