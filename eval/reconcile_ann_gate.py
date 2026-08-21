@@ -104,6 +104,95 @@ def _canonical_sha256(payload: dict) -> str:
     ).hexdigest()
 
 
+def canonical_digest(payload: dict) -> str:
+    """Public canonical digest for newly sealed confirmation packets."""
+    value = dict(payload)
+    value.pop("record_self_sha256", None)
+    return _canonical_sha256(value)
+
+
+def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
+    """Validate one non-pooled physical confirmation packet before reconciliation."""
+    required = {
+        "schema_version", "campaign_stage", "workflow_inputs_sha256", "slot", "run_id", "run_attempt",
+        "job_id", "job_key", "job_allocation_nonce", "status", "failure_class", "replacement_for_run_id",
+        "builds", "d04", "d20", "archive_sha256", "content_sha256", "retention_days", "record_self_sha256",
+    }
+    if not isinstance(packet, dict) or set(packet) != required or packet.get("record_self_sha256") != canonical_digest(packet):
+        raise ValueError("sealed confirmation packet")
+    if packet["campaign_stage"] != "confirmation" or packet["workflow_inputs_sha256"] != workflow_inputs.get("record_self_sha256") or packet["slot"] != workflow_inputs.get("slot"):
+        raise ValueError("confirmation input/request binding")
+    if not all(isinstance(packet[key], int) and packet[key] > 0 for key in ("run_id", "run_attempt", "job_id")) or not isinstance(packet["job_key"], str) or not packet["job_key"] or not isinstance(packet["job_allocation_nonce"], str) or len(packet["job_allocation_nonce"]) < 32:
+        raise ValueError("confirmation allocation identity")
+    if packet["retention_days"] != 90 or not all(isinstance(packet[key], str) and _HEX64.fullmatch(packet[key]) for key in ("archive_sha256", "content_sha256")):
+        raise ValueError("confirmation artifact retention/digest")
+    failure = packet["failure_class"]
+    if packet["status"] == "numeric-success":
+        if failure is not None:
+            raise ValueError("numeric success cannot carry a failure")
+    elif failure not in PHASE07_INFRA_FAILURES | {"numeric", "recall", "hybrid", "watchdog", "malformed", "reconciliation"}:
+        raise ValueError("typed confirmation failure class")
+    builds = packet["builds"]
+    if not isinstance(builds, list) or len(builds) != 3:
+        raise ValueError("confirmation requires exactly three fresh builds")
+    by_m = {}
+    build_ids = set()
+    for build in builds:
+        if not isinstance(build, dict) or set(build) != {"build_id", "m", "ef_construction", "query_ef"} or build.get("m") not in {16, 20, 32} or build.get("ef_construction") != 300 or not isinstance(build.get("build_id"), str) or not _HEX64.fullmatch(build["build_id"]) or build["build_id"] in build_ids:
+            raise ValueError("fresh HNSW-SQ build identity")
+        if build["m"] in by_m or not isinstance(build["query_ef"], list):
+            raise ValueError("duplicate build m")
+        by_m[build["m"]] = build; build_ids.add(build["build_id"])
+    if set(by_m) != {16, 20, 32} or by_m[16]["query_ef"] != [100, 200, 300] or any(by_m[m]["query_ef"] != [200, 300] for m in (20, 32)):
+        raise ValueError("D-04/D-20 build query allocation")
+    for name, size in (("d04", 6), ("d20", 4)):
+        family = packet[name]
+        if not isinstance(family, dict) or family.get("family_size") != size or not isinstance(family.get("raw_p_values"), list) or len(family["raw_p_values"]) != size or not isinstance(family.get("holm_adjusted_p_values"), list) or len(family["holm_adjusted_p_values"]) != size or not isinstance(family.get("basic_ci_95"), list) or len(family["basic_ci_95"]) != size:
+            raise ValueError("separate confirmation statistical family")
+    if packet["d04"].get("family_name") != "d04_ef_300_vs_200" or packet["d20"].get("family_name") != "d20_current_baseline" or packet["d20"].get("baseline_build_id") != by_m[16]["build_id"]:
+        raise ValueError("D-20 must reference this packet m=16 baseline")
+    return packet
+
+
+def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
+    """Seal six logical slots while retaining, but excluding, typed infra origins."""
+    from eval.phase07_operator_gate import validate_confirmation_plan
+    validate_confirmation_plan(plan)
+    if not isinstance(packets, list) or not packets:
+        raise ValueError("confirmation packets required")
+    inputs = {record["record_self_sha256"]: record for record in plan["workflow_inputs"]}
+    physical = []
+    per_slot: dict[str, list[dict]] = {key: [] for key in inputs}
+    seen_runs = set()
+    for packet in packets:
+        key = packet.get("workflow_inputs_sha256") if isinstance(packet, dict) else None
+        if key not in inputs:
+            raise ValueError("hand-authored or unknown confirmation input")
+        validate_confirmation_packet(packet, inputs[key])
+        allocation = (packet["run_id"], packet["run_attempt"], packet["job_id"], packet["job_allocation_nonce"])
+        if allocation in seen_runs:
+            raise ValueError("replayed confirmation physical run")
+        seen_runs.add(allocation); per_slot[key].append(packet)
+    eligible = []
+    for key, slot_packets in per_slot.items():
+        success = [packet for packet in slot_packets if packet["status"] == "numeric-success"]
+        rejected = [packet for packet in slot_packets if packet["status"] != "numeric-success"]
+        if not rejected:
+            if len(success) != 1:
+                raise ValueError("each confirmation slot requires one eligible numeric result")
+        else:
+            if len(rejected) != 1 or rejected[0]["failure_class"] not in PHASE07_INFRA_FAILURES or len(success) != 1 or success[0]["replacement_for_run_id"] != rejected[0]["run_id"]:
+                raise ValueError("non-infrastructure failure has no replacement or invalid retry lineage")
+            physical.append({**rejected[0], "eligible": False})
+        physical.append({**success[0], "eligible": True})
+        eligible.append(success[0])
+    if len(eligible) != 6 or len({record["workflow_inputs_sha256"] for record in eligible}) != 6:
+        raise ValueError("exact six eligible confirmation records")
+    ledger = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_plan_sha256": plan["record_self_sha256"], "eligible_evidence_runs": eligible, "all_physical_workflow_runs": physical}
+    ledger["record_self_sha256"] = canonical_digest(ledger)
+    return ledger
+
+
 def _stage1_reject_secrets(value: Any, location: str = "request") -> None:
     """Allow the explicit no-authority marker, reject every other credential-shaped value."""
     if isinstance(value, dict):

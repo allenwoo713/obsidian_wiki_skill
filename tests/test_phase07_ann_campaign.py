@@ -18,6 +18,7 @@ from eval.phase07_ann_campaign import (
     select_stage1_nominees,
     validate_request,
 )
+from eval.phase07_operator_gate import canonical_digest as operator_digest
 from eval.run_eval import _representative_indexed_query_separation, run_phase07_representative_campaign
 from eval.ann_corpus_manifest import canonical_content_tree_sha256
 from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256, validate_indexed_query_digest_separation
@@ -45,7 +46,12 @@ def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
         }
         request["lock_identity"] = _digest("d")
     if stage == "confirmation":
-        request.update(prior_screening_sha256=_digest("c"), nominated_m=[16], run_ordinal=1,
+        request["environment"] = {"head_sha": "c" * 40}
+        slot = {"m": 32, "ordinal": 1}
+        binding = {"kind": "phase07-confirmation/v1", "prior_screening_sha256": "6c424135ec4db8983136826575d9436b6ba88da5029384ada47fadb2d1918e33", "nominated_m": 32, "run_ordinal": 1}
+        workflow_inputs = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_request_sha256": _digest("c"), "slot": slot, "post_task0_head": "c" * 40, "continuation_binding": binding, "continuation_binding_sha256": operator_digest(binding), "dispatch_identity": "phase07-confirmation/32/1"}
+        workflow_inputs["record_self_sha256"] = operator_digest(workflow_inputs)
+        request.update(workflow_inputs=workflow_inputs,
                        run_identity={"run_id": "1", "run_attempt": 1, "job_id": "2", "job_allocation_nonce": "nonce-00000000001"})
     if stage == "continuation":
         configs = {
@@ -227,8 +233,9 @@ def test_stage1_nominee_selection_is_qualified_and_deterministically_ranked(
 def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_path: Path) -> None:
     runner = _tiny_runner(tmp_path)
     confirmation = execute(_request("confirmation"), tmp_path / "confirm", runner=runner.run)["result"]
-    assert confirmation["build_count"] == 1
-    assert [group["query_ef"] for group in confirmation["replicate"]["queries"]] == [200, 300]
+    assert confirmation["build_count"] == 3
+    assert {build["build"]["m"] for build in confirmation["builds"]} == {16, 20, 32}
+    assert [group["query_ef"] for group in confirmation["builds"][0]["queries"]] == [100, 200, 300]
     stage2 = execute(_request("continuation", mode="stage2_sq"), tmp_path / "stage2", runner=runner.run)["result"]
     assert [group["query_ef"] for group in stage2["stage2"]["queries"]] == [300, 500]
     refined = execute(_request("continuation", mode="refinement"), tmp_path / "refine", runner=runner.run)["result"]

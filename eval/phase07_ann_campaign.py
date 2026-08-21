@@ -32,7 +32,7 @@ from eval.ann_frontier_statistics import (
     validate_declared_family,
 )
 from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256
-from eval.phase07_operator_gate import validate_stage1_screening_runtime
+from eval.phase07_operator_gate import CONFIRMATION_WORKFLOW_INPUT_FIELDS, canonical_digest as operator_digest, validate_confirmation_workflow_input, validate_stage1_screening_runtime
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_", "github_pat_")
@@ -94,7 +94,7 @@ def _validate_continuation_config(mode: str, config: dict[str, Any]) -> None:
 def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(request, dict) or request.get("schema_version") != 1 or request.get("stage") not in STAGES: raise ValueError("typed Phase 7 request")
     _reject_secrets(request); stage = request["stage"]
-    extra = {"lock_identity"} if stage == "screening" else {"prior_screening_sha256", "nominated_m", "run_ordinal", "run_identity"} if stage == "confirmation" else {"mode", "prior_evidence_sha256", "config"}
+    extra = {"lock_identity"} if stage == "screening" else {"workflow_inputs", "run_identity"} if stage == "confirmation" else {"mode", "prior_evidence_sha256", "config"}
     if set(request) != BASE | extra: raise ValueError("unknown or missing request field")
     if not isinstance(request["request_id"], str) or not request["request_id"] or not isinstance(request["environment"], dict): raise ValueError("request identity/environment")
     for name in ("model_manifest_sha256", "corpus_manifest_sha256"): _digest(name, request[name])
@@ -102,10 +102,15 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
         validate_stage1_screening_runtime(request["environment"])
         _digest("lock_identity", request["lock_identity"])
     if stage == "confirmation":
-        _digest("prior_screening_sha256", request["prior_screening_sha256"])
-        # Two nominees require two requests/jobs, never one reused allocation.
-        if not isinstance(request["nominated_m"], list) or len(request["nominated_m"]) != 1 or request["nominated_m"][0] not in (16, 20, 32): raise ValueError("confirmation requires exactly one separately allocated nominated m")
-        if request["run_ordinal"] not in (1, 2, 3) or isinstance(request["run_ordinal"], bool): raise ValueError("deterministic run ordinal")
+        inputs = request["workflow_inputs"]
+        if not isinstance(inputs, dict) or set(inputs) != CONFIRMATION_WORKFLOW_INPUT_FIELDS or inputs.get("record_self_sha256") != operator_digest(inputs):
+            raise ValueError("confirmation requires a sealed generated workflow input")
+        slot = inputs.get("slot")
+        if inputs.get("campaign_stage") != "confirmation" or not isinstance(slot, dict) or set(slot) != {"m", "ordinal"} or (slot["m"], slot["ordinal"]) not in {(32, 1), (32, 2), (32, 3), (20, 1), (20, 2), (20, 3)}:
+            raise ValueError("immutable confirmation slot")
+        if not isinstance(request["environment"], dict) or set(request["environment"]) != {"head_sha"}:
+            raise ValueError("confirmation requires its exact source head")
+        validate_confirmation_workflow_input(inputs, expected_head=request["environment"]["head_sha"])
         _identity(request["run_identity"])
     elif stage == "continuation":
         if request["mode"] not in MODES or not isinstance(request["config"], dict): raise ValueError("unsupported bounded continuation mode")
@@ -325,8 +330,12 @@ class Phase07AnnCampaignRunner:
         return result
 
     def confirmation(self, request: dict[str, Any]) -> dict[str, Any]:
-        m = request["nominated_m"][0]
-        return self._with_truth(lambda root, exact, exact_ms: {"run_ordinal": request["run_ordinal"], "run_identity": request["run_identity"], "build_count": 1, "replicate": self._build(root, m=m, ef_construction=300, query_ef=(200, 300), exact_ids=exact, exact_ms=exact_ms), "authorization": "none"})
+        slot = request["workflow_inputs"]["slot"]
+        def operation(root, exact, exact_ms):
+            builds = [self._build(root, m=m, ef_construction=300, query_ef=(100, 200, 300) if m == 16 else (200, 300), exact_ids=exact, exact_ms=exact_ms) for m in (16, 20, 32)]
+            baseline, primary = next(build for build in builds if build["build"]["m"] == 16), next(build for build in builds if build["build"]["m"] == slot["m"])
+            return {"slot": slot, "run_identity": request["run_identity"], "workflow_inputs_sha256": request["workflow_inputs"]["record_self_sha256"], "build_count": 3, "builds": builds, "primary_build_id": primary["build_id"], "d04_statistics": self._screening_statistics(builds), "d20_baseline_build_id": baseline["build_id"], "d20_baseline_query_ef": 100, "authorization": "none"}
+        return self._with_truth(operation)
 
     def continuation(self, request: dict[str, Any]) -> dict[str, Any]:
         mode, config = request["mode"], request["config"]

@@ -11,8 +11,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,15 @@ STAGE1_RUNTIME_IDENTITY = {
     "python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0",
     "omp_num_threads": 2,
 }
+STAGE1_LEDGER_DIGEST = "6c424135ec4db8983136826575d9436b6ba88da5029384ada47fadb2d1918e33"
+STAGE1_NUMERIC_HEAD = "c45934d7fb8e699faa389c1dc3e80bb9dcc774c8"
+CONFIRMATION_IMPLEMENTATION_BASE = "105dab9764cb58fb10610b78345b85d7282ef4d6"
+CONFIRMATION_SLOTS = ((32, 1), (32, 2), (32, 3), (20, 1), (20, 2), (20, 3))
+CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
+    "schema_version", "campaign_stage", "confirmation_request_sha256",
+    "slot", "post_task0_head", "continuation_binding",
+    "continuation_binding_sha256", "dispatch_identity", "record_self_sha256",
+})
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -36,6 +48,158 @@ def canonical_digest(payload: dict[str, Any]) -> str:
     value = dict(payload)
     value.pop("record_self_sha256", None)
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _sealed(payload: dict[str, Any]) -> dict[str, Any]:
+    record = dict(payload)
+    record["record_self_sha256"] = canonical_digest(record)
+    return record
+
+
+def _confirmation_binding(*, slot: dict[str, int]) -> dict[str, Any]:
+    return {
+        "kind": "phase07-confirmation/v1", "prior_screening_sha256": STAGE1_LEDGER_DIGEST,
+        "nominated_m": slot["m"], "run_ordinal": slot["ordinal"],
+    }
+
+
+def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dict[str, Any]:
+    """Derive all confirmation dispatch authority from the immutable Stage 1 ledger."""
+    if not SHA.fullmatch(post_task0_head):
+        raise ValueError("confirmation requires an exact post-Task-0 head")
+    ledger = _read_object(stage1_ledger)
+    if ledger.get("record_self_sha256") != STAGE1_LEDGER_DIGEST or canonical_digest(ledger) != STAGE1_LEDGER_DIGEST:
+        raise ValueError("unrecognized immutable Stage 1 ledger")
+    if ledger.get("artifact_reported_nominated_m") != [16, 20] or ledger.get("nominated_m") != [32, 20] or ledger.get("head_sha") != STAGE1_NUMERIC_HEAD:
+        raise ValueError("immutable Stage 1 nominee/head provenance")
+    request = _sealed({
+        "schema_version": 1, "campaign_stage": "confirmation",
+        "stage1_ledger_path": str(stage1_ledger), "stage1_ledger_sha256": STAGE1_LEDGER_DIGEST,
+        "artifact_reported_nominated_m": [16, 20], "reconciled_nominated_m": [32, 20],
+        "authoritative_nominated_m": [32, 20], "stage1_numeric_head": STAGE1_NUMERIC_HEAD,
+        "confirmation_implementation_base": CONFIRMATION_IMPLEMENTATION_BASE,
+        "post_task0_head": post_task0_head,
+    })
+    inputs = []
+    for m, ordinal in CONFIRMATION_SLOTS:
+        slot = {"m": m, "ordinal": ordinal}
+        binding = _confirmation_binding(slot=slot)
+        inputs.append(_sealed({
+            "schema_version": 1, "campaign_stage": "confirmation",
+            "confirmation_request_sha256": request["record_self_sha256"], "slot": slot,
+            "post_task0_head": post_task0_head, "continuation_binding": binding,
+            "continuation_binding_sha256": canonical_digest(binding),
+            "dispatch_identity": f"phase07-confirmation/{m}/{ordinal}",
+        }))
+    return _sealed({
+        "schema_version": 1, "confirmation_request": request, "workflow_inputs": inputs,
+        "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20],
+    })
+
+
+def validate_confirmation_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict) or set(plan) != {"schema_version", "confirmation_request", "workflow_inputs", "artifact_reported_nominated_m", "authoritative_nominated_m", "record_self_sha256"} or plan.get("schema_version") != 1:
+        raise ValueError("sealed confirmation plan schema")
+    if plan.get("record_self_sha256") != canonical_digest(plan):
+        raise ValueError("confirmation plan self-digest")
+    request = plan["confirmation_request"]
+    required_request = {"schema_version", "campaign_stage", "stage1_ledger_path", "stage1_ledger_sha256", "artifact_reported_nominated_m", "reconciled_nominated_m", "authoritative_nominated_m", "stage1_numeric_head", "confirmation_implementation_base", "post_task0_head", "record_self_sha256"}
+    if not isinstance(request, dict) or set(request) != required_request or request.get("record_self_sha256") != canonical_digest(request):
+        raise ValueError("sealed confirmation request")
+    if request["campaign_stage"] != "confirmation" or request["stage1_ledger_sha256"] != STAGE1_LEDGER_DIGEST or request["stage1_numeric_head"] != STAGE1_NUMERIC_HEAD or request["confirmation_implementation_base"] != CONFIRMATION_IMPLEMENTATION_BASE or not SHA.fullmatch(request["post_task0_head"]):
+        raise ValueError("confirmation request provenance")
+    if plan["artifact_reported_nominated_m"] != [16, 20] or plan["authoritative_nominated_m"] != [32, 20] or request["artifact_reported_nominated_m"] != [16, 20] or request["reconciled_nominated_m"] != [32, 20] or request["authoritative_nominated_m"] != [32, 20]:
+        raise ValueError("confirmation nominees")
+    inputs = plan["workflow_inputs"]
+    if not isinstance(inputs, list) or len(inputs) != 6:
+        raise ValueError("exactly six generated confirmation inputs")
+    slots = []
+    for record in inputs:
+        if not isinstance(record, dict) or set(record) != CONFIRMATION_WORKFLOW_INPUT_FIELDS or record.get("record_self_sha256") != canonical_digest(record):
+            raise ValueError("sealed generated workflow input")
+        slot = record.get("slot")
+        if not isinstance(slot, dict) or set(slot) != {"m", "ordinal"} or (slot["m"], slot["ordinal"]) not in CONFIRMATION_SLOTS:
+            raise ValueError("immutable confirmation slot")
+        binding = _confirmation_binding(slot=slot)
+        if record.get("campaign_stage") != "confirmation" or record.get("confirmation_request_sha256") != request["record_self_sha256"] or record.get("post_task0_head") != request["post_task0_head"] or record.get("continuation_binding") != binding or record.get("continuation_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/{slot['m']}/{slot['ordinal']}":
+            raise ValueError("confirmation input binding")
+        slots.append((slot["m"], slot["ordinal"]))
+    if slots != list(CONFIRMATION_SLOTS):
+        raise ValueError("duplicate, missing, or replayed confirmation slot")
+    return plan
+
+
+def validate_confirmation_workflow_input(record: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
+    """Fail closed before build when a dispatched input is not one canonical slot."""
+    if not SHA.fullmatch(expected_head) or not isinstance(record, dict) or set(record) != CONFIRMATION_WORKFLOW_INPUT_FIELDS or record.get("record_self_sha256") != canonical_digest(record):
+        raise ValueError("sealed generated workflow input")
+    slot = record.get("slot")
+    if not isinstance(slot, dict) or set(slot) != {"m", "ordinal"} or (slot["m"], slot["ordinal"]) not in CONFIRMATION_SLOTS:
+        raise ValueError("immutable confirmation slot")
+    binding = _confirmation_binding(slot=slot)
+    if record.get("campaign_stage") != "confirmation" or record.get("post_task0_head") != expected_head or not isinstance(record.get("confirmation_request_sha256"), str) or not HEX64.fullmatch(record["confirmation_request_sha256"]) or record.get("continuation_binding") != binding or record.get("continuation_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/{slot['m']}/{slot['ordinal']}":
+        raise ValueError("confirmation input/request/head/binding mismatch")
+    return record
+
+
+def allocate_confirmation_job(client: Any, *, repository: str, run_id: int, run_attempt: int,
+                              job_key: str, token: str) -> dict[str, Any]:
+    """Bind the hosted allocation before any build without retaining the token."""
+    if not repository or not isinstance(run_id, int) or run_id <= 0 or not isinstance(run_attempt, int) or run_attempt <= 0 or not job_key or not token:
+        raise ValueError("invalid attempt-scoped allocation identity")
+    try:
+        response = client.get_json(f"/repos/{repository}/actions/runs/{run_id}/attempts/{run_attempt}/jobs", token)
+        jobs = response.get("jobs") if isinstance(response, dict) else None
+        matches = [job for job in jobs if isinstance(job, dict) and job.get("name") == job_key and job.get("run_id") == run_id and job.get("run_attempt") == run_attempt] if isinstance(jobs, list) else []
+        if len(matches) != 1 or not isinstance(matches[0].get("id"), int) or matches[0]["id"] <= 0:
+            raise ValueError("attempt-scoped job must match exactly once")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("attempt-scoped job lookup failed") from exc
+    try:
+        nonce = secrets.token_hex(16)
+    except Exception as exc:
+        raise ValueError("allocation nonce generation failed") from exc
+    if not isinstance(nonce, str) or len(nonce) != 32:
+        raise ValueError("allocation nonce generation failed")
+    return {"run_id": run_id, "run_attempt": run_attempt, "job_id": matches[0]["id"], "job_key": job_key, "job_allocation_nonce": nonce}
+
+
+class GitHubActionsClient:
+    """Minimal fakeable stdlib client; its token is header-only and never serialized."""
+    def get_json(self, url: str, token: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"https://api.github.com{url}", headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                if response.status != 200:
+                    raise ValueError("attempt-scoped job API status")
+                value = json.loads(response.read().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("attempt-scoped job API unavailable") from exc
+        if not isinstance(value, dict):
+            raise ValueError("attempt-scoped job API JSON")
+        return value
+
+
+def seal_confirmation_allocation(*, workflow_inputs: dict[str, Any], output: Path, repository: str,
+                                 run_id: int, run_attempt: int, job_key: str, head_sha: str, token: str,
+                                 client: Any | None = None) -> int:
+    """Seal lookup/entropy rejection before a workflow is permitted to build."""
+    record: dict[str, Any] = {"schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": workflow_inputs.get("record_self_sha256")}
+    try:
+        validate_confirmation_workflow_input(workflow_inputs, expected_head=head_sha)
+        allocation = allocate_confirmation_job(client or GitHubActionsClient(), repository=repository, run_id=run_id,
+                                                run_attempt=run_attempt, job_key=job_key, token=token)
+        record.update(status="success", allocation=allocation)
+        _write_ledger(output, record)
+        return 0
+    except Exception:
+        record.update(status="reject-evidence", failure_class="attempt_scoped_job_or_nonce")
+        _write_ledger(output, record)
+        return 1
 
 
 def _read_object(path: Path) -> dict[str, Any]:
@@ -284,7 +448,7 @@ def run_pr_gates(request_file: Path, ledger_file: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -315,6 +479,13 @@ def main() -> int:
             if args.request_file is None or args.ledger_file is None:
                 raise ValueError("reconcile-hosted requires binding and output")
             return reconcile_hosted(args.request_file, args.ledger_file)
+        if args.command == "confirmation-allocation":
+            if args.request_file is None or args.ledger_file is None:
+                raise ValueError("confirmation allocation requires sealed input and output")
+            token = os.environ.get("GITHUB_TOKEN", "")
+            return seal_confirmation_allocation(workflow_inputs=_read_object(args.request_file), output=args.ledger_file,
+                                                repository=args.repository or "", run_id=args.run_id or 0,
+                                                run_attempt=args.run_attempt or 0, job_key=args.job_key or "", head_sha=args.head_sha or "", token=token)
         if args.request_file is None or args.ledger_file is None:
             raise ValueError("operator command requires request and ledger files")
         return {"preflight": run_preflight, "campaign": run_campaign, "decision": run_decision, "pr-gates": run_pr_gates}[args.command](args.request_file, args.ledger_file)

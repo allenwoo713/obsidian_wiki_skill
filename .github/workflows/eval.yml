@@ -22,6 +22,10 @@ on:
         description: "Immutable prior-run binding; not interpolated into shell"
         required: false
         type: string
+      workflow_inputs:
+        description: "Sealed generated Phase 07 confirmation workflow input record"
+        required: false
+        type: string
 
 # Hosted jobs need only their checkout and immutable artifact reads.  No job
 # receives write, package, deployment, or id-token authority.
@@ -601,15 +605,23 @@ jobs:
         run: python scripts/download_embedding_model.py
       - name: Validate immutable cached model tree before campaign import
         run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
-      - name: Construct one fresh immutable confirmation request in this job
+      - name: Materialize only the sealed generated confirmation input
+        env:
+          WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
+        run: >
+          python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); value=json.loads(os.environ['WORKFLOW_INPUTS']); (d/'workflow-inputs.json').write_text(json.dumps(value,sort_keys=True))"
+      - name: Bind this attempt to exactly one numeric job before any index build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python eval/phase07_operator_gate.py confirmation-allocation --request-file .review-tmp/phase07/workflow-inputs.json --ledger-file .review-tmp/phase07/allocation.json --repository "${{ github.repository }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --head-sha "${{ github.sha }}" --job-key phase07-confirmation
+      - name: Construct the campaign request from sealed input and allocated job only
         env:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          JOB_KEY: ${{ github.job }}
           HEAD: ${{ github.sha }}
-          BINDING: ${{ inputs.continuation_binding }}
         run: >
-          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'prior_screening_sha256','nominated_m','run_ordinal'} and b['nominated_m'] in (16,20,32) and b['run_ordinal'] in (1,2,3); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); k=os.environ['JOB_KEY']; r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'prior_screening_sha256':b['prior_screening_sha256'],'nominated_m':[b['nominated_m']],'run_ordinal':b['run_ordinal'],'run_identity':{'run_id':int(os.environ['RUN_ID']),'run_attempt':int(os.environ['RUN_ATTEMPT']),'job_id':k,'job_allocation_nonce':os.environ['RUN_ID']+'-'+os.environ['RUN_ATTEMPT']+'-'+k}}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); i=json.loads((d/'workflow-inputs.json').read_text()); a=json.loads((d/'allocation.json').read_text())['allocation']; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'workflow_inputs':i,'run_identity':a}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real independent confirmation CLI
         run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Seal missing numeric output as a pipeline rejection

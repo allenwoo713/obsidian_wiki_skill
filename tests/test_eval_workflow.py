@@ -269,7 +269,9 @@ def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key()
     for name in ("phase07-screening", "phase07-confirmation", "phase07-continuation", "phase07-representative"):
         assert workflow["jobs"][name]["env"] == {"OMP_NUM_THREADS":"2", "OPENBLAS_NUM_THREADS":"2", "MKL_NUM_THREADS":"2"}
     confirmation = json.dumps(workflow["jobs"]["phase07-confirmation"], sort_keys=True)
-    assert "JOB_KEY" in confirmation and "job_id':k" in (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
+    source = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
+    assert "workflow_inputs" in confirmation and "confirmation-allocation" in source
+    assert "/attempts/{run_attempt}/jobs" in (SKILL_ROOT / "eval/phase07_operator_gate.py").read_text()
 
 
 def test_reconcile_hosted_seals_success_and_rejection(tmp_path: Path) -> None:
