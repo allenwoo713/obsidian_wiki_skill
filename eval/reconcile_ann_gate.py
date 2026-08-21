@@ -25,7 +25,7 @@ from eval.phase07_ann_campaign import (
     canonical_digest as campaign_digest,
     select_stage1_nominees,
 )
-from eval.ann_frontier_statistics import holm_adjust
+from eval.ann_frontier_statistics import holm_adjust, paired_basic_effect, paired_permutation_p
 
 
 PHASE07_PACKET_FIELDS = frozenset({
@@ -172,6 +172,16 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
                 raise ValueError("declared confirmation statistic mismatch")
             if family.get("holm_adjusted_p_values") is not None and family["holm_adjusted_p_values"] != holm_adjust(family["raw_p_values"]):
                 raise ValueError("declared confirmation Holm mismatch")
+            for comparison in comparisons:
+                declared = comparison.get("comparison")
+                if not isinstance(declared, dict):
+                    raise ValueError("missing confirmation comparison binding")
+                if family["family_name"] == "d20_current_baseline_member" and (declared.get("baseline_build_id") != by_m[16]["build_id"] or declared.get("candidate_build_id") not in {by_m[20]["build_id"], by_m[32]["build_id"]}):
+                    raise ValueError("D-20 comparison cross-build identity")
+                expected_effect = paired_basic_effect(comparison["paired_rows"], comparison=declared)
+                expected_p = paired_permutation_p(comparison["paired_rows"], comparison=declared)
+                if comparison.get("mean_effect") != expected_effect["mean_effect"] or comparison.get("basic_ci_95") != expected_effect["basic_ci_95"] or comparison.get("raw_permutation_p") != expected_p:
+                    raise ValueError("recomputed confirmation statistic mismatch")
     return packet
 
 

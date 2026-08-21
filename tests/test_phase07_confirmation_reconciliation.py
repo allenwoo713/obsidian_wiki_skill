@@ -9,6 +9,7 @@ import pytest
 
 from eval import phase07_operator_gate as operator
 from eval import reconcile_ann_gate as reconcile
+from eval.ann_frontier_statistics import holm_adjust, paired_basic_effect, paired_permutation_p
 
 
 LEDGER = Path("/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json")
@@ -25,6 +26,20 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
          "query_ef": [100, 200, 300] if m == 16 else [200, 300]}
         for m in (16, 20, 32)
     ]
+    d04_comparisons = []
+    for m in (16, 20, 32):
+        for metric in ("recall_at_10", "recall_at_20"):
+            comparison = {"m": m, "metric": metric, "baseline_ef": 200, "candidate_ef": 300}
+            rows = [[0.1, 0.2]]
+            d04_comparisons.append({"comparison": comparison, **paired_basic_effect(rows, comparison=comparison),
+                                    "raw_permutation_p": paired_permutation_p(rows, comparison=comparison), "paired_rows": rows})
+    for comparison, adjusted in zip(d04_comparisons, holm_adjust([row["raw_permutation_p"] for row in d04_comparisons]), strict=True): comparison["holm_adjusted_p"] = adjusted
+    d20_comparisons = []
+    for metric in ("recall_at_10", "recall_at_20"):
+        comparison = {"metric": metric, "baseline_m": 16, "candidate_m": slot["slot"]["m"], "baseline_ef": 100, "candidate_ef": 300, "baseline_build_id": builds[0]["build_id"], "candidate_build_id": next(build["build_id"] for build in builds if build["m"] == slot["slot"]["m"])}
+        rows = [[0.1, 0.2]]
+        d20_comparisons.append({"comparison": comparison, **paired_basic_effect(rows, comparison=comparison),
+                                "raw_permutation_p": paired_permutation_p(rows, comparison=comparison), "paired_rows": rows})
     packet = {
         "schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": slot["record_self_sha256"],
         "slot": slot["slot"], "run_id": run_id, "run_attempt": 1, "job_id": run_id + 100,
@@ -33,15 +48,11 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
         "failure_class": failure_class, "replacement_for_run_id": replacement_for,
         "builds": builds,
         "d04": {"family_name": "d04_ef_300_vs_200", "family_size": 6,
-                "raw_p_values": [0.01] * 6, "holm_adjusted_p_values": [0.06] * 6,
-                "basic_ci_95": [[0.01, 0.02]] * 6,
-                "comparisons": [{"raw_permutation_p": 0.01, "holm_adjusted_p": 0.06,
-                                 "basic_ci_95": [0.01, 0.02], "paired_rows": [[0.1, 0.2]]} for _ in range(6)]},
+                "raw_p_values": [row["raw_permutation_p"] for row in d04_comparisons], "holm_adjusted_p_values": [row["holm_adjusted_p"] for row in d04_comparisons],
+                "basic_ci_95": [row["basic_ci_95"] for row in d04_comparisons], "comparisons": d04_comparisons},
         "d20": {"family_name": "d20_current_baseline_member", "family_size": 2,
-                "baseline_build_id": builds[0]["build_id"], "raw_p_values": [0.01] * 2,
-                "basic_ci_95": [[0.01, 0.02]] * 2,
-                "comparisons": [{"raw_permutation_p": 0.01, "basic_ci_95": [0.01, 0.02], "paired_rows": [[0.1, 0.2]]},
-                                {"raw_permutation_p": 0.01, "basic_ci_95": [0.01, 0.02], "paired_rows": [[0.1, 0.2]]}]},
+                "baseline_build_id": builds[0]["build_id"], "raw_p_values": [row["raw_permutation_p"] for row in d20_comparisons],
+                "basic_ci_95": [row["basic_ci_95"] for row in d20_comparisons], "comparisons": d20_comparisons},
         "archive_sha256": "a" * 64, "content_sha256": "b" * 64, "retention_days": 90,
     }
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
