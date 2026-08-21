@@ -157,6 +157,17 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
         for value in [*family["raw_p_values"], *(family.get("holm_adjusted_p_values") or []), *(item for interval in family["basic_ci_95"] for item in interval)]:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError("non-finite confirmation statistic")
+        comparisons = family.get("comparisons")
+        if comparisons is not None:
+            if not isinstance(comparisons, list) or len(comparisons) != family["family_size"]:
+                raise ValueError("confirmation family member cardinality")
+            for comparison in comparisons:
+                rows = comparison.get("paired_rows") if isinstance(comparison, dict) else None
+                if not isinstance(rows, list) or not rows:
+                    raise ValueError("missing paired confirmation samples")
+                for row in rows:
+                    if not isinstance(row, list) or len(row) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in row):
+                        raise ValueError("invalid paired confirmation samples")
     return packet
 
 
