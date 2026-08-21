@@ -3,6 +3,7 @@ import hashlib
 import inspect
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -96,6 +97,40 @@ def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> 
         "model_manifest_sha256",
     ):
         assert required in workflow
+
+
+def test_phase07_screening_is_seeded_numeric_only_and_model_jobs_stay_model_backed() -> None:
+    """D-07/D-18: screening validates its lock but never hydrates a model."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    screening = workflow.split("  phase07-screening:", 1)[1].split(
+        "  phase07-confirmation:", 1
+    )[0]
+    for required in (
+        "python scripts/download_embedding_model.py --validate-manifest-only",
+        "'model_manifest_sha256':h('eval/model-manifest.json')",
+        "'lock_identity':h('requirements.txt')",
+        "Assert actual locked Stage 1 runtime and OMP settings",
+        "OMP_NUM_THREADS: '2'",
+    ):
+        assert required in screening
+    for forbidden in (
+        "actions/cache@v4",
+        "phase07-model-cache",
+        "Hydrate exact immutable model",
+        "Validate immutable cached model tree",
+        "models/paraphrase-multilingual-MiniLM-L12-v2",
+    ):
+        assert forbidden not in screening
+
+    for job, next_job in (
+        ("phase07-confirmation", "phase07-continuation"),
+        ("phase07-continuation", "phase07-representative"),
+        ("phase07-representative", "phase07-reconciliation"),
+    ):
+        section = workflow.split(f"  {job}:", 1)[1].split(f"  {next_job}:", 1)[0]
+        assert "actions/cache@v4" in section
+        assert "python scripts/download_embedding_model.py" in section
+        assert "Validate immutable cached model tree" in section
 
 
 def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -> None:
@@ -271,6 +306,34 @@ def test_exact_hf_hydration_uses_manifest_revision_and_allowlist(monkeypatch, tm
     with pytest.raises(ValueError):
         module.hydrate_exact_manifest_model(snapshot_download=fake_download)
     assert calls["revision"] == manifest["revision"] and calls["allow_patterns"] == [item["path"] for item in manifest["files"]]
+
+
+def test_direct_manifest_only_script_mode_is_read_only_and_importable_from_repo_root() -> None:
+    """The screening preflight cannot import, hydrate, or alter the model tree."""
+    model_root = SKILL_ROOT / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
+    before = sorted(
+        (path.relative_to(model_root).as_posix(), path.stat().st_mtime_ns)
+        for path in model_root.rglob("*")
+    ) if model_root.exists() else []
+
+    result = subprocess.run(
+        [sys.executable, "scripts/download_embedding_model.py", "--validate-manifest-only"],
+        cwd=SKILL_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["valid"] is True
+    assert payload["mode"] == "manifest-only"
+    assert payload["revision"] == "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+    after = sorted(
+        (path.relative_to(model_root).as_posix(), path.stat().st_mtime_ns)
+        for path in model_root.rglob("*")
+    ) if model_root.exists() else []
+    assert after == before
 
 
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
