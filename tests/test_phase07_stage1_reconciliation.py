@@ -19,6 +19,7 @@ from eval.phase07_ann_campaign import (
     CampaignConfig,
     Phase07AnnCampaignRunner,
     execute,
+    select_stage1_nominees,
 )
 from eval.reconcile_ann_gate import reconcile_stage1_screening
 
@@ -352,6 +353,40 @@ def test_stage1_tiny_three_build_artifact_reconciles_without_rep_manifest_truth(
     assert all([group["query_ef"] for group in build["queries"]] == [100, 150, 200, 300] for build in ledger["builds"])
     assert all(sum(len(group["queries"]) for group in build["queries"]) == 4 * 8 for build in ledger["builds"])
     assert output.exists()
+
+
+def test_stage1_ledger_distinguishes_artifact_and_reconciled_nominees(
+    tmp_path: Path, tiny_stage1_artifact: tuple[Path, dict[str, object]],
+) -> None:
+    """A corrected ranking must not rewrite the immutable artifact's reported list."""
+    source, result = tiny_stage1_artifact
+    artifact_dir = tmp_path / "artifact"
+    shutil.copytree(source, artifact_dir)
+    extracted = artifact_dir / "extracted"
+    result_record = json.loads((extracted / "screening-result.json").read_text(encoding="utf-8"))
+    authoritative = select_stage1_nominees(
+        result_record["result"]["builds"], result_record["result"]["d04_statistics"],
+    )
+    reported = [m for m in (16, 20, 32) if m not in authoritative][:1]
+    assert reported and reported != authoritative
+    result_record["result"]["nominated_m"] = reported
+    _seal(result_record)
+    (extracted / "screening-result.json").write_text(json.dumps(result_record), encoding="utf-8")
+    request = _reseal_bundle(artifact_dir, result)
+    request_path = tmp_path / "stage1-request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+
+    ledger = reconcile_stage1_screening(
+        stage1_request=request_path, artifact_dir=artifact_dir,
+        output=tmp_path / "stage1-ledger.json", mode="screening", expected_shape=(48, 384, 8),
+    )
+
+    assert ledger["artifact_reported_nominated_m"] == reported
+    assert ledger["nominated_m"] == authoritative
+    assert ledger["artifact_reported_nominated_m"] != ledger["nominated_m"]
+    for field in ("artifact_reported_nominated_m", "nominated_m"):
+        assert len(ledger[field]) <= 2 and len(set(ledger[field])) == len(ledger[field])
+        assert set(ledger[field]) <= {16, 20, 32}
 
 
 def test_stage1_reconciler_accepts_runner_bound_corpus_digest_not_locally_regenerated(
