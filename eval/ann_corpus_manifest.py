@@ -155,7 +155,11 @@ def validate_model_tree(model_root: Path, lock: Mapping[str, object], *, allow_d
     actual: dict[str, str] = {}
     for path in model_root.rglob("*"):
         relative = path.relative_to(model_root).as_posix()
-        if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
+        if path.is_symlink():
+            raise ValueError("model tree has symlink or nonregular file")
+        if path.is_dir():
+            continue
+        if not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
             raise ValueError("model tree has symlink or nonregular file")
         actual[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     if actual != expected:

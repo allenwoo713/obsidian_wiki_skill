@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 
@@ -99,6 +100,15 @@ def test_d10_d18_model_tree_lock_and_cache_poisoning_fail_closed(tmp_path: Path)
     }
     with pytest.raises(ValueError):
         manifests.validate_model_tree(model_root, lock, allow_download=False)
-    (model_root / "extra.bin").write_bytes(b"poison")
-    with pytest.raises(ValueError):
-        manifests.validate_model_tree(model_root, lock, allow_download=False)
+
+
+def test_model_tree_allows_nested_regular_files_but_rejects_poisoning(tmp_path: Path) -> None:
+    manifests = _manifests()
+    root = tmp_path / "model"; nested = root / "1_Pooling"; nested.mkdir(parents=True)
+    content = b"{}"; (nested / "config.json").write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+    lock = {"schema_version": 1, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision": "a" * 40, "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "files": [{"path":"1_Pooling/config.json","sha256":digest}]}
+    lock["record_self_sha256"] = manifests.canonical_sha256(lock)
+    assert manifests.validate_model_tree(root, lock) == lock
+    (root / "extra.json").write_text("x")
+    with pytest.raises(ValueError): manifests.validate_model_tree(root, lock)
