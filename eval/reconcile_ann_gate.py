@@ -168,6 +168,10 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
                 for row in rows:
                     if not isinstance(row, list) or len(row) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in row):
                         raise ValueError("invalid paired confirmation samples")
+            if any(comparison.get("raw_permutation_p") != declared for comparison, declared in zip(comparisons, family["raw_p_values"], strict=True)) or any(comparison.get("basic_ci_95") != declared for comparison, declared in zip(comparisons, family["basic_ci_95"], strict=True)):
+                raise ValueError("declared confirmation statistic mismatch")
+            if family.get("holm_adjusted_p_values") is not None and family["holm_adjusted_p_values"] != holm_adjust(family["raw_p_values"]):
+                raise ValueError("declared confirmation Holm mismatch")
     return packet
 
 
