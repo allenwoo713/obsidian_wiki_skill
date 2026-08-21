@@ -168,7 +168,7 @@ def seal_hosted_preflight(*, output: Path, stage: str, continuation: str, reposi
         manifest = json.loads((root / "eval" / "model-manifest.json").read_text(encoding="utf-8"))
         if not all(value in lock for value in ("lancedb==0.34.0", "numpy==2.2.6", "pyarrow==25.0.0")) or set(manifest) != {"schema_version", "model_id", "revision", "runtime", "files", "record_self_sha256"}:
             raise ValueError("lock or model manifest syntax")
-        if manifest["model_id"] != "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" or manifest["runtime"] != {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"}:
+        if manifest["schema_version"] != 1 or manifest["model_id"] != "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" or manifest["runtime"] != {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"}:
             raise ValueError("model manifest identity/runtime")
         if not SHA.fullmatch(manifest["revision"]) or manifest["revision"] == "0" * 40:
             raise ValueError("immutable provider revision")
@@ -178,7 +178,7 @@ def seal_hosted_preflight(*, output: Path, stage: str, continuation: str, reposi
             raise ValueError("model manifest file allowlist")
         paths = set()
         for item in manifest["files"]:
-            if not isinstance(item, dict) or set(item) != {"path", "sha256"} or not isinstance(item["path"], str) or not item["path"] or item["path"].startswith("/") or ".." in Path(item["path"]).parts or item["path"] in paths or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"]):
+            if not isinstance(item, dict) or set(item) != {"path", "sha256"} or not isinstance(item["path"], str) or not item["path"] or item["path"].startswith("/") or "\\" in item["path"] or ":" in item["path"] or ".." in Path(item["path"]).parts or item["path"] in paths or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"]):
                 raise ValueError("model manifest file record")
             paths.add(item["path"])
         record["status"] = "success"
@@ -214,10 +214,12 @@ def reconcile_hosted(binding_file: Path, output: Path) -> int:
         if set(binding) != {"repository", "head_sha", "packets"} or not isinstance(binding["packets"], list):
             raise ValueError("strict reconciliation binding")
         packets = validate_phase07_evidence_set(binding["packets"], expected_repository=binding["repository"], expected_head=binding["head_sha"])
-        _write_ledger(output, {"schema_version": 1, "status": "success", "authorization": "none", "repository": binding["repository"], "head_sha": binding["head_sha"], "packets": [{key: packet[key] for key in ("run_id", "run_attempt", "job_id", "artifact_id", "archive_sha256", "content_sha256", "build_id")} for packet in packets]})
+        output.mkdir(parents=True, exist_ok=True)
+        _write_ledger(output / "reconciliation-result.json", {"schema_version": 1, "status": "success", "authorization": "none", "repository": binding["repository"], "head_sha": binding["head_sha"], "packets": packets})
         return 0
     except (ValueError, OSError, json.JSONDecodeError, KeyError) as exc:
-        _write_ledger(output, {"schema_version": 1, "status": "reject-evidence", "authorization": "none", "reason": f"{type(exc).__name__}: {exc}"})
+        output.mkdir(parents=True, exist_ok=True)
+        _write_ledger(output / "reconciliation-rejection.json", {"schema_version": 1, "status": "reject-evidence", "authorization": "none", "reason": f"{type(exc).__name__}: {exc}"})
         return 1
 
 

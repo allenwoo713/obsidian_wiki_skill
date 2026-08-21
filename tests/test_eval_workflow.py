@@ -241,10 +241,12 @@ def test_reconcile_hosted_seals_success_and_rejection(tmp_path: Path) -> None:
     import phase07_operator_gate as gate
     packet = {"repository":"owner/repo","run_id":1,"run_attempt":1,"job_id":2,"job_allocation_nonce":"0123456789abcdef","artifact_id":3,"artifact_name":"x","archive_sha256":"a"*64,"content_sha256":"b"*64,"record_self_sha256":"","retention_days_requested":90,"retention_days_accepted":90,"head_sha":"c"*40,"runner":{"os":"Linux","image":"ubuntu","architecture":"X64"},"lock_identity":"locked","build_id":"d"*64,"retry_lineage":{"failure_class":"github_infrastructure","original_run_id":None,"replacement_run_id":None}}
     packet["record_self_sha256"] = gate.canonical_digest(packet)
-    binding = tmp_path / "binding.json"; output = tmp_path / "out.json"; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]}))
+    binding = tmp_path / "binding.json"; output = tmp_path / "out"; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]}))
     assert gate.reconcile_hosted(binding, output) == 0
-    packet["retention_days_accepted"] = 7; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]}))
-    assert gate.reconcile_hosted(binding, output) == 1 and json.loads(output.read_text())["status"] == "reject-evidence"
+    assert gate.finalize_pipeline_artifact(output_dir=output, stage="reconciliation", head_sha="c"*40, run_id=1, run_attempt=1, job_key="reconcile", job_status="success") == 0
+    assert (output / "reconciliation-result.json").is_file() and not list(output.glob("*-rejection.json"))
+    packet["retention_days_accepted"] = 7; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]})); invalid = tmp_path / "invalid"
+    assert gate.reconcile_hosted(binding, invalid) == 1 and (invalid / "reconciliation-rejection.json").is_file() and not list(invalid.glob("*-result.json"))
 
 
 def test_phase07_finalizer_creates_rejection_when_campaign_output_is_missing(tmp_path: Path) -> None:

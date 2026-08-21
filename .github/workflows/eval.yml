@@ -720,17 +720,17 @@ jobs:
       - name: Create strict reconciliation binding from supplied operator packet
         env:
           BINDING: ${{ inputs.continuation_binding }}
-        run: python -c "import json,os,pathlib; p=json.loads(os.environ['BINDING']); assert set(p)=={'repository','head_sha','packets'}; d=pathlib.Path('.review-tmp/phase07/reconciliation'); d.mkdir(parents=True,exist_ok=True); (d/'binding.json').write_text(json.dumps(p,sort_keys=True))"
+        run: python -c "import json,os,pathlib; p=json.loads(os.environ['BINDING']); assert set(p)=={'repository','head_sha','packets'}; d=pathlib.Path('.review-tmp/phase07/reconciliation-input'); d.mkdir(parents=True,exist_ok=True); (d/'binding.json').write_text(json.dumps(p,sort_keys=True))"
       - name: Reconcile supplied immutable hosted packet set
-        run: python eval/phase07_operator_gate.py reconcile-hosted --request-file .review-tmp/phase07/reconciliation/binding.json --ledger-file .review-tmp/phase07/reconciliation/reconciliation.json
+        run: python eval/phase07_operator_gate.py reconcile-hosted --request-file .review-tmp/phase07/reconciliation-input/binding.json --ledger-file .review-tmp/phase07/reconciliation-artifacts
       - name: Emit reconciliation rejection only if output is missing
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/reconciliation --stage reconciliation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-reconciliation --job-status "${{ job.status }}"
+        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/reconciliation-artifacts --stage reconciliation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-reconciliation --job-status "${{ job.status }}"
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
           name: phase07-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07/reconciliation
+          path: .review-tmp/phase07/reconciliation-artifacts
           if-no-files-found: error
           retention-days: 90
 
