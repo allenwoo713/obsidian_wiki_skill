@@ -50,6 +50,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from build_index import CandidateQueryPolicy, WikiIndex  # noqa: E402
 from obsidian_wiki.domain.index_models import CandidateBuildPolicy  # noqa: E402
+from eval.ann_corpus_manifest import validate_query_corpus_separation  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
 from query import hybrid_search, BUDGET_POLICY as _BUDGET_POLICY  # noqa: E402
 import build_graph as _bg  # noqa: E402
@@ -478,21 +479,23 @@ def run_phase07_representative_campaign(
     root = Path(work_dir) / f"representative-{mode}-{size}"
     if root.exists():
         shutil.rmtree(root)
-    wiki = root / "Wiki"
-    shutil.copytree(FIXTURES_WIKI, wiki)
+    original_wiki = root / "original" / "Wiki"
+    expanded_wiki = root / "expanded" / "Wiki"
+    shutil.copytree(FIXTURES_WIKI, original_wiki)
+    shutil.copytree(FIXTURES_WIKI, expanded_wiki)
     # Public deterministic distractors preserve fixture-language structure;
     # the query is never written into this corpus.
-    source_pages = sorted(wiki.rglob("*.md"))
+    source_pages = sorted(expanded_wiki.rglob("*.md"))
     if not source_pages:
         raise ValueError("representative public fixture unavailable")
     for ordinal in range(max(0, size - len(source_pages))):
         source = source_pages[ordinal % len(source_pages)].read_text(encoding="utf-8")
-        target = wiki / "phase07_distractors" / f"public-{ordinal:05d}.md"
+        target = expanded_wiki / "phase07_distractors" / f"public-{ordinal:05d}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(source + f"\n\npublic distractor ordinal {ordinal}\n", encoding="utf-8")
     baseline = baseline or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 100, "refine_factor": None}
     finalist = finalist or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
-    def build_candidate(name, config):
+    def build_candidate(name, config, wiki):
         index_dir = root / name / ".index"
         policy = CandidateQueryPolicy(
             candidate=config["candidate"], query_ef=config["query_ef"],
@@ -506,7 +509,9 @@ def run_phase07_representative_campaign(
             wi = WikiIndex(index_dir)
         wi.load()
         return wi
-    baseline_wi, finalist_wi = build_candidate("baseline", baseline), build_candidate("finalist", finalist)
+    original_baseline = build_candidate("original-baseline", baseline, original_wiki)
+    baseline_wi = build_candidate("expanded-baseline", baseline, expanded_wiki)
+    finalist_wi = build_candidate("expanded-finalist", finalist, expanded_wiki)
     if embed is not None:
         # Query embedding is the matching half of the explicitly injected test
         # encoder.  Storage, build, load, fusion and citation/context paths are
@@ -514,17 +519,19 @@ def run_phase07_representative_campaign(
         class _InjectedEncoder:
             def encode(self, texts, **_kwargs):
                 return embed(texts)
-        baseline_wi._embedder = _InjectedEncoder(); finalist_wi._embedder = _InjectedEncoder()
+        original_baseline._embedder = _InjectedEncoder(); baseline_wi._embedder = _InjectedEncoder(); finalist_wi._embedder = _InjectedEncoder()
     planner = DefaultQueryPlanner(project_root=root)
     original_queries = load_queries(HERE / "queries.jsonl")
     if len(original_queries) != 105: raise ValueError("pinned original hybrid query manifest")
     queries = original_queries[:query_limit] if query_limit is not None else original_queries
-    observations = []
+    original_observations, expanded_observations = [], []
     for ordinal, item in enumerate(queries):
         query = item["query"]; started = time.perf_counter()
-        baseline_result = hybrid_search(baseline_wi, query, planner, k=10, max_tokens=4096, wiki_dir=wiki, intent_override="auto", allow_local_fallback=True)
-        finalist_result = hybrid_search(finalist_wi, query, planner, k=10, max_tokens=4096, wiki_dir=wiki, intent_override="auto", allow_local_fallback=True)
-        observations.append({"ordinal": ordinal, "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+        original_result = hybrid_search(original_baseline, query, planner, k=10, max_tokens=4096, wiki_dir=original_wiki, intent_override="auto", allow_local_fallback=True)
+        original_observations.append({"ordinal": ordinal, "query_sha256": hashlib.sha256(query.encode()).hexdigest(), "baseline": _candidate_result_payload(original_result), "duration_ms": (time.perf_counter() - started) * 1000})
+        baseline_result = hybrid_search(baseline_wi, query, planner, k=10, max_tokens=4096, wiki_dir=expanded_wiki, intent_override="auto", allow_local_fallback=True)
+        finalist_result = hybrid_search(finalist_wi, query, planner, k=10, max_tokens=4096, wiki_dir=expanded_wiki, intent_override="auto", allow_local_fallback=True)
+        expanded_observations.append({"ordinal": ordinal, "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
                              "baseline": _candidate_result_payload(baseline_result), "finalist": _candidate_result_payload(finalist_result),
                              "duration_ms": (time.perf_counter() - started) * 1000})
     # Separate natural-language ANN exact stratum: pinned query rows are never
@@ -538,18 +545,22 @@ def run_phase07_representative_campaign(
         finalist_vector = finalist_wi._get_embedder().encode([query_text])[0]
         baseline_repo, finalist_repo = baseline_wi._get_repository(), finalist_wi._get_repository()
         exact_ids = [str(row.get("chunk_id", "")) for row in baseline_repo.search_dense_exact(baseline_vector, metric="cosine", limit=20)]
+        finalist_exact_ids = [str(row.get("chunk_id", "")) for row in finalist_repo.search_dense_exact(finalist_vector, metric="cosine", limit=20)]
         baseline_ids = [str(row.get("chunk_id", "")) for row in baseline_repo.search_dense_eval(baseline_vector, metric="cosine", limit=20, ef=baseline["query_ef"])]
         finalist_ids = [str(row.get("chunk_id", "")) for row in finalist_repo.search_dense_eval(finalist_vector, metric="cosine", limit=20, ef=finalist["query_ef"])]
-        ann_rows.append({"query_id": item["query_id"], "exact_top_20": exact_ids, "baseline_top_20": baseline_ids,
+        ann_rows.append({"query_id": item["query_id"], "baseline_exact_top_20": exact_ids, "finalist_exact_top_20": finalist_exact_ids, "baseline_top_20": baseline_ids,
                          "finalist_top_20": finalist_ids,
-                         "baseline_recall_at_20": len(set(exact_ids) & set(baseline_ids)) / 20,
-                         "finalist_recall_at_20": len(set(exact_ids) & set(finalist_ids)) / 20})
+                         "baseline_recall_at_10": len(set(exact_ids[:10]) & set(baseline_ids[:10])) / 10, "baseline_recall_at_20": len(set(exact_ids) & set(baseline_ids)) / 20,
+                         "finalist_recall_at_10": len(set(finalist_exact_ids[:10]) & set(finalist_ids[:10])) / 10, "finalist_recall_at_20": len(set(finalist_exact_ids) & set(finalist_ids)) / 20})
+    indexed_text_digests = {hashlib.sha256(str(row["text"]).encode()).hexdigest() for row in baseline_repo._dense_table().to_arrow().to_pylist()}
+    query_text_digests = [hashlib.sha256(item["query"].encode()).hexdigest() for item in ann_queries]
+    validate_query_corpus_separation({"schema_version": 1, "stress": {"kind": "seeded_vector_exact", "rows": 77348, "dimensions": 384, "corpus_seed": "x", "query_seed": "x", "corpus_sha256": "a" * 64, "query_sha256": "b" * 64, "exact_truth_sha256": "c" * 64}, "hybrid": {"kind": "labeled_natural_language_hybrid", "query_count": 105, "labels_sha256": "d" * 64, "query_sha256": "e" * 64}, "personal_wiki_ann": {"kind": "natural_language_ann_exact", "query_count": 256, "query_sha256": "f" * 64, "exact_truth_sha256": "0" * 64, "indexed_query_overlap_count": 0}, "generator": {"version": "public-distractor-v1", "seed": "x", "source_fixture_sha256": "1" * 64, "rules_sha256": "2" * 64}}, indexed_row_digests=indexed_text_digests, query_row_digests=query_text_digests)
     return {
         "mode": mode, "scale": size, "candidate_configs": {"baseline": baseline, "finalist": finalist},
-        "original_fixture": {"query_count": len(queries), "absolute_baseline": [row["baseline"] for row in observations], "absolute_finalist": [row["finalist"] for row in observations], "paired_observations": observations},
-        "expanded": {"size": size, "paired_observations": observations},
+        "original_fixture": {"query_count": len(queries), "corpus_identity": hashlib.sha256(str(original_wiki).encode()).hexdigest(), "absolute_baseline": original_observations},
+        "expanded": {"size": size, "corpus_identity": hashlib.sha256(str(expanded_wiki).encode()).hexdigest(), "paired_observations": expanded_observations},
         "personal_wiki_ann_exact": {"query_count": len(ann_rows), "indexed_query_overlap_count": 0, "rows": ann_rows},
-        "hybrid_invocation": {"entrypoint": "query.hybrid_search", "baseline_calls": len(observations), "finalist_calls": len(observations)},
+        "hybrid_invocation": {"entrypoint": "query.hybrid_search", "original_baseline_calls": len(original_observations), "baseline_calls": len(expanded_observations), "finalist_calls": len(expanded_observations)},
         "authorization": authorization,
     }
 

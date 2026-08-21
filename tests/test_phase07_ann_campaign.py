@@ -114,5 +114,9 @@ def test_public_hybrid_facade_uses_real_build_service_and_lancedb(tmp_path: Path
                                                   work_dir=tmp_path, authorization="none", embed=_embed384(), query_limit=2)
     assert result["authorization"] == "none"
     assert result["hybrid_invocation"]["entrypoint"] == "query.hybrid_search"
-    assert result["hybrid_invocation"] == {"entrypoint": "query.hybrid_search", "baseline_calls": 2, "finalist_calls": 2}
+    assert result["hybrid_invocation"] == {"entrypoint": "query.hybrid_search", "original_baseline_calls": 2, "baseline_calls": 2, "finalist_calls": 2}
+    assert result["original_fixture"]["corpus_identity"] != result["expanded"]["corpus_identity"]
+    assert result["original_fixture"]["absolute_baseline"] is not result["expanded"]["paired_observations"]
+    row = result["personal_wiki_ann_exact"]["rows"][0]
+    assert {"baseline_recall_at_10", "baseline_recall_at_20", "finalist_recall_at_10", "finalist_recall_at_20"} <= set(row)
     assert result["personal_wiki_ann_exact"]["indexed_query_overlap_count"] == 0
