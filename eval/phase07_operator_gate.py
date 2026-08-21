@@ -35,6 +35,7 @@ STAGE1_RUNTIME_IDENTITY = {
 STAGE1_LEDGER_DIGEST = "6c424135ec4db8983136826575d9436b6ba88da5029384ada47fadb2d1918e33"
 STAGE1_NUMERIC_HEAD = "c45934d7fb8e699faa389c1dc3e80bb9dcc774c8"
 CONFIRMATION_IMPLEMENTATION_BASE = "105dab9764cb58fb10610b78345b85d7282ef4d6"
+CANONICAL_STAGE1_LEDGER_PATH = "/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json"
 CONFIRMATION_SLOTS = ((32, 1), (32, 2), (32, 3), (20, 1), (20, 2), (20, 3))
 CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
     "schema_version", "campaign_stage", "confirmation_request_sha256",
@@ -72,15 +73,9 @@ def confirmation_input_membership_digest(record: dict[str, Any]) -> str:
     return canonical_digest(value)
 
 
-def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dict[str, Any]:
-    """Derive all confirmation dispatch authority from the immutable Stage 1 ledger."""
+def _build_confirmation_plan_from_immutable(*, stage1_ledger_path: str, post_task0_head: str) -> dict[str, Any]:
     if not SHA.fullmatch(post_task0_head):
         raise ValueError("confirmation requires an exact post-Task-0 head")
-    ledger = _read_object(stage1_ledger)
-    if ledger.get("record_self_sha256") != STAGE1_LEDGER_DIGEST or canonical_digest(ledger) != STAGE1_LEDGER_DIGEST:
-        raise ValueError("unrecognized immutable Stage 1 ledger")
-    if ledger.get("artifact_reported_nominated_m") != [16, 20] or ledger.get("nominated_m") != [32, 20] or ledger.get("head_sha") != STAGE1_NUMERIC_HEAD:
-        raise ValueError("immutable Stage 1 nominee/head provenance")
     seed_records = []
     for m, ordinal in CONFIRMATION_SLOTS:
         slot = {"m": m, "ordinal": ordinal}
@@ -91,7 +86,7 @@ def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dic
                              "dispatch_identity": f"phase07-confirmation/{m}/{ordinal}"})
     request = _sealed({
         "schema_version": 1, "campaign_stage": "confirmation",
-        "stage1_ledger_path": str(stage1_ledger), "stage1_ledger_sha256": STAGE1_LEDGER_DIGEST,
+        "stage1_ledger_path": stage1_ledger_path, "stage1_ledger_sha256": STAGE1_LEDGER_DIGEST,
         "artifact_reported_nominated_m": [16, 20], "reconciled_nominated_m": [32, 20],
         "authoritative_nominated_m": [32, 20], "stage1_numeric_head": STAGE1_NUMERIC_HEAD,
         "confirmation_implementation_base": CONFIRMATION_IMPLEMENTATION_BASE,
@@ -105,6 +100,16 @@ def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dic
         "schema_version": 1, "confirmation_request": request, "workflow_inputs": inputs,
         "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20],
     })
+
+
+def build_confirmation_plan(stage1_ledger: Path, *, post_task0_head: str) -> dict[str, Any]:
+    """Derive all confirmation dispatch authority from the immutable Stage 1 ledger."""
+    ledger = _read_object(stage1_ledger)
+    if ledger.get("record_self_sha256") != STAGE1_LEDGER_DIGEST or canonical_digest(ledger) != STAGE1_LEDGER_DIGEST:
+        raise ValueError("unrecognized immutable Stage 1 ledger")
+    if ledger.get("artifact_reported_nominated_m") != [16, 20] or ledger.get("nominated_m") != [32, 20] or ledger.get("head_sha") != STAGE1_NUMERIC_HEAD:
+        raise ValueError("immutable Stage 1 nominee/head provenance")
+    return _build_confirmation_plan_from_immutable(stage1_ledger_path=str(stage1_ledger), post_task0_head=post_task0_head)
 
 
 def validate_confirmation_plan(plan: dict[str, Any]) -> dict[str, Any]:
@@ -146,16 +151,18 @@ def validate_confirmation_dispatch_bundle(bundle: dict[str, Any], *, expected_he
     if not isinstance(bundle, dict) or set(bundle) != {"confirmation_request", "workflow_input"}:
         raise ValueError("typed confirmation dispatch bundle")
     request, record = bundle["confirmation_request"], bundle["workflow_input"]
-    probe = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": [record],
-             "artifact_reported_nominated_m": request.get("artifact_reported_nominated_m") if isinstance(request, dict) else None,
-             "authoritative_nominated_m": request.get("authoritative_nominated_m") if isinstance(request, dict) else None}
-    # Validate the request shape and the one member directly; the six-member plan
-    # is reconstructed only for deterministic membership validation.
-    if not isinstance(request, dict) or request.get("record_self_sha256") != canonical_digest(request):
-        raise ValueError("sealed confirmation request")
-    validate_confirmation_workflow_input(record, expected_head=expected_head)
-    if record.get("confirmation_request_sha256") != request["record_self_sha256"] or confirmation_input_membership_digest(record) not in request.get("workflow_input_membership_sha256", []):
-        raise ValueError("confirmation input is not a generated request member")
+    if not SHA.fullmatch(expected_head) or _git("rev-parse", "HEAD") != expected_head:
+        raise ValueError("confirmation feature head is not the exact generated head")
+    expected = _build_confirmation_plan_from_immutable(stage1_ledger_path=CANONICAL_STAGE1_LEDGER_PATH, post_task0_head=expected_head)
+    # The request is not a self-declared authority: it must byte-for-byte match
+    # the deterministic immutable lineage and all six generated members.
+    if request != expected["confirmation_request"]:
+        raise ValueError("noncanonical confirmation request authority")
+    validate_confirmation_plan(expected)
+    slot = record.get("slot") if isinstance(record, dict) else None
+    expected_record = next((item for item in expected["workflow_inputs"] if item["slot"] == slot), None)
+    if expected_record is None or record != expected_record:
+        raise ValueError("confirmation input is not a canonical generated member")
     return record
 
 
