@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
 import tempfile
 import time
@@ -14,7 +15,12 @@ from typing import Any, Callable
 import lancedb
 
 from eval import benchmark_ann_build as benchmark
-from eval.ann_frontier_statistics import validate_declared_family
+from eval.ann_frontier_statistics import (
+    holm_adjust,
+    paired_basic_effect,
+    paired_permutation_p,
+    validate_declared_family,
+)
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_", "github_pat_")
@@ -64,8 +70,11 @@ def _validate_continuation_config(mode: str, config: dict[str, Any]) -> None:
         if set(config) != {"ceiling_sha256", "m", "ef_construction", "query_ef"} or config["m"] not in (16, 20, 32) or config["ef_construction"] not in (300, 500) or config["query_ef"] not in (100, 150, 200, 300, 500): raise ValueError("refinement requires one bounded raw ceiling configuration")
         _digest("ceiling_sha256", config["ceiling_sha256"])
     else:
-        if set(config) != {"size", "baseline_sha256", "finalist_sha256"} or config["size"] not in (1000, 10000, 30000): raise ValueError("representative runs allow only pinned 1k/10k/30k corpora")
-        _digest("baseline_sha256", config["baseline_sha256"]); _digest("finalist_sha256", config["finalist_sha256"])
+        if set(config) != {"size", "baseline", "baseline_sha256", "finalist", "finalist_sha256"} or config["size"] not in (1000, 10000, 30000): raise ValueError("representative runs allow only pinned 1k/10k/30k corpora")
+        for name in ("baseline", "finalist"):
+            candidate = config[name]
+            if not isinstance(candidate, dict) or set(candidate) != {"candidate", "m", "ef_construction", "query_ef", "refine_factor"} or candidate["candidate"] != "ivf-hnsw-sq" or candidate["m"] not in (16, 20, 32) or candidate["ef_construction"] not in (300, 500) or candidate["query_ef"] not in (100, 150, 200, 300, 500) or candidate["refine_factor"] not in (None, 2, 5, 10): raise ValueError("immutable representative candidate configuration")
+            if canonical_digest(candidate) != config[f"{name}_sha256"]: raise ValueError("representative candidate digest mismatch")
 
 
 def validate_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -100,6 +109,26 @@ class CampaignConfig:
     per_build_max_seconds: float = 180.0; work_dir: Path = Path(".review-tmp/phase07-builds")
 
 
+def _build_index_child(lance_dir: str, candidate: str, m: int, ef_construction: int,
+                       rows: int, result_queue) -> None:
+    """Child owns *only* the mutable LanceDB index build operation."""
+    try:
+        from obsidian_wiki.domain.index_models import CandidateQueryPolicy, VectorIndexConfig
+        started = time.perf_counter()
+        repository = LanceDbIndexRepository(
+            Path(lance_dir), eval_candidate_policy=CandidateQueryPolicy(candidate=candidate, query_ef=100),
+        )
+        stats = repository.create_vector_index(VectorIndexConfig(
+            index_type="hnsw_sq" if candidate == "ivf-hnsw-sq" else "hnsw_flat",
+            metric="cosine", num_partitions=1, m=m, ef_construction=ef_construction,
+            dense_chunks_count=rows,
+        ))
+        result_queue.put({"status": "complete", "index_build_ms": (time.perf_counter() - started) * 1000,
+                          "unindexed_dense_rows": stats.unindexed_dense_rows})
+    except BaseException as exc:  # child error crosses a strict serializable boundary
+        result_queue.put({"status": "crashed", "reason": f"{type(exc).__name__}: {exc}"})
+
+
 class Phase07AnnCampaignRunner:
     def __init__(self, config: CampaignConfig = CampaignConfig()) -> None:
         if config.rows <= config.probes or config.dimensions <= 0 or config.probes <= 0 or not 0 < config.per_build_max_seconds <= 180: raise ValueError("trusted campaign configuration")
@@ -114,9 +143,58 @@ class Phase07AnnCampaignRunner:
 
     def _build(self, root: Path, *, candidate: str = "ivf-hnsw-sq", m: int, ef_construction: int, query_ef: tuple[int, ...], exact_ids: tuple[tuple[str, ...], ...], exact_ms: float) -> dict[str, Any]:
         build_root = root / f"{candidate}-m{m}-efc{ef_construction}"
-        run, records = benchmark._candidate_worker(candidate, str(build_root), self.config.rows, self.config.dimensions, self.config.probes, query_ef, exact_ids, exact_ms, m=m, ef_construction=ef_construction)
-        if run["index_build_ms"] / 1000 > self.config.per_build_max_seconds: raise RuntimeError("reject-evidence: per-build watchdog")
-        return {"build_id": hashlib.sha256(f"{build_root}:{run['index_build_start_monotonic']}".encode()).hexdigest(), "build": run, "queries": records}
+        lance_dir = build_root / "lance"
+        corpus = benchmark._vectors(self.config.rows, self.config.dimensions, benchmark.CORPUS_SEED)
+        queries = benchmark._vectors(self.config.probes, self.config.dimensions, benchmark.QUERY_SEED)
+        lancedb.connect(str(lance_dir)).create_table("dense_chunks", data=benchmark._arrow_table(
+            corpus, [f"synthetic::{index:016x}" for index in range(self.config.rows)]))
+        pre_index_bytes = benchmark._directory_bytes(lance_dir)
+        queue = multiprocessing.get_context("spawn").Queue()
+        child = multiprocessing.get_context("spawn").Process(
+            target=_build_index_child,
+            args=(str(lance_dir), candidate, m, ef_construction, self.config.rows, queue),
+        )
+        child.start(); child.join(self.config.per_build_max_seconds)
+        if child.is_alive():
+            child.terminate(); child.join()
+            raise RuntimeError("reject-evidence: per-build watchdog timed out")
+        if child.exitcode != 0 or queue.empty():
+            raise RuntimeError("reject-evidence: build worker crashed or emitted no result")
+        child_result = queue.get_nowait()
+        if not isinstance(child_result, dict) or child_result.get("status") != "complete":
+            raise RuntimeError("reject-evidence: malformed or failed build result")
+        build_ms = child_result.get("index_build_ms")
+        if not isinstance(build_ms, (int, float)) or build_ms < 0 or build_ms / 1000 > self.config.per_build_max_seconds:
+            raise RuntimeError("reject-evidence: invalid per-build watchdog result")
+        # Parent reopens only after the child has successfully exited.  Queries
+        # are intentionally after (and outside) the bounded build interval.
+        from obsidian_wiki.domain.index_models import CandidateQueryPolicy
+        repository = LanceDbIndexRepository(lance_dir, eval_candidate_policy=CandidateQueryPolicy(candidate=candidate, query_ef=query_ef[0]))
+        records = []
+        for ef in query_ef:
+            samples, latencies = [], []
+            for ordinal, vector in enumerate(queries):
+                started = time.perf_counter(); result = repository.search_dense_eval(vector.tolist(), metric="cosine", limit=20, ef=ef)
+                latencies.append((time.perf_counter() - started) * 1000)
+                ids = [str(row.get("chunk_id", "")) for row in result]
+                truth = list(exact_ids[ordinal])
+                samples.append({"query_index": ordinal, "exact_top_10": truth[:10], "exact_top_20": truth,
+                                "candidate_top_10": ids[:10], "candidate_top_20": ids,
+                                "recall_at_10": len(set(truth[:10]) & set(ids[:10])) / 10,
+                                "recall_at_20": len(set(truth) & set(ids)) / 20})
+            records.append({"candidate": candidate, "m": m, "ef_construction": ef_construction,
+                            "query_ef": ef, "build_time_ms": build_ms, "exact_time_ms": exact_ms,
+                            "total_bytes": benchmark._directory_bytes(lance_dir),
+                            "index_delta_bytes": benchmark._directory_bytes(lance_dir) - pre_index_bytes,
+                            "latency_p50_ms": benchmark._percentile(latencies, 50), "latency_p95_ms": benchmark._percentile(latencies, 95),
+                            "recall_at_10": sum(row["recall_at_10"] for row in samples) / len(samples),
+                            "recall_at_20": sum(row["recall_at_20"] for row in samples) / len(samples), "queries": samples})
+        build_id = hashlib.sha256(f"{lance_dir}:{build_ms}".encode()).hexdigest()
+        return {"build_id": build_id, "build": {"candidate": candidate, "m": m, "ef_construction": ef_construction,
+                "index_build_ms": build_ms, "index_bytes": benchmark._directory_bytes(lance_dir),
+                "unindexed_dense_rows": child_result["unindexed_dense_rows"], "reopen_verified": True,
+                "dense_table_open_count": repository.dense_table_open_count,
+                "normal_ann_request_count": len(query_ef) * self.config.probes, "watchdog": {"owner": "parent", "cap_seconds": self.config.per_build_max_seconds, "child_exitcode": child.exitcode}}, "queries": records}
 
     def _with_truth(self, operation: Callable[[Path, tuple[tuple[str, ...], ...], float], dict[str, Any]]) -> dict[str, Any]:
         self.config.work_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +202,34 @@ class Phase07AnnCampaignRunner:
             root = Path(raw); exact, exact_ms = self._truth(root); return operation(root, exact, exact_ms)
 
     def screening(self) -> dict[str, Any]:
-        return self._with_truth(lambda root, exact, exact_ms: {"plan": screening_plan(), "exact_truth_computed_once": True, "build_count": 3, "builds": [self._build(root, m=m, ef_construction=300, query_ef=(100, 150, 200, 300), exact_ids=exact, exact_ms=exact_ms) for m in (16, 20, 32)], "authorization": "none"})
+        def operation(root, exact, exact_ms):
+            builds = [self._build(root, m=m, ef_construction=300, query_ef=(100, 150, 200, 300), exact_ids=exact, exact_ms=exact_ms) for m in (16, 20, 32)]
+            statistics = self._screening_statistics(builds)
+            nominees = sorted({record["comparison"]["m"] for record in statistics["comparisons"]
+                               if record["mean_effect"] > 0 and record["basic_ci_95"][0] > 0 and record["holm_adjusted_p"] <= 0.05})[:2]
+            return {"plan": screening_plan(), "exact_truth_computed_once": True, "build_count": 3,
+                    "builds": builds, "d04_statistics": statistics, "nominated_m": nominees,
+                    "authorization": "none"}
+        return self._with_truth(operation)
+
+    @staticmethod
+    def _screening_statistics(builds: list[dict[str, Any]]) -> dict[str, Any]:
+        comparisons, raw = [], []
+        for build in builds:
+            by_ef = {group["query_ef"]: group for group in build["queries"]}
+            for metric in ("recall_at_10", "recall_at_20"):
+                comparison = {"m": build["build"]["m"], "metric": metric, "baseline_ef": 200, "candidate_ef": 300}
+                pairs = [[left[metric], right[metric]] for left, right in zip(by_ef[200]["queries"], by_ef[300]["queries"], strict=True)]
+                effect = paired_basic_effect(pairs, comparison=comparison)
+                p_value = paired_permutation_p(pairs, comparison=comparison)
+                comparisons.append({"comparison": comparison, **effect, "raw_permutation_p": p_value, "paired_rows": pairs})
+                raw.append(p_value)
+        validate_declared_family([record["comparison"] for record in comparisons], family_name="d04_ef_300_vs_200", expected_size=6)
+        for record, adjusted in zip(comparisons, holm_adjust(raw), strict=True): record["holm_adjusted_p"] = adjusted
+        result = {"schema_version": 1, "family_name": "d04_ef_300_vs_200", "family_size": 6,
+                  "comparisons": comparisons, "authorization": "none"}
+        result["record_self_sha256"] = canonical_digest(result)
+        return result
 
     def confirmation(self, request: dict[str, Any]) -> dict[str, Any]:
         m = request["nominated_m"][0]
@@ -136,12 +241,12 @@ class Phase07AnnCampaignRunner:
         if mode == "flat_diagnostic": return self._with_truth(lambda root, exact, exact_ms: {"mode": mode, "diagnostic_only": True, "build_count": 1, "flat": self._build(root, candidate="ivf-hnsw-flat", m=config["m"], ef_construction=300, query_ef=(config["query_ef"],), exact_ids=exact, exact_ms=exact_ms), "authorization": "none"})
         if mode == "refinement": return self._refinement(config)
         from eval.run_eval import run_phase07_representative_campaign
-        return run_phase07_representative_campaign(mode=mode, size=config["size"], work_dir=self.config.work_dir, authorization="none")
+        return run_phase07_representative_campaign(mode=mode, size=config["size"], baseline=config["baseline"], finalist=config["finalist"], work_dir=self.config.work_dir, authorization="none")
 
     def _refinement(self, config: dict[str, Any]) -> dict[str, Any]:
         def operation(root: Path, exact: tuple[tuple[str, ...], ...], exact_ms: float) -> dict[str, Any]:
             built = self._build(root, m=config["m"], ef_construction=config["ef_construction"], query_ef=(config["query_ef"],), exact_ids=exact, exact_ms=exact_ms)
-            lance_dir = root / f"ivf-hnsw-sq-m{config['m']}-efc{config['ef_construction']}" / "ivf-hnsw-sq"; repository = LanceDbIndexRepository(lance_dir); queries = benchmark._vectors(self.config.probes, self.config.dimensions, benchmark.QUERY_SEED); observations = []
+            lance_dir = root / f"ivf-hnsw-sq-m{config['m']}-efc{config['ef_construction']}" / "lance"; repository = LanceDbIndexRepository(lance_dir); queries = benchmark._vectors(self.config.probes, self.config.dimensions, benchmark.QUERY_SEED); observations = []
             for factor in (2, 5, 10):
                 started = time.perf_counter(); rows = []
                 for ordinal, vector in enumerate(queries):

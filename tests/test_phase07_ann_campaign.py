@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from eval.phase07_ann_campaign import CampaignConfig, Phase07AnnCampaignRunner, execute, validate_request
+from eval.phase07_ann_campaign import CampaignConfig, Phase07AnnCampaignRunner, canonical_digest, execute, validate_request
 from eval.run_eval import run_phase07_representative_campaign
 
 
@@ -28,11 +28,18 @@ def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
             "stage2_sq": {"approved_d04_sha256": _digest("d"), "m": 16},
             "flat_diagnostic": {"no_confirmed_sq_sha256": _digest("d"), "m": 16, "query_ef": 300},
             "refinement": {"ceiling_sha256": _digest("d"), "m": 16, "ef_construction": 300, "query_ef": 300},
-            "representative_ann": {"size": 1000, "baseline_sha256": _digest("d"), "finalist_sha256": _digest("e")},
-            "hybrid_non_regression": {"size": 1000, "baseline_sha256": _digest("d"), "finalist_sha256": _digest("e")},
+            "representative_ann": _representative_config(),
+            "hybrid_non_regression": _representative_config(),
         }
         request.update(mode=mode, prior_evidence_sha256=_digest("c"), config=configs[mode])
     return request
+
+
+def _representative_config():
+    baseline = {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 100, "refine_factor": None}
+    finalist = {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
+    return {"size": 1000, "baseline": baseline, "finalist": finalist,
+            "baseline_sha256": canonical_digest(baseline), "finalist_sha256": canonical_digest(finalist)}
 
 
 def _tiny_runner(tmp_path: Path) -> Phase07AnnCampaignRunner:
@@ -75,11 +82,14 @@ def test_tiny_screening_uses_real_lancedb_reopen_and_ann_grid(tmp_path: Path) ->
     record = execute(_request(), tmp_path / "campaign", runner=_tiny_runner(tmp_path).run)
     result = record["result"]
     assert result["exact_truth_computed_once"] is True and result["build_count"] == 3
+    assert result["d04_statistics"]["family_size"] == 6
+    assert len(result["nominated_m"]) <= 2
     assert [build["build"]["m"] for build in result["builds"]] == [16, 20, 32]
     for build in result["builds"]:
         assert build["build"]["normal_ann_request_count"] == 16
         assert [group["query_ef"] for group in build["queries"]] == [100, 150, 200, 300]
         assert build["build"]["dense_table_open_count"] >= 1
+        assert build["build"]["watchdog"]["owner"] == "parent"
 
 
 def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_path: Path) -> None:
@@ -98,8 +108,11 @@ def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_p
 
 def test_public_hybrid_facade_uses_real_build_service_and_lancedb(tmp_path: Path) -> None:
     # This is deliberately not a mock: injected encoding is the only test seam.
+    config = _representative_config()
     result = run_phase07_representative_campaign(mode="representative_ann", size=1000,
-                                                  work_dir=tmp_path, authorization="none", embed=_embed384())
+                                                  baseline=config["baseline"], finalist=config["finalist"],
+                                                  work_dir=tmp_path, authorization="none", embed=_embed384(), query_limit=2)
     assert result["authorization"] == "none"
     assert result["hybrid_invocation"]["entrypoint"] == "query.hybrid_search"
-    assert isinstance(result["result"], dict)
+    assert result["hybrid_invocation"] == {"entrypoint": "query.hybrid_search", "baseline_calls": 2, "finalist_calls": 2}
+    assert result["personal_wiki_ann_exact"]["indexed_query_overlap_count"] == 0

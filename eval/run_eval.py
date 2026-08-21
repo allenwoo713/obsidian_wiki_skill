@@ -462,8 +462,8 @@ def run_candidate_hybrid_evaluation(
 
 
 def run_phase07_representative_campaign(
-    *, mode: str, size: int, work_dir: Path, authorization: str,
-    embed=None,
+    *, mode: str, size: int, baseline: dict | None = None, finalist: dict | None = None,
+    work_dir: Path, authorization: str, embed=None, query_limit: int | None = None,
 ) -> dict:
     """Exercise the public build/load/``hybrid_search`` path for one pinned scale.
 
@@ -489,15 +489,20 @@ def run_phase07_representative_campaign(
         target = wiki / "phase07_distractors" / f"public-{ordinal:05d}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(source + f"\n\npublic distractor ordinal {ordinal}\n", encoding="utf-8")
-    index_dir = root / ".index"
-    if embed is None:
-        wi = WikiIndex(index_dir)
-        wi.build(wiki, full_rebuild=True)
-    else:
-        from build_index import build_storage_contract
-        build_storage_contract(wiki, index_dir, embed=embed)
-        wi = WikiIndex(index_dir)
-    wi.load()
+    baseline = baseline or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 100, "refine_factor": None}
+    finalist = finalist or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
+    def build_candidate(name, config):
+        index_dir = root / name / ".index"
+        policy = CandidateQueryPolicy(candidate=config["candidate"], query_ef=config["query_ef"])
+        if embed is None:
+            wi = WikiIndex(index_dir); wi.build(wiki, full_rebuild=True, candidate_query_policy=policy)
+        else:
+            from build_index import build_storage_contract
+            build_storage_contract(wiki, index_dir, embed=embed, candidate_query_policy=policy)
+            wi = WikiIndex(index_dir)
+        wi.load()
+        return wi
+    baseline_wi, finalist_wi = build_candidate("baseline", baseline), build_candidate("finalist", finalist)
     if embed is not None:
         # Query embedding is the matching half of the explicitly injected test
         # encoder.  Storage, build, load, fusion and citation/context paths are
@@ -505,18 +510,30 @@ def run_phase07_representative_campaign(
         class _InjectedEncoder:
             def encode(self, texts, **_kwargs):
                 return embed(texts)
-        wi._embedder = _InjectedEncoder()
+        baseline_wi._embedder = _InjectedEncoder(); finalist_wi._embedder = _InjectedEncoder()
     planner = DefaultQueryPlanner(project_root=root)
-    query = "retrieval evidence public fixture"
-    started = time.perf_counter()
-    result = hybrid_search(wi, query, planner, k=10, max_tokens=4096, wiki_dir=wiki,
-                           intent_override="auto", allow_local_fallback=True)
+    original_queries = load_queries(HERE / "queries.jsonl")
+    if len(original_queries) != 105: raise ValueError("pinned original hybrid query manifest")
+    queries = original_queries[:query_limit] if query_limit is not None else original_queries
+    observations = []
+    for ordinal, item in enumerate(queries):
+        query = item["query"]; started = time.perf_counter()
+        baseline_result = hybrid_search(baseline_wi, query, planner, k=10, max_tokens=4096, wiki_dir=wiki, intent_override="auto", allow_local_fallback=True)
+        finalist_result = hybrid_search(finalist_wi, query, planner, k=10, max_tokens=4096, wiki_dir=wiki, intent_override="auto", allow_local_fallback=True)
+        observations.append({"ordinal": ordinal, "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+                             "baseline": _candidate_result_payload(baseline_result), "finalist": _candidate_result_payload(finalist_result),
+                             "duration_ms": (time.perf_counter() - started) * 1000})
+    # Separate natural-language ANN exact stratum: pinned query rows are never
+    # written to the corpus and use normal candidate ANN calls only.
+    ann_queries = load_phase07_personal_wiki_ann_queries(HERE / "personal-wiki-ann-queries.jsonl")
+    ann_queries = ann_queries[:query_limit] if query_limit is not None else ann_queries
+    ann_rows = [{"query_id": item["query_id"], "baseline_hits": len(baseline_wi.search_vector(item["query"], k=20)), "finalist_hits": len(finalist_wi.search_vector(item["query"], k=20))} for item in ann_queries]
     return {
-        "mode": mode, "scale": size, "hybrid_invocation": {
-            "entrypoint": "query.hybrid_search", "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
-        },
-        "result": _candidate_result_payload(result),
-        "duration_ms": (time.perf_counter() - started) * 1000,
+        "mode": mode, "scale": size, "candidate_configs": {"baseline": baseline, "finalist": finalist},
+        "original_fixture": {"query_count": len(queries), "absolute_baseline": [row["baseline"] for row in observations], "absolute_finalist": [row["finalist"] for row in observations], "paired_observations": observations},
+        "expanded": {"size": size, "paired_observations": observations},
+        "personal_wiki_ann_exact": {"query_count": len(ann_rows), "indexed_query_overlap_count": 0, "rows": ann_rows},
+        "hybrid_invocation": {"entrypoint": "query.hybrid_search", "baseline_calls": len(observations), "finalist_calls": len(observations)},
         "authorization": authorization,
     }
 
