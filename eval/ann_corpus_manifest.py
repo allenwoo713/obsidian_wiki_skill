@@ -33,6 +33,15 @@ def _digest(name: str, value: object) -> str:
     return value
 
 
+def sha256_file(path: Path) -> str:
+    """Hash a regular file without loading a model weight into process memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _positive(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -124,34 +133,72 @@ def validate_lightweight_repository_inputs(paths: Iterable[str]) -> None:
             raise ValueError("generated embeddings or indexes are not lightweight inputs")
 
 
-def validate_model_tree(model_root: Path, lock: Mapping[str, object], *, allow_download: bool = False) -> dict[str, object]:
-    """Validate an already-present immutable model tree; never hydrate it."""
-    if allow_download:
-        raise ValueError("model validation never downloads or hydrates")
-    if not isinstance(lock, Mapping) or lock.get("schema_version") != 1:
+def validate_model_manifest(lock: Mapping[str, object]) -> dict[str, object]:
+    """Validate the sealed provider/local compatibility split without touching a tree."""
+    model_id = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    expected_keys = {
+        "schema_version", "model_id", "provider", "runtime", "provider_files",
+        "local_compatible_metadata", "record_self_sha256",
+    }
+    if not isinstance(lock, Mapping) or set(lock) != expected_keys or lock.get("schema_version") != 2:
         raise ValueError("model manifest schema")
-    if lock.get("model_id") != "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2":
+    if lock.get("model_id") != model_id:
         raise ValueError("model identity")
-    revision = lock.get("revision")
-    if not isinstance(revision, str) or len(revision) != 40 or set(revision) - set("0123456789abcdef"):
+    provider = lock.get("provider")
+    if not isinstance(provider, Mapping) or set(provider) != {"name", "repository", "revision"}:
+        raise ValueError("model provider provenance")
+    revision = provider.get("revision")
+    if provider.get("name") != "huggingface" or provider.get("repository") != model_id or (
+        not isinstance(revision, str) or len(revision) != 40 or set(revision) - _SHA256 or revision == "0" * 40
+    ):
         raise ValueError("model revision must be an immutable provider commit")
     if lock.get("runtime") != _MODEL_RUNTIME:
         raise ValueError("exact locked runtime")
-    files = lock.get("files")
+    files = lock.get("provider_files")
     if not isinstance(files, list) or not files:
-        raise ValueError("model manifest files")
-    if not model_root.is_dir() or model_root.is_symlink():
-        raise ValueError("model root unavailable or unsafe")
+        raise ValueError("model provider file allowlist")
     expected: dict[str, str] = {}
     for item in files:
-        if not isinstance(item, Mapping):
-            raise ValueError("model file record")
+        if not isinstance(item, Mapping) or set(item) != {"path", "sha256"}:
+            raise ValueError("model provider file record")
         raw = item.get("path")
-        if not isinstance(raw, str) or not raw or PurePosixPath(raw).is_absolute() or ".." in PurePosixPath(raw).parts:
-            raise ValueError("unsafe model file path")
-        if raw in expected:
-            raise ValueError("duplicate model file path")
-        expected[raw] = _digest("model file sha256", item.get("sha256"))
+        if (
+            not isinstance(raw, str) or not raw or PurePosixPath(raw).is_absolute()
+            or ".." in PurePosixPath(raw).parts or "\\" in raw or ":" in raw or raw in expected
+        ):
+            raise ValueError("unsafe model provider file path")
+        expected[raw] = _digest("model provider file sha256", item.get("sha256"))
+    compatible = lock.get("local_compatible_metadata")
+    if not isinstance(compatible, Mapping) or set(compatible) != {"path", "sha256", "provenance"}:
+        raise ValueError("model local compatible metadata")
+    metadata_path = compatible.get("path")
+    if metadata_path != "configuration.json" or metadata_path in expected:
+        raise ValueError("model local compatible metadata path")
+    metadata_digest = _digest("model local compatible metadata sha256", compatible.get("sha256"))
+    provenance = compatible.get("provenance")
+    if not isinstance(provenance, Mapping) or dict(provenance) != {
+        "provider": "modelscope", "model_id": model_id, "kind": "legacy-local-bootstrap",
+    }:
+        raise ValueError("model local compatible metadata provenance")
+    if lock.get("record_self_sha256") != canonical_sha256(lock):
+        raise ValueError("model manifest self digest")
+    return {
+        "provider_files": expected,
+        "local_compatible_metadata": {"path": metadata_path, "sha256": metadata_digest},
+    }
+
+
+def validate_model_tree(model_root: Path, lock: Mapping[str, object], *, allow_download: bool = False) -> dict[str, object]:
+    """Validate a provider-only tree or its one exact legacy metadata addition."""
+    if allow_download:
+        raise ValueError("model validation never downloads or hydrates")
+    manifest = validate_model_manifest(lock)
+    if not model_root.is_dir() or model_root.is_symlink():
+        raise ValueError("model root unavailable or unsafe")
+    expected = manifest["provider_files"]
+    allowed_with_compatibility = dict(expected)
+    compatible = manifest["local_compatible_metadata"]
+    allowed_with_compatibility[compatible["path"]] = compatible["sha256"]
     actual: dict[str, str] = {}
     for path in model_root.rglob("*"):
         relative = path.relative_to(model_root).as_posix()
@@ -161,12 +208,9 @@ def validate_model_tree(model_root: Path, lock: Mapping[str, object], *, allow_d
             continue
         if not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
             raise ValueError("model tree has symlink or nonregular file")
-        actual[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != expected:
+        actual[relative] = sha256_file(path)
+    if actual not in (expected, allowed_with_compatibility):
         raise ValueError("model tree missing, extra, or changed file")
-    claimed = lock.get("record_self_sha256")
-    if not isinstance(claimed, str) or claimed != canonical_sha256(lock):
-        raise ValueError("model manifest self digest")
     return dict(lock)
 
 

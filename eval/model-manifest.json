@@ -1,14 +1,13 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-  "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+  "provider": {"name": "huggingface", "repository": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"},
   "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
-  "files": [
+  "provider_files": [
     {"path":".gitattributes","sha256":"fd3e5d862331ec272410eb6312742550c3149899ee61827169b78fd0d5889f2e"},
     {"path":"1_Pooling/config.json","sha256":"4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23"},
     {"path":"config.json","sha256":"6300193cb75e01cf80c96decef7187dfb33094d97cc1490b7ead6ff134476e4e"},
     {"path":"config_sentence_transformers.json","sha256":"b8c64b5cece00d8424b4896ea75b512b6008576088497609dfeb6bd63e6d36b8"},
-    {"path":"configuration.json","sha256":"007c616ed9187f4f3d6096ed2d55cece33c3f48866dbd7bc6afefcb9645a37c1"},
     {"path":"model.safetensors","sha256":"eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b"},
     {"path":"modules.json","sha256":"8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460"},
     {"path":"sentence_bert_config.json","sha256":"70f4448f31320443fe3557cacea5abf2dcc4915dda8c80646bec9f3bb0aa5a1f"},
@@ -18,5 +17,10 @@
     {"path":"tokenizer_config.json","sha256":"5036ea374ffedd706e3bef33e2e0d6953cb868ef8a490e76e32ba0faa37a6b9b"},
     {"path":"unigram.json","sha256":"71b44701d7efd054205115acfa6ef126c5d2f84bd3affe0c59e48163674d19a6"}
   ],
-  "record_self_sha256": "fc47388665067ddf7dfda116fddfe1d896a8ef595e823aa4247ac649ad311fc2"
+  "local_compatible_metadata": {
+    "path": "configuration.json",
+    "sha256": "007c616ed9187f4f3d6096ed2d55cece33c3f48866dbd7bc6afefcb9645a37c1",
+    "provenance": {"provider": "modelscope", "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "kind": "legacy-local-bootstrap"}
+  },
+  "record_self_sha256": "5b3c9caf7d12536e43f0d731df9025bf7622d7634bff591c94ef52071e91d67d"
 }

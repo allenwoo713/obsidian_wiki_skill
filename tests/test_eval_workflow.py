@@ -248,16 +248,17 @@ def test_phase07_cross_run_reconciliation_rejects_reused_allocation_and_build() 
 
 def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> None:
     import phase07_operator_gate
+    from eval.ann_corpus_manifest import canonical_sha256
     root = tmp_path
     (root / "eval").mkdir()
     (root / "requirements.txt").write_text("lancedb==0.34.0\nnumpy==2.2.6\npyarrow==25.0.0\n")
-    manifest = {"schema_version": 1, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42", "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "files": [{"path": "x", "sha256": "a" * 64}]}
-    manifest["record_self_sha256"] = phase07_operator_gate.canonical_digest(manifest)
+    manifest = {"schema_version": 2, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "provider": {"name":"huggingface", "repository":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision":"e8f8c211226b894fcb81acc59f3b34ba3efd5f42"}, "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "provider_files": [{"path": "x", "sha256": "a" * 64}], "local_compatible_metadata": {"path":"configuration.json", "sha256":"b" * 64, "provenance":{"provider":"modelscope", "model_id":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "kind":"legacy-local-bootstrap"}}}
+    manifest["record_self_sha256"] = canonical_sha256(manifest)
     (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
     out = root / "proof.json"
     assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 0
     assert json.loads(out.read_text())["status"] == "success"
-    manifest["revision"] = "0" * 40
+    manifest["provider"]["revision"] = "0" * 40
     (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
     assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 1
     rejection = json.loads(out.read_text())
@@ -307,7 +308,7 @@ def test_exact_hf_hydration_uses_provider_allowlist_and_preserves_old_target_on_
     spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
     module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
     manifest = json.loads((SKILL_ROOT / "eval/model-manifest.json").read_text())
-    assert manifest["revision"] == "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+    assert manifest["provider"]["revision"] == "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
     calls = {}
     monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
     (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
@@ -319,7 +320,12 @@ def test_exact_hf_hydration_uses_provider_allowlist_and_preserves_old_target_on_
     with pytest.raises(ValueError, match="changed file"):
         module.hydrate_exact_manifest_model(snapshot_download=fake_download)
     assert (old_target / "old.bin").read_bytes() == b"old"
-    assert calls["revision"] == manifest["revision"]
+    missing = source / manifest["provider_files"][0]["path"]
+    missing.unlink()
+    with pytest.raises(RuntimeError, match="snapshot omitted"):
+        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert (old_target / "old.bin").read_bytes() == b"old"
+    assert calls["revision"] == manifest["provider"]["revision"]
     assert calls["allow_patterns"] == [item["path"] for item in manifest["provider_files"]]
     assert "configuration.json" not in calls["allow_patterns"]
 
@@ -332,7 +338,7 @@ def test_exact_hf_hydration_succeeds_from_provider_only_snapshot(monkeypatch, tm
     digest = hashlib.sha256(contents["config.json"]).hexdigest()
     manifest = {
         "schema_version": 2, "model_id": module.MODEL_ID,
-        "provider": {"name": "huggingface", "revision": "a" * 40},
+        "provider": {"name": "huggingface", "repository": module.MODEL_ID, "revision": "a" * 40},
         "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
         "provider_files": [{"path": "config.json", "sha256": digest}],
         "local_compatible_metadata": {"path": "configuration.json", "sha256": "b" * 64, "provenance": {"provider": "modelscope", "model_id": module.MODEL_ID, "kind": "legacy-local-bootstrap"}},

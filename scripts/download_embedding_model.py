@@ -6,11 +6,15 @@ pollutes a user-wide Hugging Face/ModelScope cache.
 """
 from __future__ import annotations
 
+import os
 import shutil
+import stat
+import tempfile
+import uuid
 import argparse
 import json
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -27,50 +31,27 @@ def _model_is_complete(path: Path) -> bool:
 
 def validate_manifest_only() -> dict[str, object]:
     """Validate the immutable manifest without reading or changing a model tree."""
-    from eval.ann_corpus_manifest import load_manifest
+    from eval.ann_corpus_manifest import load_manifest, validate_model_manifest
 
     lock = load_manifest(SKILL_ROOT / "eval" / "model-manifest.json")
-    if set(lock) != {"schema_version", "model_id", "revision", "runtime", "files", "record_self_sha256"}:
-        raise ValueError("model manifest schema")
-    if lock["schema_version"] != 1 or lock["model_id"] != MODEL_ID:
-        raise ValueError("model manifest identity")
-    revision = lock["revision"]
-    if not isinstance(revision, str) or len(revision) != 40 or set(revision) - set("0123456789abcdef") or revision == "0" * 40:
-        raise ValueError("model revision must be an immutable provider commit")
-    if lock["runtime"] != {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"}:
-        raise ValueError("model manifest runtime")
-    files = lock["files"]
-    if not isinstance(files, list) or not files:
-        raise ValueError("model manifest file allowlist")
-    paths: set[str] = set()
-    for item in files:
-        if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
-            raise ValueError("model manifest file record")
-        path, digest = item["path"], item["sha256"]
-        if (
-            not isinstance(path, str) or not path or PurePosixPath(path).is_absolute()
-            or ".." in PurePosixPath(path).parts or "\\" in path or ":" in path
-            or path in paths or not isinstance(digest, str) or len(digest) != 64
-            or set(digest) - set("0123456789abcdef")
-        ):
-            raise ValueError("model manifest file allowlist")
-        paths.add(path)
+    validate_model_manifest(lock)
     return lock
 
 
-def validate_model_tree_only() -> None:
+def validate_model_tree_only(*, model_dir: Path = MODEL_DIR) -> None:
     """Validate the pinned tree without a network or filesystem hydration path."""
     from eval.ann_corpus_manifest import load_manifest, validate_model_tree
     lock = load_manifest(SKILL_ROOT / "eval" / "model-manifest.json")
-    validate_model_tree(MODEL_DIR, lock, allow_download=False)
+    validate_model_tree(model_dir, lock, allow_download=False)
 
 
 def hydrate_exact_manifest_model(*, snapshot_download=None) -> None:
-    """Hydrate only the manifest's immutable HF revision, then verify every file."""
-    from eval.ann_corpus_manifest import load_manifest, validate_model_tree
+    """Stage and seal only immutable HF provider files before replacing the target."""
+    from eval.ann_corpus_manifest import load_manifest, sha256_file, validate_model_manifest, validate_model_tree
     lock = load_manifest(SKILL_ROOT / "eval" / "model-manifest.json")
-    revision = lock["revision"]
-    allow_patterns = [item["path"] for item in lock["files"]]
+    manifest = validate_model_manifest(lock)
+    revision = lock["provider"]["revision"]
+    allow_patterns = list(manifest["provider_files"])
     if snapshot_download is None:
         from huggingface_hub import snapshot_download as download
     else:
@@ -81,32 +62,55 @@ def hydrate_exact_manifest_model(*, snapshot_download=None) -> None:
         cache_dir=str(CACHE_DIR), local_files_only=False,
     ))
     MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
-    if MODEL_DIR.exists():
-        shutil.rmtree(MODEL_DIR)
-    MODEL_DIR.mkdir()
-    for relative in allow_patterns:
-        source, target = downloaded / relative, MODEL_DIR / relative
-        if not source.is_file():
-            raise RuntimeError(f"immutable provider snapshot omitted {relative}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-    validate_model_tree(MODEL_DIR, lock, allow_download=False)
+    staging = Path(tempfile.mkdtemp(prefix=f".{MODEL_DIR.name}.staging-", dir=MODEL_DIR.parent))
+    backup: Path | None = None
+    try:
+        for relative, expected_digest in manifest["provider_files"].items():
+            source, target = downloaded / relative, staging / relative
+            if source.is_symlink() or not source.is_file() or not stat.S_ISREG(source.stat().st_mode):
+                raise RuntimeError(f"immutable provider snapshot omitted {relative}")
+            if sha256_file(source) != expected_digest:
+                raise ValueError(f"immutable provider snapshot changed file {relative}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if target.is_symlink() or not target.is_file() or not stat.S_ISREG(target.stat().st_mode):
+                raise RuntimeError(f"unsafe staged provider file {relative}")
+        validate_model_tree(staging, lock, allow_download=False)
+        if MODEL_DIR.exists():
+            backup = MODEL_DIR.parent / f".{MODEL_DIR.name}.previous-{uuid.uuid4().hex}"
+            os.replace(MODEL_DIR, backup)
+        try:
+            os.replace(staging, MODEL_DIR)
+        except BaseException:
+            if backup is not None and backup.exists():
+                os.replace(backup, MODEL_DIR)
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate-model-tree", action="store_true")
     parser.add_argument("--validate-manifest-only", action="store_true")
+    parser.add_argument("--model-dir", type=Path)
     args = parser.parse_args()
+    if args.model_dir is not None and not args.validate_model_tree:
+        parser.error("--model-dir requires --validate-model-tree")
     if args.validate_manifest_only:
         lock = validate_manifest_only()
-        print(json.dumps({"valid": True, "mode": "manifest-only", "revision": lock["revision"]}, sort_keys=True))
+        print(json.dumps({"valid": True, "mode": "manifest-only", "revision": lock["provider"]["revision"]}, sort_keys=True))
         return
     if args.validate_model_tree:
-        validate_model_tree_only()
-        print(json.dumps({"valid": True, "model_dir": str(MODEL_DIR)}, sort_keys=True))
+        model_dir = args.model_dir if args.model_dir is not None else MODEL_DIR
+        validate_model_tree_only(model_dir=model_dir)
+        print(json.dumps({"valid": True, "model_dir": str(model_dir)}, sort_keys=True))
         return
-    if _model_is_complete(MODEL_DIR):
+    if MODEL_DIR.exists():
+        validate_model_tree_only()
         print(f"embedding model already available: {MODEL_DIR}")
         return
 

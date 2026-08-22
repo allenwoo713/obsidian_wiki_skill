@@ -107,7 +107,7 @@ def test_model_tree_allows_nested_regular_files_but_rejects_poisoning(tmp_path: 
     root = tmp_path / "model"; nested = root / "1_Pooling"; nested.mkdir(parents=True)
     content = b"{}"; (nested / "config.json").write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
-    lock = {"schema_version": 1, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision": "a" * 40, "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "files": [{"path":"1_Pooling/config.json","sha256":digest}]}
+    lock = {"schema_version": 2, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "provider": {"name":"huggingface","repository":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2","revision":"a" * 40}, "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "provider_files": [{"path":"1_Pooling/config.json","sha256":digest}], "local_compatible_metadata": {"path":"configuration.json", "sha256":"a" * 64, "provenance":{"provider":"modelscope","model_id":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2","kind":"legacy-local-bootstrap"}}}
     lock["record_self_sha256"] = manifests.canonical_sha256(lock)
     assert manifests.validate_model_tree(root, lock) == lock
     (root / "extra.json").write_text("x")
@@ -123,7 +123,7 @@ def test_model_tree_accepts_only_pinned_provider_files_and_one_compatible_metada
     lock = {
         "schema_version": 2,
         "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        "provider": {"name": "huggingface", "revision": "a" * 40},
+        "provider": {"name": "huggingface", "repository": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision": "a" * 40},
         "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
         "provider_files": [{"path": "config.json", "sha256": hashlib.sha256(provider).hexdigest()}],
         "local_compatible_metadata": {

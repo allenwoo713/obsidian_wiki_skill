@@ -396,21 +396,10 @@ def seal_hosted_preflight(*, output: Path, stage: str, continuation: str, reposi
             raise ValueError("invalid immutable hosted identity")
         lock = (root / "requirements.txt").read_text(encoding="utf-8")
         manifest = json.loads((root / "eval" / "model-manifest.json").read_text(encoding="utf-8"))
-        if not all(value in lock for value in ("lancedb==0.34.0", "numpy==2.2.6", "pyarrow==25.0.0")) or set(manifest) != {"schema_version", "model_id", "revision", "runtime", "files", "record_self_sha256"}:
-            raise ValueError("lock or model manifest syntax")
-        if manifest["schema_version"] != 1 or manifest["model_id"] != "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" or manifest["runtime"] != {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"}:
-            raise ValueError("model manifest identity/runtime")
-        if not SHA.fullmatch(manifest["revision"]) or manifest["revision"] == "0" * 40:
-            raise ValueError("immutable provider revision")
-        if manifest["record_self_sha256"] != canonical_digest(manifest):
-            raise ValueError("model manifest self digest")
-        if not isinstance(manifest["files"], list) or not manifest["files"]:
-            raise ValueError("model manifest file allowlist")
-        paths = set()
-        for item in manifest["files"]:
-            if not isinstance(item, dict) or set(item) != {"path", "sha256"} or not isinstance(item["path"], str) or not item["path"] or item["path"].startswith("/") or "\\" in item["path"] or ":" in item["path"] or ".." in Path(item["path"]).parts or item["path"] in paths or not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"]):
-                raise ValueError("model manifest file record")
-            paths.add(item["path"])
+        if not all(value in lock for value in ("lancedb==0.34.0", "numpy==2.2.6", "pyarrow==25.0.0")):
+            raise ValueError("lock syntax")
+        from eval.ann_corpus_manifest import validate_model_manifest
+        validate_model_manifest(manifest)
         record["status"] = "success"
         record["asvs_l1"] = {"input_validation": "pass", "secret_handling": "pass", "access_control": "pending-artifact-upload", "artifact_trust_boundary": "pending-artifact-upload"}
         code = 0
