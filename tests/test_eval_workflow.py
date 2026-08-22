@@ -452,8 +452,11 @@ def test_exact_hf_hydration_succeeds_from_provider_only_snapshot(monkeypatch, tm
     manifest["record_self_sha256"] = manifests.canonical_sha256(manifest)
     monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
     (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
-    source = tmp_path / "source"; source.mkdir(); (source / "config.json").write_bytes(contents["config.json"])
-    module.hydrate_exact_manifest_model(snapshot_download=lambda **_: str(source))
+    def fake_download(**kwargs):
+        source = Path(kwargs["local_dir"])
+        (source / "config.json").write_bytes(contents["config.json"])
+        return str(source)
+    module.hydrate_exact_manifest_model(snapshot_download=fake_download)
     assert (module.MODEL_DIR / "config.json").read_bytes() == contents["config.json"]
     assert not (module.MODEL_DIR / "configuration.json").exists()
 

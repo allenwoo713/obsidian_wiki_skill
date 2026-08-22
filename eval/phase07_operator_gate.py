@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import Any
 
 
+# ``python eval/phase07_operator_gate.py`` puts only ``eval/`` on sys.path.
+# Establish the checkout root before any delayed ``eval.*`` import so the
+# direct-file command used by both hosted runner families is deterministic.
+_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+
 SHA = re.compile(r"^[0-9a-f]{40}$")
 STAGES = frozenset({"preflight", "screening", "confirmation", "continuation", "pr-acceptance"})
 INFRA_FAILURES = frozenset({"github_infrastructure", "hosted_runner_unavailable", "artifact_service"})
