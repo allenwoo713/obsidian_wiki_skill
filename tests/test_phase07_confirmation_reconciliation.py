@@ -157,6 +157,28 @@ class _FakeActions:
         self.urls.append(url); return {"jobs": self.jobs}
 
 
+def test_confirmation_allocation_seals_inner_workflow_input_digest_from_outer_dispatch_bundle(tmp_path: Path) -> None:
+    """The hosted producer accepts the outer bundle but records only its sealed member."""
+    plan = _plan()
+    workflow_input = plan["workflow_inputs"][0]
+    bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": workflow_input}
+    output = tmp_path / "allocation.json"
+    client = _FakeActions([{
+        "id": 101, "name": "Phase 07 independent confirmation campaign",
+        "run_id": 1, "run_attempt": 1,
+    }])
+
+    assert operator.seal_confirmation_allocation(
+        workflow_inputs=bundle, output=output, repository="owner/repo", run_id=1,
+        run_attempt=1, job_key="phase07-confirmation", head_sha=HEAD,
+        token="test-token", client=client,
+    ) == 0
+
+    allocation = json.loads(output.read_text(encoding="utf-8"))
+    assert allocation["workflow_inputs_sha256"] == workflow_input["record_self_sha256"]
+    assert allocation["record_self_sha256"] == operator.canonical_digest(allocation)
+
+
 def _confirmation_provenance(tmp_path: Path, *, expires_at: str = "2026-11-18T00:00:00Z",
                              duplicate: str | None = None, directory: bool = False) -> dict:
     """Create a byte-identical archive/extraction pair for provenance boundary tests."""
@@ -309,16 +331,19 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         slot_root = tmp_path / f"slot-{index}"
         bundle = slot_root / "dispatch-bundle.json"
         bundle.parent.mkdir()
-        bundle.write_text(json.dumps({"confirmation_request": plan["confirmation_request"], "workflow_input": slot}), encoding="utf-8")
-        allocation = {
-            "schema_version": 1, "campaign_stage": "confirmation",
-            "workflow_inputs_sha256": slot["record_self_sha256"], "status": "success",
-            "allocation": {"run_id": index, "run_attempt": 1, "job_id": 100 + index,
-                           "job_key": "phase07-confirmation", "job_allocation_nonce": f"{index:032x}"},
-        }
-        allocation["record_self_sha256"] = operator.canonical_digest(allocation)
+        dispatch_bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": slot}
+        bundle.write_text(json.dumps(dispatch_bundle), encoding="utf-8")
         allocation_path = slot_root / "allocation.json"
-        allocation_path.write_text(json.dumps(allocation), encoding="utf-8")
+        assert operator.seal_confirmation_allocation(
+            workflow_inputs=dispatch_bundle, output=allocation_path, repository="owner/repo",
+            run_id=index, run_attempt=1, job_key="phase07-confirmation", head_sha=HEAD,
+            token="test-token", client=_FakeActions([{
+                "id": 100 + index, "name": "Phase 07 independent confirmation campaign",
+                "run_id": index, "run_attempt": 1,
+            }]),
+        ) == 0
+        allocation = json.loads(allocation_path.read_text(encoding="utf-8"))
+        assert allocation["workflow_inputs_sha256"] == slot["record_self_sha256"]
         campaign_request = {
             "schema_version": 1, "stage": "confirmation", "request_id": f"tiny-{index}",
             "environment": {"head_sha": HEAD}, "model_manifest_sha256": "a" * 64,
@@ -333,6 +358,35 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
             "--output-dir", str(output), "--trusted-test-config", json.dumps({"rows": 32, "dimensions": 384, "probes": 2, "work_dir": str(slot_root / "builds")}),
         ], cwd=root, capture_output=True, text=True, check=False)
         assert campaign.returncode == 0, campaign.stderr
+        if index == 1:
+            for name, invalid_digest in (
+                ("null", None),
+                ("outer", operator.canonical_digest(dispatch_bundle)),
+                ("tampered", "0" * 64),
+            ):
+                invalid = dict(allocation)
+                invalid["workflow_inputs_sha256"] = invalid_digest
+                invalid["record_self_sha256"] = operator.canonical_digest(invalid)
+                invalid_allocation = slot_root / f"allocation-{name}.json"
+                invalid_allocation.write_text(json.dumps(invalid), encoding="utf-8")
+                rejected_artifact = slot_root / f"artifact-{name}"
+                rejected = subprocess.run([
+                    sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
+                    "--campaign-output-dir", str(output), "--dispatch-bundle", str(bundle),
+                    "--allocation-ledger", str(invalid_allocation), "--artifact-dir", str(rejected_artifact),
+                ], cwd=root, capture_output=True, text=True, check=False)
+                assert rejected.returncode == 1
+                assert not (rejected_artifact / "confirmation-packet.json").exists()
+                finalized = subprocess.run([
+                    sys.executable, "eval/phase07_operator_gate.py", "finalize",
+                    "--output-dir", str(rejected_artifact), "--stage", "confirmation",
+                    "--head-sha", HEAD, "--run-id", str(index), "--run-attempt", "1",
+                    "--job-key", "phase07-confirmation", "--job-status", "failure",
+                ], cwd=root, capture_output=True, text=True, check=False)
+                assert finalized.returncode == 0, finalized.stderr
+                rejection = json.loads((rejected_artifact / "confirmation-pipeline-rejection.json").read_text())
+                assert rejection["status"] == "reject-evidence"
+                assert rejection["record_self_sha256"] == operator.canonical_digest(rejection)
         artifact = slot_root / "artifact"
         exported = subprocess.run([
             sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",

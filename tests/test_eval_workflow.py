@@ -318,6 +318,7 @@ def test_confirmation_workflow_calls_real_exporter_and_uploads_only_packet_artif
     confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
     assert "phase07_ann_campaign.py export-confirmation-packet" in confirmation
     assert "--artifact-dir .review-tmp/phase07/confirmation-artifact" in confirmation
+    assert "finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation" in confirmation
     assert "path: .review-tmp/phase07/confirmation-artifact" in confirmation
     assert "confirmation_packet_from_result" not in confirmation
     assert "raw=hashlib.sha256" not in confirmation
