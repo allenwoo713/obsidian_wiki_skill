@@ -157,6 +157,64 @@ class _FakeActions:
         self.urls.append(url); return {"jobs": self.jobs}
 
 
+def _confirmation_provenance(tmp_path: Path, *, expires_at: str = "2026-11-18T00:00:00Z",
+                             duplicate: str | None = None, directory: bool = False) -> dict:
+    """Create a byte-identical archive/extraction pair for provenance boundary tests."""
+    archive, extracted = tmp_path / "confirmation.zip", tmp_path / "extracted"
+    extracted.mkdir()
+    contents = {name: f"{name}-content".encode("utf-8") for name in reconcile._CONFIRMATION_ARTIFACT_FILES}
+    for name, content in contents.items():
+        (extracted / name).write_bytes(content)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as compressed:
+        for name, content in contents.items():
+            compressed.writestr(name, content)
+        if duplicate is not None:
+            compressed.writestr(duplicate, contents[duplicate])
+        if directory:
+            compressed.writestr("unexpected-directory/", b"")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    return {
+        "run_id": 1, "run_attempt": 1, "job_id": 2, "artifact_id": 3,
+        "artifact_name": "phase07-confirmation-1", "status": "completed", "conclusion": "success",
+        "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"],
+                   "os": "Linux", "image": "ubuntu", "architecture": "X64"},
+        "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": expires_at,
+        "api_archive_sha256": digest, "local_archive_sha256": digest,
+        "archive": str(archive), "extracted_dir": str(extracted),
+    }
+
+
+@pytest.mark.parametrize("expires_at", [
+    "2026-11-17T00:00:00Z",  # 89 days
+    "2026-11-19T00:00:00Z",  # 91 days
+    "2027-08-20T00:00:00Z",  # 365 days
+])
+def test_confirmation_provenance_rejects_nonexact_retention_windows(tmp_path: Path, expires_at: str) -> None:
+    with pytest.raises(ValueError, match="retention"):
+        reconcile._validate_confirmation_provenance(_confirmation_provenance(tmp_path, expires_at=expires_at))
+
+
+@pytest.mark.parametrize("expires_at", [
+    "2026-11-17T23:59:30Z",  # Stage 1 lower API tolerance
+    "2026-11-18T00:00:00Z",  # exactly 90 days
+    "2026-11-18T00:00:30Z",  # Stage 1 upper API tolerance
+])
+def test_confirmation_provenance_accepts_exact_retention_with_stage1_tolerance(tmp_path: Path, expires_at: str) -> None:
+    provenance = _confirmation_provenance(tmp_path, expires_at=expires_at)
+    assert reconcile._validate_confirmation_provenance(provenance) == provenance
+
+
+@pytest.mark.parametrize("duplicate", ["confirmation-request.json", "confirmation-packet.json"])
+def test_confirmation_provenance_rejects_duplicate_canonical_zip_members(tmp_path: Path, duplicate: str) -> None:
+    with pytest.raises(ValueError, match="archive"):
+        reconcile._validate_confirmation_provenance(_confirmation_provenance(tmp_path, duplicate=duplicate))
+
+
+def test_confirmation_provenance_rejects_directory_zip_entry(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="archive"):
+        reconcile._validate_confirmation_provenance(_confirmation_provenance(tmp_path, directory=True))
+
+
 def test_attempt_scoped_job_allocation_is_unique_and_never_serializes_token(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _FakeActions([{"id": 41, "name": "Phase 07 independent confirmation campaign", "run_id": 9, "run_attempt": 2}])
     allocation = operator.allocate_confirmation_job(client, repository="owner/repo", run_id=9, run_attempt=2,
