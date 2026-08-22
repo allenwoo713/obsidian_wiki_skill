@@ -357,7 +357,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 {"run_id": index, "run_attempt": 1, "job_id": 100 + index, "artifact_id": 1000 + index,
                  "artifact_name": f"phase07-confirmation-{index}", "status": "completed", "conclusion": "success",
                  "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"], "os": "Linux", "image": "ubuntu", "architecture": "X64"},
-                 "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": "2026-11-20T00:00:00Z",
+                 "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": "2026-11-18T00:00:00Z",
                  "api_archive_sha256": archive_sha256, "local_archive_sha256": archive_sha256,
                  "archive": str(archive), "extracted_dir": str(extracted)}
             ],

@@ -322,8 +322,9 @@ def _validate_confirmation_provenance(value: Any) -> dict[str, Any]:
             or not isinstance(runner["image"], str) or not runner["image"]:
         raise ValueError("confirmation runner identity")
     created, expires = _confirmation_timestamp(value["run_created_at"], "created"), _confirmation_timestamp(value["artifact_expires_at"], "expiry")
-    if expires - created < dt.timedelta(days=90):
-        raise ValueError("confirmation artifact retention below 90 days")
+    retention = expires - created
+    if not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) <= retention <= dt.timedelta(days=90, seconds=30):
+        raise ValueError("confirmation artifact retention interval")
     for name in ("api_archive_sha256", "local_archive_sha256"):
         if not isinstance(value[name], str) or not _HEX64.fullmatch(value[name]):
             raise ValueError("confirmation archive digest schema")
@@ -335,8 +336,12 @@ def _validate_confirmation_provenance(value: Any) -> dict[str, Any]:
         raise ValueError("confirmation API/local archive digest mismatch")
     try:
         with zipfile.ZipFile(archive) as compressed:
-            names = set(compressed.namelist())
-            if names != _CONFIRMATION_ARTIFACT_FILES:
+            members = compressed.infolist()
+            names = [member.filename for member in members]
+            if len(names) != len(_CONFIRMATION_ARTIFACT_FILES) \
+                    or len(set(names)) != len(names) \
+                    or set(names) != _CONFIRMATION_ARTIFACT_FILES \
+                    or any(member.is_dir() for member in members):
                 raise ValueError("strict confirmation archive allowlist")
             for name in _CONFIRMATION_ARTIFACT_FILES:
                 if compressed.read(name) != (extracted / name).read_bytes():
