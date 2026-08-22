@@ -265,6 +265,44 @@ def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> N
     assert rejection["status"] == "reject-evidence" and "retention_days_accepted" not in rejection
 
 
+def test_hosted_preflight_direct_file_bootstraps_from_repo_root_and_seals_rejection(tmp_path: Path) -> None:
+    """Both hosted OSes execute the direct script without an import traceback."""
+    def run(root: Path, output: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable, "eval/phase07_operator_gate.py", "hosted-preflight",
+                "--ledger-file", str(output), "--stage", "preflight",
+                "--repository", "owner/repo", "--run-id", "1", "--run-attempt", "1",
+                "--head-sha", "a" * 40, "--job-key", "hosted-preflight",
+                "--runner-os", "Linux", "--runner-architecture", "X64",
+            ],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+
+    # The production checkout is the Ubuntu contract; the minimal copied root
+    # exercises the exact same direct-file bootstrap used by Windows runners.
+    ubuntu_output = tmp_path / "ubuntu-proof.json"
+    ubuntu = run(SKILL_ROOT, ubuntu_output)
+    assert ubuntu.returncode == 0, ubuntu.stderr
+    assert json.loads(ubuntu_output.read_text())["status"] == "success"
+
+    windows_root = tmp_path / "windows-repo"
+    (windows_root / "eval").mkdir(parents=True)
+    for name in ("phase07_operator_gate.py", "ann_corpus_manifest.py"):
+        (windows_root / "eval" / name).write_text((SKILL_ROOT / "eval" / name).read_text())
+    (windows_root / "requirements.txt").write_text((SKILL_ROOT / "requirements.txt").read_text())
+    manifest = json.loads((SKILL_ROOT / "eval/model-manifest.json").read_text())
+    manifest["provider"]["revision"] = "0" * 40
+    (windows_root / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    windows_output = tmp_path / "windows-proof.json"
+    windows = run(windows_root, windows_output)
+    assert windows.returncode == 1
+    assert "ModuleNotFoundError" not in windows.stderr
+    rejection = json.loads(windows_output.read_text())
+    assert rejection["status"] == "reject-evidence"
+    assert "model revision" in rejection["reason"]
+
+
 def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key() -> None:
     workflow = yaml.load((SKILL_ROOT / ".github/workflows/eval.yml").read_text(), Loader=yaml.BaseLoader)
     for name in ("phase07-screening", "phase07-confirmation", "phase07-continuation", "phase07-representative"):
@@ -303,31 +341,98 @@ def test_phase07_finalizer_creates_rejection_when_campaign_output_is_missing(tmp
     assert json.loads((tmp_path / "screening-pipeline-rejection.json").read_text())["status"] == "reject-evidence"
 
 
-def test_exact_hf_hydration_uses_provider_allowlist_and_preserves_old_target_on_failure(monkeypatch, tmp_path: Path) -> None:
-    """A synthetic provider snapshot cannot alter the prior local model until sealed."""
+def _load_hydrator(monkeypatch, tmp_path: Path):
     spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
     module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
-    manifest = json.loads((SKILL_ROOT / "eval/model-manifest.json").read_text())
-    assert manifest["provider"]["revision"] == "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
-    calls = {}
     monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
+    contents = {"nested/config.json": b"provider"}
+    digest = hashlib.sha256(contents["nested/config.json"]).hexdigest()
+    manifest = {
+        "schema_version": 2, "model_id": module.MODEL_ID,
+        "provider": {"name": "huggingface", "repository": module.MODEL_ID, "revision": "a" * 40},
+        "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
+        "provider_files": [{"path": "nested/config.json", "sha256": digest}],
+        "local_compatible_metadata": {"path": "configuration.json", "sha256": "b" * 64, "provenance": {"provider": "modelscope", "model_id": module.MODEL_ID, "kind": "legacy-local-bootstrap"}},
+    }
+    import eval.ann_corpus_manifest as manifests
+    manifest["record_self_sha256"] = manifests.canonical_sha256(manifest)
     (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
-    source = tmp_path / "source"; source.mkdir()
-    for item in manifest["provider_files"]:
-        path = source / item["path"]; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"x")
-    def fake_download(**kwargs): calls.update(kwargs); return str(source)
-    old_target = module.MODEL_DIR; old_target.mkdir(parents=True); (old_target / "old.bin").write_bytes(b"old")
-    with pytest.raises(ValueError, match="changed file"):
-        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
-    assert (old_target / "old.bin").read_bytes() == b"old"
-    missing = source / manifest["provider_files"][0]["path"]
-    missing.unlink()
-    with pytest.raises(RuntimeError, match="snapshot omitted"):
-        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
-    assert (old_target / "old.bin").read_bytes() == b"old"
+    return module, contents, manifest
+
+
+def test_exact_hf_hydration_uses_private_local_dir_and_accepts_only_its_provider_files(monkeypatch, tmp_path: Path) -> None:
+    """The provider writes into an absolute private root, not a cache-style link tree."""
+    module, contents, manifest = _load_hydrator(monkeypatch, tmp_path)
+    calls = {}
+
+    def fake_download(**kwargs):
+        calls.update(kwargs)
+        root = Path(kwargs["local_dir"])
+        assert root.is_absolute() and root.is_dir()
+        for relative, data in contents.items():
+            path = root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        return str(root)
+
+    module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert Path(calls["local_dir"]).is_absolute()
+    assert Path(calls["local_dir"]) != module.CACHE_DIR
     assert calls["revision"] == manifest["provider"]["revision"]
     assert calls["allow_patterns"] == [item["path"] for item in manifest["provider_files"]]
-    assert "configuration.json" not in calls["allow_patterns"]
+    assert (module.MODEL_DIR / "nested/config.json").read_bytes() == contents["nested/config.json"]
+    assert not (module.MODEL_DIR / "configuration.json").exists()
+
+
+@pytest.mark.parametrize("attack", ("returned-root", "cache-leaf", "download-root", "ancestor"))
+def test_exact_hf_hydration_rejects_unbound_or_linked_provider_snapshots(monkeypatch, tmp_path: Path, attack: str) -> None:
+    """Provider cache links and all linked path components are fail-closed."""
+    module, contents, _ = _load_hydrator(monkeypatch, tmp_path)
+    old_target = module.MODEL_DIR; old_target.mkdir(parents=True); (old_target / "old.bin").write_bytes(b"old")
+    outside = tmp_path / "outside"; (outside / "nested").mkdir(parents=True); (outside / "nested/config.json").write_bytes(contents["nested/config.json"])
+
+    def fake_download(**kwargs):
+        root = Path(kwargs["local_dir"])
+        if attack == "returned-root":
+            return str(outside)
+        if attack == "download-root":
+            root.rmdir(); root.symlink_to(outside, target_is_directory=True)
+        elif attack == "ancestor":
+            (root / "nested").symlink_to(outside / "nested", target_is_directory=True)
+        else:
+            (root / "nested").mkdir(parents=True); (root / "nested/config.json").symlink_to(outside / "nested/config.json")
+        return str(root)
+
+    with pytest.raises(RuntimeError, match="(returned unexpected root|unsafe provider snapshot)"):
+        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert (old_target / "old.bin").read_bytes() == b"old"
+    assert not list(module.MODEL_DIR.parent.glob(".model.staging-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.previous-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.provider-*"))
+
+
+def test_exact_hf_hydration_restores_old_target_after_publish_replace_failure(monkeypatch, tmp_path: Path) -> None:
+    """A failed second replace restores the old target and cleans every temporary root."""
+    module, contents, _ = _load_hydrator(monkeypatch, tmp_path)
+    old_target = module.MODEL_DIR; old_target.mkdir(parents=True); (old_target / "old.bin").write_bytes(b"old")
+
+    def fake_download(**kwargs):
+        root = Path(kwargs["local_dir"])
+        for relative, data in contents.items():
+            path = root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        return str(root)
+
+    real_replace = module.os.replace
+    def fail_publish(source, target):
+        if Path(source).name.startswith(".model.staging-") and Path(target) == module.MODEL_DIR:
+            raise OSError("simulated publish failure")
+        return real_replace(source, target)
+    monkeypatch.setattr(module.os, "replace", fail_publish)
+
+    with pytest.raises(OSError, match="simulated publish failure"):
+        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert (old_target / "old.bin").read_bytes() == b"old"
+    assert not list(module.MODEL_DIR.parent.glob(".model.staging-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.previous-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.provider-*"))
 
 
 def test_exact_hf_hydration_succeeds_from_provider_only_snapshot(monkeypatch, tmp_path: Path) -> None:
