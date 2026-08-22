@@ -302,7 +302,8 @@ def test_phase07_finalizer_creates_rejection_when_campaign_output_is_missing(tmp
     assert json.loads((tmp_path / "screening-pipeline-rejection.json").read_text())["status"] == "reject-evidence"
 
 
-def test_exact_hf_hydration_uses_manifest_revision_and_allowlist(monkeypatch, tmp_path: Path) -> None:
+def test_exact_hf_hydration_uses_provider_allowlist_and_preserves_old_target_on_failure(monkeypatch, tmp_path: Path) -> None:
+    """A synthetic provider snapshot cannot alter the prior local model until sealed."""
     spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
     module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
     manifest = json.loads((SKILL_ROOT / "eval/model-manifest.json").read_text())
@@ -311,13 +312,54 @@ def test_exact_hf_hydration_uses_manifest_revision_and_allowlist(monkeypatch, tm
     monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
     (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
     source = tmp_path / "source"; source.mkdir()
-    for item in manifest["files"]:
+    for item in manifest["provider_files"]:
         path = source / item["path"]; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"x")
     def fake_download(**kwargs): calls.update(kwargs); return str(source)
-    monkeypatch.setattr(module, "validate_model_tree_only", lambda: None)
-    with pytest.raises(ValueError):
+    old_target = module.MODEL_DIR; old_target.mkdir(parents=True); (old_target / "old.bin").write_bytes(b"old")
+    with pytest.raises(ValueError, match="changed file"):
         module.hydrate_exact_manifest_model(snapshot_download=fake_download)
-    assert calls["revision"] == manifest["revision"] and calls["allow_patterns"] == [item["path"] for item in manifest["files"]]
+    assert (old_target / "old.bin").read_bytes() == b"old"
+    assert calls["revision"] == manifest["revision"]
+    assert calls["allow_patterns"] == [item["path"] for item in manifest["provider_files"]]
+    assert "configuration.json" not in calls["allow_patterns"]
+
+
+def test_exact_hf_hydration_succeeds_from_provider_only_snapshot(monkeypatch, tmp_path: Path) -> None:
+    """Hosted cache misses call the real hydrator, then validate a provider-only tree."""
+    spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
+    module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
+    contents = {"config.json": b"provider"}
+    digest = hashlib.sha256(contents["config.json"]).hexdigest()
+    manifest = {
+        "schema_version": 2, "model_id": module.MODEL_ID,
+        "provider": {"name": "huggingface", "revision": "a" * 40},
+        "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
+        "provider_files": [{"path": "config.json", "sha256": digest}],
+        "local_compatible_metadata": {"path": "configuration.json", "sha256": "b" * 64, "provenance": {"provider": "modelscope", "model_id": module.MODEL_ID, "kind": "legacy-local-bootstrap"}},
+    }
+    import eval.ann_corpus_manifest as manifests
+    manifest["record_self_sha256"] = manifests.canonical_sha256(manifest)
+    monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
+    (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    source = tmp_path / "source"; source.mkdir(); (source / "config.json").write_bytes(contents["config.json"])
+    module.hydrate_exact_manifest_model(snapshot_download=lambda **_: str(source))
+    assert (module.MODEL_DIR / "config.json").read_bytes() == contents["config.json"]
+    assert not (module.MODEL_DIR / "configuration.json").exists()
+
+
+def test_confirmation_workflow_hydrates_on_miss_validates_exact_tree_and_preflight_does_not_hydrate() -> None:
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
+    assert "phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}" in confirmation
+    assert "Hydrate exact immutable model only on cache miss" in confirmation
+    assert "python scripts/download_embedding_model.py" in confirmation
+    assert "validate_model_tree" in confirmation
+    for job, next_job in (
+        ("phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"),
+        ("phase07-entitlement-preflight-windows", "phase07-screening"),
+    ):
+        preflight = workflow.split(f"  {job}:", 1)[1].split(f"  {next_job}:", 1)[0]
+        assert "download_embedding_model.py" not in preflight
 
 
 def test_direct_manifest_only_script_mode_is_read_only_and_importable_from_repo_root() -> None:

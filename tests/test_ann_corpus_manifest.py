@@ -112,3 +112,38 @@ def test_model_tree_allows_nested_regular_files_but_rejects_poisoning(tmp_path: 
     assert manifests.validate_model_tree(root, lock) == lock
     (root / "extra.json").write_text("x")
     with pytest.raises(ValueError): manifests.validate_model_tree(root, lock)
+
+
+def test_model_tree_accepts_only_pinned_provider_files_and_one_compatible_metadata(tmp_path: Path) -> None:
+    """The ModelScope-only metadata is optional, singular, and hash-locked."""
+    manifests = _manifests()
+    root = tmp_path / "model"; root.mkdir()
+    provider = b"provider"; compatible = b'{"framework":"pytorch"}'
+    (root / "config.json").write_bytes(provider)
+    lock = {
+        "schema_version": 2,
+        "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "provider": {"name": "huggingface", "revision": "a" * 40},
+        "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
+        "provider_files": [{"path": "config.json", "sha256": hashlib.sha256(provider).hexdigest()}],
+        "local_compatible_metadata": {
+            "path": "configuration.json", "sha256": hashlib.sha256(compatible).hexdigest(),
+            "provenance": {"provider": "modelscope", "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "kind": "legacy-local-bootstrap"},
+        },
+    }
+    lock["record_self_sha256"] = manifests.canonical_sha256(lock)
+
+    assert manifests.validate_model_tree(root, lock) == lock
+    (root / "configuration.json").write_bytes(compatible)
+    assert manifests.validate_model_tree(root, lock) == lock
+    (root / "unexpected.json").write_text("no", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing, extra, or changed"):
+        manifests.validate_model_tree(root, lock)
+    (root / "unexpected.json").unlink()
+    (root / "configuration.json").write_text("changed", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing, extra, or changed"):
+        manifests.validate_model_tree(root, lock)
+    (root / "configuration.json").unlink()
+    (root / "configuration.json").symlink_to(root / "config.json")
+    with pytest.raises(ValueError, match="symlink"):
+        manifests.validate_model_tree(root, lock)
