@@ -377,6 +377,8 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 ], cwd=root, capture_output=True, text=True, check=False)
                 assert rejected.returncode == 1
                 assert not (rejected_artifact / "confirmation-packet.json").exists()
+                rejected_artifact.mkdir()
+                (rejected_artifact / "confirmation-result.json").write_text("partial export", encoding="utf-8")
                 finalized = subprocess.run([
                     sys.executable, "eval/phase07_operator_gate.py", "finalize",
                     "--output-dir", str(rejected_artifact), "--stage", "confirmation",
@@ -387,6 +389,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 rejection = json.loads((rejected_artifact / "confirmation-pipeline-rejection.json").read_text())
                 assert rejection["status"] == "reject-evidence"
                 assert rejection["record_self_sha256"] == operator.canonical_digest(rejection)
+                assert {path.name for path in rejected_artifact.iterdir()} == {"confirmation-pipeline-rejection.json"}
         artifact = slot_root / "artifact"
         exported = subprocess.run([
             sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
@@ -398,6 +401,15 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
             "confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json",
             "dispatch-bundle.json", "allocation.json", "confirmation-packet.json",
         }
+        before_finalize = {path.name: path.read_bytes() for path in artifact.iterdir()}
+        finalized = subprocess.run([
+            sys.executable, "eval/phase07_operator_gate.py", "finalize",
+            "--output-dir", str(artifact), "--stage", "confirmation", "--head-sha", HEAD,
+            "--run-id", str(index), "--run-attempt", "1", "--job-key", "phase07-confirmation",
+            "--job-status", "success",
+        ], cwd=root, capture_output=True, text=True, check=False)
+        assert finalized.returncode == 0, finalized.stderr
+        assert {path.name: path.read_bytes() for path in artifact.iterdir()} == before_finalize
         archive = slot_root / "archive.zip"
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for path in artifact.iterdir():

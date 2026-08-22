@@ -630,7 +630,7 @@ jobs:
           python eval/phase07_ann_campaign.py export-confirmation-packet --campaign-output-dir .review-tmp/phase07/output --dispatch-bundle .review-tmp/phase07/workflow-inputs.json --allocation-ledger .review-tmp/phase07/allocation.json --artifact-dir .review-tmp/phase07/confirmation-artifact
       - name: Seal missing numeric output as a pipeline rejection
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/output --stage confirmation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-confirmation --job-status "${{ job.status }}"
+        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-confirmation --job-status "${{ job.status }}"
       - name: Upload sealed confirmation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

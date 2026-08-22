@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -234,9 +235,10 @@ def seal_confirmation_allocation(*, workflow_inputs: dict[str, Any], output: Pat
                                  run_id: int, run_attempt: int, job_key: str, head_sha: str, token: str,
                                  client: Any | None = None) -> int:
     """Seal lookup/entropy rejection before a workflow is permitted to build."""
-    record: dict[str, Any] = {"schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": workflow_inputs.get("record_self_sha256")}
+    record: dict[str, Any] = {"schema_version": 1, "campaign_stage": "confirmation"}
     try:
-        workflow_inputs = validate_confirmation_dispatch_bundle(workflow_inputs, expected_head=head_sha)
+        workflow_input = validate_confirmation_dispatch_bundle(workflow_inputs, expected_head=head_sha)
+        record["workflow_inputs_sha256"] = workflow_input["record_self_sha256"]
         allocation = allocate_confirmation_job(client or GitHubActionsClient(), repository=repository, run_id=run_id,
                                                 run_attempt=run_attempt, job_key=job_key, token=token)
         record.update(status="success", allocation=allocation)
@@ -424,6 +426,20 @@ def finalize_pipeline_artifact(*, output_dir: Path, stage: str, head_sha: str,
                                job_status: str) -> int:
     """Preserve campaign output or seal a no-secret rejection for every Python-visible failure."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    if stage == "confirmation":
+        if _is_sealed_confirmation_artifact(output_dir):
+            return 0
+        for path in output_dir.iterdir():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        _write_ledger(output_dir / "confirmation-pipeline-rejection.json", {
+            "schema_version": 1, "stage": stage, "status": "reject-evidence",
+            "head_sha": head_sha, "run_id": run_id, "run_attempt": run_attempt,
+            "job_key": job_key, "job_status": job_status, "authorization": "none",
+        })
+        return 0
     if any(output_dir.glob("*-result.json")) or any(output_dir.glob("*-rejection.json")):
         return 0
     _write_ledger(output_dir / f"{stage}-pipeline-rejection.json", {
@@ -432,6 +448,35 @@ def finalize_pipeline_artifact(*, output_dir: Path, stage: str, head_sha: str,
         "job_key": job_key, "job_status": job_status, "authorization": "none",
     })
     return 0
+
+
+def _is_sealed_confirmation_artifact(output_dir: Path) -> bool:
+    """Accept only an exporter-complete confirmation tree as a finalizer no-op."""
+    try:
+        from eval.phase07_ann_campaign import _CONFIRMATION_ARTIFACT_FILES, _CONFIRMATION_RAW_FILES
+
+        if {path.name for path in output_dir.iterdir()} != _CONFIRMATION_ARTIFACT_FILES:
+            return False
+        wrapper = _read_object(output_dir / "confirmation-packet.json")
+        if set(wrapper) != {"schema_version", "kind", "packet", "raw_tree_sha256", "files", "record_self_sha256"} \
+                or wrapper.get("schema_version") != 1 or wrapper.get("kind") != "phase07-confirmation-packet/v1" \
+                or wrapper.get("record_self_sha256") != canonical_digest(wrapper) \
+                or not isinstance(wrapper.get("packet"), dict) \
+                or wrapper["packet"].get("record_self_sha256") != canonical_digest(wrapper["packet"]):
+            return False
+        file_digests = wrapper.get("files")
+        if not isinstance(file_digests, dict) or set(file_digests) != _CONFIRMATION_RAW_FILES:
+            return False
+        digest = hashlib.sha256()
+        for name in sorted(_CONFIRMATION_RAW_FILES):
+            content = (output_dir / name).read_bytes()
+            if file_digests[name] != hashlib.sha256(content).hexdigest():
+                return False
+            digest.update(name.encode("utf-8")); digest.update(b"\0")
+            digest.update(content); digest.update(b"\0")
+        return wrapper.get("raw_tree_sha256") == digest.hexdigest()
+    except (ImportError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def reconcile_hosted(binding_file: Path, output: Path) -> int:
