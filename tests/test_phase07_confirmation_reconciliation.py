@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import hashlib
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -11,11 +12,51 @@ import pytest
 
 from eval import phase07_operator_gate as operator
 from eval import reconcile_ann_gate as reconcile
+from eval import phase07_ann_campaign as campaign
 from eval.ann_frontier_statistics import holm_adjust, paired_basic_effect, paired_permutation_p
 
 
 LEDGER = Path("/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json")
 HEAD = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "model-manifest.json").read_bytes()).hexdigest()
+CORPUS_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest()
+REQUIREMENTS_SHA256 = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
+PACKET_FIXTURE_TREE_SHA256 = hashlib.sha256(b"phase07-confirmation-packet-fixture/v1").hexdigest()
+
+
+def _locked_confirmation_environment() -> dict:
+    return {
+        "head_sha": HEAD,
+        "runtime": {
+            "python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0",
+            "omp_num_threads": 2, "openblas_num_threads": 2, "mkl_num_threads": 2,
+        },
+        "source_digests": {
+            "requirements_sha256": REQUIREMENTS_SHA256,
+            "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+            "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
+        },
+        "host": {"os": "Linux", "architecture": "X64", "image": "ubuntu", "hostname": "fixture-host", "cpu_count": 2, "cpu_model": "fixture-cpu"},
+    }
+
+
+def _resign_downloaded_confirmation_tree(root: Path) -> None:
+    """Re-seal a deliberately mutated downloaded tree without changing its raw bytes elsewhere."""
+    raw_tree = reconcile._confirmation_tree_sha256(root)
+    packet_path = root / "confirmation-packet.json"
+    packet_wrapper = json.loads(packet_path.read_text(encoding="utf-8"))
+    packet = packet_wrapper["packet"]
+    packet["raw_tree_sha256"] = raw_tree
+    packet["record_self_sha256"] = campaign.canonical_digest(packet)
+    packet_wrapper["packet"] = packet
+    packet_wrapper["raw_tree_sha256"] = raw_tree
+    packet_wrapper["files"] = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in campaign._CONFIRMATION_RAW_FILES
+    }
+    packet_wrapper["record_self_sha256"] = campaign.canonical_digest(packet_wrapper)
+    packet_path.write_text(json.dumps(packet_wrapper, sort_keys=True), encoding="utf-8")
 
 
 def _plan() -> dict:
@@ -55,7 +96,7 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
         "d20": {"family_name": "d20_current_baseline_member", "family_size": 2,
                 "baseline_build_id": builds[0]["build_id"], "raw_p_values": [row["raw_permutation_p"] for row in d20_comparisons],
                 "basic_ci_95": [row["basic_ci_95"] for row in d20_comparisons], "comparisons": d20_comparisons},
-        "raw_tree_sha256": "a" * 64, "retention_days": 90,
+        "raw_tree_sha256": PACKET_FIXTURE_TREE_SHA256, "retention_days": 90,
     }
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     return packet
@@ -197,7 +238,7 @@ def _confirmation_provenance(tmp_path: Path, *, expires_at: str = "2026-11-18T00
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     return {
         "run_id": 1, "run_attempt": 1, "job_id": 2, "artifact_id": 3,
-        "artifact_name": "phase07-confirmation-1", "status": "completed", "conclusion": "success",
+        "artifact_name": "phase07-confirmation-1-1", "status": "completed", "conclusion": "success",
         "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"],
                    "os": "Linux", "image": "ubuntu", "architecture": "X64"},
         "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": expires_at,
@@ -235,6 +276,123 @@ def test_confirmation_provenance_rejects_duplicate_canonical_zip_members(tmp_pat
 def test_confirmation_provenance_rejects_directory_zip_entry(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="archive"):
         reconcile._validate_confirmation_provenance(_confirmation_provenance(tmp_path, directory=True))
+
+
+def test_confirmation_provenance_binds_the_attempt_scoped_artifact_name_and_identity(tmp_path: Path) -> None:
+    """The artifact API name is part of the immutable run/attempt provenance, not a label."""
+    with pytest.raises(ValueError, match="artifact name"):
+        reconcile._validate_confirmation_provenance({
+            **_confirmation_provenance(tmp_path),
+            "artifact_name": "phase07-confirmation-wrong",
+        })
+
+
+def test_confirmation_finalizer_unlinks_only_its_symlink_root_and_rejects_bad_status(tmp_path: Path) -> None:
+    """A poisoned output root/member never makes finalization traverse outside its root."""
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "must-survive.txt"
+    sentinel.write_text("outside", encoding="utf-8")
+    output = tmp_path / "confirmation-artifact"
+    output.symlink_to(external, target_is_directory=True)
+
+    assert operator.finalize_pipeline_artifact(
+        output_dir=output, stage="confirmation", head_sha=HEAD, run_id=1,
+        run_attempt=1, job_key="phase07-confirmation", job_status="failure",
+    ) == 0
+    assert sentinel.read_text(encoding="utf-8") == "outside"
+    assert output.is_dir() and not output.is_symlink()
+    assert {item.name for item in output.iterdir()} == {"confirmation-pipeline-rejection.json"}
+
+    # The old finalizer accepted a self-signed but schema-free tree, even after a
+    # failed job.  A finalizer no-op is allowed only for a complete strict packet
+    # and ``job_status=success``.
+    for name in campaign._CONFIRMATION_RAW_FILES:
+        (output / name).write_text("{}", encoding="utf-8")
+    raw_tree = campaign.confirmation_raw_tree_sha256(output)
+    wrapper = {
+        "schema_version": 1,
+        "kind": "phase07-confirmation-packet/v1",
+        "packet": {"record_self_sha256": campaign.canonical_digest({})},
+        "raw_tree_sha256": raw_tree,
+        "files": {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in campaign._CONFIRMATION_RAW_FILES},
+    }
+    wrapper["record_self_sha256"] = campaign.canonical_digest(wrapper)
+    (output / "confirmation-packet.json").write_text(json.dumps(wrapper), encoding="utf-8")
+    assert operator.finalize_pipeline_artifact(
+        output_dir=output, stage="confirmation", head_sha=HEAD, run_id=1,
+        run_attempt=1, job_key="phase07-confirmation", job_status="failure",
+    ) == 0
+    assert {item.name for item in output.iterdir()} == {"confirmation-pipeline-rejection.json"}
+
+
+def test_confirmation_packet_carries_locked_execution_and_full_raw_measurements(tmp_path: Path) -> None:
+    """Packet reconstruction must retain the numeric source/runtime and every raw measurement."""
+    plan = _plan()
+    workflow_input = plan["workflow_inputs"][0]
+    request = {
+        "schema_version": 1, "stage": "confirmation", "request_id": "complete-measurements",
+        "environment": _locked_confirmation_environment(),
+        "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+        "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
+        "workflow_inputs": workflow_input,
+        "run_identity": {"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "n" * 32},
+    }
+    runner = campaign.Phase07AnnCampaignRunner(campaign.CampaignConfig(
+        rows=32, dimensions=384, probes=2, work_dir=tmp_path / "builds",
+    ))
+    result = campaign.execute(request, tmp_path / "output", runner=runner.run)["result"]
+    packet = campaign.confirmation_packet_from_result(
+        result=result, workflow_inputs=workflow_input, run_id=1, run_attempt=1,
+        job_id=2, job_key="phase07-confirmation", job_allocation_nonce="n" * 32,
+        raw_tree_sha256="0" * 64,
+    )
+    assert packet["locked_execution"] == _locked_confirmation_environment()
+    assert packet["measurements"]["builds"] == result["builds"]
+
+
+def test_confirmation_request_rejects_runtime_thread_and_source_omission_or_mismatch() -> None:
+    """Every confirmation request binds all locked execution inputs before a build can start."""
+    plan = _plan()
+    request = {
+        "schema_version": 1, "stage": "confirmation", "request_id": "runtime-source-gate",
+        "environment": _locked_confirmation_environment(),
+        "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+        "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
+        "workflow_inputs": plan["workflow_inputs"][0],
+        "run_identity": {"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "n" * 32},
+    }
+    assert campaign.validate_request(request) == request
+    for label, mutate in (
+        ("missing-runtime", lambda value: value["environment"].pop("runtime")),
+        ("wrong-python", lambda value: value["environment"]["runtime"].update(python="3.12")),
+        ("wrong-lancedb", lambda value: value["environment"]["runtime"].update(lancedb="0.35.0")),
+        ("wrong-numpy", lambda value: value["environment"]["runtime"].update(numpy="2.2.7")),
+        ("wrong-pyarrow", lambda value: value["environment"]["runtime"].update(pyarrow="25.0.1")),
+        ("wrong-omp", lambda value: value["environment"]["runtime"].update(omp_num_threads=1)),
+        ("wrong-openblas", lambda value: value["environment"]["runtime"].update(openblas_num_threads=1)),
+        ("wrong-mkl", lambda value: value["environment"]["runtime"].update(mkl_num_threads=1)),
+        ("missing-source", lambda value: value["environment"].pop("source_digests")),
+        ("wrong-requirements", lambda value: value["environment"]["source_digests"].update(requirements_sha256="0" * 64)),
+        ("wrong-model", lambda value: value["environment"]["source_digests"].update(model_manifest_sha256="0" * 64)),
+        ("wrong-corpus", lambda value: value["environment"]["source_digests"].update(corpus_manifest_sha256="0" * 64)),
+        ("missing-host", lambda value: value["environment"].pop("host")),
+        ("missing-cpu", lambda value: value["environment"]["host"].pop("cpu_count")),
+    ):
+        mutated = json.loads(json.dumps(request))
+        mutate(mutated)
+        with pytest.raises(ValueError, match="runtime|source|host|confirmation"):
+            campaign.validate_request(mutated), label
+
+
+def test_confirmation_artifact_validator_rejects_resigned_semantic_raw_records(tmp_path: Path) -> None:
+    """Shared exporter/finalizer/post-download validation must reject re-signed semantics."""
+    root = tmp_path / "artifact"
+    root.mkdir()
+    for name in campaign._CONFIRMATION_RAW_FILES:
+        (root / name).write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError):
+        campaign.validate_confirmation_artifact_tree(root)
 
 
 def test_attempt_scoped_job_allocation_is_unique_and_never_serializes_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -346,19 +504,36 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         assert allocation["workflow_inputs_sha256"] == slot["record_self_sha256"]
         campaign_request = {
             "schema_version": 1, "stage": "confirmation", "request_id": f"tiny-{index}",
-            "environment": {"head_sha": HEAD}, "model_manifest_sha256": "a" * 64,
-            "corpus_manifest_sha256": "b" * 64, "workflow_inputs": slot,
+            "environment": _locked_confirmation_environment(), "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+            "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256, "workflow_inputs": slot,
             "run_identity": {name: allocation["allocation"][name] for name in ("run_id", "run_attempt", "job_id", "job_allocation_nonce")},
         }
         campaign_request_path = slot_root / "campaign-request.json"
         campaign_request_path.write_text(json.dumps(campaign_request), encoding="utf-8")
         output = slot_root / "campaign-output"
-        campaign = subprocess.run([
+        campaign_run = subprocess.run([
             sys.executable, "eval/phase07_ann_campaign.py", "--request-file", str(campaign_request_path),
             "--output-dir", str(output), "--trusted-test-config", json.dumps({"rows": 32, "dimensions": 384, "probes": 2, "work_dir": str(slot_root / "builds")}),
         ], cwd=root, capture_output=True, text=True, check=False)
-        assert campaign.returncode == 0, campaign.stderr
+        assert campaign_run.returncode == 0, campaign_run.stderr
         if index == 1:
+            for label, changes in (
+                ("wrong-request", {"request_sha256": "0" * 64}),
+                ("elevated", {"authorization": "elevated"}),
+            ):
+                semantic_output = slot_root / f"campaign-output-{label}"
+                shutil.copytree(output, semantic_output)
+                semantic_ledger = semantic_output / "confirmation-ledger.json"
+                value = json.loads(semantic_ledger.read_text())
+                value.update(changes)
+                value["record_self_sha256"] = campaign.canonical_digest(value)
+                semantic_ledger.write_text(json.dumps(value), encoding="utf-8")
+                rejected = subprocess.run([
+                    sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
+                    "--campaign-output-dir", str(semantic_output), "--dispatch-bundle", str(bundle),
+                    "--allocation-ledger", str(allocation_path), "--artifact-dir", str(slot_root / f"artifact-{label}"),
+                ], cwd=root, capture_output=True, text=True, check=False)
+                assert rejected.returncode == 1, rejected.stderr
             for name, invalid_digest in (
                 ("null", None),
                 ("outer", operator.canonical_digest(dispatch_bundle)),
@@ -401,6 +576,53 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
             "confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json",
             "dispatch-bundle.json", "allocation.json", "confirmation-packet.json",
         }
+        # All finalizer no-ops must pass through the same complete artifact
+        # validator as the exporter and post-download reconciliation.  Each
+        # malformed tree is cleaned inside its own root; symlink targets are
+        # deliberately external and must survive untouched.
+        for label, mutate in (
+            ("member-symlink", lambda bad, outside: ((bad / "confirmation-ledger.json").unlink(), (bad / "confirmation-ledger.json").symlink_to(outside))),
+            ("extra", lambda bad, outside: (bad / "extra.json").write_text("{}", encoding="utf-8")),
+            ("missing", lambda bad, outside: (bad / "allocation.json").unlink()),
+            ("directory", lambda bad, outside: ((bad / "allocation.json").unlink(), (bad / "allocation.json").mkdir())),
+        ):
+            bad = slot_root / f"finalizer-{label}"
+            shutil.copytree(artifact, bad)
+            outside = slot_root / f"outside-{label}.json"
+            outside.write_text("external target", encoding="utf-8")
+            mutate(bad, outside)
+            assert operator.finalize_pipeline_artifact(
+                output_dir=bad, stage="confirmation", head_sha=HEAD, run_id=index,
+                run_attempt=1, job_key="phase07-confirmation", job_status="success",
+            ) == 0
+            assert outside.read_text(encoding="utf-8") == "external target"
+        assert {path.name for path in bad.iterdir()} == {"confirmation-pipeline-rejection.json"}
+        for label, kwargs in (
+            ("head", {"head_sha": "0" * 40}),
+            ("run", {"run_id": index + 50}),
+            ("attempt", {"run_attempt": 2}),
+            ("job", {"job_key": "other-job"}),
+            ("status", {"job_status": "failure"}),
+        ):
+            bad = slot_root / f"finalizer-{label}"
+            shutil.copytree(artifact, bad)
+            arguments = {"stage": "confirmation", "head_sha": HEAD, "run_id": index,
+                         "run_attempt": 1, "job_key": "phase07-confirmation", "job_status": "success"}
+            arguments.update(kwargs)
+            assert operator.finalize_pipeline_artifact(output_dir=bad, **arguments) == 0
+            assert {path.name for path in bad.iterdir()} == {"confirmation-pipeline-rejection.json"}
+        bad_packet = slot_root / "finalizer-resigned-packet-tree"
+        shutil.copytree(artifact, bad_packet)
+        wrapper = json.loads((bad_packet / "confirmation-packet.json").read_text())
+        wrapper["packet"]["raw_tree_sha256"] = "0" * 64
+        wrapper["packet"]["record_self_sha256"] = campaign.canonical_digest(wrapper["packet"])
+        wrapper["record_self_sha256"] = campaign.canonical_digest(wrapper)
+        (bad_packet / "confirmation-packet.json").write_text(json.dumps(wrapper), encoding="utf-8")
+        assert operator.finalize_pipeline_artifact(
+            output_dir=bad_packet, stage="confirmation", head_sha=HEAD, run_id=index,
+            run_attempt=1, job_key="phase07-confirmation", job_status="success",
+        ) == 0
+        assert {path.name for path in bad_packet.iterdir()} == {"confirmation-pipeline-rejection.json"}
         before_finalize = {path.name: path.read_bytes() for path in artifact.iterdir()}
         finalized = subprocess.run([
             sys.executable, "eval/phase07_operator_gate.py", "finalize",
@@ -421,7 +643,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         provenance = {
             "schema_version": 1, "evidence": [
                 {"run_id": index, "run_attempt": 1, "job_id": 100 + index, "artifact_id": 1000 + index,
-                 "artifact_name": f"phase07-confirmation-{index}", "status": "completed", "conclusion": "success",
+                 "artifact_name": f"phase07-confirmation-{index}-1", "status": "completed", "conclusion": "success",
                  "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"], "os": "Linux", "image": "ubuntu", "architecture": "X64"},
                  "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": "2026-11-18T00:00:00Z",
                  "api_archive_sha256": archive_sha256, "local_archive_sha256": archive_sha256,
@@ -447,12 +669,27 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
     ledger = json.loads(reconciled.read_text())
     assert len(ledger["eligible_evidence_runs"]) == 6
     assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
+    for record in [*ledger["eligible_evidence_runs"], *ledger["all_physical_workflow_runs"]]:
+        provenance = record["validated_provenance"]
+        assert {
+            "artifact_id", "artifact_name", "runner", "run_created_at", "artifact_expires_at",
+            "api_archive_sha256", "local_archive_sha256", "content_sha256", "raw_tree_sha256",
+            "packet_self_sha256", "wrapper_self_sha256", "raw_result_sha256",
+        } <= set(provenance)
+        assert {"name", "group", "labels", "os", "image", "architecture"} <= set(provenance["runner"])
+        measurements = record["validated_measurements"]
+        assert len(measurements["builds"]) == 3
+        assert {build["build"]["m"] for build in measurements["builds"]} == {16, 20, 32}
+        assert all({"index_build_ms", "index_bytes", "watchdog"} <= set(build["build"]) for build in measurements["builds"])
+        assert all(group["queries"] for build in measurements["builds"] for group in build["queries"])
+        assert measurements["d04_statistics"]["family_name"] == "d04_ef_300_vs_200"
+        assert measurements["d20_member_statistics"]["family_name"] == "d20_current_baseline_member"
 
     first = artifact_dirs[0]
     provenance_path = first.parent / "provenance.json"
     archive_path = first.parent / "archive.zip"
     originals = {path: path.read_bytes() for path in (
-        archive_path, provenance_path, first / "confirmation-result.json", first / "dispatch-bundle.json",
+        archive_path, provenance_path, first / "confirmation-ledger.json", first / "confirmation-result.json", first / "dispatch-bundle.json",
         first / "allocation.json", first / "confirmation-packet.json",
     )}
 
@@ -476,3 +713,36 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
     for target in (first / "confirmation-result.json", first / "dispatch-bundle.json", first / "allocation.json"):
         assert_rejected(lambda target=target: target.write_bytes(originals[target] + b"tamper"))
     assert_rejected(lambda: (first / "confirmation-packet.json").write_text("{}", encoding="utf-8"))
+
+    def resign_raw_ledger(**changes) -> None:
+        value = json.loads(originals[first / "confirmation-ledger.json"])
+        value.update(changes)
+        value["record_self_sha256"] = campaign.canonical_digest(value)
+        (first / "confirmation-ledger.json").write_text(json.dumps(value), encoding="utf-8")
+        _resign_downloaded_confirmation_tree(first)
+
+    assert_rejected(lambda: resign_raw_ledger(request_sha256="0" * 64))
+    assert_rejected(lambda: resign_raw_ledger(authorization="elevated"))
+
+    def resign_changed_raw_result() -> None:
+        value = json.loads(originals[first / "confirmation-result.json"])
+        value["result"]["builds"][0]["build"]["index_build_ms"] += 1
+        value["record_self_sha256"] = campaign.canonical_digest(value)
+        (first / "confirmation-result.json").write_text(json.dumps(value), encoding="utf-8")
+        _resign_downloaded_confirmation_tree(first)
+
+    assert_rejected(resign_changed_raw_result)
+
+    second_provenance_path = artifact_dirs[1].parent / "provenance.json"
+    originals[second_provenance_path] = second_provenance_path.read_bytes()
+
+    def resign_provenance(mutator) -> None:
+        value = json.loads(originals[provenance_path])
+        mutator(value["evidence"][0])
+        value["record_self_sha256"] = reconcile.canonical_digest(value)
+        provenance_path.write_text(json.dumps(value), encoding="utf-8")
+
+    assert_rejected(lambda: resign_provenance(lambda row: row.update(artifact_name="phase07-confirmation-wrong")))
+    assert_rejected(lambda: resign_provenance(lambda row: row.update(artifact_id=json.loads(originals[second_provenance_path])["evidence"][0]["artifact_id"])))
+    assert_rejected(lambda: resign_provenance(lambda row: row["runner"].update(image="unexpected-runner-image")))
+    assert_rejected(lambda: resign_provenance(lambda row: row.pop("runner")))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -19,50 +20,79 @@ from eval.phase07_ann_campaign import (
     select_stage1_nominees,
     validate_request,
 )
-from eval.phase07_operator_gate import canonical_digest as operator_digest
+from eval import phase07_operator_gate as operator
 from eval.run_eval import _representative_indexed_query_separation, run_phase07_representative_campaign
 from eval.ann_corpus_manifest import canonical_content_tree_sha256
 from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256, validate_indexed_query_digest_separation
 
 
-def _digest(letter: str) -> str:
-    return letter * 64
+ROOT = Path(__file__).resolve().parent.parent
+HEAD = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+MODEL_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "model-manifest.json").read_bytes()).hexdigest()
+CORPUS_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest()
+REQUIREMENTS_SHA256 = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
+STAGE1_LEDGER = Path("/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json")
+
+
+def _digest(kind: str) -> str:
+    """Use canonical project fixture digests, never shape-only fake hexadecimal."""
+    return {
+        "model": MODEL_MANIFEST_SHA256,
+        "corpus": CORPUS_MANIFEST_SHA256,
+        "requirements": REQUIREMENTS_SHA256,
+        "evidence": hashlib.sha256((ROOT / "eval" / "ann-policy.json").read_bytes()).hexdigest(),
+    }[kind]
+
+
+def _locked_confirmation_environment() -> dict:
+    return {
+        "head_sha": HEAD,
+        "runtime": {
+            "python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0",
+            "omp_num_threads": 2, "openblas_num_threads": 2, "mkl_num_threads": 2,
+        },
+        "source_digests": {
+            "requirements_sha256": REQUIREMENTS_SHA256,
+            "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+            "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
+        },
+        "host": {"os": "Linux", "architecture": "X64", "image": "fixture-image", "hostname": "fixture-host", "cpu_count": 2, "cpu_model": "fixture-cpu"},
+    }
 
 
 def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
     request = {
         "schema_version": 1, "stage": stage, "request_id": "request-1", "environment": {},
-        "model_manifest_sha256": _digest("a"), "corpus_manifest_sha256": _digest("b"),
+        "model_manifest_sha256": _digest("model"), "corpus_manifest_sha256": _digest("corpus"),
     }
     if stage == "screening":
         request["environment"] = {
             "branch": "feature/issue-50-dense-ann-recall",
             "workflow_path": ".github/workflows/eval.yml",
-            "head_sha": "c" * 40,
+            "head_sha": HEAD,
             "run_id": 1,
             "run_attempt": 1,
             "job_key": "phase07-screening",
             "job_allocation_nonce": "1-1-phase07-screening",
             "runtime": {"python": "3.13", "lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0", "omp_num_threads": 2},
         }
-        request["lock_identity"] = _digest("d")
+        request["lock_identity"] = _digest("requirements")
     if stage == "confirmation":
-        request["environment"] = {"head_sha": "c" * 40}
-        slot = {"m": 32, "ordinal": 1}
-        binding = {"kind": "phase07-confirmation/v1", "prior_screening_sha256": "6c424135ec4db8983136826575d9436b6ba88da5029384ada47fadb2d1918e33", "nominated_m": 32, "run_ordinal": 1}
-        workflow_inputs = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_request_sha256": _digest("c"), "slot": slot, "post_task0_head": "c" * 40, "continuation_binding": binding, "continuation_binding_sha256": operator_digest(binding), "dispatch_identity": "phase07-confirmation/32/1"}
-        workflow_inputs["record_self_sha256"] = operator_digest(workflow_inputs)
-        request.update(workflow_inputs=workflow_inputs,
-                       run_identity={"run_id": "1", "run_attempt": 1, "job_id": "2", "job_allocation_nonce": "nonce-00000000001"})
+        plan = operator.build_confirmation_plan(STAGE1_LEDGER, post_task0_head=HEAD)
+        request.update(
+            environment=_locked_confirmation_environment(),
+            workflow_inputs=plan["workflow_inputs"][0],
+            run_identity={"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "n" * 32},
+        )
     if stage == "continuation":
         configs = {
-            "stage2_sq": {"approved_d04_sha256": _digest("d"), "m": 16},
-            "flat_diagnostic": {"no_confirmed_sq_sha256": _digest("d"), "m": 16, "query_ef": 300},
-            "refinement": {"ceiling_sha256": _digest("d"), "m": 16, "ef_construction": 300, "query_ef": 300},
+            "stage2_sq": {"approved_d04_sha256": _digest("evidence"), "m": 16},
+            "flat_diagnostic": {"no_confirmed_sq_sha256": _digest("evidence"), "m": 16, "query_ef": 300},
+            "refinement": {"ceiling_sha256": _digest("evidence"), "m": 16, "ef_construction": 300, "query_ef": 300},
             "representative_ann": _representative_config(),
             "hybrid_non_regression": _representative_config(),
         }
-        request.update(mode=mode, prior_evidence_sha256=_digest("c"), config=configs[mode])
+        request.update(mode=mode, prior_evidence_sha256=_digest("evidence"), config=configs[mode])
     return request
 
 
@@ -166,8 +196,12 @@ def test_representative_request_rejects_noncurrent_baseline_before_artifacts(tmp
     stale["config"]["baseline_sha256"] = "0" * 64
     with pytest.raises(ValueError):
         validate_request(stale)
+    overlapping_digest = hashlib.sha256(b"overlapping-indexed-query-fixture").hexdigest()
     with pytest.raises(ValueError):
-        validate_indexed_query_digest_separation(indexed_row_digests=["z" * 64], query_row_digests=["a" * 64])
+        validate_indexed_query_digest_separation(
+            indexed_row_digests=[overlapping_digest],
+            query_row_digests=[overlapping_digest],
+        )
 
 
 def test_tiny_screening_uses_real_lancedb_reopen_and_ann_grid(tmp_path: Path) -> None:
@@ -241,7 +275,7 @@ def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_p
     assert confirmation["d20_member_statistics"]["family_size"] == 2
     packet = confirmation_packet_from_result(result=confirmation, workflow_inputs=_request("confirmation")["workflow_inputs"],
                                              run_id=1, run_attempt=1, job_id=2, job_key="phase07-confirmation",
-                                             job_allocation_nonce="f" * 32, raw_tree_sha256="a" * 64)
+                                             job_allocation_nonce="f" * 32, raw_tree_sha256=_digest("evidence"))
     assert packet["d04"]["family_size"] == 6 and packet["d20"]["family_size"] == 2
     stage2 = execute(_request("continuation", mode="stage2_sq"), tmp_path / "stage2", runner=runner.run)["result"]
     assert [group["query_ef"] for group in stage2["stage2"]["queries"]] == [300, 500]

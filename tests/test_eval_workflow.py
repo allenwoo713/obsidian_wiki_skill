@@ -998,6 +998,25 @@ def test_stage1_screening_request_seals_actual_hosted_runtime_identity() -> None
     assert "expected_shape: tuple[int, int, int] = (77_348, 384, 256)" in source
 
 
+def test_confirmation_workflow_locks_runtime_sources_and_host_measurements_before_build() -> None:
+    """The confirmation request must record actual immutable execution identity, not labels."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
+    for required in (
+        "Assert actual locked confirmation runtime and thread settings",
+        "expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'}",
+        "OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'",
+        "requirements_sha256",
+        "model_manifest_sha256",
+        "corpus_manifest_sha256",
+        "cpu_count",
+        "cpu_model",
+        "ImageOS",
+        "ImageVersion",
+    ):
+        assert required in confirmation
+
+
 @pytest.mark.parametrize("init_baseline", [False, True])
 def test_eval_citation_gate_precedes_missing_or_initial_baseline(monkeypatch, tmp_path, init_baseline):
     """Unsafe evidence cannot become a new baseline or pass without one."""
