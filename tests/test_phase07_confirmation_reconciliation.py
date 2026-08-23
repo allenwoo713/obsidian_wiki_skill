@@ -307,6 +307,7 @@ def test_confirmation_finalizer_unlinks_only_its_symlink_root_and_rejects_bad_st
     # The old finalizer accepted a self-signed but schema-free tree, even after a
     # failed job.  A finalizer no-op is allowed only for a complete strict packet
     # and ``job_status=success``.
+    (output / "confirmation-pipeline-rejection.json").unlink()
     for name in campaign._CONFIRMATION_RAW_FILES:
         (output / name).write_text("{}", encoding="utf-8")
     raw_tree = campaign.confirmation_raw_tree_sha256(output)

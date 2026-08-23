@@ -605,6 +605,14 @@ jobs:
         run: python scripts/download_embedding_model.py
       - name: Validate immutable cached model tree before campaign import
         run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Assert actual locked confirmation runtime and thread settings
+        run: >
+          python -c "import importlib.metadata as metadata, os, sys;
+          expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'python':f'{sys.version_info.major}.{sys.version_info.minor}', 'lancedb':metadata.version('lancedb'), 'numpy':metadata.version('numpy'), 'pyarrow':metadata.version('pyarrow')};
+          threads={key:os.environ.get(key) for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')};
+          print({'runtime':actual, 'threads':threads});
+          assert actual == expected and threads == {'OMP_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'2', 'MKL_NUM_THREADS':'2'}, (actual, threads)"
       - name: Materialize only the sealed generated confirmation input
         env:
           WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
@@ -621,7 +629,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           HEAD: ${{ github.sha }}
         run: >
-          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); i=json.loads((d/'workflow-inputs.json').read_text())['workflow_input']; a=json.loads((d/'allocation.json').read_text())['allocation']; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'workflow_inputs':i,'run_identity':{k:a[k] for k in ('run_id','run_attempt','job_id','job_allocation_nonce')}}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+          python -c "import hashlib,importlib.metadata as metadata,json,os,pathlib,sys; d=pathlib.Path('.review-tmp/phase07'); i=json.loads((d/'workflow-inputs.json').read_text())['workflow_input']; a=json.loads((d/'allocation.json').read_text())['allocation']; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); cpu=next((line.split(':',1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown-cpu'); runtime={'python':f'{sys.version_info.major}.{sys.version_info.minor}','lancedb':metadata.version('lancedb'),'numpy':metadata.version('numpy'),'pyarrow':metadata.version('pyarrow'),'omp_num_threads':int(os.environ['OMP_NUM_THREADS']),'openblas_num_threads':int(os.environ['OPENBLAS_NUM_THREADS']),'mkl_num_threads':int(os.environ['MKL_NUM_THREADS'])}; source_digests={'requirements_sha256':h('requirements.txt'),'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; host={'os':'Linux','architecture':'X64','image':os.environ.get('ImageOS','ubuntu')+' '+os.environ.get('ImageVersion','unknown'),'hostname':os.uname().nodename,'cpu_count':os.cpu_count() or 1,'cpu_model':cpu}; r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD'],'runtime':runtime,'source_digests':source_digests,'host':host},'model_manifest_sha256':source_digests['model_manifest_sha256'],'corpus_manifest_sha256':source_digests['corpus_manifest_sha256'],'workflow_inputs':i,'run_identity':{k:a[k] for k in ('run_id','run_attempt','job_id','job_allocation_nonce')}}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real independent confirmation CLI
         run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Export the sealed confirmation artifact packet from production output
