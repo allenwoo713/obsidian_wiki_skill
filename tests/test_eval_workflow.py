@@ -112,6 +112,37 @@ def test_legacy_eval_script_entrypoints_provide_help_without_pythonpath() -> Non
     assert not failures, f"{len(failures)} legacy eval CLI help failures: {failures}"
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        [sys.executable, "-m", "eval.run_eval", "--help"],
+        [sys.executable, "eval/run_eval.py", "--help"],
+    ),
+    ids=("module", "legacy-script"),
+)
+def test_run_eval_help_remains_utf8_under_windows_legacy_console_encoding(
+    command: list[str],
+) -> None:
+    """Both real run_eval entrypoints must not inherit a cp1252 stdout codec."""
+    env = _isolated_eval_cli_env()
+    env["PYTHONIOENCODING"] = "cp1252"
+    completed = subprocess.run(
+        command,
+        cwd=SKILL_ROOT,
+        env=env,
+        capture_output=True,
+        text=False,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(
+        "utf-8", errors="replace"
+    )
+    stdout = completed.stdout.decode("utf-8")
+    assert "usage:" in stdout.lower()
+    assert "构建临时目录" in stdout
+
+
 def _build_mode_contract(document: Path) -> str:
     """Return the user-visible storage-mode contract, refusing partial copies."""
     start = "<!-- build-mode-contract:start -->"
