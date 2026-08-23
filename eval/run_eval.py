@@ -41,6 +41,10 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
+if str(SKILL_ROOT) not in sys.path:
+    # Direct-file entry points start with eval/ on sys.path; package imports
+    # below require the repository root before they are resolved.
+    sys.path.insert(0, str(SKILL_ROOT))
 SCRIPTS = SKILL_ROOT / "scripts"
 FIXTURES_WIKI = SKILL_ROOT / "tests" / "fixtures" / "wiki"
 GRAPH_CONTRACT_WIKI = SKILL_ROOT / "tests" / "fixtures" / "graph_contract" / "wiki"

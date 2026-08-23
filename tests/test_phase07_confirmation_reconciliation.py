@@ -416,7 +416,7 @@ def test_attempt_scoped_job_allocation_is_unique_and_never_serializes_token(monk
 def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp_path: Path) -> None:
     request, inputs, preflight = tmp_path / "request.json", tmp_path / "inputs", tmp_path / "preflight.json"
     result = subprocess.run([
-        sys.executable, "eval/phase07_operator_gate.py", "confirmation-plan", "--stage1-ledger", str(LEDGER),
+        sys.executable, "-m", "eval.phase07_operator_gate", "confirmation-plan", "--stage1-ledger", str(LEDGER),
         "--request-file", str(request), "--workflow-inputs-dir", str(inputs), "--preflight-request", str(preflight),
     ], cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -466,7 +466,7 @@ def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(t
     wrappers = [{"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot},
                  "packet": _packet(slot, run_id=index + 1)} for index, slot in enumerate(plan["workflow_inputs"])]
     ledger.write_text(json.dumps({"packets": wrappers}), encoding="utf-8")
-    result = subprocess.run([sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
+    result = subprocess.run([sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
                              "--confirmation-ledger", str(ledger), "--mode", "confirmation"],
                             cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -513,7 +513,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         campaign_request_path.write_text(json.dumps(campaign_request), encoding="utf-8")
         output = slot_root / "campaign-output"
         campaign_run = subprocess.run([
-            sys.executable, "eval/phase07_ann_campaign.py", "--request-file", str(campaign_request_path),
+            sys.executable, "-m", "eval.phase07_ann_campaign", "--request-file", str(campaign_request_path),
             "--output-dir", str(output), "--trusted-test-config", json.dumps({"rows": 32, "dimensions": 384, "probes": 2, "work_dir": str(slot_root / "builds")}),
         ], cwd=root, capture_output=True, text=True, check=False)
         assert campaign_run.returncode == 0, campaign_run.stderr
@@ -530,7 +530,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 value["record_self_sha256"] = campaign.canonical_digest(value)
                 semantic_ledger.write_text(json.dumps(value), encoding="utf-8")
                 rejected = subprocess.run([
-                    sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
+                    sys.executable, "-m", "eval.phase07_ann_campaign", "export-confirmation-packet",
                     "--campaign-output-dir", str(semantic_output), "--dispatch-bundle", str(bundle),
                     "--allocation-ledger", str(allocation_path), "--artifact-dir", str(slot_root / f"artifact-{label}"),
                 ], cwd=root, capture_output=True, text=True, check=False)
@@ -547,7 +547,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 invalid_allocation.write_text(json.dumps(invalid), encoding="utf-8")
                 rejected_artifact = slot_root / f"artifact-{name}"
                 rejected = subprocess.run([
-                    sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
+                    sys.executable, "-m", "eval.phase07_ann_campaign", "export-confirmation-packet",
                     "--campaign-output-dir", str(output), "--dispatch-bundle", str(bundle),
                     "--allocation-ledger", str(invalid_allocation), "--artifact-dir", str(rejected_artifact),
                 ], cwd=root, capture_output=True, text=True, check=False)
@@ -556,7 +556,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 rejected_artifact.mkdir()
                 (rejected_artifact / "confirmation-result.json").write_text("partial export", encoding="utf-8")
                 finalized = subprocess.run([
-                    sys.executable, "eval/phase07_operator_gate.py", "finalize",
+                    sys.executable, "-m", "eval.phase07_operator_gate", "finalize",
                     "--output-dir", str(rejected_artifact), "--stage", "confirmation",
                     "--head-sha", HEAD, "--run-id", str(index), "--run-attempt", "1",
                     "--job-key", "phase07-confirmation", "--job-status", "failure",
@@ -568,7 +568,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
                 assert {path.name for path in rejected_artifact.iterdir()} == {"confirmation-pipeline-rejection.json"}
         artifact = slot_root / "artifact"
         exported = subprocess.run([
-            sys.executable, "eval/phase07_ann_campaign.py", "export-confirmation-packet",
+            sys.executable, "-m", "eval.phase07_ann_campaign", "export-confirmation-packet",
             "--campaign-output-dir", str(output), "--dispatch-bundle", str(bundle),
             "--allocation-ledger", str(allocation_path), "--artifact-dir", str(artifact),
         ], cwd=root, capture_output=True, text=True, check=False)
@@ -626,7 +626,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         assert {path.name for path in bad_packet.iterdir()} == {"confirmation-pipeline-rejection.json"}
         before_finalize = {path.name: path.read_bytes() for path in artifact.iterdir()}
         finalized = subprocess.run([
-            sys.executable, "eval/phase07_operator_gate.py", "finalize",
+            sys.executable, "-m", "eval.phase07_operator_gate", "finalize",
             "--output-dir", str(artifact), "--stage", "confirmation", "--head-sha", HEAD,
             "--run-id", str(index), "--run-attempt", "1", "--job-key", "phase07-confirmation",
             "--job-status", "success",
@@ -663,7 +663,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
     evidence_manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
     reconciled = tmp_path / "reconciled-ledger.json"
     result = subprocess.run([
-        sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
+        sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
         "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
     ], cwd=root, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -697,7 +697,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
     def assert_rejected(mutator) -> None:
         mutator()
         rejected = subprocess.run([
-            sys.executable, "eval/reconcile_ann_gate.py", "--confirmation-request", str(request),
+            sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
             "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
         ], cwd=root, capture_output=True, text=True, check=False)
         assert rejected.returncode == 1

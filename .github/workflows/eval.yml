@@ -69,7 +69,7 @@ jobs:
           print(', '.join(f'{package}={metadata.version(package)}' for package in
           ('lancedb', 'pyarrow', 'sentence-transformers')))"
       - name: Validate approved production ANN policy record (Phase 06)
-        run: python eval/run_eval.py --validate-ann-policy
+        run: python -m eval.run_eval --validate-ann-policy
       # #17 API coverage: adapter call shapes, persisted real artifacts, exact-bypass
       # and ANN policy, SDK-free import boundaries, and installed-version reporting.
       # D-03 timing and resource values are recorded observations, never timing gates.
@@ -99,7 +99,7 @@ jobs:
       - name: Run #22 public build-mode equivalence gate
         run: |
           set -euo pipefail
-          python eval/compare_build_modes.py \
+          python -m eval.compare_build_modes \
             --work-dir .review-tmp/phase04-modes \
             --output .review-tmp/phase04-modes/equivalence.json
           test -s .review-tmp/phase04-modes/equivalence.json
@@ -158,7 +158,7 @@ jobs:
           fi
       - name: Retrieval eval (regression check)
         run: |
-          python eval/run_eval.py --work-dir .review-tmp/eval
+          python -m eval.run_eval --work-dir .review-tmp/eval
       - name: Bind #22 evidence to the accepted workflow inputs
         run: >
           python -c "import json, pathlib; root=pathlib.Path('.review-tmp/phase04-modes');
@@ -227,7 +227,7 @@ jobs:
           assert actual == expected, f'expected LanceDB 0.34.0 / NumPy 2.2.6 / PyArrow 25.0.0, got {actual}'"
       - name: Run manual non-authorizing OMP calibration and batch observation
         run: >
-          python eval/benchmark_ann_build.py
+          python -m eval.benchmark_ann_build
           --rows 77348
           --dimensions 384
           --max-probes 256
@@ -313,7 +313,7 @@ jobs:
           env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
           [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
       - name: Validate approved production ANN policy record (Phase 06)
-        run: python eval/run_eval.py --validate-ann-policy
+        run: python -m eval.run_eval --validate-ann-policy
       - name: Run static-cap held-out FLAT/SQ ANN acceptance comparator
         env:
           # Bind native thread pools to the approved calibration setting so the
@@ -322,7 +322,7 @@ jobs:
           OPENBLAS_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
           MKL_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
         run: >
-          python eval/benchmark_ann_build.py
+          python -m eval.benchmark_ann_build
           --rows 77348
           --dimensions 384
           --max-probes 256
@@ -382,13 +382,13 @@ jobs:
           path: .review-tmp/held-out-evidence
       - name: Run model-backed candidate decision records without baseline refresh
         run: >
-          python eval/run_eval.py
+          python -m eval.run_eval
           --work-dir .review-tmp/model-backed-ann
           --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
           --decision-output eval/candidate-hybrid-ann-decision.json
       - name: Validate all twelve candidate-specific production hybrid records
         run: >
-          python eval/run_eval.py
+          python -m eval.run_eval
           --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
           --validate-candidate-hybrid-evidence eval/candidate-hybrid-ann-decision.json
       - name: Upload model-backed candidate decision records
@@ -443,7 +443,7 @@ jobs:
       - name: Reconcile numeric same-head Eval evidence
         if: ${{ always() }}
         run: >
-          python eval/reconcile_ann_gate.py
+          python -m eval.reconcile_ann_gate
           --scale-evidence .review-tmp/reconcile/scale/index-benchmark.json
           --model-records .review-tmp/reconcile/model/candidate-hybrid-ann-decision.json
           --test-and-eval "${{ needs.test-and-eval.result }}"
@@ -493,7 +493,7 @@ jobs:
           RUNNER_OS: ${{ runner.os }}
           RUNNER_ARCH: ${{ runner.arch }}
         run: >
-          python eval/phase07_operator_gate.py hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$PHASE07_STAGE" --continuation "$PHASE07_CONTINUATION" --repository "$REPOSITORY" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --head-sha "$HEAD_SHA" --job-key phase07-entitlement-preflight-ubuntu --runner-os "$RUNNER_OS" --runner-architecture "$RUNNER_ARCH"
+          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$PHASE07_STAGE" --continuation "$PHASE07_CONTINUATION" --repository "$REPOSITORY" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --head-sha "$HEAD_SHA" --job-key phase07-entitlement-preflight-ubuntu --runner-os "$RUNNER_OS" --runner-architecture "$RUNNER_ARCH"
       - name: Upload preflight evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -525,7 +525,7 @@ jobs:
           RUNNER_OS: ${{ runner.os }}
           RUNNER_ARCH: ${{ runner.arch }}
         run: >
-          python eval/phase07_operator_gate.py hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$env:PHASE07_STAGE" --continuation "$env:PHASE07_CONTINUATION" --repository "$env:REPOSITORY" --run-id "$env:RUN_ID" --run-attempt "$env:RUN_ATTEMPT" --head-sha "$env:HEAD_SHA" --job-key phase07-entitlement-preflight-windows --runner-os "$env:RUNNER_OS" --runner-architecture "$env:RUNNER_ARCH"
+          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$env:PHASE07_STAGE" --continuation "$env:PHASE07_CONTINUATION" --repository "$env:REPOSITORY" --run-id "$env:RUN_ID" --run-attempt "$env:RUN_ATTEMPT" --head-sha "$env:HEAD_SHA" --job-key phase07-entitlement-preflight-windows --runner-os "$env:RUNNER_OS" --runner-architecture "$env:RUNNER_ARCH"
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
@@ -568,10 +568,10 @@ jobs:
         run: >
           python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); k=os.environ['JOB_KEY']; r={'schema_version':1,'stage':'screening','request_id':'screening-'+os.environ['RUN_ID'],'environment':{'branch':os.environ['BRANCH'],'workflow_path':'.github/workflows/eval.yml','head_sha':os.environ['HEAD'],'run_id':int(os.environ['RUN_ID']),'run_attempt':int(os.environ['RUN_ATTEMPT']),'job_key':k,'job_allocation_nonce':os.environ['RUN_ID']+'-'+os.environ['RUN_ATTEMPT']+'-'+k,'runtime':{'python':'3.13','lancedb':'0.34.0','numpy':'2.2.6','pyarrow':'25.0.0','omp_num_threads':2}},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'lock_identity':h('requirements.txt')}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real campaign CLI
-        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Seal missing numeric output as a pipeline rejection
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/output --stage screening --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-screening --job-status "${{ job.status }}"
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/output --stage screening --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-screening --job-status "${{ job.status }}"
       - name: Upload sealed screening evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -622,7 +622,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >
-          python eval/phase07_operator_gate.py confirmation-allocation --request-file .review-tmp/phase07/workflow-inputs.json --ledger-file .review-tmp/phase07/allocation.json --repository "${{ github.repository }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --head-sha "${{ github.sha }}" --job-key phase07-confirmation
+          python -m eval.phase07_operator_gate confirmation-allocation --request-file .review-tmp/phase07/workflow-inputs.json --ledger-file .review-tmp/phase07/allocation.json --repository "${{ github.repository }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --head-sha "${{ github.sha }}" --job-key phase07-confirmation
       - name: Construct the campaign request from sealed input and allocated job only
         env:
           RUN_ID: ${{ github.run_id }}
@@ -631,14 +631,14 @@ jobs:
         run: >
           python -c "import hashlib,importlib.metadata as metadata,json,os,pathlib,sys; d=pathlib.Path('.review-tmp/phase07'); i=json.loads((d/'workflow-inputs.json').read_text())['workflow_input']; a=json.loads((d/'allocation.json').read_text())['allocation']; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); cpu=next((line.split(':',1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown-cpu'); runtime={'python':f'{sys.version_info.major}.{sys.version_info.minor}','lancedb':metadata.version('lancedb'),'numpy':metadata.version('numpy'),'pyarrow':metadata.version('pyarrow'),'omp_num_threads':int(os.environ['OMP_NUM_THREADS']),'openblas_num_threads':int(os.environ['OPENBLAS_NUM_THREADS']),'mkl_num_threads':int(os.environ['MKL_NUM_THREADS'])}; source_digests={'requirements_sha256':h('requirements.txt'),'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; host={'os':'Linux','architecture':'X64','image':os.environ.get('ImageOS','ubuntu')+' '+os.environ.get('ImageVersion','unknown'),'hostname':os.uname().nodename,'cpu_count':os.cpu_count() or 1,'cpu_model':cpu}; r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD'],'runtime':runtime,'source_digests':source_digests,'host':host},'model_manifest_sha256':source_digests['model_manifest_sha256'],'corpus_manifest_sha256':source_digests['corpus_manifest_sha256'],'workflow_inputs':i,'run_identity':{k:a[k] for k in ('run_id','run_attempt','job_id','job_allocation_nonce')}}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real independent confirmation CLI
-        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Export the sealed confirmation artifact packet from production output
         if: ${{ success() }}
         run: >
-          python eval/phase07_ann_campaign.py export-confirmation-packet --campaign-output-dir .review-tmp/phase07/output --dispatch-bundle .review-tmp/phase07/workflow-inputs.json --allocation-ledger .review-tmp/phase07/allocation.json --artifact-dir .review-tmp/phase07/confirmation-artifact
+          python -m eval.phase07_ann_campaign export-confirmation-packet --campaign-output-dir .review-tmp/phase07/output --dispatch-bundle .review-tmp/phase07/workflow-inputs.json --allocation-ledger .review-tmp/phase07/allocation.json --artifact-dir .review-tmp/phase07/confirmation-artifact
       - name: Seal missing numeric output as a pipeline rejection
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-confirmation --job-status "${{ job.status }}"
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-confirmation --job-status "${{ job.status }}"
       - name: Upload sealed confirmation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -680,10 +680,10 @@ jobs:
         run: >
           python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'mode','prior_evidence_sha256','config'}; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'continuation','request_id':'continuation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),**b}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real bounded continuation CLI
-        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Seal missing numeric output as a pipeline rejection
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/output --stage continuation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-continuation --job-status "${{ job.status }}"
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/output --stage continuation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-continuation --job-status "${{ job.status }}"
       - name: Upload sealed continuation evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -724,10 +724,10 @@ jobs:
         run: >
           python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'mode','prior_evidence_sha256','config'} and b['mode'] in {'representative_ann','hybrid_non_regression'}; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'continuation','request_id':'representative-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),**b}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
       - name: Invoke the real representative campaign CLI
-        run: python eval/phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
       - name: Seal missing numeric output as a pipeline rejection
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/output --stage representative --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-representative --job-status "${{ job.status }}"
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/output --stage representative --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-representative --job-status "${{ job.status }}"
       - name: Upload sealed representative success or rejection evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -751,10 +751,10 @@ jobs:
           BINDING: ${{ inputs.continuation_binding }}
         run: python -c "import json,os,pathlib; p=json.loads(os.environ['BINDING']); assert set(p)=={'repository','head_sha','packets'}; d=pathlib.Path('.review-tmp/phase07/reconciliation-input'); d.mkdir(parents=True,exist_ok=True); (d/'binding.json').write_text(json.dumps(p,sort_keys=True))"
       - name: Reconcile supplied immutable hosted packet set
-        run: python eval/phase07_operator_gate.py reconcile-hosted --request-file .review-tmp/phase07/reconciliation-input/binding.json --ledger-file .review-tmp/phase07/reconciliation-artifacts
+        run: python -m eval.phase07_operator_gate reconcile-hosted --request-file .review-tmp/phase07/reconciliation-input/binding.json --ledger-file .review-tmp/phase07/reconciliation-artifacts
       - name: Emit reconciliation rejection only if output is missing
         if: ${{ always() }}
-        run: python eval/phase07_operator_gate.py finalize --output-dir .review-tmp/phase07/reconciliation-artifacts --stage reconciliation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-reconciliation --job-status "${{ job.status }}"
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/reconciliation-artifacts --stage reconciliation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-reconciliation --job-status "${{ job.status }}"
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:

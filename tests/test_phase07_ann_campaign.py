@@ -157,17 +157,18 @@ def test_request_schema_seals_success_and_rejection_artifacts(tmp_path: Path) ->
     assert rejected["status"] == "reject-evidence" and rejected["record_self_sha256"]
 
 
-def test_direct_campaign_script_cli_reaches_request_validation_without_running_stress_matrix(
+def test_module_campaign_cli_reaches_request_validation_without_running_stress_matrix(
     tmp_path: Path,
 ) -> None:
-    """The hosted workflow invokes the script path, not ``python -m``."""
+    """The hosted workflow invokes the production package entry point."""
     request = tmp_path / "invalid-request.json"
     request.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
 
     result = subprocess.run(
         [
             sys.executable,
-            "eval/phase07_ann_campaign.py",
+            "-m",
+            "eval.phase07_ann_campaign",
             "--request-file",
             str(request),
             "--output-dir",

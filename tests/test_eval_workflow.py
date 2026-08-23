@@ -22,7 +22,8 @@ from run_eval import _citation_violations  # noqa: E402
 
 
 _DIRECT_EVAL_CLI = re.compile(
-    r"""(?im)(?<![\w.-])python(?:3(?:\.\d+)?)?(?:\.exe)?\s+["']?(?:\.[/\\])?eval[/\\][A-Za-z_][A-Za-z0-9_]*\.py\b"""
+    r"(?im)(?<![\w.-])python(?:3(?:\.\d+)?)?(?:\.exe)?\s+"
+    r"""["']?(?:\.[/\\])?eval[/\\]+[A-Za-z_][A-Za-z0-9_]*\.py\b"""
 )
 _EVAL_CLI_MODULES = (
     "eval.run_eval",
@@ -53,11 +54,15 @@ def _eval_cli_help_failures(commands: list[list[str]]) -> list[str]:
         )
         for command in commands
     ]
-    return [
-        f"{' '.join(command[1:])}: exit={result.returncode}; usage={'usage' in (result.stdout + result.stderr).lower()}; stderr={result.stderr!r}"
-        for command, result in zip(commands, results)
-        if result.returncode != 0 or "usage" not in (result.stdout + result.stderr).lower()
-    ]
+    failures = []
+    for command, result in zip(commands, results):
+        output = result.stdout + result.stderr
+        if result.returncode != 0 or "usage" not in output.lower():
+            failures.append(
+                f"{' '.join(command[1:])}: exit={result.returncode}; "
+                f"usage={'usage' in output.lower()}; stderr={result.stderr!r}"
+            )
+    return failures
 
 
 def test_direct_eval_cli_regex_covers_supported_python_launcher_spellings() -> None:
@@ -68,6 +73,9 @@ def test_direct_eval_cli_regex_covers_supported_python_launcher_spellings() -> N
         'python3.13 ".\\eval\\run_eval.py"',
         'python.exe "eval/run_eval.py"',
         "python3.exe .\\eval\\run_eval.py",
+        "python eval//run_eval.py",
+        "python .\\eval\\\\run_eval.py",
+        "python .\\eval//run_eval.py",
     )
     assert all(_DIRECT_EVAL_CLI.search(command) for command in direct_launchers)
     assert not _DIRECT_EVAL_CLI.search("python -m eval.run_eval")
@@ -80,13 +88,15 @@ def test_eval_workflows_have_no_direct_eval_cli_launchers() -> None:
         for workflow in sorted((SKILL_ROOT / ".github" / "workflows").glob("*.y*ml"))
         for match in _DIRECT_EVAL_CLI.finditer(workflow.read_text(encoding="utf-8"))
     ]
-    assert not violations, f"found {len(violations)} direct eval CLI launchers: {violations}"
+    assert not violations, (
+        f"found {len(violations)} direct eval CLI launchers: {violations}"
+    )
+
 
 def test_eval_module_cli_entrypoints_provide_help_without_pythonpath() -> None:
     """All CI module entrypoints must be import-safe from the repository root."""
     commands = [
-        [sys.executable, "-m", module, "--help"]
-        for module in _EVAL_CLI_MODULES
+        [sys.executable, "-m", module, "--help"] for module in _EVAL_CLI_MODULES
     ]
     failures = _eval_cli_help_failures(commands)
     assert not failures, f"{len(failures)} module eval CLI help failures: {failures}"
@@ -159,7 +169,7 @@ def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_clos
         "per-build-cap-seconds",
         "run_attempt",
             "hosted-preflight",
-            "phase07_operator_gate.py finalize",
+            "python -m eval.phase07_operator_gate finalize",
         "workflow_dispatch",
     ):
         assert required in workflow
@@ -290,7 +300,10 @@ def test_phase07_workflow_commands_are_real_and_do_not_consume_review_tmp_reques
     for job in ("phase07-screening:", "phase07-confirmation:", "phase07-continuation:", "phase07-representative:"):
         section = workflow.split(job, 1)[1].split("\n  phase07-", 1)[0]
         assert "Construct" in section
-        assert "phase07_ann_campaign.py --request-file .review-tmp/phase07/request.json" in section
+        assert (
+            "python -m eval.phase07_ann_campaign "
+            "--request-file .review-tmp/phase07/request.json"
+        ) in section
         assert "screening-request.json" not in section
         assert "confirmation-request.json" not in section
         assert "continuation-request.json" not in section
@@ -348,12 +361,12 @@ def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> N
     assert rejection["status"] == "reject-evidence" and "retention_days_accepted" not in rejection
 
 
-def test_hosted_preflight_direct_file_bootstraps_from_repo_root_and_seals_rejection(tmp_path: Path) -> None:
-    """Both hosted OSes execute the direct script without an import traceback."""
+def test_hosted_preflight_module_entrypoint_seals_rejection(tmp_path: Path) -> None:
+    """Both hosted OSes execute the package entry point without an import traceback."""
     def run(root: Path, output: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
-                sys.executable, "eval/phase07_operator_gate.py", "hosted-preflight",
+                sys.executable, "-m", "eval.phase07_operator_gate", "hosted-preflight",
                 "--ledger-file", str(output), "--stage", "preflight",
                 "--repository", "owner/repo", "--run-id", "1", "--run-attempt", "1",
                 "--head-sha", "a" * 40, "--job-key", "hosted-preflight",
@@ -363,7 +376,7 @@ def test_hosted_preflight_direct_file_bootstraps_from_repo_root_and_seals_reject
         )
 
     # The production checkout is the Ubuntu contract; the minimal copied root
-    # exercises the exact same direct-file bootstrap used by Windows runners.
+    # exercises the same package entry point used by Windows runners.
     ubuntu_output = tmp_path / "ubuntu-proof.json"
     ubuntu = run(SKILL_ROOT, ubuntu_output)
     assert ubuntu.returncode == 0, ubuntu.stderr
@@ -399,7 +412,7 @@ def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key()
 def test_confirmation_workflow_calls_real_exporter_and_uploads_only_packet_artifact_dir() -> None:
     workflow = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
     confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
-    assert "phase07_ann_campaign.py export-confirmation-packet" in confirmation
+    assert "python -m eval.phase07_ann_campaign export-confirmation-packet" in confirmation
     assert "--artifact-dir .review-tmp/phase07/confirmation-artifact" in confirmation
     assert "finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation" in confirmation
     assert "path: .review-tmp/phase07/confirmation-artifact" in confirmation
@@ -607,7 +620,7 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     bootstrap_at = test_and_eval.index("Bootstrap local embedding model")
     phase04_at = test_and_eval.index("Run #22 public build-mode equivalence gate")
     assert bootstrap_at < phase04_at
-    assert "python eval/compare_build_modes.py" in test_and_eval
+    assert "python -m eval.compare_build_modes" in test_and_eval
     assert "--work-dir .review-tmp/phase04-modes" in test_and_eval
     assert "--output .review-tmp/phase04-modes/equivalence.json" in test_and_eval
     comparator = test_and_eval.split("Run #22 public build-mode equivalence gate", 1)[1].split(
@@ -1042,7 +1055,7 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "test-and-eval" in reconciliation
     assert "issue41-scale-benchmark" in reconciliation
     assert "model-backed-ann-decision" in reconciliation
-    assert "eval/reconcile_ann_gate.py" in reconciliation
+    assert "python -m eval.reconcile_ann_gate" in reconciliation
     assert '--expected-head "${{ github.sha }}"' in reconciliation
     assert '--expected-pr-head "${{ github.event.pull_request.head.sha }}"' in reconciliation
     assert "Architecture (ubuntu-latest, Python 3.10)" in reconciliation

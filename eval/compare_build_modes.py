@@ -19,6 +19,10 @@ from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
+if str(SKILL_ROOT) not in sys.path:
+    # Retain direct-file compatibility while resolving shared helpers through
+    # the same package path used by workflow module entry points.
+    sys.path.insert(0, str(SKILL_ROOT))
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -30,7 +34,7 @@ from obsidian_wiki.domain.index_models import FtsIndexConfig  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 from query import hybrid_search  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
-from run_eval import (  # noqa: E402
+from eval.run_eval import (  # noqa: E402
     _citation_violations,
     _evidence_recall,
     _fixture_digest,

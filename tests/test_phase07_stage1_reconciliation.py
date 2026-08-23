@@ -205,10 +205,10 @@ def _post_download_request(artifact_dir: Path, result: dict[str, object]) -> dic
     return request
 
 
-def test_stage1_reconciler_direct_script_cli_bootstraps_package_imports() -> None:
-    """The production ``python eval/reconcile_ann_gate.py`` entry point imports cleanly."""
+def test_stage1_reconciler_module_cli_uses_production_package_entrypoint() -> None:
+    """The production module entry point imports cleanly from the repository root."""
     completed = subprocess.run(
-        [sys.executable, str(ROOT / "eval" / "reconcile_ann_gate.py"), "--help"],
+        [sys.executable, "-m", "eval.reconcile_ann_gate", "--help"],
         cwd=ROOT,
         text=True,
         capture_output=True,
