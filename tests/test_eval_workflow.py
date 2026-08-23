@@ -3,6 +3,8 @@ import hashlib
 import inspect
 import importlib.util
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,6 +19,87 @@ sys.path.insert(0, str(SKILL_ROOT / "eval"))
 from models import ChunkHit, ContextBundle, ContextItem  # noqa: E402
 import run_eval  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
+
+
+_DIRECT_EVAL_CLI = re.compile(
+    r"""(?im)(?<![\w.-])python(?:3(?:\.\d+)?)?(?:\.exe)?\s+["']?(?:\.[/\\])?eval[/\\][A-Za-z_][A-Za-z0-9_]*\.py\b"""
+)
+_EVAL_CLI_MODULES = (
+    "eval.run_eval",
+    "eval.compare_build_modes",
+    "eval.benchmark_ann_build",
+    "eval.reconcile_ann_gate",
+    "eval.phase07_operator_gate",
+    "eval.phase07_ann_campaign",
+)
+
+
+def _isolated_eval_cli_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _eval_cli_help_failures(commands: list[list[str]]) -> list[str]:
+    results = [
+        subprocess.run(
+            command,
+            cwd=SKILL_ROOT,
+            env=_isolated_eval_cli_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        for command in commands
+    ]
+    return [
+        f"{' '.join(command[1:])}: exit={result.returncode}; usage={'usage' in (result.stdout + result.stderr).lower()}; stderr={result.stderr!r}"
+        for command, result in zip(commands, results)
+        if result.returncode != 0 or "usage" not in (result.stdout + result.stderr).lower()
+    ]
+
+
+def test_direct_eval_cli_regex_covers_supported_python_launcher_spellings() -> None:
+    """The workflow static gate must reject every supported direct-script spelling."""
+    direct_launchers = (
+        "python eval/run_eval.py",
+        "python3 ./eval/run_eval.py",
+        'python3.13 ".\\eval\\run_eval.py"',
+        'python.exe "eval/run_eval.py"',
+        "python3.exe .\\eval\\run_eval.py",
+    )
+    assert all(_DIRECT_EVAL_CLI.search(command) for command in direct_launchers)
+    assert not _DIRECT_EVAL_CLI.search("python -m eval.run_eval")
+
+
+def test_eval_workflows_have_no_direct_eval_cli_launchers() -> None:
+    """CI must use package module entrypoints, never direct eval script paths."""
+    violations = [
+        f"{workflow.relative_to(SKILL_ROOT)}:{match.group(0)}"
+        for workflow in sorted((SKILL_ROOT / ".github" / "workflows").glob("*.y*ml"))
+        for match in _DIRECT_EVAL_CLI.finditer(workflow.read_text(encoding="utf-8"))
+    ]
+    assert not violations, f"found {len(violations)} direct eval CLI launchers: {violations}"
+
+def test_eval_module_cli_entrypoints_provide_help_without_pythonpath() -> None:
+    """All CI module entrypoints must be import-safe from the repository root."""
+    commands = [
+        [sys.executable, "-m", module, "--help"]
+        for module in _EVAL_CLI_MODULES
+    ]
+    failures = _eval_cli_help_failures(commands)
+    assert not failures, f"{len(failures)} module eval CLI help failures: {failures}"
+
+
+def test_legacy_eval_script_entrypoints_provide_help_without_pythonpath() -> None:
+    """README-compatible run_eval and comparison scripts remain directly usable."""
+    commands = [
+        [sys.executable, "eval/run_eval.py", "--help"],
+        [sys.executable, "eval/compare_build_modes.py", "--help"],
+    ]
+    failures = _eval_cli_help_failures(commands)
+    assert not failures, f"{len(failures)} legacy eval CLI help failures: {failures}"
 
 
 def _build_mode_contract(document: Path) -> str:
