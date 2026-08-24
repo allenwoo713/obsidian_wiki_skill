@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import shutil
 import zipfile
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -127,7 +128,7 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
     packet = {
         "schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": slot["record_self_sha256"],
         "slot": slot["slot"], "run_id": run_id, "run_attempt": 1, "job_id": run_id + 100,
-        "job_key": "phase07-confirmation", "job_allocation_nonce": (f"nonce-{run_id:032x}"),
+        "job_key": "phase07-confirmation", "job_allocation_nonce": f"{run_id:032x}",
         "status": "numeric-success" if failure_class is None else "rejected",
         "failure_class": failure_class, "replacement_for_run_id": replacement_for,
         "builds": builds,
@@ -169,6 +170,23 @@ def test_confirmation_plan_rejects_missing_extra_hand_authored_replayed_or_stale
     mutation(plan)
     with pytest.raises(ValueError):
         operator.validate_confirmation_plan(plan)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda binding: binding["baseline"].update(query_ef=300),
+    lambda binding: binding["candidates"][0].update(ef_construction=500),
+    lambda binding: binding["candidates"][1].update(query_ef=500),
+    lambda binding: binding["candidates"][0].update(index_type="hnsw_flat"),
+    lambda binding: binding["candidates"][0].update(refine_factor=2),
+    lambda binding: binding.update(scale=1000),
+])
+def test_d25_generated_input_rejects_every_retired_configuration_before_build(mutation) -> None:
+    record = deepcopy(_plan()["workflow_inputs"][0])
+    mutation(record["d25_binding"])
+    record["d25_binding_sha256"] = operator.canonical_digest(record["d25_binding"])
+    record["record_self_sha256"] = operator.canonical_digest(record)
+    with pytest.raises(ValueError, match="binding"):
+        operator.validate_confirmation_workflow_input(record, expected_head=HEAD)
 
 
 def test_confirmation_reconciliation_requires_three_ordinals_and_preserves_typed_infra_origin() -> None:
@@ -416,7 +434,7 @@ def test_confirmation_packet_carries_locked_execution_and_full_raw_measurements(
         "model_manifest_sha256": MODEL_MANIFEST_SHA256,
         "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
         "workflow_inputs": workflow_input,
-        "run_identity": {"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "n" * 32},
+        "run_identity": {"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "a" * 32},
     }
     runner = campaign.Phase07AnnCampaignRunner(campaign.CampaignConfig(
         rows=32, dimensions=384, probes=2, work_dir=tmp_path / "builds",
@@ -424,11 +442,35 @@ def test_confirmation_packet_carries_locked_execution_and_full_raw_measurements(
     result = campaign.execute(request, tmp_path / "output", runner=runner.run)["result"]
     packet = campaign.confirmation_packet_from_result(
         result=result, workflow_inputs=workflow_input, run_id=1, run_attempt=1,
-        job_id=2, job_key="phase07-confirmation", job_allocation_nonce="n" * 32,
+        job_id=2, job_key="phase07-confirmation", job_allocation_nonce="a" * 32,
         raw_tree_sha256="0" * 64,
     )
     assert packet["locked_execution"] == _locked_confirmation_environment()
     assert packet["measurements"]["builds"] == result["builds"]
+    reconcile.validate_confirmation_packet(packet, workflow_input)
+
+    for label, mutate, message in (
+        (
+            "unindexed",
+            lambda value: value["measurements"]["builds"][0]["build"].update(unindexed_dense_rows=1),
+            "raw build",
+        ),
+        (
+            "p95",
+            lambda value: value["measurements"]["builds"][1]["queries"][0].update(latency_p95_ms=float("nan")),
+            "query cost",
+        ),
+        (
+            "samples",
+            lambda value: value["measurements"]["builds"][2]["queries"][0].update(queries=[]),
+            "samples",
+        ),
+    ):
+        broken = deepcopy(packet)
+        mutate(broken)
+        broken["record_self_sha256"] = reconcile.canonical_digest(broken)
+        with pytest.raises(ValueError, match=message):
+            reconcile.validate_confirmation_packet(broken, workflow_input), label
 
 
 def test_confirmation_request_rejects_runtime_thread_and_source_omission_or_mismatch() -> None:
@@ -440,7 +482,7 @@ def test_confirmation_request_rejects_runtime_thread_and_source_omission_or_mism
         "model_manifest_sha256": MODEL_MANIFEST_SHA256,
         "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
         "workflow_inputs": plan["workflow_inputs"][0],
-        "run_identity": {"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "n" * 32},
+        "run_identity": {"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "a" * 32},
     }
     assert campaign.validate_request(request) == request
     for label, mutate in (

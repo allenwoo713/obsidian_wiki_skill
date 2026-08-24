@@ -47,11 +47,16 @@ CONFIRMATION_IMPLEMENTATION_BASE = "105dab9764cb58fb10610b78345b85d7282ef4d6"
 CANONICAL_STAGE1_AUTHORITY_PATH = _REPOSITORY_ROOT / "eval" / "phase07-stage1-authority.json"
 CANONICAL_STAGE1_AUTHORITY_REFERENCE = "eval/phase07-stage1-authority.json"
 STAGE1_AUTHORITY_DIGEST = "a983ac4be1bb992e237474fc237cd927529ef9dd60e9330de7b959e6159bb319"
-CONFIRMATION_SLOTS = ((32, 1), (32, 2), (32, 3), (20, 1), (20, 2), (20, 3))
+CONFIRMATION_SLOTS = (1, 2, 3)
+D25_BASELINE = {"index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100}
+D25_CANDIDATES = (
+    {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300},
+    {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300},
+)
 CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
     "schema_version", "campaign_stage", "confirmation_request_sha256",
-    "slot", "post_task0_head", "continuation_binding",
-    "continuation_binding_sha256", "dispatch_identity", "record_self_sha256",
+    "slot", "post_task0_head", "d25_binding",
+    "d25_binding_sha256", "dispatch_identity", "record_self_sha256",
 })
 JOB_DISPLAY_NAMES = {"phase07-confirmation": "Phase 07 independent confirmation campaign"}
 CONFIRMATION_DOWNLOAD_FIELDS = frozenset({"run_id", "run_attempt", "archive", "extracted_dir"})
@@ -70,10 +75,16 @@ def _sealed(payload: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-def _confirmation_binding(*, slot: dict[str, int]) -> dict[str, Any]:
+def d25_confirmation_binding(ordinal: int) -> dict[str, Any]:
+    """Return the complete immutable D-25 build/query allowlist for one run."""
+    if isinstance(ordinal, bool) or ordinal not in CONFIRMATION_SLOTS:
+        raise ValueError("D-25 confirmation ordinal must be 1, 2, or 3")
     return {
-        "kind": "phase07-confirmation/v1", "prior_screening_sha256": STAGE1_LEDGER_DIGEST,
-        "nominated_m": slot["m"], "run_ordinal": slot["ordinal"],
+        "kind": "phase07-d25-paired-confirmation/v1",
+        "prior_screening_sha256": STAGE1_LEDGER_DIGEST,
+        "run_ordinal": ordinal,
+        "baseline": dict(D25_BASELINE),
+        "candidates": [dict(candidate) for candidate in D25_CANDIDATES],
     }
 
 
@@ -89,13 +100,13 @@ def _build_confirmation_plan_from_immutable(*, stage1_ledger_path: str, post_tas
     if not SHA.fullmatch(post_task0_head):
         raise ValueError("confirmation requires an exact post-Task-0 head")
     seed_records = []
-    for m, ordinal in CONFIRMATION_SLOTS:
-        slot = {"m": m, "ordinal": ordinal}
-        binding = _confirmation_binding(slot=slot)
+    for ordinal in CONFIRMATION_SLOTS:
+        slot = {"ordinal": ordinal}
+        binding = d25_confirmation_binding(ordinal)
         seed_records.append({"schema_version": 1, "campaign_stage": "confirmation", "slot": slot,
-                             "post_task0_head": post_task0_head, "continuation_binding": binding,
-                             "continuation_binding_sha256": canonical_digest(binding),
-                             "dispatch_identity": f"phase07-confirmation/{m}/{ordinal}"})
+                             "post_task0_head": post_task0_head, "d25_binding": binding,
+                             "d25_binding_sha256": canonical_digest(binding),
+                             "dispatch_identity": f"phase07-confirmation/ordinal/{ordinal}"})
     request = _sealed({
         "schema_version": 1, "campaign_stage": "confirmation",
         "stage1_ledger_path": stage1_ledger_path, "stage1_ledger_sha256": STAGE1_LEDGER_DIGEST,
@@ -151,22 +162,22 @@ def validate_confirmation_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if plan["artifact_reported_nominated_m"] != [16, 20] or plan["authoritative_nominated_m"] != [32, 20] or request["artifact_reported_nominated_m"] != [16, 20] or request["reconciled_nominated_m"] != [32, 20] or request["authoritative_nominated_m"] != [32, 20]:
         raise ValueError("confirmation nominees")
     inputs = plan["workflow_inputs"]
-    if not isinstance(inputs, list) or len(inputs) != 6:
-        raise ValueError("exactly six generated confirmation inputs")
+    if not isinstance(inputs, list) or len(inputs) != 3:
+        raise ValueError("exactly three generated confirmation ordinal inputs")
     slots = []
     for record in inputs:
         if not isinstance(record, dict) or set(record) != CONFIRMATION_WORKFLOW_INPUT_FIELDS or record.get("record_self_sha256") != canonical_digest(record):
             raise ValueError("sealed generated workflow input")
         slot = record.get("slot")
-        if not isinstance(slot, dict) or set(slot) != {"m", "ordinal"} or (slot["m"], slot["ordinal"]) not in CONFIRMATION_SLOTS:
+        if not isinstance(slot, dict) or set(slot) != {"ordinal"} or slot["ordinal"] not in CONFIRMATION_SLOTS:
             raise ValueError("immutable confirmation slot")
-        binding = _confirmation_binding(slot=slot)
-        if record.get("campaign_stage") != "confirmation" or record.get("confirmation_request_sha256") != request["record_self_sha256"] or record.get("post_task0_head") != request["post_task0_head"] or record.get("continuation_binding") != binding or record.get("continuation_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/{slot['m']}/{slot['ordinal']}":
+        binding = d25_confirmation_binding(slot["ordinal"])
+        if record.get("campaign_stage") != "confirmation" or record.get("confirmation_request_sha256") != request["record_self_sha256"] or record.get("post_task0_head") != request["post_task0_head"] or record.get("d25_binding") != binding or record.get("d25_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/ordinal/{slot['ordinal']}":
             raise ValueError("confirmation input binding")
-        slots.append((slot["m"], slot["ordinal"]))
+        slots.append(slot["ordinal"])
     if slots != list(CONFIRMATION_SLOTS):
         raise ValueError("duplicate, missing, or replayed confirmation slot")
-    if request["workflow_input_membership_sha256"] != [confirmation_input_membership_digest(record) for record in inputs] or len(set(request["workflow_input_membership_sha256"])) != 6:
+    if request["workflow_input_membership_sha256"] != [confirmation_input_membership_digest(record) for record in inputs] or len(set(request["workflow_input_membership_sha256"])) != 3:
         raise ValueError("confirmation request bundle membership")
     return plan
 
@@ -180,7 +191,7 @@ def validate_confirmation_dispatch_bundle(bundle: dict[str, Any], *, expected_he
         raise ValueError("confirmation feature head is not the exact generated head")
     expected = build_confirmation_plan(CANONICAL_STAGE1_AUTHORITY_PATH, post_task0_head=expected_head)
     # The request is not a self-declared authority: it must byte-for-byte match
-    # the deterministic immutable lineage and all six generated members.
+    # the deterministic immutable lineage and all three generated members.
     if request != expected["confirmation_request"]:
         raise ValueError("noncanonical confirmation request authority")
     validate_confirmation_plan(expected)
@@ -196,10 +207,10 @@ def validate_confirmation_workflow_input(record: dict[str, Any], *, expected_hea
     if not SHA.fullmatch(expected_head) or not isinstance(record, dict) or set(record) != CONFIRMATION_WORKFLOW_INPUT_FIELDS or record.get("record_self_sha256") != canonical_digest(record):
         raise ValueError("sealed generated workflow input")
     slot = record.get("slot")
-    if not isinstance(slot, dict) or set(slot) != {"m", "ordinal"} or (slot["m"], slot["ordinal"]) not in CONFIRMATION_SLOTS:
+    if not isinstance(slot, dict) or set(slot) != {"ordinal"} or slot["ordinal"] not in CONFIRMATION_SLOTS:
         raise ValueError("immutable confirmation slot")
-    binding = _confirmation_binding(slot=slot)
-    if record.get("campaign_stage") != "confirmation" or record.get("post_task0_head") != expected_head or not isinstance(record.get("confirmation_request_sha256"), str) or not HEX64.fullmatch(record["confirmation_request_sha256"]) or record.get("continuation_binding") != binding or record.get("continuation_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/{slot['m']}/{slot['ordinal']}":
+    binding = d25_confirmation_binding(slot["ordinal"])
+    if record.get("campaign_stage") != "confirmation" or record.get("post_task0_head") != expected_head or not isinstance(record.get("confirmation_request_sha256"), str) or not HEX64.fullmatch(record["confirmation_request_sha256"]) or record.get("d25_binding") != binding or record.get("d25_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/ordinal/{slot['ordinal']}":
         raise ValueError("confirmation input/request/head/binding mismatch")
     return record
 
@@ -537,8 +548,8 @@ def collect_confirmation_provenance(*, request_file: Path, output: Path,
     repository, head_sha, downloads = request["repository"], request["head_sha"], request["downloads"]
     if not isinstance(repository, str) or not repository or not isinstance(head_sha, str) or not SHA.fullmatch(head_sha):
         raise ValueError("confirmation collection repository/head binding")
-    if not isinstance(downloads, list) or len(downloads) not in {6, 7}:
-        raise ValueError("confirmation collection requires six physical downloads or one preserved replacement")
+    if not isinstance(downloads, list) or len(downloads) not in {3, 4}:
+        raise ValueError("confirmation collection requires three physical downloads or one preserved replacement")
     if not token:
         raise ValueError("GitHub actions read token unavailable")
     if output.exists() or provenance_dir.is_symlink() or (provenance_dir.exists() and any(provenance_dir.iterdir())):
@@ -679,7 +690,7 @@ def run_pr_gates(request_file: Path, ledger_file: Path) -> int:
 
 def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_inputs_dir: Path,
                           preflight_request: Path) -> int:
-    """Materialize the only six dispatchable records from the exact feature head."""
+    """Materialize the only three dispatchable ordinal records from the exact head."""
     root = Path(_git("rev-parse", "--show-toplevel"))
     head = _git("rev-parse", "HEAD")
     plan = build_confirmation_plan(stage1_ledger, post_task0_head=head)
@@ -689,7 +700,7 @@ def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_i
     workflow_inputs_dir.mkdir(parents=True, exist_ok=True)
     for record in plan["workflow_inputs"]:
         slot = record["slot"]
-        (workflow_inputs_dir / f"confirmation-m{slot['m']}-ordinal{slot['ordinal']}.json").write_text(
+        (workflow_inputs_dir / f"confirmation-ordinal{slot['ordinal']}.json").write_text(
             json.dumps({"confirmation_request": plan["confirmation_request"], "workflow_input": record}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     preflight = {
         "repository": _read_object(stage1_ledger)["repository"], "branch": _git("branch", "--show-current"),

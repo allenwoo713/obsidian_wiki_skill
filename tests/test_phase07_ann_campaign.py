@@ -82,7 +82,7 @@ def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
         request.update(
             environment=_locked_confirmation_environment(),
             workflow_inputs=plan["workflow_inputs"][0],
-            run_identity={"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "n" * 32},
+            run_identity={"run_id": 1, "run_attempt": 1, "job_id": 2, "job_allocation_nonce": "a" * 32},
         )
     if stage == "continuation":
         configs = {
@@ -289,7 +289,7 @@ def test_confirmation_is_one_paired_d25_ordinal_and_only_queries_fixed_efs(tmp_p
     ]
     packet = confirmation_packet_from_result(result=confirmation, workflow_inputs=_request("confirmation")["workflow_inputs"],
                                              run_id=1, run_attempt=1, job_id=2, job_key="phase07-confirmation",
-                                             job_allocation_nonce="f" * 32, raw_tree_sha256=_digest("evidence"))
+                                             job_allocation_nonce="a" * 32, raw_tree_sha256=_digest("evidence"))
     assert packet["d25"]["family_size"] == 4
     assert packet["slot"] == {"ordinal": 1}
 

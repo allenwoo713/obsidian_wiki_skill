@@ -127,7 +127,7 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
     required = {
         "schema_version", "campaign_stage", "workflow_inputs_sha256", "slot", "run_id", "run_attempt",
         "job_id", "job_key", "job_allocation_nonce", "status", "failure_class", "replacement_for_run_id",
-        "builds", "d04", "d20", "raw_tree_sha256", "retention_days", "record_self_sha256",
+        "builds", "d25", "raw_tree_sha256", "retention_days", "record_self_sha256",
     }
     extended = {"locked_execution", "measurements"}
     if not isinstance(packet, dict) or set(packet) not in (required, required | extended) \
@@ -135,7 +135,10 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
         raise ValueError("sealed confirmation packet")
     if packet["campaign_stage"] != "confirmation" or packet["workflow_inputs_sha256"] != workflow_inputs.get("record_self_sha256") or packet["slot"] != workflow_inputs.get("slot"):
         raise ValueError("confirmation input/request binding")
-    if not all(isinstance(packet[key], int) and packet[key] > 0 for key in ("run_id", "run_attempt", "job_id")) or not isinstance(packet["job_key"], str) or not packet["job_key"] or not isinstance(packet["job_allocation_nonce"], str) or len(packet["job_allocation_nonce"]) < 32:
+    if not all(isinstance(packet[key], int) and packet[key] > 0 for key in ("run_id", "run_attempt", "job_id")) \
+            or packet["job_key"] != "phase07-confirmation" \
+            or not isinstance(packet["job_allocation_nonce"], str) \
+            or re.fullmatch(r"[0-9a-f]{32}", packet["job_allocation_nonce"]) is None:
         raise ValueError("confirmation allocation identity")
     if packet["retention_days"] != 90 or not isinstance(packet["raw_tree_sha256"], str) or not _HEX64.fullmatch(packet["raw_tree_sha256"]):
         raise ValueError("confirmation artifact retention/digest")
@@ -145,6 +148,8 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
             raise ValueError("numeric success cannot carry a failure")
     elif failure not in PHASE07_INFRA_FAILURES | {"numeric", "recall", "hybrid", "watchdog", "malformed", "reconciliation"}:
         raise ValueError("typed confirmation failure class")
+    if packet["status"] != "numeric-success" and packet["replacement_for_run_id"] is not None:
+        raise ValueError("rejected origin cannot replace another run")
     builds = packet["builds"]
     if not isinstance(builds, list) or len(builds) != 3:
         raise ValueError("confirmation requires exactly three fresh builds")
@@ -156,53 +161,76 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
         if build["m"] in by_m or not isinstance(build["query_ef"], list):
             raise ValueError("duplicate build m")
         by_m[build["m"]] = build; build_ids.add(build["build_id"])
-    if set(by_m) != {16, 20, 32} or by_m[16]["query_ef"] != [100, 200, 300] or any(by_m[m]["query_ef"] != [200, 300] for m in (20, 32)):
-        raise ValueError("D-04/D-20 build query allocation")
-    for name, size in (("d04", 6), ("d20", 4)):
-        family = packet[name]
-        member_d20 = name == "d20" and isinstance(family, dict) and family.get("family_name") == "d20_current_baseline_member" and family.get("family_size") == 2
-        if not isinstance(family, dict) or (not member_d20 and (family.get("family_size") != size or not isinstance(family.get("holm_adjusted_p_values"), list) or len(family["holm_adjusted_p_values"]) != size)) or not isinstance(family.get("raw_p_values"), list) or len(family["raw_p_values"]) != (2 if member_d20 else size) or not isinstance(family.get("basic_ci_95"), list) or len(family["basic_ci_95"]) != (2 if member_d20 else size):
-            raise ValueError("separate confirmation statistical family")
-    if packet["d04"].get("family_name") != "d04_ef_300_vs_200" or packet["d20"].get("family_name") not in {"d20_current_baseline", "d20_current_baseline_member"} or packet["d20"].get("baseline_build_id") != by_m[16]["build_id"]:
-        raise ValueError("D-20 must reference this packet m=16 baseline")
-    for family in (packet["d04"], packet["d20"]):
-        for value in [*family["raw_p_values"], *(family.get("holm_adjusted_p_values") or []), *(item for interval in family["basic_ci_95"] for item in interval)]:
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                raise ValueError("non-finite confirmation statistic")
-        comparisons = family.get("comparisons")
-        if not isinstance(comparisons, list) or len(comparisons) != family["family_size"]:
+    if set(by_m) != {16, 20, 32} or by_m[16]["query_ef"] != [100] \
+            or any(by_m[m]["query_ef"] != [300] for m in (20, 32)):
+        raise ValueError("D-25 fixed build/query allocation")
+    family = packet["d25"]
+    family_fields = {
+        "family_name", "family_size", "baseline_build_id", "candidate_build_ids",
+        "raw_p_values", "holm_adjusted_p_values", "basic_ci_95", "comparisons",
+    }
+    if not isinstance(family, dict) or set(family) != family_fields:
+        raise ValueError("missing numeric confirmation family members")
+    if family.get("family_name") != "d25_candidate_vs_production_baseline" \
+            or family.get("family_size") != 4:
+        raise ValueError("D-25 family/build identity")
+    if family.get("baseline_build_id") != by_m[16]["build_id"]:
+        raise ValueError("D-25 family must reference this packet m=16 baseline")
+    if family.get("candidate_build_ids") != {
+        "20": by_m[20]["build_id"], "32": by_m[32]["build_id"],
+    }:
+        raise ValueError("D-25 candidate build identity")
+    for name in ("raw_p_values", "holm_adjusted_p_values", "basic_ci_95", "comparisons"):
+        if not isinstance(family.get(name), list) or len(family[name]) != 4:
             raise ValueError("missing numeric confirmation family members")
-        canonical_keys = set()
-        for comparison in comparisons:
-            rows = comparison.get("paired_rows") if isinstance(comparison, dict) else None
-            if not isinstance(rows, list) or not rows:
-                raise ValueError("missing paired confirmation samples")
-            for row in rows:
-                if not isinstance(row, list) or len(row) != 2 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in row):
-                    raise ValueError("invalid paired confirmation samples")
-        if any(comparison.get("raw_permutation_p") != declared for comparison, declared in zip(comparisons, family["raw_p_values"], strict=True)) or any(comparison.get("basic_ci_95") != declared for comparison, declared in zip(comparisons, family["basic_ci_95"], strict=True)):
+    for value in [
+        *family["raw_p_values"], *family["holm_adjusted_p_values"],
+        *(item for interval in family["basic_ci_95"] for item in interval),
+    ]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("non-finite confirmation statistic")
+    if family["holm_adjusted_p_values"] != holm_adjust(family["raw_p_values"]):
+        raise ValueError("declared confirmation Holm mismatch")
+    canonical_order = [
+        (m, metric) for m in (20, 32) for metric in ("recall_at_10", "recall_at_20")
+    ]
+    seen = []
+    for index, comparison in enumerate(family["comparisons"]):
+        rows = comparison.get("paired_rows") if isinstance(comparison, dict) else None
+        declared = comparison.get("comparison") if isinstance(comparison, dict) else None
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("missing paired confirmation samples")
+        if not isinstance(declared, dict) or set(declared) != {
+            "family", "metric", "baseline_m", "baseline_ef", "candidate_m", "candidate_ef",
+            "baseline_build_id", "candidate_build_id",
+        }:
+            raise ValueError("missing confirmation comparison binding")
+        key = (declared["candidate_m"], declared["metric"])
+        if key != canonical_order[index] or declared["family"] != family["family_name"] \
+                or declared["baseline_m"] != 16 or declared["baseline_ef"] != 100 \
+                or declared["candidate_ef"] != 300 \
+                or declared["baseline_build_id"] != by_m[16]["build_id"] \
+                or declared["candidate_build_id"] != by_m[declared["candidate_m"]]["build_id"]:
+            raise ValueError("noncanonical D-25 paired member")
+        seen.append(key)
+        for row in rows:
+            if not isinstance(row, list) or len(row) != 2 or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) for value in row
+            ):
+                raise ValueError("invalid paired confirmation samples")
+        if comparison.get("raw_permutation_p") != family["raw_p_values"][index] \
+                or comparison.get("holm_adjusted_p") != family["holm_adjusted_p_values"][index] \
+                or comparison.get("basic_ci_95") != family["basic_ci_95"][index]:
             raise ValueError("declared confirmation statistic mismatch")
-        if family.get("holm_adjusted_p_values") is not None and family["holm_adjusted_p_values"] != holm_adjust(family["raw_p_values"]):
-            raise ValueError("declared confirmation Holm mismatch")
-        for comparison in comparisons:
-            declared = comparison.get("comparison")
-            if not isinstance(declared, dict):
-                raise ValueError("missing confirmation comparison binding")
-            if family["family_name"] == "d04_ef_300_vs_200":
-                key = (declared.get("m"), declared.get("metric"), declared.get("baseline_ef"), declared.get("candidate_ef"))
-                if key not in {(m, metric, 200, 300) for m in (16, 20, 32) for metric in ("recall_at_10", "recall_at_20")}:
-                    raise ValueError("noncanonical D-04 member")
-            else:
-                key = (declared.get("candidate_m"), declared.get("metric"), declared.get("baseline_ef"), declared.get("candidate_ef"))
-                if key not in {(workflow_inputs["slot"]["m"], metric, 100, 300) for metric in ("recall_at_10", "recall_at_20")} or declared.get("baseline_build_id") != by_m[16]["build_id"] or declared.get("candidate_build_id") != by_m[workflow_inputs["slot"]["m"]]["build_id"]:
-                    raise ValueError("D-20 comparison cross-build identity")
-            if key in canonical_keys:
-                raise ValueError("duplicate canonical confirmation member")
-            canonical_keys.add(key)
-            expected_effect = paired_basic_effect(comparison["paired_rows"], comparison=declared)
-            expected_p = paired_permutation_p(comparison["paired_rows"], comparison=declared)
-            if comparison.get("mean_effect") != expected_effect["mean_effect"] or comparison.get("basic_ci_95") != expected_effect["basic_ci_95"] or comparison.get("raw_permutation_p") != expected_p:
-                raise ValueError("recomputed confirmation statistic mismatch")
+        expected_effect = paired_basic_effect(rows, comparison=declared)
+        expected_p = paired_permutation_p(rows, comparison=declared)
+        if comparison.get("mean_effect") != expected_effect["mean_effect"] \
+                or comparison.get("basic_ci_95") != expected_effect["basic_ci_95"] \
+                or comparison.get("raw_permutation_p") != expected_p:
+            raise ValueError("recomputed confirmation statistic mismatch")
+    if seen != canonical_order:
+        raise ValueError("duplicate canonical confirmation member")
     if extended <= set(packet):
         validate_confirmation_execution(packet["locked_execution"])
         measurements = packet["measurements"]
@@ -213,20 +241,61 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
              "query_ef": [group.get("query_ef") for group in build.get("queries", [])]}
             for build in raw_builds
         ] if isinstance(raw_builds, list) else None
-        if not isinstance(measurements, dict) or set(measurements) != {"builds", "d04_statistics", "d20_member_statistics"} \
+        expected_statistics = {
+            "schema_version": 1, "family_name": family["family_name"],
+            "family_size": 4, "comparisons": family["comparisons"], "authorization": "none",
+        }
+        expected_statistics["record_self_sha256"] = campaign_digest(expected_statistics)
+        if not isinstance(measurements, dict) or set(measurements) != {"builds", "paired_statistics"} \
                 or expected_builds != packet["builds"] \
-                or measurements["d04_statistics"] != {"schema_version": 1, "family_name": packet["d04"]["family_name"], "family_size": packet["d04"]["family_size"], "comparisons": packet["d04"]["comparisons"], "authorization": "none", "record_self_sha256": campaign_digest({"schema_version": 1, "family_name": packet["d04"]["family_name"], "family_size": packet["d04"]["family_size"], "comparisons": packet["d04"]["comparisons"], "authorization": "none"})}:
+                or measurements["paired_statistics"] != expected_statistics:
             raise ValueError("confirmation raw measurement binding")
-        d20 = measurements["d20_member_statistics"]
-        if not isinstance(d20, dict) or d20.get("family_name") != packet["d20"]["family_name"] \
-                or d20.get("comparisons") != packet["d20"]["comparisons"] \
-                or d20.get("authorization") != "none":
-            raise ValueError("confirmation D-20 raw measurement binding")
+        raw_by_m = {build.get("build", {}).get("m"): build for build in raw_builds}
+        if set(raw_by_m) != {16, 20, 32}:
+            raise ValueError("confirmation raw build cardinality")
+        for m, raw in raw_by_m.items():
+            card, groups = raw.get("build"), raw.get("queries")
+            expected_ef = 100 if m == 16 else 300
+            if not isinstance(card, dict) or card.get("candidate") != "ivf-hnsw-sq" \
+                    or card.get("ef_construction") != 300 or card.get("unindexed_dense_rows") != 0 \
+                    or card.get("reopen_verified") is not True or not isinstance(groups, list) \
+                    or len(groups) != 1 or groups[0].get("query_ef") != expected_ef:
+                raise ValueError("D-25 raw build/query evidence")
+            watchdog = card.get("watchdog")
+            if not isinstance(watchdog, dict) or watchdog.get("owner") != "parent" \
+                    or watchdog.get("child_exitcode") != 0 \
+                    or not isinstance(watchdog.get("cap_seconds"), (int, float)) \
+                    or isinstance(watchdog.get("cap_seconds"), bool) \
+                    or not 0 < watchdog["cap_seconds"] <= 180:
+                raise ValueError("D-25 per-build watchdog evidence")
+            for name in ("index_build_ms", "index_bytes"):
+                value = card.get(name)
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(value) or value < 0:
+                    raise ValueError("finite D-25 build cost evidence")
+            group = groups[0]
+            p95, samples = group.get("latency_p95_ms"), group.get("queries")
+            if isinstance(p95, bool) or not isinstance(p95, (int, float)) \
+                    or not math.isfinite(p95) or p95 < 0 or not isinstance(samples, list) or not samples:
+                raise ValueError("finite D-25 query cost/samples")
+            if [sample.get("query_index") for sample in samples] != list(range(len(samples))):
+                raise ValueError("ordered D-25 query samples")
+        baseline_samples = raw_by_m[16]["queries"][0]["queries"]
+        for comparison in family["comparisons"]:
+            declared = comparison["comparison"]
+            candidate_samples = raw_by_m[declared["candidate_m"]]["queries"][0]["queries"]
+            metric = declared["metric"]
+            raw_pairs = [
+                [left.get(metric), right.get(metric)]
+                for left, right in zip(baseline_samples, candidate_samples, strict=True)
+            ]
+            if comparison["paired_rows"] != raw_pairs:
+                raise ValueError("paired statistics/raw query mismatch")
     return packet
 
 
 def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
-    """Seal six logical slots while retaining, but excluding, typed infra origins."""
+    """Seal three ordinal runs while retaining, but excluding, one typed infra origin."""
     from eval.phase07_operator_gate import validate_confirmation_plan
     validate_confirmation_plan(plan)
     if not isinstance(packets, list) or not packets:
@@ -234,17 +303,22 @@ def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
     inputs = {record["record_self_sha256"]: record for record in plan["workflow_inputs"]}
     physical = []
     per_slot: dict[str, list[dict]] = {key: [] for key in inputs}
-    seen_runs = set()
+    seen_allocations, seen_run_ids, seen_job_ids, seen_nonces = set(), set(), set(), set()
     for packet in packets:
         key = packet.get("workflow_inputs_sha256") if isinstance(packet, dict) else None
         if key not in inputs:
             raise ValueError("hand-authored or unknown confirmation input")
         validate_confirmation_packet(packet, inputs[key])
         allocation = (packet["run_id"], packet["run_attempt"], packet["job_id"], packet["job_allocation_nonce"])
-        if allocation in seen_runs:
+        if allocation in seen_allocations or packet["run_id"] in seen_run_ids \
+                or packet["job_id"] in seen_job_ids \
+                or packet["job_allocation_nonce"] in seen_nonces:
             raise ValueError("replayed confirmation physical run")
-        seen_runs.add(allocation); per_slot[key].append(packet)
+        seen_allocations.add(allocation); seen_run_ids.add(packet["run_id"])
+        seen_job_ids.add(packet["job_id"]); seen_nonces.add(packet["job_allocation_nonce"])
+        per_slot[key].append(packet)
     eligible = []
+    replacement_edges = 0
     for key, slot_packets in per_slot.items():
         success = [packet for packet in slot_packets if packet["status"] == "numeric-success"]
         rejected = [packet for packet in slot_packets if packet["status"] != "numeric-success"]
@@ -254,29 +328,33 @@ def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
         else:
             if len(rejected) != 1 or rejected[0]["failure_class"] not in PHASE07_INFRA_FAILURES or len(success) != 1 or success[0]["replacement_for_run_id"] != rejected[0]["run_id"]:
                 raise ValueError("non-infrastructure failure has no replacement or invalid retry lineage")
+            replacement_edges += 1
             physical.append({**rejected[0], "eligible": False})
+        if not rejected and success[0]["replacement_for_run_id"] is not None:
+            raise ValueError("replacement success requires its preserved infrastructure origin")
         physical.append({**success[0], "eligible": True})
         eligible.append(success[0])
-    if len(eligible) != 6 or len({record["workflow_inputs_sha256"] for record in eligible}) != 6:
-        raise ValueError("exact six eligible confirmation records")
-    ordinal_families = []
-    for ordinal in (1, 2, 3):
-        pair = [record for record in eligible if record["slot"]["ordinal"] == ordinal]
-        if {record["slot"]["m"] for record in pair} != {20, 32}:
-            raise ValueError("D-20 requires both primary m values per ordinal")
-        members = [comparison for record in pair for comparison in record["d20"].get("comparisons", [])]
-        if members:
-            if len(members) != 4:
-                raise ValueError("D-20 ordinal family must contain four paired members")
-            raw = [member["raw_permutation_p"] for member in members]
-            ordinal_families.append({"ordinal": ordinal, "family_name": "d20_current_baseline", "family_size": 4, "comparisons": members, "raw_p_values": raw, "holm_adjusted_p_values": holm_adjust(raw), "basic_ci_95": [member["basic_ci_95"] for member in members], "baseline_build_ids": [record["d20"]["baseline_build_id"] for record in pair]})
-    ledger = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_plan_sha256": plan["record_self_sha256"], "eligible_evidence_runs": eligible, "all_physical_workflow_runs": physical, "d20_ordinal_families": ordinal_families}
+    if replacement_edges > 1:
+        raise ValueError("only one infrastructure replacement edge is permitted")
+    if len(eligible) != 3 or len({record["workflow_inputs_sha256"] for record in eligible}) != 3:
+        raise ValueError("exact three eligible confirmation ordinal records")
+    eligible.sort(key=lambda record: record["slot"]["ordinal"])
+    build_ids = [build["build_id"] for record in eligible for build in record["builds"]]
+    if len(build_ids) != 9 or len(set(build_ids)) != 9:
+        raise ValueError("three disjoint fresh build-ID sets required")
+    ordinal_families = [
+        {"ordinal": record["slot"]["ordinal"], **record["d25"]}
+        for record in eligible
+    ]
+    if [family["ordinal"] for family in ordinal_families] != [1, 2, 3]:
+        raise ValueError("exact ordinal family order")
+    ledger = {"schema_version": 1, "campaign_stage": "confirmation", "confirmation_plan_sha256": plan["record_self_sha256"], "eligible_evidence_runs": eligible, "all_physical_workflow_runs": physical, "paired_ordinal_families": ordinal_families}
     ledger["record_self_sha256"] = canonical_digest(ledger)
     return ledger
 
 
 def reconcile_confirmation_request(request: dict, source: dict) -> dict:
-    """Consume downloaded packet wrappers and recompute the six-slot cross-run ledger."""
+    """Consume downloaded packet wrappers and recompute the three-ordinal ledger."""
     from eval.phase07_operator_gate import canonical_digest as operator_digest, validate_confirmation_dispatch_bundle
     if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
         raise ValueError("sealed confirmation request")
@@ -292,10 +370,10 @@ def reconcile_confirmation_request(request: dict, source: dict) -> dict:
         if bundle["confirmation_request"] != request:
             raise ValueError("cross-request confirmation replay")
         inputs.append(record); packets.append(wrapper["packet"])
-    if len({record["record_self_sha256"] for record in inputs}) != 6:
-        raise ValueError("exact six unique downloaded confirmation inputs")
+    if len({record["record_self_sha256"] for record in inputs}) != 3:
+        raise ValueError("exact three unique downloaded confirmation inputs")
     unique_inputs = {record["record_self_sha256"]: record for record in inputs}
-    plan = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": sorted(unique_inputs.values(), key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
+    plan = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": sorted(unique_inputs.values(), key=lambda row: row["slot"]["ordinal"]),
             "artifact_reported_nominated_m": request["artifact_reported_nominated_m"], "authoritative_nominated_m": request["authoritative_nominated_m"]}
     plan["record_self_sha256"] = operator_digest(plan)
     return reconcile_confirmation(plan, packets)
@@ -411,14 +489,14 @@ def _read_confirmation_artifact(root: Path, provenance: dict[str, Any], request:
 
 
 def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
-    """Reconcile six downloaded, API-provenanced confirmation artifacts fail-closed."""
+    """Reconcile three ordinal artifacts plus at most one preserved infra origin."""
     from eval.phase07_operator_gate import canonical_digest as operator_digest
 
     if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
         raise ValueError("sealed confirmation request")
     if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "evidence", "record_self_sha256"} \
             or manifest.get("schema_version") != 1 or manifest.get("record_self_sha256") != canonical_digest(manifest) \
-            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) not in {6, 7}:
+            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) not in {3, 4}:
         raise ValueError("strict confirmation provenance manifest cardinality")
     inputs, packets, provenance_by_allocation, seen_archives = [], [], {}, set()
     artifact_ids, job_ids, run_identities = set(), set(), set()
@@ -447,10 +525,10 @@ def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
         artifact_ids.add(artifact_id); job_ids.add(job_id); run_identities.add(run_identity)
         allocation = tuple(packet[name] for name in ("run_id", "run_attempt", "job_id", "job_allocation_nonce"))
         inputs.append(generated); packets.append(packet); provenance_by_allocation[allocation] = metadata
-    if len({item["record_self_sha256"] for item in inputs}) != 6:
+    if len({item["record_self_sha256"] for item in inputs}) != 3:
         raise ValueError("duplicate confirmation input provenance")
     plan = {"schema_version": 1, "confirmation_request": request,
-            "workflow_inputs": sorted(inputs, key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
+            "workflow_inputs": sorted({item["record_self_sha256"]: item for item in inputs}.values(), key=lambda row: row["slot"]["ordinal"]),
             "artifact_reported_nominated_m": request["artifact_reported_nominated_m"],
             "authoritative_nominated_m": request["authoritative_nominated_m"]}
     plan["record_self_sha256"] = operator_digest(plan)
@@ -606,6 +684,7 @@ def emit_confirmation_continuation(
     no_continuation_output: Path,
 ) -> dict[str, Any]:
     """Materialize exactly one D-20..D-22 authority outcome and link it."""
+    raise ValueError("D-25 retires all confirmation continuation authority")
     outputs = {continuation_request_output, continuation_preflight_output, no_continuation_output}
     if len(outputs) != 3 or any(path.exists() or path.is_symlink() for path in outputs):
         raise ValueError("continuation output paths must be distinct and unused")
@@ -1171,15 +1250,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.continuation_preflight_output,
                 args.no_continuation_output,
             )
-            if any(path is None for path in continuation_outputs):
-                raise ValueError("post-download confirmation reconciliation requires all continuation authority output paths")
-            request = _read_json(args.confirmation_request)
-            result = emit_confirmation_continuation(
-                request, result,
-                continuation_request_output=args.continuation_request_output,
-                continuation_preflight_output=args.continuation_preflight_output,
-                no_continuation_output=args.no_continuation_output,
-            )
+            if any(path is not None for path in continuation_outputs):
+                raise ValueError("D-25 rejects retired continuation authority outputs")
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             print("[PASS] post-download confirmation ANN reconciliation", file=sys.stderr)
