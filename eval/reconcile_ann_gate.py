@@ -6,6 +6,8 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
+import statistics
 import sys
 import re
 import stat
@@ -28,7 +30,12 @@ from eval.phase07_ann_campaign import (
     select_stage1_nominees,
     validate_confirmation_execution,
 )
-from eval.ann_frontier_statistics import holm_adjust, paired_basic_effect, paired_permutation_p
+from eval.ann_frontier_statistics import (
+    holm_adjust,
+    paired_basic_effect,
+    paired_permutation_p,
+    select_stage2,
+)
 
 
 PHASE07_PACKET_FIELDS = frozenset({
@@ -458,6 +465,263 @@ def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
     return ledger
 
 
+def _recall_family_confirms(
+    comparisons: list[dict[str, Any]], adjusted_p_values: list[float],
+) -> bool:
+    """Apply the shared direction/CI/Holm/non-regression rule to two recalls."""
+    if len(comparisons) != 2 or len(adjusted_p_values) != 2:
+        raise ValueError("confirmation selector requires both recall metrics")
+    metrics = {
+        comparison.get("comparison", {}).get("metric")
+        for comparison in comparisons if isinstance(comparison, dict)
+    }
+    if metrics != {"recall_at_10", "recall_at_20"}:
+        raise ValueError("confirmation selector recall family")
+    positive = False
+    for comparison, adjusted in zip(comparisons, adjusted_p_values, strict=True):
+        effect, interval = comparison.get("mean_effect"), comparison.get("basic_ci_95")
+        if isinstance(effect, bool) or not isinstance(effect, (int, float)) or not math.isfinite(effect) \
+                or not isinstance(interval, list) or len(interval) != 2 \
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in interval) \
+                or isinstance(adjusted, bool) or not isinstance(adjusted, (int, float)) or not math.isfinite(adjusted):
+            raise ValueError("confirmation selector finite statistics")
+        positive |= effect > 0 and interval[0] > 0 and adjusted <= 0.05
+        if interval[1] < 0:
+            return False
+    return positive
+
+
+def _confirmed_d04_m(ledger: dict[str, Any]) -> list[int]:
+    records = ledger.get("eligible_evidence_runs")
+    if not isinstance(records, list) or len(records) != 6:
+        raise ValueError("confirmation selector requires six eligible records")
+    candidates = sorted({record.get("slot", {}).get("m") for record in records})
+    confirmed: list[int] = []
+    for m in candidates:
+        replicates = [record for record in records if record.get("slot", {}).get("m") == m]
+        if len(replicates) != 3 or {record.get("slot", {}).get("ordinal") for record in replicates} != {1, 2, 3}:
+            raise ValueError("confirmation selector requires three primary replicates per m")
+        passes = []
+        for record in replicates:
+            family = record.get("d04")
+            comparisons = family.get("comparisons") if isinstance(family, dict) else None
+            adjusted = family.get("holm_adjusted_p_values") if isinstance(family, dict) else None
+            if not isinstance(comparisons, list) or not isinstance(adjusted, list) or len(comparisons) != len(adjusted):
+                raise ValueError("confirmation selector D-04 family")
+            selected = [
+                (comparison, p_value)
+                for comparison, p_value in zip(comparisons, adjusted, strict=True)
+                if comparison.get("comparison", {}).get("m") == m
+            ]
+            passes.append(_recall_family_confirms(
+                [item[0] for item in selected], [item[1] for item in selected],
+            ))
+        if all(passes):
+            confirmed.append(m)
+    return confirmed
+
+
+def _confirmed_d20_m(ledger: dict[str, Any]) -> list[int]:
+    families = ledger.get("d20_ordinal_families")
+    records = ledger.get("eligible_evidence_runs")
+    if not isinstance(families, list) or len(families) != 3 or not isinstance(records, list):
+        raise ValueError("confirmation selector D-20 ordinal families")
+    candidates = sorted({record.get("slot", {}).get("m") for record in records})
+    confirmed: list[int] = []
+    for m in candidates:
+        ordinal_passes = []
+        for family in families:
+            comparisons = family.get("comparisons") if isinstance(family, dict) else None
+            adjusted = family.get("holm_adjusted_p_values") if isinstance(family, dict) else None
+            if not isinstance(comparisons, list) or not isinstance(adjusted, list) or len(comparisons) != len(adjusted):
+                raise ValueError("confirmation selector D-20 family")
+            selected = [
+                (comparison, p_value)
+                for comparison, p_value in zip(comparisons, adjusted, strict=True)
+                if comparison.get("comparison", {}).get("candidate_m") == m
+            ]
+            ordinal_passes.append(_recall_family_confirms(
+                [item[0] for item in selected], [item[1] for item in selected],
+            ))
+        if all(ordinal_passes):
+            confirmed.append(m)
+    return confirmed
+
+
+def _confirmation_candidate_measurements(ledger: dict[str, Any], m: int) -> dict[str, float | int]:
+    """Reduce three primary ef=300 records to one deterministic D-21 input."""
+    observations: list[dict[str, float]] = []
+    for record in ledger["eligible_evidence_runs"]:
+        if record.get("slot", {}).get("m") != m:
+            continue
+        result = record.get("validated_measurements")
+        builds = result.get("builds") if isinstance(result, dict) else None
+        if not isinstance(builds, list):
+            raise ValueError("validated confirmation measurements required for continuation")
+        matched = [build for build in builds if build.get("build", {}).get("m") == m]
+        if len(matched) != 1:
+            raise ValueError("one primary build measurement required")
+        card = matched[0]["build"]
+        groups = matched[0].get("queries")
+        query = [group for group in groups if group.get("query_ef") == 300] if isinstance(groups, list) else []
+        if len(query) != 1:
+            raise ValueError("one primary ef=300 measurement required")
+        values = {
+            "recall_at_10": query[0].get("recall_at_10"),
+            "recall_at_20": query[0].get("recall_at_20"),
+            "p95_ms": query[0].get("latency_p95_ms"),
+            "index_bytes": card.get("index_bytes"),
+            "build_time_s": card.get("index_build_ms") / 1000 if isinstance(card.get("index_build_ms"), (int, float)) else None,
+        }
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in values.values()):
+            raise ValueError("finite primary continuation measurements required")
+        observations.append({name: float(value) for name, value in values.items()})
+    if len(observations) != 3:
+        raise ValueError("three primary measurements required for continuation")
+    return {
+        "m": m,
+        **{name: statistics.median(row[name] for row in observations) for name in observations[0]},
+    }
+
+
+def _write_json_atomic(path: Path, record: dict[str, Any]) -> None:
+    if path.exists() or path.is_symlink():
+        raise ValueError(f"refusing to overwrite continuation authority: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def emit_confirmation_continuation(
+    request: dict[str, Any], ledger: dict[str, Any], *,
+    continuation_request_output: Path, continuation_preflight_output: Path,
+    no_continuation_output: Path,
+) -> dict[str, Any]:
+    """Materialize exactly one D-20..D-22 authority outcome and link it."""
+    outputs = {continuation_request_output, continuation_preflight_output, no_continuation_output}
+    if len(outputs) != 3 or any(path.exists() or path.is_symlink() for path in outputs):
+        raise ValueError("continuation output paths must be distinct and unused")
+    evidence_sha256 = ledger.get("record_self_sha256")
+    if not isinstance(evidence_sha256, str) or not _HEX64.fullmatch(evidence_sha256):
+        raise ValueError("sealed confirmation evidence required for continuation")
+    confirmed_d04 = _confirmed_d04_m(ledger)
+    confirmed_d20 = _confirmed_d20_m(ledger)
+    artifacts: dict[str, Any] = {
+        "result": "continuation" if confirmed_d04 or not confirmed_d20 else "no-continuation",
+        "reconciled_evidence_sha256": evidence_sha256,
+        "continuation_request_sha256": None,
+        "continuation_preflight_sha256": None,
+        "no_continuation_sha256": None,
+    }
+    if not confirmed_d04 and confirmed_d20:
+        decision = {
+            "schema_version": 1,
+            "kind": "phase07-no-continuation/v1",
+            "campaign_stage": "confirmation",
+            "confirmation_request_sha256": request["record_self_sha256"],
+            "confirmation_evidence_sha256": evidence_sha256,
+            "result": "no-continuation",
+            "reason": "D-04 blocks Stage 2 and D-20 makes the matched FLAT diagnostic unnecessary",
+            "confirmed_d04_m": confirmed_d04,
+            "confirmed_d20_m": confirmed_d20,
+            "selected_branches": [],
+            "skipped_branches": ["stage2_sq", "flat_diagnostic", "refinement"],
+            "authorization": "none",
+        }
+        decision["record_self_sha256"] = canonical_digest(decision)
+        _write_json_atomic(no_continuation_output, decision)
+        artifacts["no_continuation_sha256"] = decision["record_self_sha256"]
+    else:
+        measurements = [
+            _confirmation_candidate_measurements(ledger, m)
+            for m in (confirmed_d04 or sorted({record["slot"]["m"] for record in ledger["eligible_evidence_runs"]}))
+        ]
+        if confirmed_d04:
+            stage2 = select_stage2(measurements)
+            selected_branch = "stage2_sq"
+            bindings = [
+                {
+                    "mode": "stage2_sq",
+                    "prior_evidence_sha256": evidence_sha256,
+                    "config": {"approved_d04_sha256": evidence_sha256, "m": candidate["m"]},
+                }
+                for candidate in stage2["stage2_candidates"]
+            ]
+            skipped = ["flat_diagnostic"]
+        else:
+            selected = min(
+                measurements,
+                key=lambda item: (
+                    -(float(item["recall_at_10"]) + float(item["recall_at_20"])),
+                    float(item["p95_ms"]), float(item["index_bytes"]),
+                    float(item["build_time_s"]), int(item["m"]),
+                ),
+            )
+            selected_branch = "flat_diagnostic"
+            bindings = [{
+                "mode": "flat_diagnostic",
+                "prior_evidence_sha256": evidence_sha256,
+                "config": {"no_confirmed_sq_sha256": evidence_sha256, "m": selected["m"], "query_ef": 300},
+            }]
+            skipped = ["stage2_sq", "refinement"]
+        continuation = {
+            "schema_version": 1,
+            "kind": "phase07-continuation-request/v1",
+            "campaign_stage": "continuation",
+            "confirmation_request_sha256": request["record_self_sha256"],
+            "confirmation_evidence_sha256": evidence_sha256,
+            "selection": {
+                "selected_branch": selected_branch,
+                "confirmed_d04_m": confirmed_d04,
+                "confirmed_d20_m": confirmed_d20,
+                "continuation_bindings": bindings,
+                "skipped_branches": skipped,
+            },
+            "authorization": "none",
+        }
+        continuation["record_self_sha256"] = canonical_digest(continuation)
+        authority_path = (REPOSITORY_ROOT / request["stage1_ledger_path"]).resolve()
+        if not authority_path.is_relative_to(REPOSITORY_ROOT):
+            raise ValueError("Stage 1 authority path containment")
+        authority = _read_json(authority_path)
+        if authority.get("original_ledger_sha256") != request.get("stage1_ledger_sha256"):
+            raise ValueError("Stage 1 authority/request binding")
+        preflight = {
+            "repository": authority["repository"],
+            "branch": authority["branch"],
+            "worktree_root": str(REPOSITORY_ROOT),
+            "head_sha": request["post_task0_head"],
+            "allowed_dirty_paths": [],
+            "workflow_name": "eval",
+            "campaign_stage": "continuation",
+            "continuation_binding": {
+                "kind": continuation["kind"],
+                "continuation_request_sha256": continuation["record_self_sha256"],
+                "confirmation_evidence_sha256": evidence_sha256,
+            },
+            "require_upstream_head": True,
+            "ledger_path": str(continuation_preflight_output.with_name(
+                continuation_preflight_output.name.replace("-request", "-ledger")
+            ).resolve()),
+        }
+        _write_json_atomic(continuation_request_output, continuation)
+        _write_json_atomic(continuation_preflight_output, preflight)
+        artifacts["continuation_request_sha256"] = continuation["record_self_sha256"]
+        artifacts["continuation_preflight_sha256"] = _canonical_sha256(preflight)
+    linked = dict(ledger)
+    linked["continuation_artifacts"] = artifacts
+    linked["record_self_sha256"] = canonical_digest(linked)
+    return linked
+
+
 def _stage1_reject_secrets(value: Any, location: str = "request") -> None:
     """Allow the explicit no-authority marker, reject every other credential-shaped value."""
     if isinstance(value, dict):
@@ -875,7 +1139,7 @@ def reconcile(
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale-evidence", type=Path)
     parser.add_argument("--model-records", type=Path)
@@ -891,13 +1155,30 @@ def main() -> int:
     parser.add_argument("--confirmation-request", type=Path)
     parser.add_argument("--confirmation-ledger", type=Path)
     parser.add_argument("--confirmation-evidence-manifest", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--continuation-request-output", type=Path)
+    parser.add_argument("--continuation-preflight-output", type=Path)
+    parser.add_argument("--no-continuation-output", type=Path)
+    args = parser.parse_args(argv)
     try:
         if args.confirmation_evidence_manifest is not None:
             if args.confirmation_request is None or args.output is None or args.mode != "confirmation-postdownload":
                 raise ValueError("post-download confirmation reconciliation requires request, manifest, output, and mode")
             result = reconcile_confirmation_postdownload(
                 _read_json(args.confirmation_request), _read_json(args.confirmation_evidence_manifest),
+            )
+            continuation_outputs = (
+                args.continuation_request_output,
+                args.continuation_preflight_output,
+                args.no_continuation_output,
+            )
+            if any(path is None for path in continuation_outputs):
+                raise ValueError("post-download confirmation reconciliation requires all continuation authority output paths")
+            request = _read_json(args.confirmation_request)
+            result = emit_confirmation_continuation(
+                request, result,
+                continuation_request_output=args.continuation_request_output,
+                continuation_preflight_output=args.continuation_preflight_output,
+                no_continuation_output=args.no_continuation_output,
             )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

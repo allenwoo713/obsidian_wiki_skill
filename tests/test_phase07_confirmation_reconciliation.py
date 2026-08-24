@@ -763,12 +763,32 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
     assert "collector-test-token" not in evidence_manifest.read_text(encoding="utf-8")
     assert len(list(provenance_dir.glob("*.json"))) == 6
     reconciled = tmp_path / "reconciled-ledger.json"
+    continuation_request = tmp_path / "continuation-request.json"
+    continuation_preflight = tmp_path / "continuation-preflight-request.json"
+    no_continuation = tmp_path / "no-continuation.json"
     result = subprocess.run([
         sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
         "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
+        "--continuation-request-output", str(continuation_request),
+        "--continuation-preflight-output", str(continuation_preflight),
+        "--no-continuation-output", str(no_continuation),
     ], cwd=root, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     ledger = json.loads(reconciled.read_text())
+    assert continuation_request.is_file() and continuation_preflight.is_file()
+    assert not no_continuation.exists()
+    continuation = json.loads(continuation_request.read_text())
+    preflight = json.loads(continuation_preflight.read_text())
+    assert continuation["selection"]["selected_branch"] == "flat_diagnostic"
+    assert continuation["record_self_sha256"] == reconcile.canonical_digest(continuation)
+    assert len(continuation["selection"]["continuation_bindings"]) == 1
+    assert preflight["continuation_binding"]["continuation_request_sha256"] == continuation["record_self_sha256"]
+    assert preflight["campaign_stage"] == "continuation"
+    assert preflight["head_sha"] == HEAD and preflight["require_upstream_head"] is True
+    assert Path(preflight["worktree_root"]).resolve() == root.resolve()
+    assert ledger["continuation_artifacts"]["continuation_request_sha256"] == continuation["record_self_sha256"]
+    assert ledger["continuation_artifacts"]["continuation_preflight_sha256"] == reconcile._canonical_sha256(preflight)
+    assert ledger["record_self_sha256"] == reconcile.canonical_digest(ledger)
     assert len(ledger["eligible_evidence_runs"]) == 6
     assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
     for record in [*ledger["eligible_evidence_runs"], *ledger["all_physical_workflow_runs"]]:
@@ -795,13 +815,24 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
         first / "allocation.json", first / "confirmation-packet.json",
     )}
 
+    rejection_count = 0
+
     def assert_rejected(mutator) -> None:
+        nonlocal rejection_count
+        rejection_count += 1
+        rejected_continuation = tmp_path / f"rejected-{rejection_count}-continuation.json"
+        rejected_preflight = tmp_path / f"rejected-{rejection_count}-preflight-request.json"
+        rejected_no_continuation = tmp_path / f"rejected-{rejection_count}-no-continuation.json"
         mutator()
         rejected = subprocess.run([
             sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
             "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
+            "--continuation-request-output", str(rejected_continuation),
+            "--continuation-preflight-output", str(rejected_preflight),
+            "--no-continuation-output", str(rejected_no_continuation),
         ], cwd=root, capture_output=True, text=True, check=False)
         assert rejected.returncode == 1
+        assert not any(path.exists() for path in (rejected_continuation, rejected_preflight, rejected_no_continuation))
         for path, content in originals.items():
             path.write_bytes(content)
 
@@ -848,3 +879,48 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
     assert_rejected(lambda: resign_provenance(lambda row: row.update(artifact_id=json.loads(originals[second_provenance_path])["evidence"][0]["artifact_id"])))
     assert_rejected(lambda: resign_provenance(lambda row: row["runner"].update(image="unexpected-runner-image")))
     assert_rejected(lambda: resign_provenance(lambda row: row.pop("runner")))
+
+
+def test_confirmation_postdownload_cli_emits_explicit_no_continuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-04 failure plus D-20 success seals skips instead of inventing a dispatch."""
+    plan = _plan()
+    packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
+    ledger = reconcile.reconcile_confirmation(plan, packets)
+    for family in ledger["d20_ordinal_families"]:
+        for comparison in family["comparisons"]:
+            comparison.update(mean_effect=0.1, basic_ci_95=[0.05, 0.15], raw_permutation_p=0.001)
+        family["raw_p_values"] = [0.001] * 4
+        family["holm_adjusted_p_values"] = holm_adjust(family["raw_p_values"])
+        family["basic_ci_95"] = [[0.05, 0.15]] * 4
+    ledger["record_self_sha256"] = reconcile.canonical_digest(ledger)
+    monkeypatch.setattr(
+        reconcile, "reconcile_confirmation_postdownload",
+        lambda _request, _manifest: json.loads(json.dumps(ledger)),
+    )
+    request = tmp_path / "confirmation-request.json"
+    manifest = tmp_path / "manifest.json"
+    output = tmp_path / "confirmation-ledger.json"
+    continuation = tmp_path / "continuation-request.json"
+    preflight = tmp_path / "continuation-preflight-request.json"
+    no_continuation = tmp_path / "no-continuation.json"
+    request.write_text(json.dumps(plan["confirmation_request"]), encoding="utf-8")
+    manifest.write_text("{}", encoding="utf-8")
+
+    assert reconcile.main([
+        "--confirmation-request", str(request), "--confirmation-evidence-manifest", str(manifest),
+        "--output", str(output), "--mode", "confirmation-postdownload",
+        "--continuation-request-output", str(continuation),
+        "--continuation-preflight-output", str(preflight),
+        "--no-continuation-output", str(no_continuation),
+    ]) == 0
+    assert no_continuation.is_file()
+    assert not continuation.exists() and not preflight.exists()
+    decision = json.loads(no_continuation.read_text())
+    assert decision["result"] == "no-continuation"
+    assert decision["skipped_branches"] == ["stage2_sq", "flat_diagnostic", "refinement"]
+    assert decision["record_self_sha256"] == reconcile.canonical_digest(decision)
+    final_ledger = json.loads(output.read_text())
+    assert final_ledger["continuation_artifacts"]["no_continuation_sha256"] == decision["record_self_sha256"]
+    assert final_ledger["record_self_sha256"] == reconcile.canonical_digest(final_ledger)
