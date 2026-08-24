@@ -1182,7 +1182,19 @@ def load_phase07_personal_wiki_ann_queries(path: Path) -> list[dict]:
     return queries
 
 
+def _configure_cli_text_streams() -> None:
+    """Use UTF-8 for CLI output when the host exposes reconfigurable streams."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+
+
 def main():
+    _configure_cli_text_streams()
     ap = argparse.ArgumentParser()
     ap.add_argument("--wiki", type=Path, default=FIXTURES_WIKI)
     ap.add_argument("--queries", type=Path, default=HERE / "queries.jsonl")

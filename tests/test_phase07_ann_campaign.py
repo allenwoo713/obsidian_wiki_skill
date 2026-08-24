@@ -31,7 +31,7 @@ HEAD = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
 MODEL_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "model-manifest.json").read_bytes()).hexdigest()
 CORPUS_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest()
 REQUIREMENTS_SHA256 = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
-STAGE1_LEDGER = Path("/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json")
+STAGE1_LEDGER = ROOT / "eval" / "phase07-stage1-authority.json"
 
 
 def _digest(kind: str) -> str:

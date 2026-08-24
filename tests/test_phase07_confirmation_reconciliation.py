@@ -16,9 +16,9 @@ from eval import phase07_ann_campaign as campaign
 from eval.ann_frontier_statistics import holm_adjust, paired_basic_effect, paired_permutation_p
 
 
-LEDGER = Path("/Users/ww/Workspace/General/obsidian_wiki_skill/.planning/phases/07-issue-50-improve-dense-ann-recall/operator/07-04-repair2-stage1-ledger.json")
-HEAD = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 ROOT = Path(__file__).resolve().parent.parent
+LEDGER = ROOT / "eval" / "phase07-stage1-authority.json"
+HEAD = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 MODEL_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "model-manifest.json").read_bytes()).hexdigest()
 CORPUS_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest()
 REQUIREMENTS_SHA256 = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
@@ -61,6 +61,44 @@ def _resign_downloaded_confirmation_tree(root: Path) -> None:
 
 def _plan() -> dict:
     return operator.build_confirmation_plan(LEDGER, post_task0_head=HEAD)
+
+
+def test_compact_stage1_authority_is_portable_sealed_and_bound_to_original_ledger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    authority = json.loads(LEDGER.read_text(encoding="utf-8"))
+    assert not LEDGER.is_absolute() or LEDGER.is_relative_to(ROOT)
+    assert authority["original_ledger_sha256"] == operator.STAGE1_LEDGER_DIGEST
+    assert authority["authoritative_nominated_m"] == [32, 20]
+    operator.build_confirmation_plan(LEDGER, post_task0_head=HEAD)
+
+    authority["artifact"]["artifact_id"] += 1
+    tampered = tmp_path / "authority.json"
+    tampered.write_text(json.dumps(authority), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical Stage 1 authority"):
+        operator.build_confirmation_plan(tampered, post_task0_head=HEAD)
+
+    for mutate in (
+        lambda record: record["run"].update(run_id=record["run"]["run_id"] + 1),
+        lambda record: record.update(authoritative_nominated_m=[20, 32]),
+    ):
+        resealed = json.loads(LEDGER.read_text(encoding="utf-8"))
+        mutate(resealed)
+        resealed["record_self_sha256"] = operator.canonical_digest(resealed)
+        path = tmp_path / f"resealed-{len(list(tmp_path.iterdir()))}.json"
+        path.write_text(json.dumps(resealed), encoding="utf-8")
+        monkeypatch.setattr(operator, "CANONICAL_STAGE1_AUTHORITY_PATH", path)
+        with pytest.raises(ValueError, match="immutable Stage 1 authority"):
+            operator.build_confirmation_plan(path, post_task0_head=HEAD)
+        monkeypatch.setattr(operator, "CANONICAL_STAGE1_AUTHORITY_PATH", LEDGER)
+
+    external = tmp_path / "phase07-stage1-authority.json"
+    external.write_bytes(LEDGER.read_bytes())
+    with pytest.raises(ValueError, match="canonical Stage 1 authority"):
+        operator.build_confirmation_plan(external, post_task0_head=HEAD)
+
+    plan = operator.build_confirmation_plan(LEDGER, post_task0_head=HEAD)
+    assert plan["confirmation_request"]["stage1_ledger_path"] == "eval/phase07-stage1-authority.json"
 
 
 def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replacement_for: int | None = None) -> dict:

@@ -143,6 +143,25 @@ def test_run_eval_help_remains_utf8_under_windows_legacy_console_encoding(
     assert "构建临时目录" in stdout
 
 
+def test_import_run_eval_under_forced_cp1252_does_not_reconfigure_streams() -> None:
+    script = """
+import sys
+before = (sys.stdout, sys.stderr, sys.stdout.encoding, sys.stderr.encoding, sys.stdout.errors, sys.stderr.errors)
+import eval.run_eval
+after = (sys.stdout, sys.stderr, sys.stdout.encoding, sys.stderr.encoding, sys.stdout.errors, sys.stderr.errors)
+assert after == before, (before, after)
+print('IMPORT_STREAMS_UNCHANGED')
+"""
+    env = _isolated_eval_cli_env()
+    env["PYTHONIOENCODING"] = "cp1252:strict"
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=SKILL_ROOT, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "IMPORT_STREAMS_UNCHANGED"
+
+
 def _build_mode_contract(document: Path) -> str:
     """Return the user-visible storage-mode contract, refusing partial copies."""
     start = "<!-- build-mode-contract:start -->"
@@ -1078,6 +1097,11 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--error-output .review-tmp/issue41-scale/index-benchmark-error.json" in scale
     assert "if: success()" in scale
     assert "index-benchmark-error.json" in scale
+
+    model_job = workflow.split("model-backed-ann-decision:", 1)[1].split("reconcile-ann-decision:", 1)[0]
+    validation = "python -m eval.benchmark_ann_build --validate-evidence .review-tmp/held-out-evidence/index-benchmark.json"
+    assert validation in model_job
+    assert model_job.index(validation) < model_job.index("python scripts/download_embedding_model.py")
     assert "issue41-index-benchmark-error" in scale
     assert "Upload rejected issue #41 comparator error evidence" in scale
 

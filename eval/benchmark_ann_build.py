@@ -117,7 +117,12 @@ def _finite(value: Any) -> bool:
 
 
 def _valid_approved_static_cap(value: float) -> bool:
-    return 0 < value <= MAX_APPROVED_STATIC_CAP_SECONDS
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) == MAX_APPROVED_STATIC_CAP_SECONDS
+    )
 
 
 def _locked_runtime_identity() -> dict[str, str]:
@@ -167,6 +172,195 @@ def _spawn_worker_schedule() -> dict[str, Any]:
 
 def _candidate_assignment() -> dict[str, str]:
     return {candidate: f"candidate-run::{candidate}" for candidate in CANDIDATES}
+
+
+class _BuildPhaseWatchdog:
+    """Child-side half of the parent's build-only deadline handshake."""
+
+    def __init__(self, connection: Any, candidate: str) -> None:
+        self._connection = connection
+        self._candidate = candidate
+        self._active = False
+
+    def __enter__(self) -> "_BuildPhaseWatchdog":
+        self._connection.send(("build_ready", self._candidate))
+        if self._connection.recv() != ("start_build", self._candidate):
+            raise RuntimeError("invalid parent build-watchdog release")
+        self._active = True
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        if self._active:
+            self._connection.send(("build_finished", self._candidate))
+            self._active = False
+
+
+def _candidate_process_entry(
+    connection: Any, candidate: str, worker: Any, worker_args: tuple[Any, ...]
+) -> None:
+    """Run one complete candidate in a spawn-isolated child and report via Pipe."""
+    try:
+        watchdog = _BuildPhaseWatchdog(connection, candidate)
+        value = worker(*worker_args, _build_watchdog=watchdog)
+        connection.send(("candidate_result", candidate, True, value))
+    except BaseException as exc:  # pragma: no cover - exercised through parent evidence
+        try:
+            connection.send(("candidate_result", candidate, False, {
+                "class": type(exc).__name__, "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
+def _run_spawned_candidates_with_deadline(
+    *, candidates: tuple[str, ...], worker_args_for: Any, deadline_seconds: float,
+    worker: Any,
+) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Parent-bound only each candidate's marked index-build phase."""
+    context = multiprocessing.get_context("spawn")
+    processes: dict[str, Any] = {}
+    connections: dict[str, Any] = {}
+    phases: dict[str, str] = {}
+    deadlines: dict[str, float] = {}
+    results: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+
+    def drain_ready_connections() -> bool:
+        drained = False
+        for expected_candidate, connection in connections.items():
+            if phases[expected_candidate] == "complete":
+                continue
+            while connection.poll():
+                drained = True
+                try:
+                    message = connection.recv()
+                except EOFError:
+                    connection.close()
+                    raise RuntimeError(
+                        "candidate child closed its endpoint before completion: "
+                        f"{expected_candidate} phase={phases[expected_candidate]}"
+                    )
+                kind, candidate, *values = message
+                if candidate != expected_candidate:
+                    raise RuntimeError("candidate child identity mismatch")
+                if kind == "build_ready":
+                    if phases[candidate] != "pre_build":
+                        raise RuntimeError("invalid duplicate build start")
+                    phases[candidate] = "building"
+                    deadlines[candidate] = time.monotonic() + deadline_seconds
+                    connection.send(("start_build", candidate))
+                elif kind == "build_finished":
+                    if phases[candidate] != "building":
+                        raise RuntimeError("build finished outside active watchdog")
+                    phases[candidate] = "post_build"
+                    deadlines.pop(candidate, None)
+                elif kind == "candidate_result":
+                    if phases[candidate] != "post_build":
+                        raise RuntimeError("candidate returned without a completed build phase")
+                    succeeded, value = values
+                    if not succeeded:
+                        raise RuntimeError(
+                            f"candidate child failed: {candidate}: {value['class']}: "
+                            f"{value['message']}\n{value['traceback']}"
+                        )
+                    results[candidate] = value
+                    phases[candidate] = "complete"
+                    connection.close()
+                    break
+                else:
+                    raise RuntimeError(f"unknown candidate child message: {kind}")
+        return drained
+
+    def terminal_processes() -> dict[str, int]:
+        terminal: dict[str, int] = {}
+        for candidate, process in processes.items():
+            if phases[candidate] == "complete":
+                continue
+            exitcode = process.exitcode
+            if exitcode is not None:
+                terminal[candidate] = exitcode
+        return terminal
+
+    try:
+        for candidate in candidates:
+            parent_connection, child_connection = context.Pipe(duplex=True)
+            process = None
+            try:
+                process = context.Process(
+                    target=_candidate_process_entry,
+                    args=(child_connection, candidate, worker, worker_args_for(candidate)),
+                    name=f"phase07-{candidate}",
+                )
+                process.start()
+            except BaseException:
+                if process is not None:
+                    try:
+                        alive = process.is_alive()
+                        if alive:
+                            process.terminate()
+                        if alive or process.exitcode is not None:
+                            process.join()
+                    except BaseException:
+                        # Cleanup must never replace the constructor/start error
+                        # that explains why no candidate evidence was produced.
+                        pass
+                parent_connection.close()
+                raise
+            finally:
+                child_connection.close()
+            processes[candidate] = process
+            connections[candidate] = parent_connection
+            phases[candidate] = "pre_build"
+
+        while len(results) < len(candidates):
+            progressed = drain_ready_connections()
+
+            now = time.monotonic()
+            expired = [
+                candidate for candidate, deadline in deadlines.items()
+                if phases[candidate] == "building" and now >= deadline
+            ]
+            terminal = terminal_processes()
+            if expired or terminal:
+                # A child may publish a synchronous Pipe message after the
+                # preceding negative poll but before its deadline/exit state is
+                # observed.  Drain once at that stable observation boundary so
+                # buffered causal state wins over a stale check-then-act error.
+                progressed = drain_ready_connections() or progressed
+                now = time.monotonic()
+                expired = [
+                    candidate for candidate, deadline in deadlines.items()
+                    if phases[candidate] == "building" and now >= deadline
+                ]
+                terminal = terminal_processes()
+            if expired:
+                raise TimeoutError(
+                    f"per-build watchdog timed out after {deadline_seconds:.3f}s: {expired[0]}"
+                )
+            if terminal:
+                candidate, exitcode = next(iter(terminal.items()))
+                connections[candidate].close()
+                raise RuntimeError(
+                    "candidate child exited before completion: "
+                    f"{candidate} phase={phases[candidate]} exit={exitcode}"
+                )
+            if not progressed:
+                remaining = min(
+                    (deadline - now for deadline in deadlines.values()), default=0.01
+                )
+                time.sleep(max(0.0, min(remaining, 0.01)))
+
+        return [results[candidate] for candidate in candidates]
+    finally:
+        for process in processes.values():
+            if process.is_alive():
+                process.terminate()
+        for process in processes.values():
+            process.join()
+        for connection in connections.values():
+            connection.close()
 
 
 def build_calibration_record(
@@ -348,6 +542,9 @@ def validate_evidence(
     _require(math.isclose(matrix_end - matrix_start, float(wall_seconds), abs_tol=0.01), "matrix timing")
     acceptance = payload.get("acceptance", {})
     _require(isinstance(acceptance, dict), "acceptance")
+    if acceptance.get("mode") == "per_build_static_acceptance":
+        per_build_cap = acceptance.get("per_build_cap_seconds")
+        _require(_valid_approved_static_cap(per_build_cap), "per-build watchdog cap")
     if acceptance.get("mode") == "calibration_non_accepting":
         _require(allow_calibration, "calibration cannot authorize evidence")
     if acceptance.get("mode") == "calibrated_acceptance":
@@ -358,7 +555,9 @@ def validate_evidence(
             and acceptance.get("selected_omp_threads") in {1, 2},
             "calibration binding",
         )
-    if acceptance.get("mode") == "calibration_non_accepting" and allow_calibration:
+    if acceptance.get("mode") == "per_build_static_acceptance":
+        cap = None
+    elif acceptance.get("mode") == "calibration_non_accepting" and allow_calibration:
         cap = None
     else:
         cap = aggregate_cap_seconds if aggregate_cap_seconds is not None else acceptance.get(
@@ -392,6 +591,11 @@ def validate_evidence(
             "candidate_query_wall_ms", "candidate_wall_ms", "total_bytes", "index_delta_bytes",
         ):
             _require(key in run and _finite(run[key]), f"candidate run {key}")
+        if acceptance.get("mode") == "per_build_static_acceptance":
+            _require(
+                float(run["index_build_ms"]) / 1000 <= float(acceptance["per_build_cap_seconds"]),
+                "per-build watchdog cap",
+            )
         _require(
             matrix_start <= run["candidate_start_monotonic"] <= run["table_create_start_monotonic"]
             <= run["table_create_end_monotonic"] <= run["index_build_start_monotonic"]
@@ -449,6 +653,8 @@ def _candidate_worker(
     exact_time_ms: float,
     m: int = 16,
     ef_construction: int = 300,
+    *,
+    _build_watchdog: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build and query one isolated candidate in a bounded worker process.
 
@@ -474,12 +680,20 @@ def _candidate_worker(
             candidate=candidate, query_ef=ef_grid[0] if ef_grid else 100
         ),
     )
-    index_build_start = time.perf_counter()
-    stats = repository.create_vector_index(VectorIndexConfig(
-        index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
-        m=m, ef_construction=ef_construction, dense_chunks_count=rows,
-    ))
-    index_build_end = time.perf_counter()
+    def create_index() -> tuple[Any, float, float]:
+        index_build_start = time.perf_counter()
+        stats = repository.create_vector_index(VectorIndexConfig(
+            index_type=_REPOSITORY_TYPES[candidate], metric="cosine", num_partitions=1,
+            m=m, ef_construction=ef_construction, dense_chunks_count=rows,
+        ))
+        index_build_end = time.perf_counter()
+        return stats, index_build_start, index_build_end
+
+    if _build_watchdog is None:
+        stats, index_build_start, index_build_end = create_index()
+    else:
+        with _build_watchdog:
+            stats, index_build_start, index_build_end = create_index()
     total_bytes = _directory_bytes(lance_dir)
     # A campaign observation is not complete until a fresh repository can open
     # the just-built index.  Keep the reopened handle for every ordinary ANN
@@ -558,64 +772,14 @@ def _candidate_worker(
     }, records
 
 
-def run_reduced_sq_build_watchdog(*, work_dir: Path, rows: int, dimensions: int,
-                                  probes: int, query_ef: tuple[int, ...],
-                                  per_build_cap_seconds: float) -> dict[str, Any]:
-    """Run one SQ build with a build-only parent watchdog and reusable query grid.
-
-    The parent measures only ``create_vector_index``; table creation, exact
-    truth, and every query are deliberately outside the 180-second KPI.
-    """
-    if not 0 < per_build_cap_seconds <= DEFAULT_PER_BUILD_MAX_SECONDS:
-        raise ValueError("per-build watchdog cap")
-    if not query_ef or any(not isinstance(value, int) or value <= 0 for value in query_ef):
-        raise ValueError("query ef grid")
-    work_dir.mkdir(parents=True, exist_ok=True)
-    corpus = _vectors(rows, dimensions, CORPUS_SEED)
-    queries = _vectors(probes, dimensions, QUERY_SEED)
-    if _row_hashes(corpus) & _row_hashes(queries):
-        raise ValueError("exact truth queries overlap corpus")
-    with tempfile.TemporaryDirectory(prefix="phase07-sq-build-", dir=work_dir) as directory:
-        root = Path(directory)
-        chunk_ids = [f"synthetic::{index:016x}" for index in range(rows)]
-        lance_dir = root / "sq"
-        lancedb.connect(str(lance_dir)).create_table("dense_chunks", data=_arrow_table(corpus, chunk_ids))
-        truth = LanceDbIndexRepository(lance_dir).search_dense_exact_batch(
-            queries.tolist(), metric="cosine", limit=20, row_batch_size=8192, query_batch_size=32,
-        )
-        from obsidian_wiki.domain.index_models import CandidateQueryPolicy
-        repository = LanceDbIndexRepository(lance_dir, eval_candidate_policy=CandidateQueryPolicy(
-            candidate="ivf-hnsw-sq", query_ef=query_ef[0],
-        ))
-        build_started = time.monotonic()
-        stats = repository.create_vector_index(VectorIndexConfig(
-            index_type="hnsw_sq", metric="cosine", num_partitions=1,
-            m=16, ef_construction=PHASE07_STAGE1_EF_CONSTRUCTION, dense_chunks_count=rows,
-        ))
-        build_elapsed = time.monotonic() - build_started
-        if build_elapsed > per_build_cap_seconds:
-            raise RuntimeError("reject-evidence: per-build watchdog timed out")
-        reopened = LanceDbIndexRepository(lance_dir, eval_candidate_policy=CandidateQueryPolicy(
-            candidate="ivf-hnsw-sq", query_ef=query_ef[0],
-        ))
-        # Each ef is query-only reuse of the one sealed SQ index; exact truth is
-        # computed once above and is never used as a fallback request.
-        requests = 0
-        for ef in query_ef:
-            for vector in queries:
-                reopened.search_dense_eval(vector.tolist(), metric="cosine", limit=20, ef=ef)
-                requests += 1
-        return {
-            "schema_version": 1, "status": "complete", "lifecycle": "completed",
-            "per_build_cap_seconds": per_build_cap_seconds, "build_elapsed_seconds": build_elapsed,
-            "build_count": 1, "build_id": hashlib.sha256(f"{lance_dir}:{build_started}".encode()).hexdigest(),
-            "index_type": "hnsw_sq", "m": 16, "ef_construction": PHASE07_STAGE1_EF_CONSTRUCTION,
-            "query_ef": list(query_ef), "exact_truth_computed_once": len(truth.result_ids) == probes,
-            "reopen_verified": stats.unindexed_dense_rows == 0, "normal_ann_request_count": requests,
-        }
-
-
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def run(
+    args: argparse.Namespace, *, _watchdog_deadline_seconds: float | None = None,
+    _candidate_worker_override: Any = None,
+    _candidate_worker_extra_args: tuple[Any, ...] = (),
+) -> dict[str, Any]:
+    # Accepted evidence is published only by the final atomic staging replace.
+    # A rejected rerun must never leave an older accepted artifact in its role.
+    Path(args.output).unlink(missing_ok=True)
     if args.rows <= args.max_probes or args.dimensions <= 0 or not 0 < args.max_probes <= BENCHMARK_MAX_PROBES:
         raise ValueError("rows must exceed probes, dimensions must be positive, and probes must be bounded")
     if tuple(args.ef_grid) != DECISION_EF_GRID or tuple(args.candidates) != CANDIDATES:
@@ -645,20 +809,40 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             failure_phase = "candidate_execution"
             # Spawn is explicit: children never inherit the parent process's LanceDB
             # runtime, connection, table handle, or Arrow state.
-            with ProcessPoolExecutor(
-                max_workers=2, mp_context=multiprocessing.get_context("spawn")
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        _candidate_worker, candidate, str(root), args.rows, args.dimensions,
-                        args.max_probes, tuple(args.ef_grid), exact.result_ids, exact_time_ms,
-                    )
-                    for candidate in args.candidates
-                ]
-                for future in futures:
-                    candidate_run, candidate_records = future.result()
+            per_build_cap = getattr(args, "per_build_cap_seconds", None)
+            if per_build_cap is not None:
+                deadline_seconds = (
+                    float(_watchdog_deadline_seconds)
+                    if _watchdog_deadline_seconds is not None else float(per_build_cap)
+                )
+                worker = _candidate_worker_override or _candidate_worker
+                completed = _run_spawned_candidates_with_deadline(
+                    candidates=tuple(args.candidates), deadline_seconds=deadline_seconds,
+                    worker=worker,
+                    worker_args_for=lambda candidate: (
+                        candidate, str(root), args.rows, args.dimensions, args.max_probes,
+                        tuple(args.ef_grid), exact.result_ids, exact_time_ms,
+                        *_candidate_worker_extra_args,
+                    ),
+                )
+                for candidate_run, candidate_records in completed:
                     candidate_runs.append(candidate_run)
                     records.extend(candidate_records)
+            else:
+                with ProcessPoolExecutor(
+                    max_workers=2, mp_context=multiprocessing.get_context("spawn")
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            _candidate_worker, candidate, str(root), args.rows, args.dimensions,
+                            args.max_probes, tuple(args.ef_grid), exact.result_ids, exact_time_ms,
+                        )
+                        for candidate in args.candidates
+                    ]
+                    for future in futures:
+                        candidate_run, candidate_records = future.result()
+                        candidate_runs.append(candidate_run)
+                        records.extend(candidate_records)
             accounting_started = time.perf_counter()
             candidate_runs.sort(key=lambda record: record["candidate"])
             records.sort(key=lambda record: (record["candidate"], record["query_ef"]))
@@ -669,11 +853,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         calibration_mode = bool(getattr(args, "calibration_mode", False))
         has_calibration_reference = bool(getattr(args, "calibration_reference", None))
         acceptance = {
-            "mode": "calibration_non_accepting" if calibration_mode else (
-                "calibrated_acceptance" if has_calibration_reference else "acceptance"
+            "mode": "per_build_static_acceptance" if per_build_cap is not None else (
+                "calibration_non_accepting" if calibration_mode else (
+                    "calibrated_acceptance" if has_calibration_reference else "acceptance"
+                )
             ),
-            "aggregate_cap_seconds": None if calibration_mode else args.max_seconds,
+            "aggregate_cap_seconds": None if calibration_mode or per_build_cap is not None else args.max_seconds,
         }
+        if per_build_cap is not None:
+            acceptance["per_build_cap_seconds"] = per_build_cap
         if not calibration_mode and has_calibration_reference:
             acceptance.update(getattr(args, "calibration_reference"))
         payload: dict[str, Any] = {
@@ -709,7 +897,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append(str(exc))
         if exact_time_ms / 1000 > args.max_exact_seconds:
             failures.append("exact-time cap")
-        if wall_seconds > args.max_seconds:
+        if per_build_cap is None and wall_seconds > args.max_seconds:
             failures.append("wall-time cap")
         if payload["benchmark_payload_bytes"] > args.max_evidence_bytes:
             failures.append("evidence-size cap")
@@ -891,19 +1079,8 @@ def main() -> int:
             args.approved_calibration_rule_version, args.approved_omp_threads,
         )):
             parser.error("per-build watchdog cannot use whole-comparator approval inputs")
-        try:
-            report = run_reduced_sq_build_watchdog(
-                work_dir=args.work_dir, rows=args.rows, dimensions=args.dimensions,
-                probes=args.max_probes, query_ef=args.ef_grid,
-                per_build_cap_seconds=args.per_build_cap_seconds,
-            )
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as exc:
-            print(f"[FAIL] Phase 07 per-build watchdog: {type(exc).__name__}: {exc}", file=sys.stderr)
-            return 1
-        print("[PASS] Phase 07 per-build watchdog", file=sys.stderr)
-        return 0
+        if not _valid_approved_static_cap(args.per_build_cap_seconds):
+            parser.error("--per-build-cap-seconds must equal the approved 180-second cap")
     approval_values = (
         args.approved_static_cap, args.approved_calibration_sha256,
         args.approved_calibration_rule_version, args.approved_omp_threads,
