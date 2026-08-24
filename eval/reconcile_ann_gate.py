@@ -285,9 +285,10 @@ def reconcile_confirmation_request(request: dict, source: dict) -> dict:
         if bundle["confirmation_request"] != request:
             raise ValueError("cross-request confirmation replay")
         inputs.append(record); packets.append(wrapper["packet"])
-    if len(inputs) != 6:
-        raise ValueError("exact six downloaded confirmation inputs")
-    plan = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": sorted(inputs, key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
+    if len({record["record_self_sha256"] for record in inputs}) != 6:
+        raise ValueError("exact six unique downloaded confirmation inputs")
+    unique_inputs = {record["record_self_sha256"]: record for record in inputs}
+    plan = {"schema_version": 1, "confirmation_request": request, "workflow_inputs": sorted(unique_inputs.values(), key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"])),
             "artifact_reported_nominated_m": request["artifact_reported_nominated_m"], "authoritative_nominated_m": request["authoritative_nominated_m"]}
     plan["record_self_sha256"] = operator_digest(plan)
     return reconcile_confirmation(plan, packets)

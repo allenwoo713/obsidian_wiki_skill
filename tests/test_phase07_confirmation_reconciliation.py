@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import hashlib
+import inspect
 import shutil
 import zipfile
 from pathlib import Path
@@ -183,6 +184,31 @@ def test_confirmation_reconciliation_requires_six_eligible_and_preserves_typed_i
     assert ledger["all_physical_workflow_runs"][0]["eligible"] is False
     bad = [_packet(plan["workflow_inputs"][0], run_id=1, failure_class="numeric"), *packets[1:]]
     with pytest.raises(ValueError, match="non-infrastructure"): reconcile.reconcile_confirmation(plan, bad)
+
+
+def test_downloaded_wrapper_reconciliation_preserves_one_infra_origin_and_replacement() -> None:
+    """The production wrapper path must accept seven physical runs for six slots."""
+    plan = _plan()
+    packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
+    origin = _packet(plan["workflow_inputs"][0], run_id=1, failure_class="github_infrastructure")
+    replacement = _packet(plan["workflow_inputs"][0], run_id=7, replacement_for=1)
+    wrappers = [
+        {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}, "packet": origin},
+        {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}, "packet": replacement},
+        *[
+            {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot}, "packet": packet}
+            for slot, packet in zip(plan["workflow_inputs"][1:], packets[1:], strict=True)
+        ],
+    ]
+    ledger = reconcile.reconcile_confirmation_request(plan["confirmation_request"], {"packets": wrappers})
+    assert len(ledger["eligible_evidence_runs"]) == 6
+    assert len(ledger["all_physical_workflow_runs"]) == 7
+    assert sum(record["eligible"] is False for record in ledger["all_physical_workflow_runs"]) == 1
+
+
+def test_production_packet_export_can_encode_generated_replacement_lineage() -> None:
+    signature = inspect.signature(campaign.confirmation_packet_from_result)
+    assert "replacement_for_run_id" in signature.parameters
 
 
 def test_packet_proves_three_fresh_builds_and_distinct_d04_d20_families() -> None:

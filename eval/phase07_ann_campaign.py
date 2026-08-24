@@ -439,7 +439,8 @@ def _write(path: Path, value: dict[str, Any]) -> None:
 
 def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: dict[str, Any],
                                     run_id: int, run_attempt: int, job_id: int, job_key: str,
-                                    job_allocation_nonce: str, raw_tree_sha256: str) -> dict[str, Any]:
+                                    job_allocation_nonce: str, raw_tree_sha256: str,
+                                    replacement_for_run_id: int | None = None) -> dict[str, Any]:
     """Convert production campaign output to the strict, self-sealed packet shape."""
     if result.get("build_count") != 3 or result.get("workflow_inputs_sha256") != workflow_inputs.get("record_self_sha256"):
         raise ValueError("confirmation campaign result binding")
@@ -455,10 +456,15 @@ def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: 
     d04, d20 = result.get("d04_statistics"), result.get("d20_member_statistics")
     if not isinstance(d04, dict) or not isinstance(d20, dict):
         raise ValueError("missing computed confirmation families")
+    if replacement_for_run_id is not None and (
+        not isinstance(replacement_for_run_id, int) or isinstance(replacement_for_run_id, bool)
+        or replacement_for_run_id <= 0 or replacement_for_run_id == run_id
+    ):
+        raise ValueError("invalid confirmation replacement origin")
     packet = {"schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": workflow_inputs["record_self_sha256"],
               "slot": workflow_inputs["slot"], "run_id": run_id, "run_attempt": run_attempt, "job_id": job_id,
               "job_key": job_key, "job_allocation_nonce": job_allocation_nonce, "status": "numeric-success",
-              "failure_class": None, "replacement_for_run_id": None,
+              "failure_class": None, "replacement_for_run_id": replacement_for_run_id,
               "builds": [{"build_id": build["build_id"], "m": build["build"]["m"], "ef_construction": build["build"]["ef_construction"], "query_ef": [group["query_ef"] for group in build["queries"]]} for build in result["builds"]],
               "d04": {"family_name": d04["family_name"], "family_size": d04["family_size"], "comparisons": d04["comparisons"], "raw_p_values": [row["raw_permutation_p"] for row in d04["comparisons"]], "holm_adjusted_p_values": [row["holm_adjusted_p"] for row in d04["comparisons"]], "basic_ci_95": [row["basic_ci_95"] for row in d04["comparisons"]]},
               "d20": {"family_name": d20["family_name"], "family_size": d20["family_size"], "baseline_build_id": result["d20_baseline_build_id"], "comparisons": d20["comparisons"], "raw_p_values": [row["raw_permutation_p"] for row in d20["comparisons"]], "basic_ci_95": [row["basic_ci_95"] for row in d20["comparisons"]]},
@@ -637,7 +643,8 @@ def validate_confirmation_artifact_tree(
 
 
 def export_confirmation_packet(*, campaign_output_dir: Path, dispatch_bundle: Path,
-                               allocation_ledger: Path, artifact_dir: Path) -> None:
+                               allocation_ledger: Path, artifact_dir: Path,
+                               replacement_for_run_id: int | None = None) -> None:
     """Create the sole uploadable confirmation evidence tree from real campaign output."""
     from eval.phase07_operator_gate import validate_confirmation_dispatch_bundle
 
@@ -700,7 +707,7 @@ def export_confirmation_packet(*, campaign_output_dir: Path, dispatch_bundle: Pa
         result=result, workflow_inputs=workflow_inputs,
         run_id=identity["run_id"], run_attempt=identity["run_attempt"], job_id=identity["job_id"],
         job_key=identity["job_key"], job_allocation_nonce=identity["job_allocation_nonce"],
-        raw_tree_sha256=raw_tree_sha256,
+        raw_tree_sha256=raw_tree_sha256, replacement_for_run_id=replacement_for_run_id,
     )
     file_digests = {name: hashlib.sha256((artifact_dir / name).read_bytes()).hexdigest() for name in sorted(_CONFIRMATION_RAW_FILES)}
     wrapper = {"schema_version": 1, "kind": "phase07-confirmation-packet/v1", "packet": packet,
@@ -759,10 +766,12 @@ def main() -> int:
         parser.add_argument("--dispatch-bundle", type=Path, required=True)
         parser.add_argument("--allocation-ledger", type=Path, required=True)
         parser.add_argument("--artifact-dir", type=Path, required=True)
+        parser.add_argument("--replacement-for-run-id", type=int)
         args = parser.parse_args()
         try:
             export_confirmation_packet(campaign_output_dir=args.campaign_output_dir, dispatch_bundle=args.dispatch_bundle,
-                                       allocation_ledger=args.allocation_ledger, artifact_dir=args.artifact_dir)
+                                       allocation_ledger=args.allocation_ledger, artifact_dir=args.artifact_dir,
+                                       replacement_for_run_id=args.replacement_for_run_id)
             return 0
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"[FAIL] confirmation packet export: {exc}", file=os.sys.stderr)
