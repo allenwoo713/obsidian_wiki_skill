@@ -185,18 +185,21 @@ def test_module_campaign_cli_reaches_request_validation_without_running_stress_m
     assert not (tmp_path / "output").exists()
 
 
-def test_representative_request_rejects_noncurrent_baseline_before_artifacts(tmp_path: Path) -> None:
-    for key, value in (("candidate", "ivf-hnsw-flat"), ("m", 20), ("ef_construction", 500), ("query_ef", 300), ("refine_factor", 2)):
-        request = _request("continuation", mode="representative_ann")
-        request["config"]["baseline"][key] = value
-        request["config"]["baseline_sha256"] = canonical_digest(request["config"]["baseline"])
-        with pytest.raises(ValueError):
-            execute(request, tmp_path / key)
-        assert not (tmp_path / key).exists()
-    stale = _request("continuation", mode="representative_ann")
-    stale["config"]["baseline_sha256"] = "0" * 64
-    with pytest.raises(ValueError):
-        validate_request(stale)
+@pytest.mark.parametrize(
+    "mode",
+    ["stage2_sq", "flat_diagnostic", "refinement", "representative_ann", "hybrid_non_regression"],
+)
+def test_d25_rejects_every_retired_continuation_before_artifacts(
+    tmp_path: Path, mode: str,
+) -> None:
+    request = _request("continuation", mode=mode)
+    output = tmp_path / mode
+    with pytest.raises(ValueError, match="D-25|typed Phase 7 request"):
+        validate_request(request)
+    assert not output.exists(), "retired work must fail before build or artifact creation"
+
+
+def test_representative_query_overlap_guard_remains_available_for_later_hybrid_gates() -> None:
     overlapping_digest = hashlib.sha256(b"overlapping-indexed-query-fixture").hexdigest()
     with pytest.raises(ValueError):
         validate_indexed_query_digest_separation(
@@ -266,25 +269,29 @@ def test_stage1_nominee_selection_is_qualified_and_deterministically_ranked(
     assert select_stage1_nominees(builds, statistics) == expected
 
 
-def test_confirmation_and_continuations_are_bounded_and_prerequisite_gated(tmp_path: Path) -> None:
+def test_confirmation_is_one_paired_d25_ordinal_and_only_queries_fixed_efs(tmp_path: Path) -> None:
     runner = _tiny_runner(tmp_path)
     confirmation = execute(_request("confirmation"), tmp_path / "confirm", runner=runner.run)["result"]
     assert confirmation["build_count"] == 3
     assert {build["build"]["m"] for build in confirmation["builds"]} == {16, 20, 32}
-    assert [group["query_ef"] for group in confirmation["builds"][0]["queries"]] == [100, 200, 300]
-    assert confirmation["d04_statistics"]["family_size"] == 6
-    assert confirmation["d20_member_statistics"]["family_size"] == 2
+    assert {
+        build["build"]["m"]: [group["query_ef"] for group in build["queries"]]
+        for build in confirmation["builds"]
+    } == {16: [100], 20: [300], 32: [300]}
+    assert confirmation["paired_statistics"]["family_name"] == "d25_candidate_vs_production_baseline"
+    assert confirmation["paired_statistics"]["family_size"] == 4
+    assert [
+        (row["comparison"]["candidate_m"], row["comparison"]["metric"])
+        for row in confirmation["paired_statistics"]["comparisons"]
+    ] == [
+        (20, "recall_at_10"), (20, "recall_at_20"),
+        (32, "recall_at_10"), (32, "recall_at_20"),
+    ]
     packet = confirmation_packet_from_result(result=confirmation, workflow_inputs=_request("confirmation")["workflow_inputs"],
                                              run_id=1, run_attempt=1, job_id=2, job_key="phase07-confirmation",
                                              job_allocation_nonce="f" * 32, raw_tree_sha256=_digest("evidence"))
-    assert packet["d04"]["family_size"] == 6 and packet["d20"]["family_size"] == 2
-    stage2 = execute(_request("continuation", mode="stage2_sq"), tmp_path / "stage2", runner=runner.run)["result"]
-    assert [group["query_ef"] for group in stage2["stage2"]["queries"]] == [300, 500]
-    refined = execute(_request("continuation", mode="refinement"), tmp_path / "refine", runner=runner.run)["result"]
-    assert refined["build_count"] == 1 and [row["refine_factor"] for row in refined["refinement"]] == [2, 5, 10]
-    missing = _request("continuation", mode="flat_diagnostic"); missing["config"].pop("no_confirmed_sq_sha256")
-    with pytest.raises(ValueError, match="FLAT requires"):
-        validate_request(missing)
+    assert packet["d25"]["family_size"] == 4
+    assert packet["slot"] == {"ordinal": 1}
 
 
 def test_public_hybrid_facade_uses_real_build_service_and_lancedb(tmp_path: Path) -> None:

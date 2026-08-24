@@ -105,23 +105,25 @@ def test_compact_stage1_authority_is_portable_sealed_and_bound_to_original_ledge
 def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replacement_for: int | None = None) -> dict:
     builds = [
         {"build_id": f"{run_id:02x}{m:02x}".ljust(64, "a"), "m": m, "ef_construction": 300,
-         "query_ef": [100, 200, 300] if m == 16 else [200, 300]}
+         "query_ef": [100] if m == 16 else [300]}
         for m in (16, 20, 32)
     ]
-    d04_comparisons = []
-    for m in (16, 20, 32):
+    comparisons = []
+    for m in (20, 32):
         for metric in ("recall_at_10", "recall_at_20"):
-            comparison = {"m": m, "metric": metric, "baseline_ef": 200, "candidate_ef": 300}
+            comparison = {
+                "family": "d25_candidate_vs_production_baseline", "metric": metric,
+                "baseline_m": 16, "baseline_ef": 100, "candidate_m": m, "candidate_ef": 300,
+                "baseline_build_id": builds[0]["build_id"],
+                "candidate_build_id": next(build["build_id"] for build in builds if build["m"] == m),
+            }
             rows = [[0.1, 0.2]]
-            d04_comparisons.append({"comparison": comparison, **paired_basic_effect(rows, comparison=comparison),
-                                    "raw_permutation_p": paired_permutation_p(rows, comparison=comparison), "paired_rows": rows})
-    for comparison, adjusted in zip(d04_comparisons, holm_adjust([row["raw_permutation_p"] for row in d04_comparisons]), strict=True): comparison["holm_adjusted_p"] = adjusted
-    d20_comparisons = []
-    for metric in ("recall_at_10", "recall_at_20"):
-        comparison = {"metric": metric, "baseline_m": 16, "candidate_m": slot["slot"]["m"], "baseline_ef": 100, "candidate_ef": 300, "baseline_build_id": builds[0]["build_id"], "candidate_build_id": next(build["build_id"] for build in builds if build["m"] == slot["slot"]["m"])}
-        rows = [[0.1, 0.2]]
-        d20_comparisons.append({"comparison": comparison, **paired_basic_effect(rows, comparison=comparison),
+            comparisons.append({"comparison": comparison, **paired_basic_effect(rows, comparison=comparison),
                                 "raw_permutation_p": paired_permutation_p(rows, comparison=comparison), "paired_rows": rows})
+    for comparison, adjusted in zip(
+        comparisons, holm_adjust([row["raw_permutation_p"] for row in comparisons]), strict=True,
+    ):
+        comparison["holm_adjusted_p"] = adjusted
     packet = {
         "schema_version": 1, "campaign_stage": "confirmation", "workflow_inputs_sha256": slot["record_self_sha256"],
         "slot": slot["slot"], "run_id": run_id, "run_attempt": 1, "job_id": run_id + 100,
@@ -129,35 +131,36 @@ def _packet(slot: dict, *, run_id: int, failure_class: str | None = None, replac
         "status": "numeric-success" if failure_class is None else "rejected",
         "failure_class": failure_class, "replacement_for_run_id": replacement_for,
         "builds": builds,
-        "d04": {"family_name": "d04_ef_300_vs_200", "family_size": 6,
-                "raw_p_values": [row["raw_permutation_p"] for row in d04_comparisons], "holm_adjusted_p_values": [row["holm_adjusted_p"] for row in d04_comparisons],
-                "basic_ci_95": [row["basic_ci_95"] for row in d04_comparisons], "comparisons": d04_comparisons},
-        "d20": {"family_name": "d20_current_baseline_member", "family_size": 2,
-                "baseline_build_id": builds[0]["build_id"], "raw_p_values": [row["raw_permutation_p"] for row in d20_comparisons],
-                "basic_ci_95": [row["basic_ci_95"] for row in d20_comparisons], "comparisons": d20_comparisons},
+        "d25": {"family_name": "d25_candidate_vs_production_baseline", "family_size": 4,
+                "baseline_build_id": builds[0]["build_id"],
+                "candidate_build_ids": {str(m): next(build["build_id"] for build in builds if build["m"] == m) for m in (20, 32)},
+                "raw_p_values": [row["raw_permutation_p"] for row in comparisons],
+                "holm_adjusted_p_values": [row["holm_adjusted_p"] for row in comparisons],
+                "basic_ci_95": [row["basic_ci_95"] for row in comparisons], "comparisons": comparisons},
         "raw_tree_sha256": PACKET_FIXTURE_TREE_SHA256, "retention_days": 90,
     }
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     return packet
 
 
-def test_confirmation_plan_is_exactly_six_immutable_slots_with_generated_only_inputs() -> None:
+def test_confirmation_plan_is_exactly_three_ordinal_owned_generated_inputs() -> None:
     plan = _plan()
     assert [record["slot"] for record in plan["workflow_inputs"]] == [
-        {"m": 32, "ordinal": 1}, {"m": 32, "ordinal": 2}, {"m": 32, "ordinal": 3},
-        {"m": 20, "ordinal": 1}, {"m": 20, "ordinal": 2}, {"m": 20, "ordinal": 3},
+        {"ordinal": 1}, {"ordinal": 2}, {"ordinal": 3},
     ]
     assert plan["artifact_reported_nominated_m"] == [16, 20]
     assert plan["authoritative_nominated_m"] == [32, 20]
     assert all(record["campaign_stage"] == "confirmation" for record in plan["workflow_inputs"])
     assert all(set(record) == operator.CONFIRMATION_WORKFLOW_INPUT_FIELDS for record in plan["workflow_inputs"])
+    assert all(record["d25_binding"] == operator.d25_confirmation_binding(record["slot"]["ordinal"])
+               for record in plan["workflow_inputs"])
     operator.validate_confirmation_plan(plan)
 
 
 @pytest.mark.parametrize("mutation", [
     lambda plan: plan["workflow_inputs"].pop(),
     lambda plan: plan["workflow_inputs"].append(dict(plan["workflow_inputs"][0])),
-    lambda plan: plan["workflow_inputs"][0].update(slot={"m": 16, "ordinal": 1}),
+    lambda plan: plan["workflow_inputs"][0].update(slot={"ordinal": 4}),
     lambda plan: plan["workflow_inputs"][0].update(record_self_sha256="0" * 64),
     lambda plan: plan.update(authoritative_nominated_m=[16, 20]),
 ])
@@ -168,30 +171,30 @@ def test_confirmation_plan_rejects_missing_extra_hand_authored_replayed_or_stale
         operator.validate_confirmation_plan(plan)
 
 
-def test_confirmation_reconciliation_requires_six_eligible_and_preserves_typed_infra_origin() -> None:
+def test_confirmation_reconciliation_requires_three_ordinals_and_preserves_typed_infra_origin() -> None:
     plan = _plan()
     packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
     ledger = reconcile.reconcile_confirmation(plan, packets)
-    assert len(ledger["eligible_evidence_runs"]) == 6
-    assert len(ledger["all_physical_workflow_runs"]) == 6
-    assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
+    assert len(ledger["eligible_evidence_runs"]) == 3
+    assert len(ledger["all_physical_workflow_runs"]) == 3
+    assert [family["family_size"] for family in ledger["paired_ordinal_families"]] == [4, 4, 4]
     origin = _packet(plan["workflow_inputs"][0], run_id=1, failure_class="github_infrastructure")
-    replacement = _packet(plan["workflow_inputs"][0], run_id=7, replacement_for=1)
+    replacement = _packet(plan["workflow_inputs"][0], run_id=4, replacement_for=1)
     retried = [origin, replacement, *packets[1:]]
     ledger = reconcile.reconcile_confirmation(plan, retried)
-    assert len(ledger["eligible_evidence_runs"]) == 6
-    assert len(ledger["all_physical_workflow_runs"]) == 7
+    assert len(ledger["eligible_evidence_runs"]) == 3
+    assert len(ledger["all_physical_workflow_runs"]) == 4
     assert ledger["all_physical_workflow_runs"][0]["eligible"] is False
     bad = [_packet(plan["workflow_inputs"][0], run_id=1, failure_class="numeric"), *packets[1:]]
     with pytest.raises(ValueError, match="non-infrastructure"): reconcile.reconcile_confirmation(plan, bad)
 
 
 def test_downloaded_wrapper_reconciliation_preserves_one_infra_origin_and_replacement() -> None:
-    """The production wrapper path must accept seven physical runs for six slots."""
+    """The production wrapper path accepts four physical runs for three ordinals."""
     plan = _plan()
     packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
     origin = _packet(plan["workflow_inputs"][0], run_id=1, failure_class="github_infrastructure")
-    replacement = _packet(plan["workflow_inputs"][0], run_id=7, replacement_for=1)
+    replacement = _packet(plan["workflow_inputs"][0], run_id=4, replacement_for=1)
     wrappers = [
         {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}, "packet": origin},
         {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}, "packet": replacement},
@@ -201,8 +204,8 @@ def test_downloaded_wrapper_reconciliation_preserves_one_infra_origin_and_replac
         ],
     ]
     ledger = reconcile.reconcile_confirmation_request(plan["confirmation_request"], {"packets": wrappers})
-    assert len(ledger["eligible_evidence_runs"]) == 6
-    assert len(ledger["all_physical_workflow_runs"]) == 7
+    assert len(ledger["eligible_evidence_runs"]) == 3
+    assert len(ledger["all_physical_workflow_runs"]) == 4
     assert sum(record["eligible"] is False for record in ledger["all_physical_workflow_runs"]) == 1
 
 
@@ -211,7 +214,7 @@ def test_production_packet_export_can_encode_generated_replacement_lineage() -> 
     assert "replacement_for_run_id" in signature.parameters
 
 
-def test_packet_proves_three_fresh_builds_and_distinct_d04_d20_families() -> None:
+def test_packet_proves_three_fresh_builds_and_one_four_member_d25_family() -> None:
     plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
     reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
     packet["builds"].append(dict(packet["builds"][0]))
@@ -221,37 +224,37 @@ def test_packet_proves_three_fresh_builds_and_distinct_d04_d20_families() -> Non
 
 def test_confirmation_packet_rejects_missing_pairs_nonfinite_and_wrong_m16_baseline() -> None:
     plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d20"]["comparisons"][0]["paired_rows"] = []
+    packet["d25"]["comparisons"][0]["paired_rows"] = []
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="paired"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
     packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d20"]["raw_p_values"][0] = float("nan")
+    packet["d25"]["raw_p_values"][0] = float("nan")
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="non-finite"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
     packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d20"]["baseline_build_id"] = "0" * 64
+    packet["d25"]["baseline_build_id"] = "0" * 64
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="m=16"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
 
 
-def test_confirmation_packet_requires_all_six_d04_members_and_declared_values() -> None:
+def test_confirmation_packet_requires_all_four_d25_members_and_declared_values() -> None:
     plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d04"]["comparisons"] = packet["d04"]["comparisons"][:-1]
+    packet["d25"]["comparisons"] = packet["d25"]["comparisons"][:-1]
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="members|cardinality"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
     packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d04"]["raw_p_values"][0] = 0.02
+    packet["d25"]["raw_p_values"][0] = 0.02
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="declared"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
 
 
 def test_numeric_packet_rejects_omitted_or_duplicate_canonical_members() -> None:
     plan = _plan(); packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d04"].pop("comparisons")
+    packet["d25"].pop("comparisons")
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="members"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
     packet = _packet(plan["workflow_inputs"][0], run_id=1)
-    packet["d04"]["comparisons"][1]["comparison"] = dict(packet["d04"]["comparisons"][0]["comparison"])
+    packet["d25"]["comparisons"][1]["comparison"] = dict(packet["d25"]["comparisons"][0]["comparison"])
     packet["record_self_sha256"] = reconcile.canonical_digest(packet)
     with pytest.raises(ValueError, match="canonical"): reconcile.validate_confirmation_packet(packet, plan["workflow_inputs"][0])
 
@@ -498,8 +501,11 @@ def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp
     assert result.returncode == 0, result.stderr
     generated = json.loads(request.read_text())
     bundles = [json.loads(path.read_text()) for path in inputs.glob("*.json")]
-    records = sorted((bundle["workflow_input"] for bundle in bundles), key=lambda row: (-row["slot"]["m"], row["slot"]["ordinal"]))
-    assert len(records) == 6 and generated["post_task0_head"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    records = sorted((bundle["workflow_input"] for bundle in bundles), key=lambda row: row["slot"]["ordinal"])
+    assert len(records) == 3 and generated["post_task0_head"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    assert {path.name for path in inputs.glob("*.json")} == {
+        "confirmation-ordinal1.json", "confirmation-ordinal2.json", "confirmation-ordinal3.json",
+    }
     assert preflight.exists()
     plan = {"schema_version": 1, "confirmation_request": generated, "workflow_inputs": records,
             "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20]}
@@ -508,19 +514,19 @@ def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp
     assert all(operator.validate_confirmation_dispatch_bundle(bundle, expected_head=generated["post_task0_head"]) for bundle in bundles)
 
 
-def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across_six() -> None:
+def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across_three() -> None:
     jobs = [{"id": 41, "name": "Phase 07 independent confirmation campaign", "run_id": 9, "run_attempt": 2}]
     allocations = [operator.allocate_confirmation_job(_FakeActions(jobs), repository="owner/repo", run_id=9,
                                                     run_attempt=2, job_key="phase07-confirmation", token="x")
-                   for _ in range(6)]
-    assert {row["job_allocation_nonce"] for row in allocations}.__len__() == 6
+                   for _ in range(3)]
+    assert {row["job_allocation_nonce"] for row in allocations}.__len__() == 3
 
 
 def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> None:
     plan = _plan()
     bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": dict(plan["workflow_inputs"][0])}
     operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
-    bundle["workflow_input"]["slot"] = {"m": 20, "ordinal": 1}
+    bundle["workflow_input"]["slot"] = {"ordinal": 2}
     bundle["workflow_input"]["record_self_sha256"] = operator.canonical_digest(bundle["workflow_input"])
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
     pristine = {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}
@@ -547,7 +553,7 @@ def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(t
                             cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     sealed = json.loads(ledger.read_text())
-    assert len(sealed["eligible_evidence_runs"]) == 6 and sealed["record_self_sha256"] == reconcile.canonical_digest(sealed)
+    assert len(sealed["eligible_evidence_runs"]) == 3 and sealed["record_self_sha256"] == reconcile.canonical_digest(sealed)
 
 
 def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
@@ -758,39 +764,21 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
         "confirmation-provenance", "--request-file", str(collection_request_path),
         "--ledger-file", str(evidence_manifest), "--provenance-dir", str(provenance_dir),
     ], github_client=github) == 0
-    assert len(github.calls) == 18
+    assert len(github.calls) == 9
     assert all(token == "collector-test-token" for _, token in github.calls)
     assert "collector-test-token" not in evidence_manifest.read_text(encoding="utf-8")
-    assert len(list(provenance_dir.glob("*.json"))) == 6
+    assert len(list(provenance_dir.glob("*.json"))) == 3
     reconciled = tmp_path / "reconciled-ledger.json"
-    continuation_request = tmp_path / "continuation-request.json"
-    continuation_preflight = tmp_path / "continuation-preflight-request.json"
-    no_continuation = tmp_path / "no-continuation.json"
     result = subprocess.run([
         sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
         "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
-        "--continuation-request-output", str(continuation_request),
-        "--continuation-preflight-output", str(continuation_preflight),
-        "--no-continuation-output", str(no_continuation),
     ], cwd=root, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     ledger = json.loads(reconciled.read_text())
-    assert continuation_request.is_file() and continuation_preflight.is_file()
-    assert not no_continuation.exists()
-    continuation = json.loads(continuation_request.read_text())
-    preflight = json.loads(continuation_preflight.read_text())
-    assert continuation["selection"]["selected_branch"] == "flat_diagnostic"
-    assert continuation["record_self_sha256"] == reconcile.canonical_digest(continuation)
-    assert len(continuation["selection"]["continuation_bindings"]) == 1
-    assert preflight["continuation_binding"]["continuation_request_sha256"] == continuation["record_self_sha256"]
-    assert preflight["campaign_stage"] == "continuation"
-    assert preflight["head_sha"] == HEAD and preflight["require_upstream_head"] is True
-    assert Path(preflight["worktree_root"]).resolve() == root.resolve()
-    assert ledger["continuation_artifacts"]["continuation_request_sha256"] == continuation["record_self_sha256"]
-    assert ledger["continuation_artifacts"]["continuation_preflight_sha256"] == reconcile._canonical_sha256(preflight)
     assert ledger["record_self_sha256"] == reconcile.canonical_digest(ledger)
-    assert len(ledger["eligible_evidence_runs"]) == 6
-    assert [family["family_size"] for family in ledger["d20_ordinal_families"]] == [4, 4, 4]
+    assert "continuation_artifacts" not in ledger
+    assert len(ledger["eligible_evidence_runs"]) == 3
+    assert [family["family_size"] for family in ledger["paired_ordinal_families"]] == [4, 4, 4]
     for record in [*ledger["eligible_evidence_runs"], *ledger["all_physical_workflow_runs"]]:
         provenance = record["validated_provenance"]
         assert {
@@ -804,8 +792,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
         assert {build["build"]["m"] for build in measurements["builds"]} == {16, 20, 32}
         assert all({"index_build_ms", "index_bytes", "watchdog"} <= set(build["build"]) for build in measurements["builds"])
         assert all(group["queries"] for build in measurements["builds"] for group in build["queries"])
-        assert measurements["d04_statistics"]["family_name"] == "d04_ef_300_vs_200"
-        assert measurements["d20_member_statistics"]["family_name"] == "d20_current_baseline_member"
+        assert measurements["paired_statistics"]["family_name"] == "d25_candidate_vs_production_baseline"
 
     first = artifact_dirs[0]
     provenance_path = provenance_dir / "confirmation-1-1-provenance.json"
@@ -820,19 +807,12 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
     def assert_rejected(mutator) -> None:
         nonlocal rejection_count
         rejection_count += 1
-        rejected_continuation = tmp_path / f"rejected-{rejection_count}-continuation.json"
-        rejected_preflight = tmp_path / f"rejected-{rejection_count}-preflight-request.json"
-        rejected_no_continuation = tmp_path / f"rejected-{rejection_count}-no-continuation.json"
         mutator()
         rejected = subprocess.run([
             sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
             "--confirmation-evidence-manifest", str(evidence_manifest), "--output", str(reconciled), "--mode", "confirmation-postdownload",
-            "--continuation-request-output", str(rejected_continuation),
-            "--continuation-preflight-output", str(rejected_preflight),
-            "--no-continuation-output", str(rejected_no_continuation),
         ], cwd=root, capture_output=True, text=True, check=False)
         assert rejected.returncode == 1
-        assert not any(path.exists() for path in (rejected_continuation, rejected_preflight, rejected_no_continuation))
         for path, content in originals.items():
             path.write_bytes(content)
 
@@ -881,20 +861,13 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
     assert_rejected(lambda: resign_provenance(lambda row: row.pop("runner")))
 
 
-def test_confirmation_postdownload_cli_emits_explicit_no_continuation(
+def test_confirmation_postdownload_cli_rejects_retired_continuation_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """D-04 failure plus D-20 success seals skips instead of inventing a dispatch."""
+    """D-25 evidence can be sealed, but it can never mint continuation authority."""
     plan = _plan()
     packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
     ledger = reconcile.reconcile_confirmation(plan, packets)
-    for family in ledger["d20_ordinal_families"]:
-        for comparison in family["comparisons"]:
-            comparison.update(mean_effect=0.1, basic_ci_95=[0.05, 0.15], raw_permutation_p=0.001)
-        family["raw_p_values"] = [0.001] * 4
-        family["holm_adjusted_p_values"] = holm_adjust(family["raw_p_values"])
-        family["basic_ci_95"] = [[0.05, 0.15]] * 4
-    ledger["record_self_sha256"] = reconcile.canonical_digest(ledger)
     monkeypatch.setattr(
         reconcile, "reconcile_confirmation_postdownload",
         lambda _request, _manifest: json.loads(json.dumps(ledger)),
@@ -904,7 +877,6 @@ def test_confirmation_postdownload_cli_emits_explicit_no_continuation(
     output = tmp_path / "confirmation-ledger.json"
     continuation = tmp_path / "continuation-request.json"
     preflight = tmp_path / "continuation-preflight-request.json"
-    no_continuation = tmp_path / "no-continuation.json"
     request.write_text(json.dumps(plan["confirmation_request"]), encoding="utf-8")
     manifest.write_text("{}", encoding="utf-8")
 
@@ -913,14 +885,15 @@ def test_confirmation_postdownload_cli_emits_explicit_no_continuation(
         "--output", str(output), "--mode", "confirmation-postdownload",
         "--continuation-request-output", str(continuation),
         "--continuation-preflight-output", str(preflight),
-        "--no-continuation-output", str(no_continuation),
-    ]) == 0
-    assert no_continuation.is_file()
+        "--no-continuation-output", str(tmp_path / "legacy-no-continuation.json"),
+    ]) == 1
+    assert not output.exists()
     assert not continuation.exists() and not preflight.exists()
-    decision = json.loads(no_continuation.read_text())
-    assert decision["result"] == "no-continuation"
-    assert decision["skipped_branches"] == ["stage2_sq", "flat_diagnostic", "refinement"]
-    assert decision["record_self_sha256"] == reconcile.canonical_digest(decision)
+
+    assert reconcile.main([
+        "--confirmation-request", str(request), "--confirmation-evidence-manifest", str(manifest),
+        "--output", str(output), "--mode", "confirmation-postdownload",
+    ]) == 0
     final_ledger = json.loads(output.read_text())
-    assert final_ledger["continuation_artifacts"]["no_continuation_sha256"] == decision["record_self_sha256"]
+    assert "continuation_artifacts" not in final_ledger
     assert final_ledger["record_self_sha256"] == reconcile.canonical_digest(final_ledger)
