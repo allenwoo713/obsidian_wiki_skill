@@ -227,21 +227,30 @@ def _run_spawned_candidates_with_deadline(
     deadlines: dict[str, float] = {}
     results: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
 
+    def endpoint_closed(expected_candidate: str, connection: Any, exc: BaseException) -> None:
+        connection.close()
+        raise RuntimeError(
+            "candidate child closed its endpoint before completion: "
+            f"{expected_candidate} phase={phases[expected_candidate]}"
+        ) from exc
+
     def drain_ready_connections() -> bool:
         drained = False
         for expected_candidate, connection in connections.items():
             if phases[expected_candidate] == "complete":
                 continue
-            while connection.poll():
+            while True:
+                try:
+                    ready = connection.poll()
+                except (EOFError, BrokenPipeError) as exc:
+                    endpoint_closed(expected_candidate, connection, exc)
+                if not ready:
+                    break
                 drained = True
                 try:
                     message = connection.recv()
-                except EOFError:
-                    connection.close()
-                    raise RuntimeError(
-                        "candidate child closed its endpoint before completion: "
-                        f"{expected_candidate} phase={phases[expected_candidate]}"
-                    )
+                except (EOFError, BrokenPipeError) as exc:
+                    endpoint_closed(expected_candidate, connection, exc)
                 kind, candidate, *values = message
                 if candidate != expected_candidate:
                     raise RuntimeError("candidate child identity mismatch")

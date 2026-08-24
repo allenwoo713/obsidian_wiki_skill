@@ -50,6 +50,8 @@ def _eval_cli_help_failures(commands: list[list[str]]) -> list[str]:
             env=_isolated_eval_cli_env(),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
             check=False,
         )
         for command in commands
@@ -110,6 +112,32 @@ def test_legacy_eval_script_entrypoints_provide_help_without_pythonpath() -> Non
     ]
     failures = _eval_cli_help_failures(commands)
     assert not failures, f"{len(failures)} legacy eval CLI help failures: {failures}"
+
+
+@pytest.mark.parametrize(
+    "commands",
+    (
+        [[sys.executable, "-m", "eval.run_eval", "--help"]],
+        [[sys.executable, "eval/run_eval.py", "--help"]],
+    ),
+    ids=("module-help-gate", "legacy-help-gate"),
+)
+def test_eval_cli_help_parent_decodes_strict_utf8(
+    monkeypatch: pytest.MonkeyPatch, commands: list[list[str]],
+) -> None:
+    """The parent capture boundary must not inherit Windows CP1252."""
+    def run(command, **kwargs):
+        if kwargs.get("encoding") != "utf-8" or kwargs.get("errors") != "strict":
+            raise UnicodeDecodeError(
+                "cp1252", b"\x81", 0, 1, "simulated Windows parent decoder failure"
+            )
+        return subprocess.CompletedProcess(
+            command, 0, stdout="usage: 构建临时目录", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert _eval_cli_help_failures(commands) == []
 
 
 @pytest.mark.parametrize(

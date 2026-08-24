@@ -6,6 +6,7 @@ and pass without weakening the existing recall thresholds.
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import inspect
 import json
@@ -801,6 +802,99 @@ def test_buffered_candidate_result_wins_over_stale_exitcode_poll(
     assert completed == [expected_result]
 
 
+def _install_poll_failure_context(
+    monkeypatch: pytest.MonkeyPatch, *, messages: list[tuple], poll_error: OSError,
+) -> str:
+    candidate = benchmark_ann_build.CANDIDATES[0]
+
+    class Connection:
+        def poll(self):
+            if messages:
+                return True
+            raise poll_error
+
+        def recv(self):
+            return messages.pop(0)
+
+        def send(self, message):
+            assert message == ("start_build", candidate)
+
+        def close(self):
+            pass
+
+    class ChildConnection:
+        def close(self):
+            pass
+
+    class Process:
+        exitcode = 0
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def terminate(self):
+            pytest.fail("a cleanly exited child must not be terminated")
+
+        def join(self):
+            pass
+
+    class Context:
+        def Pipe(self, *, duplex):
+            assert duplex is True
+            return Connection(), ChildConnection()
+
+        def Process(self, **_kwargs):
+            return Process()
+
+    monkeypatch.setattr(
+        benchmark_ann_build.multiprocessing, "get_context", lambda _method: Context()
+    )
+    return candidate
+
+
+@pytest.mark.parametrize("exit_phase", ("pre_build", "post_build"))
+def test_closed_pipe_poll_after_clean_child_exit_is_phase_aware(
+    monkeypatch: pytest.MonkeyPatch, exit_phase: str,
+) -> None:
+    """Win32 closed-pipe polling must retain the supervisor phase contract."""
+    candidate = benchmark_ann_build.CANDIDATES[0]
+    messages = [] if exit_phase == "pre_build" else [
+        ("build_ready", candidate),
+        ("build_finished", candidate),
+    ]
+    candidate = _install_poll_failure_context(
+        monkeypatch,
+        messages=messages,
+        poll_error=BrokenPipeError(109, "The pipe has been ended"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"endpoint.*phase={exit_phase}",
+    ):
+        benchmark_ann_build._run_spawned_candidates_with_deadline(
+            candidates=(candidate,), deadline_seconds=1.0,
+            worker=lambda: None, worker_args_for=lambda _candidate: (),
+        )
+
+
+def test_unrelated_poll_oserror_is_not_reclassified_as_endpoint_closure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _install_poll_failure_context(
+        monkeypatch, messages=[], poll_error=PermissionError(13, "permission denied")
+    )
+
+    with pytest.raises(PermissionError, match="permission denied"):
+        benchmark_ann_build._run_spawned_candidates_with_deadline(
+            candidates=(candidate,), deadline_seconds=1.0,
+            worker=lambda: None, worker_args_for=lambda _candidate: (),
+        )
+
+
 def _never_returning_candidate_worker(*args, _build_watchdog=None):
     candidate = args[0]
     pid_path = Path(args[-1]) / f"{candidate}.pid"
@@ -813,12 +907,112 @@ def _never_returning_candidate_worker(*args, _build_watchdog=None):
             time.sleep(1)
 
 
+def _process_is_active(pid: int, *, _windows_api=None) -> bool:
+    """Query process status without assuming POSIX signal-0 semantics."""
+    if sys.platform == "win32":
+        from ctypes import wintypes
+
+        if _windows_api is None:
+            _windows_api = ctypes.WinDLL("kernel32", use_last_error=True)
+            _windows_api.OpenProcess.argtypes = [
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+            ]
+            _windows_api.OpenProcess.restype = wintypes.HANDLE
+            _windows_api.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+            ]
+            _windows_api.GetExitCodeProcess.restype = wintypes.BOOL
+            _windows_api.CloseHandle.argtypes = [wintypes.HANDLE]
+            _windows_api.CloseHandle.restype = wintypes.BOOL
+        handle = _windows_api.OpenProcess(0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:
+                return False
+            raise ctypes.WinError(error)
+        try:
+            exit_code = wintypes.DWORD()
+            if not _windows_api.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return exit_code.value == 259
+        finally:
+            _windows_api.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _clean_exit_candidate_worker(candidate, exit_phase, *, _build_watchdog=None):
     if exit_phase == "pre_build":
         os._exit(0)
     with _build_watchdog:
         pass
     os._exit(0)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_active"), ((0, False), (259, True)),
+    ids=("exited", "still-active"),
+)
+def test_process_liveness_probe_uses_win32_exit_status(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, expected_active: bool,
+) -> None:
+    from ctypes import wintypes
+
+    calls = []
+
+    class Kernel32:
+        def OpenProcess(self, access, inherit_handle, pid):
+            calls.append(("open", access, inherit_handle, pid))
+            return 17
+
+        def GetExitCodeProcess(self, handle, output):
+            calls.append(("status", handle))
+            assert isinstance(output._obj, wintypes.DWORD)
+            output._obj.value = exit_code
+            return 1
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+            return 1
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert _process_is_active(4321, _windows_api=Kernel32()) is expected_active
+    assert calls == [
+        ("open", 0x1000, False, 4321),
+        ("status", 17),
+        ("close", 17),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("last_error", "inactive"), ((87, True), (5, False)),
+    ids=("missing-process", "access-denied"),
+)
+def test_process_liveness_probe_handles_win32_open_failure(
+    monkeypatch: pytest.MonkeyPatch, last_error: int, inactive: bool,
+) -> None:
+    class Kernel32:
+        def OpenProcess(self, _access, _inherit_handle, _pid):
+            return 0
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
+    monkeypatch.setattr(
+        ctypes, "WinError", lambda error: OSError(error, f"winerror {error}"),
+        raising=False,
+    )
+
+    if inactive:
+        assert not _process_is_active(4321, _windows_api=Kernel32())
+    else:
+        with pytest.raises(OSError, match="winerror 5"):
+            _process_is_active(4321, _windows_api=Kernel32())
 
 
 @pytest.mark.parametrize("exit_phase, expected_phase", (("pre_build", "pre_build"), ("post_build", "post_build")))
@@ -919,8 +1113,7 @@ def test_per_build_deadline_terminates_never_returning_spawn_child_and_rejects_o
     assert {path.stem for path in pid_paths} == set(benchmark_ann_build.CANDIDATES)
     for pid_path in pid_paths:
         pid = int(pid_path.read_text(encoding="utf-8"))
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
+        assert not _process_is_active(pid)
     assert not args.output.exists()
     error = json.loads(args.error_output.read_text(encoding="utf-8"))
     assert error["status"] == "reject-evidence"
