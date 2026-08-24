@@ -300,7 +300,8 @@ _CONFIRMATION_RAW_FILES = frozenset({
 })
 _CONFIRMATION_ARTIFACT_FILES = _CONFIRMATION_RAW_FILES | {"confirmation-packet.json"}
 _CONFIRMATION_PROVENANCE_FIELDS = frozenset({
-    "run_id", "run_attempt", "job_id", "artifact_id", "artifact_name", "status", "conclusion",
+    "run_id", "run_attempt", "job_id", "job_key", "job_name", "artifact_id", "artifact_name", "status", "conclusion",
+    "head_branch", "head_sha", "event",
     "runner", "run_created_at", "artifact_expires_at", "api_archive_sha256", "local_archive_sha256",
     "archive", "extracted_dir",
 })
@@ -324,6 +325,12 @@ def _validate_confirmation_provenance(value: Any) -> dict[str, Any]:
             or not isinstance(value["artifact_name"], str) or not value["artifact_name"] \
             or value["status"] != "completed" or value["conclusion"] != "success":
         raise ValueError("confirmation API run/job/artifact status")
+    if value["job_key"] != "phase07-confirmation" \
+            or value["job_name"] != "Phase 07 independent confirmation campaign" \
+            or not isinstance(value["head_branch"], str) or value["head_branch"] in {"", "main", "master"} \
+            or not isinstance(value["head_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["head_sha"]) \
+            or value["event"] != "workflow_dispatch":
+        raise ValueError("confirmation API head/event/job binding")
     if value["artifact_name"] != f"phase07-confirmation-{value['run_id']}-{value['run_attempt']}":
         raise ValueError("confirmation artifact name/run-attempt binding")
     runner = value["runner"]
@@ -404,8 +411,8 @@ def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
         raise ValueError("sealed confirmation request")
     if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "evidence", "record_self_sha256"} \
             or manifest.get("schema_version") != 1 or manifest.get("record_self_sha256") != canonical_digest(manifest) \
-            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) != 6:
-        raise ValueError("strict six-record confirmation provenance manifest")
+            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) not in {6, 7}:
+        raise ValueError("strict confirmation provenance manifest cardinality")
     inputs, packets, provenance_by_allocation, seen_archives = [], [], {}, set()
     artifact_ids, job_ids, run_identities = set(), set(), set()
     for row in manifest["evidence"]:
@@ -418,6 +425,8 @@ def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
                 or not isinstance(provenance_document.get("evidence"), list) or len(provenance_document["evidence"]) != 1:
             raise ValueError("strict per-artifact API provenance document")
         provenance = _validate_confirmation_provenance(provenance_document["evidence"][0])
+        if provenance["head_sha"] != request.get("post_task0_head"):
+            raise ValueError("confirmation API/request head mismatch")
         if provenance["archive"] in seen_archives:
             raise ValueError("replayed confirmation archive")
         seen_archives.add(provenance["archive"])

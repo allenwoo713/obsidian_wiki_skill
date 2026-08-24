@@ -262,6 +262,16 @@ class _FakeActions:
         self.urls.append(url); return {"jobs": self.jobs}
 
 
+class _FakeGitHubAPI:
+    def __init__(self, responses: dict[str, dict]) -> None:
+        self.responses = responses
+        self.calls: list[tuple[str, str]] = []
+
+    def get_json(self, url: str, token: str) -> dict:
+        self.calls.append((url, token))
+        return json.loads(json.dumps(self.responses[url]))
+
+
 def test_confirmation_allocation_seals_inner_workflow_input_digest_from_outer_dispatch_bundle(tmp_path: Path) -> None:
     """The hosted producer accepts the outer bundle but records only its sealed member."""
     plan = _plan()
@@ -302,7 +312,9 @@ def _confirmation_provenance(tmp_path: Path, *, expires_at: str = "2026-11-18T00
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     return {
         "run_id": 1, "run_attempt": 1, "job_id": 2, "artifact_id": 3,
+        "job_key": "phase07-confirmation", "job_name": "Phase 07 independent confirmation campaign",
         "artifact_name": "phase07-confirmation-1-1", "status": "completed", "conclusion": "success",
+        "head_branch": "feature/issue-50-dense-ann-recall", "head_sha": HEAD, "event": "workflow_dispatch",
         "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"],
                    "os": "Linux", "image": "ubuntu", "architecture": "X64"},
         "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": expires_at,
@@ -538,7 +550,9 @@ def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(t
     assert len(sealed["eligible_evidence_runs"]) == 6 and sealed["record_self_sha256"] == reconcile.canonical_digest(sealed)
 
 
-def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp_path: Path) -> None:
+def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The success path is campaign CLI -> exporter -> zip/provenance -> reconciler.
 
     Unlike the legacy unit fixtures above, this deliberately creates no hand-written
@@ -550,6 +564,8 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
     request = tmp_path / "confirmation-request.json"
     request.write_text(json.dumps(plan["confirmation_request"]), encoding="utf-8")
     artifact_dirs: list[Path] = []
+    downloads: list[dict[str, object]] = []
+    api_responses: dict[str, dict] = {}
     for index, slot in enumerate(plan["workflow_inputs"], start=1):
         slot_root = tmp_path / f"slot-{index}"
         bundle = slot_root / "dispatch-bundle.json"
@@ -705,26 +721,47 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         extracted = slot_root / "extracted"
         with zipfile.ZipFile(archive) as zip_file:
             zip_file.extractall(extracted)
-        provenance = {
-            "schema_version": 1, "evidence": [
-                {"run_id": index, "run_attempt": 1, "job_id": 100 + index, "artifact_id": 1000 + index,
-                 "artifact_name": f"phase07-confirmation-{index}-1", "status": "completed", "conclusion": "success",
-                 "runner": {"name": "GitHub Actions test", "group": "GitHub Actions", "labels": ["ubuntu-latest"], "os": "Linux", "image": "ubuntu", "architecture": "X64"},
-                 "run_created_at": "2026-08-20T00:00:00Z", "artifact_expires_at": "2026-11-18T00:00:00Z",
-                 "api_archive_sha256": archive_sha256, "local_archive_sha256": archive_sha256,
-                 "archive": str(archive), "extracted_dir": str(extracted)}
-            ],
-        }
-        provenance["record_self_sha256"] = reconcile.canonical_digest(provenance)
-        provenance_path = slot_root / "provenance.json"
-        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
         artifact_dirs.append(extracted)
-        # Keep a per-slot manifest rather than a packet fixture; the reconciler consumes it below.
-        (slot_root / "evidence.json").write_text(json.dumps({"artifact_dir": str(extracted), "provenance": str(provenance_path)}), encoding="utf-8")
+        downloads.append({"run_id": index, "run_attempt": 1, "archive": str(archive), "extracted_dir": str(extracted)})
+        run_url = f"/repos/owner/repo/actions/runs/{index}"
+        jobs_url = f"{run_url}/attempts/1/jobs"
+        artifacts_url = f"{run_url}/artifacts"
+        api_responses[run_url] = {
+            "id": index, "run_attempt": 1, "head_branch": "feature/issue-50-dense-ann-recall",
+            "head_sha": HEAD, "event": "workflow_dispatch", "status": "completed",
+            "conclusion": "success", "created_at": "2026-08-20T00:00:00Z",
+        }
+        api_responses[jobs_url] = {"jobs": [{
+            "id": 100 + index, "run_id": index, "run_attempt": 1,
+            "name": "Phase 07 independent confirmation campaign", "status": "completed",
+            "conclusion": "success", "runner_name": "GitHub Actions test",
+            "runner_group_name": "GitHub Actions", "labels": ["ubuntu-latest"],
+        }]}
+        api_responses[artifacts_url] = {"artifacts": [{
+            "id": 1000 + index, "name": f"phase07-confirmation-{index}-1",
+            "expired": False, "digest": f"sha256:{archive_sha256}",
+            "created_at": "2026-08-20T00:00:01Z", "expires_at": "2026-11-18T00:00:00Z",
+            "workflow_run": {"id": index, "head_branch": "feature/issue-50-dense-ann-recall", "head_sha": HEAD},
+        }]}
     evidence_manifest = tmp_path / "evidence-manifest.json"
-    manifest_payload = {"schema_version": 1, "evidence": [json.loads((path.parent / "evidence.json").read_text()) for path in artifact_dirs]}
-    manifest_payload["record_self_sha256"] = reconcile.canonical_digest(manifest_payload)
-    evidence_manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    collection_request = {
+        "schema_version": 1, "repository": "owner/repo", "head_sha": HEAD,
+        "downloads": downloads,
+    }
+    collection_request["record_self_sha256"] = operator.canonical_digest(collection_request)
+    collection_request_path = tmp_path / "collection-request.json"
+    collection_request_path.write_text(json.dumps(collection_request), encoding="utf-8")
+    provenance_dir = tmp_path / "provenance"
+    monkeypatch.setenv("GITHUB_TOKEN", "collector-test-token")
+    github = _FakeGitHubAPI(api_responses)
+    assert operator.main([
+        "confirmation-provenance", "--request-file", str(collection_request_path),
+        "--ledger-file", str(evidence_manifest), "--provenance-dir", str(provenance_dir),
+    ], github_client=github) == 0
+    assert len(github.calls) == 18
+    assert all(token == "collector-test-token" for _, token in github.calls)
+    assert "collector-test-token" not in evidence_manifest.read_text(encoding="utf-8")
+    assert len(list(provenance_dir.glob("*.json"))) == 6
     reconciled = tmp_path / "reconciled-ledger.json"
     result = subprocess.run([
         sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
@@ -751,7 +788,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
         assert measurements["d20_member_statistics"]["family_name"] == "d20_current_baseline_member"
 
     first = artifact_dirs[0]
-    provenance_path = first.parent / "provenance.json"
+    provenance_path = provenance_dir / "confirmation-1-1-provenance.json"
     archive_path = first.parent / "archive.zip"
     originals = {path: path.read_bytes() for path in (
         archive_path, provenance_path, first / "confirmation-ledger.json", first / "confirmation-result.json", first / "dispatch-bundle.json",
@@ -798,7 +835,7 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(tmp
 
     assert_rejected(resign_changed_raw_result)
 
-    second_provenance_path = artifact_dirs[1].parent / "provenance.json"
+    second_provenance_path = provenance_dir / "confirmation-2-1-provenance.json"
     originals[second_provenance_path] = second_provenance_path.read_bytes()
 
     def resign_provenance(mutator) -> None:

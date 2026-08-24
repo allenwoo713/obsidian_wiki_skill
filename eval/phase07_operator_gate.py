@@ -54,6 +54,7 @@ CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
     "continuation_binding_sha256", "dispatch_identity", "record_self_sha256",
 })
 JOB_DISPLAY_NAMES = {"phase07-confirmation": "Phase 07 independent confirmation campaign"}
+CONFIRMATION_DOWNLOAD_FIELDS = frozenset({"run_id", "run_attempt", "archive", "extracted_dir"})
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -517,6 +518,134 @@ def reconcile_hosted(binding_file: Path, output: Path) -> int:
         return 1
 
 
+def collect_confirmation_provenance(*, request_file: Path, output: Path,
+                                    provenance_dir: Path, token: str,
+                                    client: Any | None = None) -> int:
+    """Collect API-bound provenance for downloaded confirmation artifacts.
+
+    The request supplies only immutable run/attempt identities and local download
+    paths.  Every status, job, runner label, artifact identity, expiry, and API
+    digest comes from GitHub; locked host details come from the already-sealed
+    production packet and are cross-checked again by the post-download reconciler.
+    """
+    request = _read_object(request_file)
+    _reject_secrets(request)
+    if set(request) != {"schema_version", "repository", "head_sha", "downloads", "record_self_sha256"} \
+            or request.get("schema_version") != 1 \
+            or request.get("record_self_sha256") != canonical_digest(request):
+        raise ValueError("sealed confirmation download collection request")
+    repository, head_sha, downloads = request["repository"], request["head_sha"], request["downloads"]
+    if not isinstance(repository, str) or not repository or not isinstance(head_sha, str) or not SHA.fullmatch(head_sha):
+        raise ValueError("confirmation collection repository/head binding")
+    if not isinstance(downloads, list) or len(downloads) not in {6, 7}:
+        raise ValueError("confirmation collection requires six physical downloads or one preserved replacement")
+    if not token:
+        raise ValueError("GitHub actions read token unavailable")
+    if output.exists() or provenance_dir.is_symlink() or (provenance_dir.exists() and any(provenance_dir.iterdir())):
+        raise ValueError("confirmation provenance output must be new and empty")
+
+    from eval.phase07_ann_campaign import validate_confirmation_artifact_tree
+    from eval.reconcile_ann_gate import _validate_confirmation_provenance
+
+    github = client or GitHubActionsClient()
+    records: list[dict[str, Any]] = []
+    seen_runs: set[tuple[int, int]] = set()
+    seen_paths: set[tuple[Path, Path]] = set()
+    for download in downloads:
+        if not isinstance(download, dict) or set(download) != CONFIRMATION_DOWNLOAD_FIELDS:
+            raise ValueError("strict confirmation download record")
+        run_id, run_attempt = download["run_id"], download["run_attempt"]
+        if not isinstance(run_id, int) or run_id <= 0 or not isinstance(run_attempt, int) or run_attempt <= 0:
+            raise ValueError("confirmation download run identity")
+        archive, extracted = Path(download["archive"]), Path(download["extracted_dir"])
+        identity, paths = (run_id, run_attempt), (archive.resolve(), extracted.resolve())
+        if identity in seen_runs or paths in seen_paths or archive.is_symlink() or not archive.is_file() \
+                or extracted.is_symlink() or not extracted.is_dir():
+            raise ValueError("duplicate or unavailable confirmation download")
+        seen_runs.add(identity); seen_paths.add(paths)
+
+        validated = validate_confirmation_artifact_tree(
+            extracted, expected_head=head_sha, expected_run_id=run_id,
+            expected_run_attempt=run_attempt, expected_job_key="phase07-confirmation",
+        )
+        packet, allocation = validated["packet"], validated["allocation"]["allocation"]
+        run_url = f"/repos/{repository}/actions/runs/{run_id}"
+        jobs_url = f"{run_url}/attempts/{run_attempt}/jobs"
+        artifacts_url = f"{run_url}/artifacts"
+        try:
+            run = github.get_json(run_url, token)
+            jobs_payload = github.get_json(jobs_url, token)
+            artifacts_payload = github.get_json(artifacts_url, token)
+        except Exception as exc:
+            raise ValueError("GitHub confirmation provenance lookup failed") from exc
+
+        if not isinstance(run, dict) or run.get("id") != run_id or run.get("run_attempt") != run_attempt \
+                or run.get("head_sha") != head_sha or not isinstance(run.get("head_branch"), str) \
+                or run["head_branch"] in {"", "main", "master"} or run.get("event") != "workflow_dispatch" \
+                or run.get("status") != "completed" or run.get("conclusion") != "success" \
+                or not isinstance(run.get("created_at"), str):
+            raise ValueError("confirmation workflow-run API binding")
+        jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+        job_name = JOB_DISPLAY_NAMES["phase07-confirmation"]
+        matches = [job for job in jobs if isinstance(job, dict) and job.get("id") == allocation["job_id"]
+                   and job.get("run_id") == run_id and job.get("run_attempt") == run_attempt
+                   and job.get("name") == job_name and job.get("status") == "completed"
+                   and job.get("conclusion") == "success"] if isinstance(jobs, list) else []
+        if len(matches) != 1:
+            raise ValueError("confirmation attempt-job API binding")
+        job = matches[0]
+        if not isinstance(job.get("runner_name"), str) or not job["runner_name"] \
+                or not isinstance(job.get("runner_group_name"), str) or not job["runner_group_name"] \
+                or not isinstance(job.get("labels"), list) or not job["labels"] \
+                or not all(isinstance(label, str) and label for label in job["labels"]):
+            raise ValueError("confirmation runner API binding")
+        artifacts = artifacts_payload.get("artifacts") if isinstance(artifacts_payload, dict) else None
+        artifact_name = f"phase07-confirmation-{run_id}-{run_attempt}"
+        artifact_matches = [artifact for artifact in artifacts if isinstance(artifact, dict)
+                            and artifact.get("name") == artifact_name] if isinstance(artifacts, list) else []
+        if len(artifact_matches) != 1:
+            raise ValueError("confirmation artifact API binding")
+        artifact = artifact_matches[0]
+        workflow_run = artifact.get("workflow_run")
+        api_digest = artifact.get("digest")
+        local_archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if not isinstance(artifact.get("id"), int) or artifact["id"] <= 0 or artifact.get("expired") is not False \
+                or not isinstance(api_digest, str) or api_digest != f"sha256:{local_archive_sha256}" \
+                or not isinstance(artifact.get("expires_at"), str) \
+                or not isinstance(workflow_run, dict) or workflow_run.get("id") != run_id \
+                or workflow_run.get("head_branch") != run["head_branch"] or workflow_run.get("head_sha") != head_sha:
+            raise ValueError("confirmation artifact API identity/digest")
+        host = packet.get("locked_execution", {}).get("host", {})
+        if not isinstance(host, dict) or not all(isinstance(host.get(name), str) and host[name]
+                                                for name in ("os", "image", "architecture")):
+            raise ValueError("confirmation locked host provenance")
+        provenance = {
+            "run_id": run_id, "run_attempt": run_attempt, "job_id": job["id"],
+            "job_key": allocation["job_key"], "job_name": job_name,
+            "artifact_id": artifact["id"], "artifact_name": artifact_name,
+            "status": run["status"], "conclusion": run["conclusion"],
+            "head_branch": run["head_branch"], "head_sha": head_sha, "event": run["event"],
+            "runner": {"name": job["runner_name"], "group": job["runner_group_name"],
+                       "labels": job["labels"], "os": host["os"], "image": host["image"],
+                       "architecture": host["architecture"]},
+            "run_created_at": run["created_at"], "artifact_expires_at": artifact["expires_at"],
+            "api_archive_sha256": local_archive_sha256, "local_archive_sha256": local_archive_sha256,
+            "archive": str(archive.resolve()), "extracted_dir": str(extracted.resolve()),
+        }
+        _validate_confirmation_provenance(provenance)
+        records.append(provenance)
+
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+    evidence = []
+    for provenance in records:
+        document = {"schema_version": 1, "evidence": [provenance]}
+        path = provenance_dir / f"confirmation-{provenance['run_id']}-{provenance['run_attempt']}-provenance.json"
+        _write_ledger(path, document)
+        evidence.append({"artifact_dir": provenance["extracted_dir"], "provenance": str(path.resolve())})
+    _write_ledger(output, {"schema_version": 1, "evidence": evidence})
+    return 0
+
+
 def run_preflight(request_file: Path, ledger_file: Path) -> int:
     request = _read_object(request_file)
     _reject_secrets(request)
@@ -573,9 +702,9 @@ def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_i
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -592,7 +721,8 @@ def main() -> int:
     parser.add_argument("--stage1-ledger", type=Path)
     parser.add_argument("--workflow-inputs-dir", type=Path)
     parser.add_argument("--preflight-request", type=Path)
-    args = parser.parse_args()
+    parser.add_argument("--provenance-dir", type=Path)
+    args = parser.parse_args(argv)
     try:
         if args.command == "hosted-preflight":
             if args.ledger_file is None:
@@ -621,6 +751,14 @@ def main() -> int:
                 raise ValueError("confirmation-plan requires immutable ledger and all generated output paths")
             return run_confirmation_plan(stage1_ledger=args.stage1_ledger, request_file=args.request_file,
                                          workflow_inputs_dir=args.workflow_inputs_dir, preflight_request=args.preflight_request)
+        if args.command == "confirmation-provenance":
+            if None in (args.request_file, args.ledger_file, args.provenance_dir):
+                raise ValueError("confirmation provenance requires request, manifest, and provenance directory")
+            return collect_confirmation_provenance(
+                request_file=args.request_file, output=args.ledger_file,
+                provenance_dir=args.provenance_dir, token=os.environ.get("GITHUB_TOKEN", ""),
+                client=github_client,
+            )
         if args.request_file is None or args.ledger_file is None:
             raise ValueError("operator command requires request and ledger files")
         return {"preflight": run_preflight, "campaign": run_campaign, "decision": run_decision, "pr-gates": run_pr_gates}[args.command](args.request_file, args.ledger_file)
