@@ -340,6 +340,64 @@ def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -
         assert '"actions": "read"' in serialized
 
 
+def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> None:
+    """D-25 removes every continuation surface; confirmation is ordinal-owned."""
+    workflow = yaml.load(
+        (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    dispatch = workflow["on"]["workflow_dispatch"]["inputs"]
+
+    assert set(dispatch) == {"campaign_stage", "workflow_inputs"}
+    assert dispatch["campaign_stage"]["options"] == [
+        "preflight", "screening", "confirmation",
+    ]
+    assert dispatch["workflow_inputs"]["description"] == (
+        "Sealed generated Phase 07 ordinal confirmation input record"
+    )
+
+    selected = {
+        name
+        for name, spec in workflow["jobs"].items()
+        if "inputs.campaign_stage" in spec.get("if", "")
+    }
+    assert selected == {
+        "phase07-entitlement-preflight-ubuntu",
+        "phase07-entitlement-preflight-windows",
+        "phase07-screening",
+        "phase07-confirmation",
+    }
+
+
+def test_phase07_d25_confirmation_workflow_has_no_retired_authority() -> None:
+    """Retired D-25 modes must be unreachable before central allocation validation."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    phase07_dispatch = workflow.split("  phase07-entitlement-preflight-ubuntu:", 1)[1].split(
+        "  phase07-pr-acceptance-gate:", 1
+    )[0].lower()
+
+    for retired in (
+        "continuation",
+        "stage2",
+        "ef=500",
+        "ef_construction=500",
+        "hnsw-flat",
+        "refine_factor",
+        "representative",
+        "1k",
+        "10k",
+    ):
+        assert retired not in phase07_dispatch
+
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split(
+        "  phase07-pr-acceptance-gate:", 1
+    )[0]
+    assert "runs-on: ubuntu-latest" in confirmation
+    assert "permissions: {contents: read, actions: read}" in confirmation
+    assert "confirmation-allocation" in confirmation
+    assert "retention-days: 90" in confirmation
+
+
 def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
     """ASVS L1 boundary checks must reject secrets, replay, and retry laundering."""
     import phase07_operator_gate
