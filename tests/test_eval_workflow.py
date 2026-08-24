@@ -293,15 +293,15 @@ def test_phase07_screening_is_seeded_numeric_only_and_model_jobs_stay_model_back
     ):
         assert forbidden not in screening
 
-    for job, next_job in (
-        ("phase07-confirmation", "phase07-continuation"),
-        ("phase07-continuation", "phase07-representative"),
-        ("phase07-representative", "phase07-reconciliation"),
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split(
+        "  phase07-pr-acceptance-gate:", 1
+    )[0]
+    for required in (
+        "actions/cache@v4",
+        "python scripts/download_embedding_model.py",
+        "Validate immutable cached model tree",
     ):
-        section = workflow.split(f"  {job}:", 1)[1].split(f"  {next_job}:", 1)[0]
-        assert "actions/cache@v4" in section
-        assert "python scripts/download_embedding_model.py" in section
-        assert "Validate immutable cached model tree" in section
+        assert required in confirmation
 
 
 def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -> None:
@@ -315,8 +315,6 @@ def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -
         "preflight": {"phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"},
         "screening": {"phase07-screening"},
         "confirmation": {"phase07-confirmation"},
-        "continuation": {"phase07-continuation"},
-        "representative": {"phase07-representative"},
     }
     for stage, allowed in expected.items():
         selected = {
@@ -359,7 +357,7 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
     selected = {
         name
         for name, spec in workflow["jobs"].items()
-        if "inputs.campaign_stage" in spec.get("if", "")
+        if name.startswith("phase07") and "inputs.campaign_stage" in spec.get("if", "")
     }
     assert selected == {
         "phase07-entitlement-preflight-ubuntu",
@@ -433,7 +431,7 @@ def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
 def test_phase07_workflow_commands_are_real_and_do_not_consume_review_tmp_requests() -> None:
     """Regression gate for the rejected Plan 03 placeholder workflow topology."""
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
-    for job in ("phase07-screening:", "phase07-confirmation:", "phase07-continuation:", "phase07-representative:"):
+    for job in ("phase07-screening:", "phase07-confirmation:"):
         section = workflow.split(job, 1)[1].split("\n  phase07-", 1)[0]
         assert "Construct" in section
         assert (
@@ -537,7 +535,7 @@ def test_hosted_preflight_module_entrypoint_seals_rejection(tmp_path: Path) -> N
 
 def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key() -> None:
     workflow = yaml.load((SKILL_ROOT / ".github/workflows/eval.yml").read_text(), Loader=yaml.BaseLoader)
-    for name in ("phase07-screening", "phase07-confirmation", "phase07-continuation", "phase07-representative"):
+    for name in ("phase07-screening", "phase07-confirmation"):
         assert workflow["jobs"][name]["env"] == {"OMP_NUM_THREADS":"2", "OPENBLAS_NUM_THREADS":"2", "MKL_NUM_THREADS":"2"}
     confirmation = json.dumps(workflow["jobs"]["phase07-confirmation"], sort_keys=True)
     source = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
@@ -547,7 +545,7 @@ def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key()
 
 def test_confirmation_workflow_calls_real_exporter_and_uploads_only_packet_artifact_dir() -> None:
     workflow = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
-    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-pr-acceptance-gate:", 1)[0]
     assert "python -m eval.phase07_ann_campaign export-confirmation-packet" in confirmation
     assert "--artifact-dir .review-tmp/phase07/confirmation-artifact" in confirmation
     assert "finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation" in confirmation
@@ -696,7 +694,7 @@ def test_exact_hf_hydration_succeeds_from_provider_only_snapshot(monkeypatch, tm
 
 def test_confirmation_workflow_hydrates_on_miss_validates_exact_tree_and_preflight_does_not_hydrate() -> None:
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
-    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-pr-acceptance-gate:", 1)[0]
     assert "phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}" in confirmation
     assert "Hydrate exact immutable model only on cache miss" in confirmation
     assert "python scripts/download_embedding_model.py" in confirmation
@@ -1238,7 +1236,7 @@ def test_stage1_screening_request_seals_actual_hosted_runtime_identity() -> None
 def test_confirmation_workflow_locks_runtime_sources_and_host_measurements_before_build() -> None:
     """The confirmation request must record actual immutable execution identity, not labels."""
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
-    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-continuation:", 1)[0]
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-pr-acceptance-gate:", 1)[0]
     for required in (
         "Assert actual locked confirmation runtime and thread settings",
         "expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'}",

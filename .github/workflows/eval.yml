@@ -17,13 +17,9 @@ on:
         required: false
         default: preflight
         type: choice
-        options: [preflight, screening, confirmation, continuation, representative, reconciliation, pr-acceptance, legacy-issue41-calibration]
-      continuation_binding:
-        description: "Immutable prior-run binding; not interpolated into shell"
-        required: false
-        type: string
+        options: [preflight, screening, confirmation]
       workflow_inputs:
-        description: "Sealed generated Phase 07 confirmation workflow input record"
+        description: "Sealed generated Phase 07 ordinal confirmation input record"
         required: false
         type: string
 
@@ -487,7 +483,6 @@ jobs:
       - name: Seal stdlib-only preflight success or rejection without dependency import
         env:
           PHASE07_STAGE: ${{ inputs.campaign_stage }}
-          PHASE07_CONTINUATION: ${{ inputs.continuation_binding }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -495,7 +490,7 @@ jobs:
           RUNNER_OS: ${{ runner.os }}
           RUNNER_ARCH: ${{ runner.arch }}
         run: >
-          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$PHASE07_STAGE" --continuation "$PHASE07_CONTINUATION" --repository "$REPOSITORY" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --head-sha "$HEAD_SHA" --job-key phase07-entitlement-preflight-ubuntu --runner-os "$RUNNER_OS" --runner-architecture "$RUNNER_ARCH"
+          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$PHASE07_STAGE" --repository "$REPOSITORY" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --head-sha "$HEAD_SHA" --job-key phase07-entitlement-preflight-ubuntu --runner-os "$RUNNER_OS" --runner-architecture "$RUNNER_ARCH"
       - name: Upload preflight evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -519,7 +514,6 @@ jobs:
         shell: pwsh
         env:
           PHASE07_STAGE: ${{ inputs.campaign_stage }}
-          PHASE07_CONTINUATION: ${{ inputs.continuation_binding }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -527,7 +521,7 @@ jobs:
           RUNNER_OS: ${{ runner.os }}
           RUNNER_ARCH: ${{ runner.arch }}
         run: >
-          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$env:PHASE07_STAGE" --continuation "$env:PHASE07_CONTINUATION" --repository "$env:REPOSITORY" --run-id "$env:RUN_ID" --run-attempt "$env:RUN_ATTEMPT" --head-sha "$env:HEAD_SHA" --job-key phase07-entitlement-preflight-windows --runner-os "$env:RUNNER_OS" --runner-architecture "$env:RUNNER_ARCH"
+          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$env:PHASE07_STAGE" --repository "$env:REPOSITORY" --run-id "$env:RUN_ID" --run-attempt "$env:RUN_ATTEMPT" --head-sha "$env:HEAD_SHA" --job-key phase07-entitlement-preflight-windows --runner-os "$env:RUNNER_OS" --runner-architecture "$env:RUNNER_ARCH"
       - uses: actions/upload-artifact@v4
         if: ${{ always() }}
         with:
@@ -647,121 +641,6 @@ jobs:
         with:
           name: phase07-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
           path: .review-tmp/phase07/confirmation-artifact
-          if-no-files-found: error
-          retention-days: 90
-
-  phase07-continuation:
-    name: "Phase 07 bounded continuation campaign"
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'continuation' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions: {contents: read, actions: read}
-    env: {OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '2', MKL_NUM_THREADS: '2'}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - id: phase07-model-cache
-        uses: actions/cache@v4
-        with:
-          path: models/paraphrase-multilingual-MiniLM-L12-v2
-          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
-      - name: Install exact numeric dependencies and validate model cache before import
-        run: python -m pip install -r requirements.txt pytest
-      - name: Hydrate exact immutable model only on cache miss
-        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
-        run: python scripts/download_embedding_model.py
-      - name: Validate immutable cached model tree before campaign import
-        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
-      - name: Construct continuation request with immutable prior digest in this job
-        env:
-          RUN_ID: ${{ github.run_id }}
-          HEAD: ${{ github.sha }}
-          BINDING: ${{ inputs.continuation_binding }}
-        run: >
-          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'mode','prior_evidence_sha256','config'}; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'continuation','request_id':'continuation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),**b}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
-      - name: Invoke the real bounded continuation CLI
-        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
-      - name: Seal missing numeric output as a pipeline rejection
-        if: ${{ always() }}
-        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/output --stage continuation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-continuation --job-status "${{ job.status }}"
-      - name: Upload sealed continuation evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: phase07-continuation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07/output
-          if-no-files-found: error
-          retention-days: 90
-
-  phase07-representative:
-    name: "Phase 07 representative-corpus continuation campaign"
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'representative' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions: {contents: read, actions: read}
-    env: {OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '2', MKL_NUM_THREADS: '2'}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.13'}
-      - id: phase07-model-cache
-        uses: actions/cache@v4
-        with:
-          path: models/paraphrase-multilingual-MiniLM-L12-v2
-          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
-      - name: Install exact numeric dependencies and validate model cache before import
-        run: python -m pip install -r requirements.txt pytest
-      - name: Hydrate exact immutable model only on cache miss
-        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
-        run: python scripts/download_embedding_model.py
-      - name: Validate immutable cached model tree before campaign import
-        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
-      - name: Construct representative request with immutable prior digest in this job
-        env:
-          RUN_ID: ${{ github.run_id }}
-          HEAD: ${{ github.sha }}
-          BINDING: ${{ inputs.continuation_binding }}
-        run: >
-          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); b=json.loads(os.environ['BINDING']); assert set(b)=={'mode','prior_evidence_sha256','config'} and b['mode'] in {'representative_ann','hybrid_non_regression'}; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); r={'schema_version':1,'stage':'continuation','request_id':'representative-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD']},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),**b}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
-      - name: Invoke the real representative campaign CLI
-        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
-      - name: Seal missing numeric output as a pipeline rejection
-        if: ${{ always() }}
-        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/output --stage representative --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-representative --job-status "${{ job.status }}"
-      - name: Upload sealed representative success or rejection evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: phase07-representative-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07/output
-          if-no-files-found: error
-          retention-days: 90
-
-  phase07-reconciliation:
-    name: "Phase 07 immutable evidence reconciliation"
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'reconciliation' }}
-    runs-on: ubuntu-latest
-    permissions: {contents: read, actions: read}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.13'}
-      - name: Create strict reconciliation binding from supplied operator packet
-        env:
-          BINDING: ${{ inputs.continuation_binding }}
-        run: python -c "import json,os,pathlib; p=json.loads(os.environ['BINDING']); assert set(p)=={'repository','head_sha','packets'}; d=pathlib.Path('.review-tmp/phase07/reconciliation-input'); d.mkdir(parents=True,exist_ok=True); (d/'binding.json').write_text(json.dumps(p,sort_keys=True))"
-      - name: Reconcile supplied immutable hosted packet set
-        run: python -m eval.phase07_operator_gate reconcile-hosted --request-file .review-tmp/phase07/reconciliation-input/binding.json --ledger-file .review-tmp/phase07/reconciliation-artifacts
-      - name: Emit reconciliation rejection only if output is missing
-        if: ${{ always() }}
-        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/reconciliation-artifacts --stage reconciliation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-reconciliation --job-status "${{ job.status }}"
-      - uses: actions/upload-artifact@v4
-        if: ${{ always() }}
-        with:
-          name: phase07-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07/reconciliation-artifacts
           if-no-files-found: error
           retention-days: 90
 
