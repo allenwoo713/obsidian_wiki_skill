@@ -9,6 +9,7 @@ import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,12 +158,17 @@ def _write_sealed_dense_ledger(tmp_path: Path) -> Path:
     def digest(label: str) -> str:
         return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
+    build_ids = {
+        1: ("078cc8451c21e17dfac726d6a26aa7519375756d1ec71c38ce7ecf8bc5f256dc", "d550c98e3aff255c53d459b0ffe19b00d19d6afa702023e37558777fe9223e73", "bb0b4a1fd23cbdfab4845a4975a0119f4d9963fc65bf1d6afd825d4ba6d2b42a"),
+        2: ("45d772249ce3790b85955ca68cbea16d5a003e8db34177609bb18f3a9536fd02", "42aaee989e396e3b9030bdd099b183a1903b80f8fcd1d0d07c9694828e2f8744", "2674f4dd7caba0744a0cf499fece5d8bf0b2c7841b22cc8b62113e3a976a87c4"),
+        3: ("825c1a3f523e62affe8385443f628aa3d0638db7468f8c6871e76a9038ef44c0", "b6f66e475137e3e58c7554d503b0714586df6a0558b5ab9c22b2118cf28ea4e4", "95194274760a8b9f083c629250e4437d4199efe633241a0ae02bb161300b848f"),
+    }
     records = []
     for ordinal, run_id, job_id, artifact_id in ordinals:
         builds = [
-            {"build_id": digest(f"ordinal-{ordinal}-m-{m}"), "m": m,
+            {"build_id": build_id, "m": m,
              "ef_construction": 300, "query_ef": [ef]}
-            for m, ef in ((16, 100), (20, 300), (32, 300))
+            for build_id, (m, ef) in zip(build_ids[ordinal], ((16, 100), (20, 300), (32, 300)), strict=True)
         ]
         baseline_build_id = builds[0]["build_id"]
         candidate_build_ids = {str(row["m"]): row["build_id"] for row in builds[1:]}
@@ -198,6 +204,7 @@ def _write_sealed_dense_ledger(tmp_path: Path) -> Path:
                 "run_id": run_id, "run_attempt": 1, "job_id": job_id, "artifact_id": artifact_id,
                 "job_key": "phase07-confirmation", "head_sha": DENSE_SOURCE_HEAD,
                 "status": "completed", "conclusion": "success", "retention_days": 90,
+                "artifact_expires_at": "2026-11-23T02:35:30Z",
                 "artifact_name": f"phase07-confirmation-{run_id}-1",
                 "api_archive_sha256": digest(f"archive-{ordinal}"),
             },
@@ -586,6 +593,7 @@ def test_hybrid_gates_are_recomputable_and_numeric_regressions_are_rejected_not_
     paired = {"baseline": baseline, "candidate": baseline}
     verdict = operator.recompute_hybrid_gate_verdicts(
         original_absolute=original, expanded_paired=paired,
+        committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
     )
     assert verdict["candidate_verdict"] == "rejected-candidate"
     assert verdict["authorization"] == "none"
@@ -610,6 +618,7 @@ def test_hybrid_gate_rejection_table_covers_absolute_paired_and_zero_tolerance_c
         verdict = operator.recompute_hybrid_gate_verdicts(
             original_absolute={"baseline": base, "candidate": {**base, **regression} if stratum == "original_absolute" else base},
             expanded_paired={"baseline": base, "candidate": {**base, **regression} if stratum == "paired_30k" else base},
+            committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
         )
         assert verdict["candidate_verdict"] == "rejected-candidate"
         assert verdict["authorization"] == "none"
@@ -630,6 +639,287 @@ def test_real_hybrid_path_writes_graph_artifact_for_each_index_and_emits_two_gat
     assert set(result) >= {"original_absolute_gate", "paired_30k_non_regression_gate"}
     assert result["original_absolute_gate"]["authorization"] == "none"
     assert result["paired_30k_non_regression_gate"]["authorization"] == "none"
+
+
+def _faithful_hybrid_result(*, query: str, page_id: str, context: str, bad_citation: bool = False,
+                            overflow: bool = False, budget_violation: bool = False,
+                            unsupported_graph: bool = False) -> SimpleNamespace:
+    """Small object graph with the fields produced by public ``hybrid_search``."""
+    path = "Wiki/invalid.md" if bad_citation else "Wiki/valid.md"
+    item = SimpleNamespace(
+        page_id=page_id, path=path, scope="section", evidence=[] if unsupported_graph else [SimpleNamespace(chunk_id="e1")],
+        graph_paths=(), inclusion_reason="graph_expansion" if unsupported_graph else "dense_retrieval",
+    )
+    bundle = SimpleNamespace(
+        items=[item], context_text=context if not bad_citation else context,
+        token_count=11 if overflow else 5, effective_budget_tokens=10,
+        budget_contract_violations=lambda: ["over"] if budget_violation else [],
+    )
+    return SimpleNamespace(
+        query=query, candidates=[SimpleNamespace(page_id=page_id)], bundle=bundle,
+        plan=SimpleNamespace(to_json=lambda: {"intent": "lookup"}), graph_validated_count=0,
+    )
+
+
+def test_hybrid_aggregates_real_result_metrics_and_rejects_fact_citation_budget_graph_failures() -> None:
+    """Hybrid gates must consume HybridResult facts, not page aliases or hard-coded zero counters."""
+    import eval.run_eval as run_eval
+
+    specification = [{"query": "needle", "relevant_pages": ["page-1"], "required_facts": ["must appear"]}]
+    baseline = [_faithful_hybrid_result(query="needle", page_id="page-1", context="must appear [来源: Wiki/valid.md]")]
+    candidate = [_faithful_hybrid_result(
+        query="needle", page_id="page-1", context="page hit only", bad_citation=True,
+        overflow=True, budget_violation=True, unsupported_graph=True,
+    )]
+    aggregate = run_eval.aggregate_hybrid_result_metrics(
+        specifications=specification, baseline_results=baseline, candidate_results=candidate,
+    )
+    assert aggregate["candidate"]["page_recall_at_5"] == 1.0
+    assert aggregate["candidate"]["evidence_recall_at_10"] == 0.0
+    assert aggregate["candidate"]["exact_lookup_hit_at_3"] == 1.0
+    assert aggregate["candidate"]["citation_violation_count"] == 1
+    assert aggregate["candidate"]["context_overflow_count"] == 1
+    assert aggregate["candidate"]["budget_violation_count"] == 1
+    assert aggregate["candidate"]["graph_unsupported_count"] == 1
+    verdict = operator.recompute_hybrid_gate_verdicts(
+        original_absolute=aggregate, expanded_paired=aggregate,
+        committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
+    )
+    assert verdict["candidate_verdict"] == "rejected-candidate"
+
+
+def _committed_baselines_sha256() -> str:
+    return hashlib.sha256((ROOT / "eval" / "baselines.json").read_bytes()).hexdigest()
+
+
+def _committed_hybrid_floors() -> dict[str, float | int]:
+    quality = json.loads((ROOT / "eval" / "baselines.json").read_text(encoding="utf-8"))["quality"]
+    return {
+        # ``functional_final_retrieval_ann_overlap_at_10`` is a distinct
+        # hybrid contract, so it must never be silently substituted with ANN
+        # recall.  The committed original-absolute floor is exact lookup.
+        "page_recall_at_5": quality["page_recall_at_5"],
+        "evidence_recall_at_10": quality["evidence_recall_at_10"], "mrr_at_10": quality["mrr_at_10"],
+        "exact_lookup_hit_at_3": quality["exact_lookup_hit_at_3"],
+        "citation_violation_count": 0, "context_overflow_count": 0,
+        "budget_violation_count": 0, "graph_unsupported_count": 0,
+    }
+
+
+def test_hybrid_original_absolute_fails_when_observed_baseline_is_below_committed_floor_or_tampered() -> None:
+    """The original stratum is also an absolute baseline sanity check; paired is relative only."""
+    floors = _committed_hybrid_floors()
+    full = {**_hybrid_gate_metrics(), "page_recall_at_5": floors["page_recall_at_5"],
+            "evidence_recall_at_10": floors["evidence_recall_at_10"], "mrr_at_10": floors["mrr_at_10"],
+            "exact_lookup_hit_at_3": floors["exact_lookup_hit_at_3"]}
+    weak = {**full, "page_recall_at_5": floors["page_recall_at_5"] - 0.03,
+            "exact_lookup_hit_at_3": floors["exact_lookup_hit_at_3"] - 0.03}
+    verdict = operator.recompute_hybrid_gate_verdicts(
+        original_absolute={"baseline": weak, "candidate": weak},
+        expanded_paired={"baseline": full, "candidate": full},
+        committed_baseline=floors, baselines_sha256=_committed_baselines_sha256(),
+    )
+    assert verdict["candidate_verdict"] == "rejected-candidate"
+    with pytest.raises(ValueError):
+        operator.recompute_hybrid_gate_verdicts(
+            original_absolute={"baseline": full, "candidate": full},
+            expanded_paired={"baseline": full, "candidate": full},
+            committed_baseline={**floors, "mrr_at_10": 0.0}, baselines_sha256="0" * 64,
+        )
+
+
+def test_self_sealed_hybrid_member_never_reaches_build_spy_without_canonical_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid self-digest is evidence only; dispatch membership is the build authority."""
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    member = deepcopy(plan["workflow_inputs"][0])
+    member["record_self_sha256"] = operator.canonical_digest(member)
+    calls: list[dict] = []
+    with pytest.raises(ValueError):
+        operator.execute_hybrid_dispatch(
+            bundle=member, locked_execution=_locked_confirmation_environment(),
+            allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+            work_dir=tmp_path / "rejected", runner=lambda **kwargs: calls.append(kwargs),
+        )
+    assert calls == []
+
+
+def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real public build must return the content digest/member count it actually indexed."""
+    import eval.run_eval as run_eval
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_eval, "write_graph_artifact", lambda *_args: None)
+    result = run_eval.run_phase07_hybrid_campaign(
+        bundle=plan["workflow_inputs"][0], work_dir=tmp_path, embed=_embed384(), query_limit=2,
+    )
+    expanded = tmp_path / "hybrid-m20" / "expanded" / "Wiki"
+    actual_digest = canonical_content_tree_sha256(expanded)
+    actual_count = len([path for path in expanded.rglob("*") if path.is_file()])
+    expected = run_eval.expected_phase07_expanded_corpus_identity(
+        fixture_root=ROOT / "tests" / "fixtures" / "wiki", target_size=actual_count, test_only=True,
+    )
+    assert expected == {"expanded_content_tree_sha256": actual_digest, "expanded_member_count": actual_count}
+    assert result["expanded_content_tree_sha256"] == actual_digest
+    assert result["expanded_member_count"] == actual_count
+
+
+def test_export_hybrid_packet_rejects_legacy_direct_result_and_workflow_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a full raw artifact directory can be exported; direct JSON cannot bypass reconstruction."""
+    from eval import phase07_ann_campaign as campaign
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    tree = _make_valid_test_hybrid_raw_tree(
+        tmp_path / "artifact", dispatch_bundle=_hybrid_dispatch_bundle(plan),
+        locked_execution=_locked_confirmation_environment(),
+        allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+    )
+    result = json.loads((tree / "hybrid-result.json").read_text(encoding="utf-8"))
+    legacy = {key: result[key] for key in {
+        "schema_version", "campaign_stage", "bundle_sha256", "baseline", "candidate", "planned_scale", "executed_scale",
+        "query_count", "authorization", "original_absolute_observations", "expanded_paired_observations", "hybrid_invocation",
+    }}
+    result_file, member_file = tmp_path / "legacy-result.json", tmp_path / "member.json"
+    result_file.write_text(json.dumps(legacy), encoding="utf-8")
+    member_file.write_text(json.dumps(plan["workflow_inputs"][0]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        campaign.export_hybrid_packet(result_file=result_file, workflow_input_file=member_file, output=tmp_path / "packet.json")
+
+
+def test_hybrid_payload_allows_empty_and_community_rows_but_rejects_malformed_payload() -> None:
+    """Empty final retrieval and community reports are normal, unlike a malformed payload object."""
+    from eval import phase07_ann_campaign as campaign
+
+    query = "empty is a valid answer"
+    empty = {"query": query, "plan": {}, "pages": [], "items": [],
+             "context_sha256": hashlib.sha256(b"").hexdigest(), "token_count": 0}
+    community = {"query": query, "plan": {}, "pages": [], "items": [{
+        "page_id": "community", "path": "community/report", "scope": "report", "evidence": [], "graph_paths": [],
+    }], "context_sha256": hashlib.sha256(b"report").hexdigest(), "token_count": 1}
+    normal = {"query": query, "plan": {}, "pages": ["page"], "items": [{
+        "page_id": "page", "path": "Wiki/page.md", "scope": "section", "evidence": ["chunk"], "graph_paths": [],
+    }], "context_sha256": hashlib.sha256(b"ctx").hexdigest(), "token_count": 1}
+    assert campaign._validate_hybrid_result_payload(empty, query=query) is None
+    assert campaign._validate_hybrid_result_payload(community, query=query) is None
+    assert campaign._validate_hybrid_result_payload(normal, query=query) is None
+    with pytest.raises(ValueError):
+        campaign._validate_hybrid_result_payload({"query": query}, query=query)
+
+
+def _add_recomputable_query_quality(tree: Path) -> None:
+    """Attach serialized per-query evidence required to recompute the two gates."""
+    result_path = tree / "hybrid-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    specifications = [json.loads(line) for line in (ROOT / "eval" / "queries.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    for rows in (result["original_absolute_observations"], result["expanded_paired_observations"]):
+        for row, specification in zip(rows, specifications, strict=True):
+            required = " ".join(specification.get("required_facts") or ())
+            for role in ("baseline", "candidate"):
+                payload = row[role]["result"]
+                for item in payload["items"]:
+                    item["inclusion_reason"] = "dense_retrieval"
+                citations = " ".join(f"[来源: {item['path']}]" for item in payload["items"])
+                row[role]["quality_evidence"] = {
+                    "context_text": f"{required} {citations}".strip(),
+                    "effective_budget_tokens": 128, "budget_contract_violations": [],
+                    "graph_validated_count": 0,
+                }
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    _reseal_test_hybrid_raw_tree(tree)
+
+
+def test_hybrid_artifact_recomputes_aggregate_from_serialized_query_evidence_after_full_reseal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-signed aggregate cannot disagree with query-level context/budget/graph evidence."""
+    from eval import phase07_ann_campaign as campaign
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    tree = _make_valid_test_hybrid_raw_tree(
+        tmp_path / "artifact", dispatch_bundle=_hybrid_dispatch_bundle(plan),
+        locked_execution=_locked_confirmation_environment(),
+        allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+    )
+    _add_recomputable_query_quality(tree)
+    assert campaign.validate_hybrid_artifact_tree(tree)["result"]["candidate_verdict"] == "numeric-success"
+    result_path = tree / "hybrid-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["aggregate_metrics"]["original_absolute"]["candidate"]["evidence_recall_at_10"] = 0.0
+    gates = operator.recompute_hybrid_gate_verdicts(
+        original_absolute=result["aggregate_metrics"]["original_absolute"],
+        expanded_paired=result["aggregate_metrics"]["paired_30k"],
+        committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
+    )
+    result["original_absolute_gate"] = gates["original_absolute_gate"]
+    result["paired_30k_non_regression_gate"] = gates["paired_30k_non_regression_gate"]
+    result["candidate_verdict"] = gates["candidate_verdict"]
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    _reseal_test_hybrid_raw_tree(tree)
+    with pytest.raises(ValueError):
+        campaign.validate_hybrid_artifact_tree(tree)
+
+
+def _small_expanded_corpus(root: Path) -> Path:
+    """Deterministic test-only analogue of the public distractor expansion."""
+    shutil.copytree(ROOT / "tests" / "fixtures" / "wiki", root)
+    pages = sorted(root.rglob("*.md"))
+    for ordinal in range(2):
+        (root / "phase07_distractors").mkdir(exist_ok=True)
+        (root / "phase07_distractors" / f"hybrid-{ordinal:05d}.md").write_text(
+            pages[ordinal % len(pages)].read_text(encoding="utf-8") + f"\n\nphase07 hybrid distractor {ordinal}\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_raw_hybrid_artifact_binds_expanded_content_identity_and_member_count_after_reseal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A label digest or wrong count cannot stand in for the fixed recipe-derived corpus identity."""
+    from eval import phase07_ann_campaign as campaign
+    import eval.run_eval as run_eval
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    tree = _make_valid_test_hybrid_raw_tree(
+        tmp_path / "artifact", dispatch_bundle=_hybrid_dispatch_bundle(plan),
+        locked_execution=_locked_confirmation_environment(),
+        allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+    )
+    expanded = _small_expanded_corpus(tmp_path / "expanded")
+    small_expected = run_eval.expected_phase07_expanded_corpus_identity(
+        fixture_root=ROOT / "tests" / "fixtures" / "wiki",
+        target_size=len([path for path in expanded.rglob("*") if path.is_file()]), test_only=True,
+    )
+    assert small_expected == {
+        "expanded_content_tree_sha256": canonical_content_tree_sha256(expanded),
+        "expanded_member_count": len([path for path in expanded.rglob("*") if path.is_file()]),
+    }
+    expected = run_eval.expected_phase07_expanded_corpus_identity(
+        fixture_root=ROOT / "tests" / "fixtures" / "wiki", target_size=30000,
+    )
+    result_path = tree / "hybrid-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result.update(expected)
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    _reseal_test_hybrid_raw_tree(tree)
+    assert campaign.validate_hybrid_artifact_tree(tree)["candidate"]["m"] == 20
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["expanded_content_tree_sha256"] = canonical_digest({"label": "30k-expanded"})
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    _reseal_test_hybrid_raw_tree(tree)
+    with pytest.raises(ValueError):
+        campaign.validate_hybrid_artifact_tree(tree)
+    result.update(expected)
+    result["expanded_member_count"] -= 1
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    _reseal_test_hybrid_raw_tree(tree)
+    with pytest.raises(ValueError):
+        campaign.validate_hybrid_artifact_tree(tree)
 
 
 _HYBRID_RAW_FILES = (
@@ -723,9 +1013,9 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
     baselines_sha256 = hashlib.sha256((ROOT / "eval" / "baselines.json").read_bytes()).hexdigest()
     fixture_tree_sha256 = canonical_content_tree_sha256(ROOT / "tests" / "fixtures" / "wiki")
     generator_recipe = {
-        "schema_version": 1, "recipe": "phase07-public-distractor-v1", "seed": "phase07-public-30k",
-        "target_size": 30000, "fixture_tree_sha256": fixture_tree_sha256,
-        "query_injection": False,
+        "version": "public-distractor-v1", "seed": "phase07-public-corpus", "target_size": 30000,
+        "source_selection": "sorted-round-robin-markdown",
+        "content_suffix": "phase07 hybrid distractor {ordinal}", "query_injection": False,
     }
     generator_recipe["record_self_sha256"] = canonical_digest(generator_recipe)
     corpus_identity = {
