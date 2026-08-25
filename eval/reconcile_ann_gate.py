@@ -295,7 +295,7 @@ def validate_confirmation_packet(packet: dict, workflow_inputs: dict) -> dict:
 
 
 def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
-    """Seal three ordinal runs while retaining, but excluding, one typed infra origin."""
+    """Seal exactly three ordinal numeric-success runs for D-25."""
     from eval.phase07_operator_gate import validate_confirmation_plan
     validate_confirmation_plan(plan)
     if not isinstance(packets, list) or not packets:
@@ -318,24 +318,13 @@ def reconcile_confirmation(plan: dict, packets: list[dict]) -> dict:
         seen_job_ids.add(packet["job_id"]); seen_nonces.add(packet["job_allocation_nonce"])
         per_slot[key].append(packet)
     eligible = []
-    replacement_edges = 0
     for key, slot_packets in per_slot.items():
         success = [packet for packet in slot_packets if packet["status"] == "numeric-success"]
         rejected = [packet for packet in slot_packets if packet["status"] != "numeric-success"]
-        if not rejected:
-            if len(success) != 1:
-                raise ValueError("each confirmation slot requires one eligible numeric result")
-        else:
-            if len(rejected) != 1 or rejected[0]["failure_class"] not in PHASE07_INFRA_FAILURES or len(success) != 1 or success[0]["replacement_for_run_id"] != rejected[0]["run_id"]:
-                raise ValueError("non-infrastructure failure has no replacement or invalid retry lineage")
-            replacement_edges += 1
-            physical.append({**rejected[0], "eligible": False})
-        if not rejected and success[0]["replacement_for_run_id"] is not None:
-            raise ValueError("replacement success requires its preserved infrastructure origin")
+        if rejected or len(success) != 1 or success[0]["replacement_for_run_id"] is not None:
+            raise ValueError("D-25 confirmation requires one unreplaced numeric result per ordinal")
         physical.append({**success[0], "eligible": True})
         eligible.append(success[0])
-    if replacement_edges > 1:
-        raise ValueError("only one infrastructure replacement edge is permitted")
     if len(eligible) != 3 or len({record["workflow_inputs_sha256"] for record in eligible}) != 3:
         raise ValueError("exact three eligible confirmation ordinal records")
     eligible.sort(key=lambda record: record["slot"]["ordinal"])
@@ -489,14 +478,14 @@ def _read_confirmation_artifact(root: Path, provenance: dict[str, Any], request:
 
 
 def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
-    """Reconcile three ordinal artifacts plus at most one preserved infra origin."""
+    """Reconcile exactly three successful downloaded ordinal artifacts."""
     from eval.phase07_operator_gate import canonical_digest as operator_digest
 
     if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
         raise ValueError("sealed confirmation request")
     if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "evidence", "record_self_sha256"} \
             or manifest.get("schema_version") != 1 or manifest.get("record_self_sha256") != canonical_digest(manifest) \
-            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) not in {3, 4}:
+            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) != 3:
         raise ValueError("strict confirmation provenance manifest cardinality")
     inputs, packets, provenance_by_allocation, seen_archives = [], [], {}, set()
     artifact_ids, job_ids, run_identities = set(), set(), set()
@@ -517,12 +506,12 @@ def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
         seen_archives.add(provenance["archive"])
         if Path(row["artifact_dir"]).resolve() != Path(provenance["extracted_dir"]).resolve():
             raise ValueError("manifest/extracted artifact mismatch")
-        generated, packet, metadata = _read_confirmation_artifact(Path(row["artifact_dir"]), provenance, request)
         artifact_id, job_id = provenance["artifact_id"], provenance["job_id"]
         run_identity = (provenance["run_id"], provenance["run_attempt"])
         if artifact_id in artifact_ids or job_id in job_ids or run_identity in run_identities:
             raise ValueError("duplicate confirmation artifact/job/run provenance")
         artifact_ids.add(artifact_id); job_ids.add(job_id); run_identities.add(run_identity)
+        generated, packet, metadata = _read_confirmation_artifact(Path(row["artifact_dir"]), provenance, request)
         allocation = tuple(packet[name] for name in ("run_id", "run_attempt", "job_id", "job_allocation_nonce"))
         inputs.append(generated); packets.append(packet); provenance_by_allocation[allocation] = metadata
     if len({item["record_self_sha256"] for item in inputs}) != 3:

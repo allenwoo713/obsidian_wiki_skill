@@ -189,7 +189,7 @@ def test_d25_generated_input_rejects_every_retired_configuration_before_build(mu
         operator.validate_confirmation_workflow_input(record, expected_head=HEAD)
 
 
-def test_confirmation_reconciliation_requires_three_ordinals_and_preserves_typed_infra_origin() -> None:
+def test_confirmation_reconciliation_requires_three_unreplaced_ordinals() -> None:
     plan = _plan()
     packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
     ledger = reconcile.reconcile_confirmation(plan, packets)
@@ -198,36 +198,31 @@ def test_confirmation_reconciliation_requires_three_ordinals_and_preserves_typed
     assert [family["family_size"] for family in ledger["paired_ordinal_families"]] == [4, 4, 4]
     origin = _packet(plan["workflow_inputs"][0], run_id=1, failure_class="github_infrastructure")
     replacement = _packet(plan["workflow_inputs"][0], run_id=4, replacement_for=1)
-    retried = [origin, replacement, *packets[1:]]
-    ledger = reconcile.reconcile_confirmation(plan, retried)
-    assert len(ledger["eligible_evidence_runs"]) == 3
-    assert len(ledger["all_physical_workflow_runs"]) == 4
-    assert ledger["all_physical_workflow_runs"][0]["eligible"] is False
+    with pytest.raises(ValueError, match="unreplaced"):
+        reconcile.reconcile_confirmation(plan, [origin, replacement, *packets[1:]])
     bad = [_packet(plan["workflow_inputs"][0], run_id=1, failure_class="numeric"), *packets[1:]]
-    with pytest.raises(ValueError, match="non-infrastructure"): reconcile.reconcile_confirmation(plan, bad)
+    with pytest.raises(ValueError, match="unreplaced"): reconcile.reconcile_confirmation(plan, bad)
 
 
-def test_downloaded_wrapper_reconciliation_preserves_one_infra_origin_and_replacement() -> None:
-    """The production wrapper path accepts four physical runs for three ordinals."""
+def test_downloaded_wrapper_reconciliation_rejects_replacement_lineage() -> None:
+    """D-25 never turns an infrastructure claim into replacement evidence."""
     plan = _plan()
     packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
     origin = _packet(plan["workflow_inputs"][0], run_id=1, failure_class="github_infrastructure")
     replacement = _packet(plan["workflow_inputs"][0], run_id=4, replacement_for=1)
     wrappers = [
-        {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}, "packet": origin},
-        {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}, "packet": replacement},
+        {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0], "replacement_for_run_id": None}, "packet": origin},
+        {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0], "replacement_for_run_id": None}, "packet": replacement},
         *[
-            {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot}, "packet": packet}
+            {"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot, "replacement_for_run_id": None}, "packet": packet}
             for slot, packet in zip(plan["workflow_inputs"][1:], packets[1:], strict=True)
         ],
     ]
-    ledger = reconcile.reconcile_confirmation_request(plan["confirmation_request"], {"packets": wrappers})
-    assert len(ledger["eligible_evidence_runs"]) == 3
-    assert len(ledger["all_physical_workflow_runs"]) == 4
-    assert sum(record["eligible"] is False for record in ledger["all_physical_workflow_runs"]) == 1
+    with pytest.raises(ValueError, match="unreplaced"):
+        reconcile.reconcile_confirmation_request(plan["confirmation_request"], {"packets": wrappers})
 
 
-def test_production_packet_export_can_encode_generated_replacement_lineage() -> None:
+def test_production_packet_export_rejects_generated_replacement_lineage() -> None:
     signature = inspect.signature(campaign.confirmation_packet_from_result)
     assert "replacement_for_run_id" in signature.parameters
 
@@ -297,7 +292,8 @@ def test_confirmation_allocation_seals_inner_workflow_input_digest_from_outer_di
     """The hosted producer accepts the outer bundle but records only its sealed member."""
     plan = _plan()
     workflow_input = plan["workflow_inputs"][0]
-    bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": workflow_input}
+    bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": workflow_input,
+              "replacement_for_run_id": None}
     output = tmp_path / "allocation.json"
     client = _FakeActions([{
         "id": 101, "name": "Phase 07 independent confirmation campaign",
@@ -548,12 +544,61 @@ def test_confirmation_plan_cli_generates_request_inputs_and_preflight_bundle(tmp
     assert {path.name for path in inputs.glob("*.json")} == {
         "confirmation-ordinal1.json", "confirmation-ordinal2.json", "confirmation-ordinal3.json",
     }
+    assert all(bundle["replacement_for_run_id"] is None for bundle in bundles)
     assert preflight.exists()
+    assert json.loads(preflight.read_text())["ledger_path"] == str(
+        preflight.with_name("preflight-ledger.json").resolve()
+    )
     plan = {"schema_version": 1, "confirmation_request": generated, "workflow_inputs": records,
             "artifact_reported_nominated_m": [16, 20], "authoritative_nominated_m": [32, 20]}
     plan["record_self_sha256"] = operator.canonical_digest(plan)
     operator.validate_confirmation_plan(plan)
     assert all(operator.validate_confirmation_dispatch_bundle(bundle, expected_head=generated["post_task0_head"]) for bundle in bundles)
+
+
+def test_d25_rejects_replacement_claims_at_dispatch_and_reconciliation() -> None:
+    plan = _plan()
+    missing_null = {
+        "confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0],
+    }
+    with pytest.raises(ValueError, match="typed confirmation dispatch bundle"):
+        operator.validate_confirmation_dispatch_bundle(missing_null, expected_head=HEAD)
+    bundle = {
+        "confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0],
+        "replacement_for_run_id": 1,
+    }
+    with pytest.raises(ValueError, match="not authorized"):
+        operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
+    bundle["replacement_for_run_id"] = None
+    bundle["replacement_origin"] = {"failure_class": "github_infrastructure"}
+    with pytest.raises(ValueError, match="typed confirmation dispatch bundle"):
+        operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
+
+    packets = [_packet(slot, run_id=index + 1) for index, slot in enumerate(plan["workflow_inputs"])]
+    packets[0]["replacement_for_run_id"] = 99
+    packets[0]["record_self_sha256"] = reconcile.canonical_digest(packets[0])
+    with pytest.raises(ValueError, match="unreplaced"):
+        reconcile.reconcile_confirmation(plan, packets)
+
+
+def test_confirmation_collector_rejects_claimed_infrastructure_origin_before_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request = {
+        "schema_version": 1, "repository": "owner/repo", "head_sha": HEAD,
+        "downloads": [
+            {"run_id": 1, "run_attempt": 1, "archive": "unused.zip", "extracted_dir": "unused",
+             "failure_class": "github_infrastructure", "workflow_inputs_sha256": "a" * 64},
+            {"run_id": 2, "run_attempt": 1, "archive": "unused2.zip", "extracted_dir": "unused2"},
+            {"run_id": 3, "run_attempt": 1, "archive": "unused3.zip", "extracted_dir": "unused3"},
+        ],
+    }
+    request["record_self_sha256"] = operator.canonical_digest(request)
+    request_path = tmp_path / "claimed-infra.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    assert operator.main([
+        "confirmation-provenance", "--request-file", str(request_path),
+        "--ledger-file", str(tmp_path / "manifest.json"), "--provenance-dir", str(tmp_path / "provenance"),
+    ]) == 1
 
 
 def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across_three() -> None:
@@ -566,12 +611,14 @@ def test_actions_allocator_uses_workflow_display_name_and_nonce_is_unique_across
 
 def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> None:
     plan = _plan()
-    bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": dict(plan["workflow_inputs"][0])}
+    bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": dict(plan["workflow_inputs"][0]),
+              "replacement_for_run_id": None}
     operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
     bundle["workflow_input"]["slot"] = {"ordinal": 2}
     bundle["workflow_input"]["record_self_sha256"] = operator.canonical_digest(bundle["workflow_input"])
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(bundle, expected_head=HEAD)
-    pristine = {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0]}
+    pristine = {"confirmation_request": plan["confirmation_request"], "workflow_input": plan["workflow_inputs"][0],
+                "replacement_for_run_id": None}
     with pytest.raises(ValueError, match="feature head|mismatch"): operator.validate_confirmation_dispatch_bundle(pristine, expected_head="e" * 40)
     other = operator.build_confirmation_plan(LEDGER, post_task0_head="d" * 40); pristine["confirmation_request"] = other["confirmation_request"]
     with pytest.raises(ValueError): operator.validate_confirmation_dispatch_bundle(pristine, expected_head=HEAD)
@@ -579,7 +626,8 @@ def test_dispatch_bundle_rejects_tampered_stale_and_cross_request_inputs() -> No
 
 def test_dispatch_bundle_rejects_fully_resigned_noncanonical_authority() -> None:
     forged = operator.build_confirmation_plan(LEDGER, post_task0_head="e" * 40)
-    bundle = {"confirmation_request": forged["confirmation_request"], "workflow_input": forged["workflow_inputs"][0]}
+    bundle = {"confirmation_request": forged["confirmation_request"], "workflow_input": forged["workflow_inputs"][0],
+              "replacement_for_run_id": None}
     with pytest.raises(ValueError, match="feature head|canonical"):
         operator.validate_confirmation_dispatch_bundle(bundle, expected_head="e" * 40)
 
@@ -587,7 +635,8 @@ def test_dispatch_bundle_rejects_fully_resigned_noncanonical_authority() -> None
 def test_confirmation_reconciler_cli_consumes_packet_wrappers_and_seals_ledger(tmp_path: Path) -> None:
     plan = _plan(); request, ledger = tmp_path / "request.json", tmp_path / "ledger.json"
     request.write_text(json.dumps(plan["confirmation_request"]), encoding="utf-8")
-    wrappers = [{"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot},
+    wrappers = [{"dispatch_bundle": {"confirmation_request": plan["confirmation_request"], "workflow_input": slot,
+                                      "replacement_for_run_id": None},
                  "packet": _packet(slot, run_id=index + 1)} for index, slot in enumerate(plan["workflow_inputs"])]
     ledger.write_text(json.dumps({"packets": wrappers}), encoding="utf-8")
     result = subprocess.run([sys.executable, "-m", "eval.reconcile_ann_gate", "--confirmation-request", str(request),
@@ -618,7 +667,8 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
         slot_root = tmp_path / f"slot-{index}"
         bundle = slot_root / "dispatch-bundle.json"
         bundle.parent.mkdir()
-        dispatch_bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": slot}
+        dispatch_bundle = {"confirmation_request": plan["confirmation_request"], "workflow_input": slot,
+                           "replacement_for_run_id": None}
         bundle.write_text(json.dumps(dispatch_bundle), encoding="utf-8")
         allocation_path = slot_root / "allocation.json"
         assert operator.seal_confirmation_allocation(
@@ -646,6 +696,13 @@ def test_confirmation_exporter_and_postdownload_reconciler_run_real_cli_path(
         ], cwd=root, capture_output=True, text=True, check=False)
         assert campaign_run.returncode == 0, campaign_run.stderr
         if index == 1:
+            rejected_replacement = subprocess.run([
+                sys.executable, "-m", "eval.phase07_ann_campaign", "export-confirmation-packet",
+                "--campaign-output-dir", str(output), "--dispatch-bundle", str(bundle),
+                "--allocation-ledger", str(allocation_path), "--artifact-dir", str(slot_root / "replacement-rejected"),
+                "--replacement-for-run-id", "1",
+            ], cwd=root, capture_output=True, text=True, check=False)
+            assert rejected_replacement.returncode == 1
             for label, changes in (
                 ("wrong-request", {"request_sha256": "0" * 64}),
                 ("elevated", {"authorization": "elevated"}),

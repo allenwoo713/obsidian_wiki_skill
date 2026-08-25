@@ -184,7 +184,8 @@ def validate_confirmation_plan(plan: dict[str, Any]) -> dict[str, Any]:
 
 def validate_confirmation_dispatch_bundle(bundle: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
     """Require an input to carry the sealed request that proves bundle membership."""
-    if not isinstance(bundle, dict) or set(bundle) != {"confirmation_request", "workflow_input"}:
+    allowed = {"confirmation_request", "workflow_input", "replacement_for_run_id"}
+    if not isinstance(bundle, dict) or set(bundle) != allowed:
         raise ValueError("typed confirmation dispatch bundle")
     request, record = bundle["confirmation_request"], bundle["workflow_input"]
     if not SHA.fullmatch(expected_head) or _git("rev-parse", "HEAD") != expected_head:
@@ -199,6 +200,8 @@ def validate_confirmation_dispatch_bundle(bundle: dict[str, Any], *, expected_he
     expected_record = next((item for item in expected["workflow_inputs"] if item["slot"] == slot), None)
     if expected_record is None or record != expected_record:
         raise ValueError("confirmation input is not a canonical generated member")
+    if bundle.get("replacement_for_run_id") is not None:
+        raise ValueError("D-25 confirmation replacements are not authorized")
     return record
 
 
@@ -548,8 +551,8 @@ def collect_confirmation_provenance(*, request_file: Path, output: Path,
     repository, head_sha, downloads = request["repository"], request["head_sha"], request["downloads"]
     if not isinstance(repository, str) or not repository or not isinstance(head_sha, str) or not SHA.fullmatch(head_sha):
         raise ValueError("confirmation collection repository/head binding")
-    if not isinstance(downloads, list) or len(downloads) not in {3, 4}:
-        raise ValueError("confirmation collection requires three physical downloads or one preserved replacement")
+    if not isinstance(downloads, list) or len(downloads) != 3:
+        raise ValueError("confirmation collection requires exactly three successful downloads")
     if not token:
         raise ValueError("GitHub actions read token unavailable")
     if output.exists() or provenance_dir.is_symlink() or (provenance_dir.exists() and any(provenance_dir.iterdir())):
@@ -701,12 +704,16 @@ def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_i
     for record in plan["workflow_inputs"]:
         slot = record["slot"]
         (workflow_inputs_dir / f"confirmation-ordinal{slot['ordinal']}.json").write_text(
-            json.dumps({"confirmation_request": plan["confirmation_request"], "workflow_input": record}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            json.dumps({"confirmation_request": plan["confirmation_request"], "workflow_input": record,
+                        "replacement_for_run_id": None}, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    ledger_name = preflight_request.name.replace("-request.json", "-ledger.json")
+    if ledger_name == preflight_request.name:
+        ledger_name = f"{preflight_request.stem}-ledger{preflight_request.suffix}"
     preflight = {
         "repository": _read_object(stage1_ledger)["repository"], "branch": _git("branch", "--show-current"),
         "worktree_root": str(root), "head_sha": head, "allowed_dirty_paths": [],
         "workflow_name": "eval", "campaign_stage": "confirmation", "continuation_binding": "",
-        "require_upstream_head": True, "ledger_path": str(preflight_request.with_name("07-05-confirmations-preflight-ledger.json")),
+        "require_upstream_head": True, "ledger_path": str(preflight_request.with_name(ledger_name).resolve()),
     }
     preflight_request.parent.mkdir(parents=True, exist_ok=True)
     preflight_request.write_text(json.dumps(preflight, sort_keys=True, indent=2) + "\n", encoding="utf-8")

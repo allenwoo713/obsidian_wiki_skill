@@ -637,8 +637,6 @@ def validate_confirmation_artifact_tree(
         bundle = json.loads((root / "dispatch-bundle.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("invalid confirmation dispatch bundle") from exc
-    if not isinstance(bundle, dict) or set(bundle) != {"confirmation_request", "workflow_input"}:
-        raise ValueError("strict confirmation dispatch bundle")
     workflow_input = validate_confirmation_dispatch_bundle(
         bundle, expected_head=request["environment"]["head_sha"],
     )
@@ -673,6 +671,8 @@ def validate_confirmation_artifact_tree(
             or any(wrapper["files"][name] != hashlib.sha256((root / name).read_bytes()).hexdigest() for name in _CONFIRMATION_RAW_FILES):
         raise ValueError("confirmation packet wrapper/file digest binding")
     packet = wrapper.get("packet")
+    if bundle.get("replacement_for_run_id") is not None:
+        raise ValueError("D-25 confirmation replacements are not authorized")
     expected_packet = confirmation_packet_from_result(
         result=result, workflow_inputs=workflow_input, run_id=identity["run_id"],
         run_attempt=identity["run_attempt"], job_id=identity["job_id"], job_key=identity["job_key"],
@@ -723,8 +723,6 @@ def export_confirmation_packet(*, campaign_output_dir: Path, dispatch_bundle: Pa
         bundle = json.loads(dispatch_bundle.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("invalid confirmation dispatch bundle") from exc
-    if not isinstance(bundle, dict) or set(bundle) != {"confirmation_request", "workflow_input"}:
-        raise ValueError("strict confirmation dispatch bundle")
     workflow_inputs = validate_confirmation_dispatch_bundle(bundle, expected_head=request.get("environment", {}).get("head_sha", ""))
     if bundle["workflow_input"] != request.get("workflow_inputs"):
         raise ValueError("confirmation dispatch/request mismatch")
@@ -761,11 +759,13 @@ def export_confirmation_packet(*, campaign_output_dir: Path, dispatch_bundle: Pa
     ):
         (artifact_dir / name).write_bytes(source.read_bytes())
     raw_tree_sha256 = confirmation_raw_tree_sha256(artifact_dir)
+    if bundle.get("replacement_for_run_id") is not None or replacement_for_run_id is not None:
+        raise ValueError("D-25 confirmation replacements are not authorized")
     packet = confirmation_packet_from_result(
         result=result, workflow_inputs=workflow_inputs,
         run_id=identity["run_id"], run_attempt=identity["run_attempt"], job_id=identity["job_id"],
         job_key=identity["job_key"], job_allocation_nonce=identity["job_allocation_nonce"],
-        raw_tree_sha256=raw_tree_sha256, replacement_for_run_id=replacement_for_run_id,
+        raw_tree_sha256=raw_tree_sha256,
     )
     file_digests = {name: hashlib.sha256((artifact_dir / name).read_bytes()).hexdigest() for name in sorted(_CONFIRMATION_RAW_FILES)}
     wrapper = {"schema_version": 1, "kind": "phase07-confirmation-packet/v1", "packet": packet,

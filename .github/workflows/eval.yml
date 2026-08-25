@@ -19,7 +19,7 @@ on:
         type: choice
         options: [preflight, screening, confirmation]
       workflow_inputs:
-        description: "Sealed generated Phase 07 ordinal confirmation input record"
+        description: "Sealed generated Phase 07 ordinal confirmation input bundle"
         required: false
         type: string
 
