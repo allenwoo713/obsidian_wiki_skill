@@ -84,6 +84,20 @@ def test_d09_d10_public_distractor_recipe_accepts_only_lightweight_inputs() -> N
             manifests.validate_lightweight_repository_inputs(tracked | {prohibited})
 
 
+def test_committed_personal_wiki_manifest_binds_actual_fixture_and_generator_recipe() -> None:
+    """Placeholder hashes cannot stand in for the committed public recipe."""
+    manifests = _manifests()
+    manifest_path = ROOT / "eval" / "personal-wiki-corpus-manifest.json"
+    fixture_root = ROOT / "tests" / "fixtures" / "wiki"
+    manifest = manifests.validate_committed_personal_wiki_manifest(
+        manifest_path, fixture_root=fixture_root,
+    )
+    assert manifest["generator"]["source_fixture_sha256"] == \
+        "3df4b971354569af4f9a26c86189e6865926f0e81f7083a94ebdde8dd4e0e2f5"
+    assert manifest["generator"]["source_fixture_sha256"] == manifests.canonical_content_tree_sha256(fixture_root)
+    assert manifest["generator"]["rules_sha256"] == manifests.public_distractor_recipe_sha256()
+
+
 def test_d10_d18_model_tree_lock_and_cache_poisoning_fail_closed(tmp_path: Path) -> None:
     """D-10/D-18: local validation is read-only and rejects mutable/poisoned trees."""
     manifests = _manifests()
