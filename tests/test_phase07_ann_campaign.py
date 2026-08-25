@@ -7,6 +7,7 @@ import random
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ MODEL_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "model-manifest.json").r
 CORPUS_MANIFEST_SHA256 = hashlib.sha256((ROOT / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest()
 REQUIREMENTS_SHA256 = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
 STAGE1_LEDGER = ROOT / "eval" / "phase07-stage1-authority.json"
+DENSE_SOURCE_HEAD = "2f15d6a4fef54dda9b0f4a258e78898e2ef6ea57"
 
 
 def _digest(kind: str) -> str:
@@ -136,6 +138,84 @@ def _embed384():
             vectors.append([value / norm for value in raw])
         return vectors
     return encode
+
+
+def _write_sealed_dense_ledger(tmp_path: Path) -> Path:
+    """Materialize the real 07-05 ledger shape without a developer-machine path.
+
+    This is deliberately an evidence fixture rather than a tiny synthetic
+    request: it has all three physical D-25 ordinal identities, disjoint
+    baseline/m20/m32 build identities, exact hosted provenance fields, and a
+    canonical self-digest made by the production JSON helper.
+    """
+    ordinals = (
+        (1, 32801985769, 97664517767, 9546915747),
+        (2, 32802007002, 97664580321, 9546916208),
+        (3, 32802027355, 97664640212, 9546924769),
+    )
+
+    def digest(label: str) -> str:
+        return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+    records = []
+    for ordinal, run_id, job_id, artifact_id in ordinals:
+        builds = [
+            {"build_id": digest(f"ordinal-{ordinal}-m-{m}"), "m": m,
+             "ef_construction": 300, "query_ef": [ef]}
+            for m, ef in ((16, 100), (20, 300), (32, 300))
+        ]
+        baseline_build_id = builds[0]["build_id"]
+        candidate_build_ids = {str(row["m"]): row["build_id"] for row in builds[1:]}
+        record = {
+            "schema_version": 1,
+            "campaign_stage": "confirmation",
+            "slot": {"ordinal": ordinal},
+            "run_id": run_id,
+            "run_attempt": 1,
+            "job_id": job_id,
+            "job_key": "phase07-confirmation",
+            "job_allocation_nonce": digest(f"allocation-{ordinal}")[:32],
+            "status": "numeric-success",
+            "failure_class": None,
+            "replacement_for_run_id": None,
+            "retention_days": 90,
+            "workflow_inputs_sha256": digest(f"workflow-input-{ordinal}"),
+            "raw_tree_sha256": digest(f"tree-{ordinal}"),
+            "builds": builds,
+            "d25": {"baseline_build_id": baseline_build_id, "candidate_build_ids": candidate_build_ids},
+            "measurements": {"authorization": "none", "build_count": 3, "builds": builds},
+            "locked_execution": {"head_sha": DENSE_SOURCE_HEAD},
+            "validated_measurements": {
+                "authorization": "none", "build_count": 3, "builds": builds,
+                "baseline_build_id": baseline_build_id, "candidate_build_ids": candidate_build_ids,
+                "locked_execution": {"head_sha": DENSE_SOURCE_HEAD},
+                "run_identity": {"run_id": run_id, "run_attempt": 1, "job_id": job_id,
+                                 "job_allocation_nonce": digest(f"allocation-{ordinal}")[:32]},
+                "slot": {"ordinal": ordinal}, "workflow_inputs_sha256": digest(f"workflow-input-{ordinal}"),
+                "paired_statistics": {"family_name": "d25_candidate_vs_production_baseline", "family_size": 4},
+            },
+            "validated_provenance": {
+                "run_id": run_id, "run_attempt": 1, "job_id": job_id, "artifact_id": artifact_id,
+                "job_key": "phase07-confirmation", "head_sha": DENSE_SOURCE_HEAD,
+                "status": "completed", "conclusion": "success", "retention_days": 90,
+                "artifact_name": f"phase07-confirmation-{run_id}-1",
+                "api_archive_sha256": digest(f"archive-{ordinal}"),
+            },
+        }
+        record["record_self_sha256"] = operator.canonical_digest(record)
+        records.append(record)
+    ledger = {
+        "schema_version": 1,
+        "campaign_stage": "confirmation",
+        "confirmation_plan_sha256": digest("confirmation-plan"),
+        "eligible_evidence_runs": records,
+        "all_physical_workflow_runs": records,
+        "paired_ordinal_families": [{"ordinal": ordinal} for ordinal, *_ in ordinals],
+    }
+    ledger["record_self_sha256"] = operator.canonical_digest(ledger)
+    target = tmp_path / "07-05-dense-ledger.json"
+    target.write_text(json.dumps(ledger, sort_keys=True), encoding="utf-8")
+    return target
 
 
 def test_request_schema_seals_success_and_rejection_artifacts(tmp_path: Path) -> None:
@@ -292,6 +372,69 @@ def test_confirmation_is_one_paired_d25_ordinal_and_only_queries_fixed_efs(tmp_p
                                              job_allocation_nonce="a" * 32, raw_tree_sha256=_digest("evidence"))
     assert packet["d25"]["family_size"] == 4
     assert packet["slot"] == {"ordinal": 1}
+
+
+def test_hybrid_plan_is_derived_from_the_sealed_dense_ledger_and_rejects_tampering(tmp_path: Path) -> None:
+    """D-25 hybrid authority is a fresh, exact two-member derivation only."""
+    dense_ledger = _write_sealed_dense_ledger(tmp_path)
+    dense_ledger_sha256 = operator.canonical_digest(json.loads(dense_ledger.read_text(encoding="utf-8")))
+    plan = operator.build_hybrid_plan(dense_ledger, post_implementation_head=HEAD)
+
+    request = plan["hybrid_request"]
+    assert request["dense_ledger_sha256"] == dense_ledger_sha256
+    assert request["dense_source_head"] == DENSE_SOURCE_HEAD
+    assert request["hybrid_implementation_head"] == HEAD
+    assert request["authorization"] == "none"
+    inputs = plan["workflow_inputs"]
+    assert [row["candidate"] for row in inputs] == [
+        {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300},
+        {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300},
+    ]
+    assert all(row["baseline"] == {"index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100}
+               and row["scale"] == 30000 and row["query_count"] == 105
+               and row["replacement_for_run_id"] is None for row in inputs)
+
+    for field, value in (
+        ("dense_ledger_sha256", "0" * 64),
+        ("dense_source_head", "0" * 40),
+        ("authorization", "approve-sq"),
+        ("retention_days", 1),
+        ("replacement_for_run_id", 1),
+    ):
+        tampered = deepcopy(plan)
+        tampered["hybrid_request"][field] = value
+        with pytest.raises(ValueError):
+            operator.validate_hybrid_plan(tampered)
+    for field, value in (("run_id", 1), ("job_id", 1), ("artifact_id", 1), ("build_ids", [])):
+        tampered = deepcopy(plan)
+        tampered["hybrid_request"]["dense_ordinal_identities"][0][field] = value
+        with pytest.raises(ValueError):
+            operator.validate_hybrid_plan(tampered)
+
+
+def test_hybrid_m20_bundle_exercises_public_hybrid_path_without_retired_campaign_modes(tmp_path: Path) -> None:
+    """The injected encoder is the sole test seam; retrieval remains production code."""
+    plan = operator.build_hybrid_plan(_write_sealed_dense_ledger(tmp_path), post_implementation_head=HEAD)
+    m20 = plan["workflow_inputs"][0]
+    from eval.run_eval import run_phase07_hybrid_campaign
+
+    result = run_phase07_hybrid_campaign(
+        bundle=m20, work_dir=tmp_path, embed=_embed384(), query_limit=2,
+    )
+
+    assert result["hybrid_invocation"] == {
+        "entrypoint": "query.hybrid_search",
+        "candidate_aware_public_arguments": False,
+        "original_baseline_calls": 2,
+        "original_candidate_calls": 2,
+        "expanded_baseline_calls": 2,
+        "expanded_candidate_calls": 2,
+    }
+    assert len(result["original_absolute_observations"]) == 2
+    assert len(result["expanded_paired_observations"]) == 2
+    assert set(result["expanded_paired_observations"][0]) >= {"ordinal", "query_sha256", "baseline", "candidate"}
+    assert "representative_ann" not in json.dumps(result, sort_keys=True)
+    assert all(token not in json.dumps(result, sort_keys=True) for token in ("continuation", "flat", "refinement", "ef_construction=500"))
 
 
 def test_public_hybrid_facade_uses_real_build_service_and_lancedb(tmp_path: Path) -> None:
