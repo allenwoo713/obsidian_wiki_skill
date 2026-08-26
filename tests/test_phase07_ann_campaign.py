@@ -411,12 +411,12 @@ def test_hybrid_plan_is_derived_from_the_sealed_dense_ledger_and_rejects_tamperi
     assert request["hybrid_implementation_head"] == HEAD
     assert request["authorization"] == "none"
     inputs = plan["workflow_inputs"]
-    assert [row["candidate"] for row in inputs] == [
-        {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300},
-        {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300},
+    assert [(row["role"], row["config"]) for row in inputs] == [
+        ("baseline", {"index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100}),
+        ("candidate", {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300}),
+        ("candidate", {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300}),
     ]
-    assert all(row["baseline"] == {"index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100}
-               and row["scale"] == 30000 and row["query_count"] == 105
+    assert all(row["scale"] == 30000 and row["query_count"] == 105
                and row["replacement_for_run_id"] is None for row in inputs)
 
     for field, value in (
@@ -478,8 +478,11 @@ def test_bare_sealed_workflow_member_cannot_reach_any_campaign_build_boundary(
     assert calls == []
 
 
-def _hybrid_dispatch_bundle(plan: dict, *, m: int = 20) -> dict:
-    member = next(row for row in plan["workflow_inputs"] if row["candidate"]["m"] == m)
+def _hybrid_dispatch_bundle(plan: dict, *, role: str = "candidate", m: int = 20) -> dict:
+    member = next(
+        row for row in plan["workflow_inputs"]
+        if row["role"] == role and row["config"]["m"] == (16 if role == "baseline" else m)
+    )
     bundle = {
         "schema_version": 1,
         "hybrid_request": plan["hybrid_request"], "workflow_input": member,
@@ -1035,11 +1038,28 @@ def test_self_sealed_hybrid_member_never_reaches_build_spy_without_canonical_wra
 def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A real public build must return the content digest/member count it actually indexed."""
+    """One role builds two indexes and invokes public hybrid search twice per query."""
     import eval.run_eval as run_eval
+    import build_index
 
     plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
     monkeypatch.setattr(run_eval, "write_graph_artifact", lambda *_args: None)
+    storage_builds: list[Path] = []
+    real_build_storage_contract = build_index.build_storage_contract
+
+    def track_build_storage_contract(*args, **kwargs):
+        storage_builds.append(Path(args[1]))
+        return real_build_storage_contract(*args, **kwargs)
+
+    monkeypatch.setattr(build_index, "build_storage_contract", track_build_storage_contract)
+    hybrid_calls: list[Path] = []
+    real_hybrid_search = run_eval.hybrid_search
+
+    def track_hybrid_search(*args, **kwargs):
+        hybrid_calls.append(Path(kwargs["wiki_dir"]))
+        return real_hybrid_search(*args, **kwargs)
+
+    monkeypatch.setattr(run_eval, "hybrid_search", track_hybrid_search)
     # A direct dict/member runner is deliberately absent.  The real, private
     # runner receives its opaque capability only from the fully validated
     # dispatch boundary; the injected encoder/limit are the finite test seam.
@@ -1057,7 +1077,7 @@ def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
         work_dir=tmp_path, runner=production_test_runner,
     )
     assert len(observed_capabilities) == 1 and not isinstance(observed_capabilities[0], dict)
-    expanded = tmp_path / "hybrid-m20" / "expanded" / "Wiki"
+    expanded = tmp_path / "hybrid-candidate-m20" / "expanded" / "Wiki"
     actual_digest = canonical_content_tree_sha256(expanded)
     actual_count = len([path for path in expanded.rglob("*") if path.is_file()])
     expected = run_eval.expected_phase07_expanded_corpus_identity(
@@ -1066,6 +1086,24 @@ def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
     assert expected == {"expanded_content_tree_sha256": actual_digest, "expanded_member_count": actual_count}
     assert result["expanded_content_tree_sha256"] == actual_digest
     assert result["expanded_member_count"] == actual_count
+    assert result["role"] == "candidate"
+    assert result["config"] == {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300}
+    assert "aggregate_metrics" not in result and "candidate_verdict" not in result
+    assert len(storage_builds) == 2
+    assert len(hybrid_calls) == 4
+    assert sum(path == expanded for path in hybrid_calls) == 2
+    original = tmp_path / "hybrid-candidate-m20" / "original" / "Wiki"
+    assert sum(path == original for path in hybrid_calls) == 2
+    assert result["hybrid_invocation"] == {
+        "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
+        "original_calls": 2, "expanded_calls": 2,
+    }
+    assert result["campaign_progress"] == {
+        "role": "candidate", "original_completed": 2, "expanded_completed": 2,
+    }
+    for observations in (result["original_observations"], result["expanded_observations"]):
+        assert len(observations) == 2
+        assert all(set(row) == {"ordinal", "query_sha256", "observation"} for row in observations)
 
 
 def test_export_hybrid_packet_rejects_legacy_direct_result_and_workflow_fallback(
