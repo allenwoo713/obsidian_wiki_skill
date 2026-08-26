@@ -548,11 +548,21 @@ def test_hybrid_preflight_dispatch_and_export_require_a_complete_raw_tree(
     plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
     bundle = _hybrid_dispatch_bundle(plan)
     preflight = operator.build_hybrid_preflight(bundle, expected_head=HEAD)
-    assert preflight["allowed_dirty_paths"] == []
-    real_git = operator._git
     branch = "feature/issue-50-dense-ann-recall"
     merge_ref = f"refs/heads/{branch}"
-    monkeypatch.setattr(operator, "_git", lambda *args: "" if args == ("status", "--porcelain=v1") else HEAD if args == ("rev-parse", "--verify", "@{upstream}") else "origin" if args == ("config", "--get", f"branch.{branch}.remote") else merge_ref if args == ("config", "--get", f"branch.{branch}.merge") else f"{HEAD}\t{merge_ref}" if args == ("ls-remote", "--exit-code", "--refs", "origin", merge_ref) else real_git(*args))
+    preflight.update(branch=branch, worktree_root=str(ROOT), head_sha=HEAD)
+    assert preflight["allowed_dirty_paths"] == []
+    replies = {
+        ("rev-parse", "--show-toplevel"): str(ROOT),
+        ("branch", "--show-current"): branch,
+        ("rev-parse", "HEAD"): HEAD,
+        ("rev-parse", "--verify", "@{upstream}"): HEAD,
+        ("config", "--get", f"branch.{branch}.remote"): "origin",
+        ("config", "--get", f"branch.{branch}.merge"): merge_ref,
+        ("ls-remote", "--exit-code", "--refs", "origin", merge_ref): f"{HEAD}\t{merge_ref}",
+        ("status", "--porcelain=v1"): "",
+    }
+    monkeypatch.setattr(operator, "_git", lambda *args: replies[args])
     assert operator.validate_feature_worktree_preflight(preflight)["head_sha"] == HEAD
     calls: list[dict] = []
     result = operator.execute_hybrid_dispatch(
@@ -591,14 +601,23 @@ def test_feature_worktree_preflight_requires_exact_resolved_upstream_head(
         "workflow_name": "eval", "campaign_stage": "hybrid",
         "require_upstream_head": True,
     }
-    real_git = operator._git
+    branch = preflight["branch"]
+    merge_ref = f"refs/heads/{branch}"
+    replies = {
+        ("rev-parse", "--show-toplevel"): str(ROOT),
+        ("branch", "--show-current"): branch,
+        ("rev-parse", "HEAD"): HEAD,
+        ("rev-parse", "--verify", "@{upstream}"): HEAD,
+        ("config", "--get", f"branch.{branch}.remote"): "origin",
+        ("config", "--get", f"branch.{branch}.merge"): merge_ref,
+        ("ls-remote", "--exit-code", "--refs", "origin", merge_ref): f"{HEAD}\t{merge_ref}",
+        ("status", "--porcelain=v1"): "",
+    }
 
     def diverged_git(*args: str) -> str:
-        if args == ("status", "--porcelain=v1"):
-            return ""
         if args == ("rev-parse", "--verify", "@{upstream}"):
             return "0" * 40
-        return real_git(*args)
+        return replies[args]
 
     monkeypatch.setattr(operator, "_git", diverged_git)
     with pytest.raises(ValueError, match="upstream"):
@@ -610,15 +629,39 @@ def test_feature_worktree_preflight_requires_exact_resolved_upstream_head(
     assert not ledger_file.exists()
 
     def unresolved_git(*args: str) -> str:
-        if args == ("status", "--porcelain=v1"):
-            return ""
         if args == ("rev-parse", "--verify", "@{upstream}"):
             raise subprocess.CalledProcessError(128, ["git", *args])
-        return real_git(*args)
+        return replies[args]
 
     monkeypatch.setattr(operator, "_git", unresolved_git)
     with pytest.raises(ValueError, match="upstream"):
         operator.validate_feature_worktree_preflight(preflight)
+
+
+def test_feature_worktree_preflight_rejects_detached_current_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A detached checkout never obtains feature-worktree authority."""
+    branch = "feature/issue-50-dense-ann-recall"
+    merge_ref = f"refs/heads/{branch}"
+    request = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "branch": branch,
+        "worktree_root": str(ROOT), "head_sha": HEAD, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "hybrid", "require_upstream_head": True,
+    }
+    replies = {
+        ("rev-parse", "--show-toplevel"): str(ROOT),
+        ("branch", "--show-current"): "",
+        ("rev-parse", "HEAD"): HEAD,
+        ("rev-parse", "--verify", "@{upstream}"): HEAD,
+        ("config", "--get", f"branch.{branch}.remote"): "origin",
+        ("config", "--get", f"branch.{branch}.merge"): merge_ref,
+        ("ls-remote", "--exit-code", "--refs", "origin", merge_ref): f"{HEAD}\t{merge_ref}",
+        ("status", "--porcelain=v1"): "",
+    }
+    monkeypatch.setattr(operator, "_git", lambda *args: replies[args])
+    with pytest.raises(ValueError, match="feature branch"):
+        operator.validate_feature_worktree_preflight(request)
 
 
 @pytest.mark.parametrize(
