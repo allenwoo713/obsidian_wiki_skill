@@ -1307,7 +1307,7 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
     assert "hybrid-allocation" in hybrid
     assert "python -m eval.phase07_operator_gate hybrid-dispatch" in hybrid
     assert "python -m eval.phase07_ann_campaign export-hybrid-packet" in hybrid
-    assert 'PYTHONUNBUFFERED: "1"' in hybrid
+    assert "PYTHONUNBUFFERED" not in hybrid
     assert "sealed-role hybrid campaign with live progress" in hybrid
     assert "finalize --output-dir .review-tmp/phase07/hybrid-artifact --stage hybrid" in hybrid
     assert "if: ${{ always() }}" in hybrid

@@ -650,7 +650,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions: {contents: read, actions: read}
-    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2", PYTHONUNBUFFERED: "1"}
+    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
