@@ -23,6 +23,18 @@ from pathlib import Path
 from typing import Any
 
 
+# ``-m`` executes this source as ``__main__`` while the production runner
+# imports its package name.  Alias the executing module before any capability
+# issuer exists, or fail closed rather than minting a second issuer.
+_CANONICAL_MODULE_NAME = "eval.phase07_operator_gate"
+if __name__ == "__main__":
+    _executing_module = sys.modules[__name__]
+    _canonical_module = sys.modules.get(_CANONICAL_MODULE_NAME)
+    if _canonical_module is not None and _canonical_module is not _executing_module:
+        raise RuntimeError("duplicate phase07 operator module identity")
+    sys.modules[_CANONICAL_MODULE_NAME] = _executing_module
+
+
 # ``python eval/phase07_operator_gate.py`` puts only ``eval/`` on sys.path.
 # Establish the checkout root before any delayed ``eval.*`` import so the
 # direct-file command used by both hosted runner families is deterministic.
