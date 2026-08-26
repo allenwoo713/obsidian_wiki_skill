@@ -112,8 +112,20 @@ def validate_query_corpus_separation(manifest: Mapping[str, object], *, indexed_
         raise ValueError("query/corpus overlap")
 
 
+def canonical_corpus_file_bytes(path: Path) -> bytes:
+    """Read a corpus member with platform line endings normalized for Markdown."""
+    contents = path.read_bytes()
+    if path.suffix.lower() == ".md":
+        return contents.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return contents
+
+
 def canonical_content_tree_sha256(root: Path) -> str:
-    """Digest a public corpus by canonical relative path and file bytes, never path root."""
+    """Digest a public corpus by canonical relative path and content, never path root.
+
+    Markdown sources are text corpus members, so normalize their platform line
+    endings.  Other files remain byte-for-byte significant.
+    """
     if not root.is_dir() or root.is_symlink():
         raise ValueError("unsafe corpus root")
     digest = hashlib.sha256()
@@ -124,7 +136,8 @@ def canonical_content_tree_sha256(root: Path) -> str:
         if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
             raise ValueError("unsafe corpus entry")
         relative = path.relative_to(root).as_posix().encode("utf-8")
-        digest.update(relative); digest.update(b"\0"); digest.update(path.read_bytes()); digest.update(b"\0")
+        contents = canonical_corpus_file_bytes(path)
+        digest.update(relative); digest.update(b"\0"); digest.update(contents); digest.update(b"\0")
     return digest.hexdigest()
 
 
