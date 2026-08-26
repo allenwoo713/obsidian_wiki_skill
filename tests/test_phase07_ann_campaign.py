@@ -513,7 +513,7 @@ def test_hybrid_dispatch_module_cli_consumes_its_opaque_capability_before_filesy
         "schema_version": 1, "campaign_stage": "hybrid",
         "hybrid_request_sha256": request["record_self_sha256"],
         "dense_source_head": operator.DENSE_SOURCE_HEAD, "hybrid_implementation_head": HEAD,
-        "baseline": dict(operator.HYBRID_BASELINE), "candidate": candidate,
+        "role": "candidate", "config": candidate,
         "scale": 30000, "query_count": 105, "authorization": "none", "retention_days": 90,
         "replacement_for_run_id": None, "dispatch_identity": "phase07-hybrid/m20",
         "record_self_sha256": "",
@@ -1036,7 +1036,7 @@ def test_self_sealed_hybrid_member_never_reaches_build_spy_without_canonical_wra
 
 
 def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """One role builds two indexes and invokes public hybrid search twice per query."""
     import eval.run_eval as run_eval
@@ -1104,6 +1104,12 @@ def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
     for observations in (result["original_observations"], result["expanded_observations"]):
         assert len(observations) == 2
         assert all(set(row) == {"ordinal", "query_sha256", "observation"} for row in observations)
+    progress = capsys.readouterr().out
+    assert "[phase07-hybrid] role=candidate build=original complete" in progress
+    assert "[phase07-hybrid] role=candidate build=expanded complete" in progress
+    assert "[phase07-hybrid] role=candidate original_queries=2/2 complete" in progress
+    assert "[phase07-hybrid] role=candidate expanded_queries=2/2 complete" in progress
+    assert "authorization" not in progress
 
 
 def test_export_hybrid_packet_rejects_legacy_direct_result_and_workflow_fallback(

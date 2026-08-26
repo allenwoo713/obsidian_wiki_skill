@@ -809,7 +809,9 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         return index
 
     original_index = build_candidate("original", config, original_wiki)
+    print(f"[phase07-hybrid] role={role} build=original complete", flush=True)
     expanded_index = build_candidate("expanded", config, expanded_wiki)
+    print(f"[phase07-hybrid] role={role} build=expanded complete", flush=True)
     if embed is not None:
         class _InjectedEncoder:
             def encode(self, texts, **_kwargs):
@@ -837,6 +839,10 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         expanded_row, _ = observe(expanded_index, query, expanded_wiki)
         original.append({"ordinal": ordinal, "query_sha256": query_sha256, "observation": original_row})
         expanded.append({"ordinal": ordinal, "query_sha256": query_sha256, "observation": expanded_row})
+        completed = ordinal + 1
+        if completed % 15 == 0 or completed == len(queries):
+            print(f"[phase07-hybrid] role={role} original_queries={completed}/{len(queries)} complete", flush=True)
+            print(f"[phase07-hybrid] role={role} expanded_queries={completed}/{len(queries)} complete", flush=True)
     return {
         "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": bundle["record_self_sha256"],
         "role": role, "config": config,
