@@ -1434,7 +1434,11 @@ class _HybridGitHubFixtureClient:
             artifact = {
                 "id": record["artifact_id"],
                 "name": f"phase07-hybrid-{run_id}-{record['run_attempt']}",
-                "expired": False, "expires_at": "2026-11-23T00:00:00Z",
+                # GitHub's artifact creation time, not the workflow creation
+                # time, is the only valid retention anchor.  The 27-minute
+                # gap makes an accidental run-created-at calculation visible.
+                "created_at": record.get("artifact_created_at", "2026-08-25T00:27:00Z"),
+                "expired": False, "expires_at": record.get("artifact_expires_at", "2026-11-23T00:27:00Z"),
                 "digest": f"sha256:{record['archive_sha256']}",
                 "workflow_run": {
                     "id": run_id, "head_branch": "feature/issue-50-dense-ann-recall",
@@ -1465,7 +1469,10 @@ def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             "api_job_id_mismatch": 1801, "api_artifact_id_mismatch": 1901,
         },
         32: {
-            "run_id": 702, "run_attempt": 2, "job_id": 802, "artifact_id": 902,
+            # Separate workflow runs may both be their first (and only)
+            # attempt.  The happy path must not accidentally require an
+            # attempt number to increase across candidates.
+            "run_id": 702, "run_attempt": 1, "job_id": 802, "artifact_id": 902,
             "api_run_id_mismatch": 1702, "api_run_attempt_mismatch": 12,
             "api_job_id_mismatch": 1802, "api_artifact_id_mismatch": 1902,
         },
@@ -1573,6 +1580,296 @@ def test_hybrid_two_download_collection_provenance_and_postdownload_reconstructs
     assert all(record["status"] in {"numeric-success", "rejected-candidate"}
                for record in ledger["candidate_records"])
     assert ledger["record_self_sha256"] == reconcile_ann_gate.canonical_digest(ledger)
+
+
+def test_hybrid_success_uses_raw_upload_envelope_and_roundtrips_through_production_clis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful hosted artifact is exactly the seven raw files, then reconciled by CLI."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    _job, workflow = _phase07_hybrid_workflow_section()
+    upload = workflow.split("uses: actions/upload-artifact@v4", 1)[1]
+    assert "path: .review-tmp/phase07/hybrid-artifact/raw" in upload
+    assert "path: .review-tmp/phase07/hybrid-artifact\n" not in upload
+    assert "export-hybrid-packet" not in upload
+
+    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    expected_files = {
+        "hybrid-request.json", "hybrid-ledger.json", "hybrid-result.json",
+        "dispatch-bundle.json", "locked-execution.json", "allocation.json",
+        "hybrid-packet.json",
+    }
+    for record in records:
+        with zipfile.ZipFile(record["archive"]) as archive:
+            assert {member.filename for member in archive.infolist()} == expected_files
+            assert all(not member.is_dir() for member in archive.infolist())
+
+    request_file, downloads = tmp_path / "request.json", tmp_path / "downloads.json"
+    collection, manifest, ledger = (
+        tmp_path / "collection.json", tmp_path / "manifest.json", tmp_path / "ledger.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    monkeypatch.setenv("GITHUB_TOKEN", "fixture-read-token")
+    assert gate.main([
+        "hybrid-provenance", "--request-file", str(collection),
+        "--ledger-file", str(manifest), "--provenance-dir", str(tmp_path / "provenance"),
+    ], github_client=_HybridGitHubFixtureClient(
+        head=request["hybrid_implementation_head"], records=records,
+    )) == 0
+    assert reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(ledger), "--mode", "hybrid-postdownload",
+    ]) == 0
+    assert json.loads(ledger.read_text(encoding="utf-8"))["campaign_stage"] == "hybrid"
+
+
+def test_hybrid_finalizer_failure_removes_partial_raw_and_seals_only_one_rejection(
+    tmp_path: Path,
+) -> None:
+    """`always()` upload must never retain partial raw/campaign evidence after failure."""
+    import phase07_operator_gate as gate
+
+    output = tmp_path / "hybrid-artifact"
+    (output / "raw").mkdir(parents=True)
+    (output / "raw" / "hybrid-result.json").write_text("partial", encoding="utf-8")
+    (output / "campaign-output").mkdir()
+    (output / "campaign-output" / "measurement.json").write_text("partial", encoding="utf-8")
+    (output / "exported-hybrid-packet.json").write_text("partial", encoding="utf-8")
+
+    assert gate.finalize_pipeline_artifact(
+        output_dir=output, stage="hybrid", head_sha="a" * 40, run_id=701,
+        run_attempt=1, job_key="phase07-hybrid", job_status="failure",
+    ) == 0
+    files = [path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()]
+    assert files == ["hybrid-pipeline-rejection.json"]
+    rejection = json.loads((output / files[0]).read_text(encoding="utf-8"))
+    assert rejection["status"] == "reject-evidence"
+
+
+@pytest.mark.parametrize(
+    ("created_at", "expires_at", "api_mutation", "accepted"),
+    (
+        ("2026-08-25T00:27:00Z", "2026-11-23T00:27:00Z", None, True),
+        ("2026-08-25T00:27:00Z", "2026-11-22T00:27:00Z", None, False),
+        ("2026-08-25T00:27:00Z", "2026-11-24T00:27:00Z", None, False),
+        # Artifact creation preceding the run is impossible even if its own
+        # apparent retention duration looks correct.
+        ("2026-08-24T23:59:59Z", "2026-11-22T23:59:59Z", None, False),
+        ("2026-08-25T00:27:00Z", "2026-11-23T00:27:00Z", "expired", False),
+    ),
+    ids=("artifact-plus-90d", "89d", "91d", "created-before-run", "expired"),
+)
+def test_hybrid_provenance_retention_is_anchored_to_artifact_creation_and_not_run_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, created_at: str, expires_at: str,
+    api_mutation: str | None, accepted: bool,
+) -> None:
+    """Retention accepts only artifact.created_at + 90 days, never run.created_at."""
+    import phase07_operator_gate as gate
+
+    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    for record in records:
+        record["artifact_created_at"] = created_at
+        record["artifact_expires_at"] = expires_at
+    request_file, downloads, collection = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    output = tmp_path / "manifest.json"
+    client = _HybridGitHubFixtureClient(
+        head=request["hybrid_implementation_head"], records=records, mutation=api_mutation,
+    )
+    if accepted:
+        assert gate.collect_hybrid_provenance(
+            request_file=collection, output=output, provenance_dir=tmp_path / "provenance",
+            token="fixture-read-token", client=client,
+        ) == 0
+    else:
+        with pytest.raises(ValueError):
+            gate.collect_hybrid_provenance(
+                request_file=collection, output=output, provenance_dir=tmp_path / "provenance",
+                token="fixture-read-token", client=client,
+            )
+        assert not output.exists()
+
+
+def test_hybrid_partial_retry_is_not_two_independent_first_attempt_packets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One candidate cannot be re-run within a workflow and passed off as peer evidence."""
+    import phase07_operator_gate as gate
+
+    request, records, fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    retried = records[1]
+    raw = Path(retried["extracted_dir"])
+    allocation = json.loads((raw / "allocation.json").read_text(encoding="utf-8"))
+    allocation["allocation"]["run_attempt"] = 2
+    allocation["record_self_sha256"] = gate.canonical_digest(allocation)
+    (raw / "allocation.json").write_text(json.dumps(allocation, sort_keys=True), encoding="utf-8")
+    fixture._reseal_test_hybrid_raw_tree(raw)
+    retried["run_attempt"] = 2
+    retried["archive_sha256"] = _zip_hybrid_artifact(raw, Path(retried["archive"]))
+
+    request_file, downloads, collection = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    with pytest.raises(ValueError, match="attempt|retry|independent"):
+        gate.collect_hybrid_provenance(
+            request_file=collection, output=tmp_path / "manifest.json",
+            provenance_dir=tmp_path / "provenance", token="fixture-read-token",
+            client=_HybridGitHubFixtureClient(
+                head=request["hybrid_implementation_head"], records=records,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("os", "Windows"), ("architecture", "ARM64"), ("image", "replayed-image")),
+    ids=("os", "architecture", "image"),
+)
+def test_hybrid_workflow_binds_runner_context_without_image_fallbacks_and_raw_host_mutation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str,
+) -> None:
+    """Hosted facts originate in GitHub runner context and must match the raw packet."""
+    import phase07_operator_gate as gate
+
+    _job, workflow = _phase07_hybrid_workflow_section()
+    assert "RUNNER_OS: ${{ runner.os }}" in workflow
+    assert "RUNNER_ARCH: ${{ runner.arch }}" in workflow
+    assert "'os':os.environ['RUNNER_OS']" in workflow
+    assert "'architecture':os.environ['RUNNER_ARCH']" in workflow
+    assert "os.environ.get('ImageOS'" not in workflow
+    assert "os.environ.get('ImageVersion'" not in workflow
+
+    request, records, fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    raw = Path(records[0]["extracted_dir"])
+    execution = json.loads((raw / "locked-execution.json").read_text(encoding="utf-8"))
+    execution["host"][field] = value
+    execution["record_self_sha256"] = gate.canonical_digest(execution)
+    (raw / "locked-execution.json").write_text(json.dumps(execution, sort_keys=True), encoding="utf-8")
+    fixture._reseal_test_hybrid_raw_tree(raw)
+    records[0]["archive_sha256"] = _zip_hybrid_artifact(raw, Path(records[0]["archive"]))
+    request_file, downloads, collection = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    with pytest.raises(ValueError, match="runner|host"):
+        gate.collect_hybrid_provenance(
+            request_file=collection, output=tmp_path / "manifest.json",
+            provenance_dir=tmp_path / "provenance", token="fixture-read-token",
+            client=_HybridGitHubFixtureClient(
+                head=request["hybrid_implementation_head"], records=records,
+            ),
+        )
+
+
+@pytest.mark.parametrize("mutation", ("manifest-provenance-replay", "provenance-raw-candidate"))
+def test_hybrid_postcollection_identity_mutation_or_replay_is_rejected_by_reconcile_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    """Reconciliation rechecks manifest ↔ provenance ↔ raw identity after collection."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+        tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    if mutation == "manifest-provenance-replay":
+        evidence["evidence"][1]["provenance"] = evidence["evidence"][0]["provenance"]
+    else:
+        provenance_path = Path(evidence["evidence"][0]["provenance"])
+        provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance_document["evidence"][0]["candidate"] = deepcopy(evidence["evidence"][1]["candidate"])
+        provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
+        provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
+    evidence["record_self_sha256"] = reconcile_ann_gate.canonical_digest(evidence)
+    manifest.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+
+    output = tmp_path / "ledger.json"
+    assert reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(output), "--mode", "hybrid-postdownload",
+    ]) == 1
+    assert not output.exists()
+
+
+def test_hybrid_postdownload_rejects_retention_provenance_tamper_after_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resealed manifest cannot launder a changed artifact creation/expiry binding."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+        tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    provenance_path = Path(evidence["evidence"][0]["provenance"])
+    provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance = provenance_document["evidence"][0]
+    # The future production provenance schema must retain this field and make
+    # post-download reconciliation recompute the exact interval from it.
+    provenance["artifact_created_at"] = "2026-08-25T00:27:00Z"
+    provenance["artifact_expires_at"] = "2026-11-24T00:27:00Z"
+    provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
+    provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
+    assert reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(tmp_path / "ledger.json"), "--mode", "hybrid-postdownload",
+    ]) == 1
 
 
 @pytest.mark.parametrize(
