@@ -1348,10 +1348,13 @@ def test_hybrid_allocation_and_collection_interfaces_are_typed_and_fail_closed()
     assert hasattr(gate, "build_hybrid_collection_request")
     assert hasattr(gate, "collect_hybrid_provenance")
     valid = {
-        "run_id": 701, "run_attempt": 2, "job_id": 703,
+        "run_id": 701, "run_attempt": 1, "job_id": 703,
         "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32,
     }
     assert gate.validate_hybrid_allocation(valid) == valid
+    retried = {**valid, "run_attempt": 2}
+    with pytest.raises(ValueError):
+        gate.validate_hybrid_allocation(retried)
     for field, value in (
         ("run_id", True),
         ("run_attempt", 0),
