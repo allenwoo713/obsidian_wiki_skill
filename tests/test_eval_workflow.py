@@ -1428,7 +1428,7 @@ class _HybridGitHubFixtureClient:
                 "name": "Phase 07 independent hybrid campaign",
                 "status": "completed", "conclusion": "success",
                 "runner_name": "GitHub Actions 42", "runner_group_name": "GitHub Actions",
-                "labels": ["ubuntu-latest", "X64"],
+                "labels": ["ubuntu-latest"],
             }
             if self.mutation == "job-mismatch":
                 job["id"] = record["api_job_id_mismatch"]
@@ -1610,6 +1610,30 @@ def test_hybrid_success_uses_raw_upload_envelope_and_roundtrips_through_producti
         "hybrid-packet.json",
     }
     for record in records:
+        candidate_m = record["candidate"]["m"]
+        artifact_root = tmp_path / f"hybrid-artifact-m{candidate_m}"
+        raw = artifact_root / "raw"
+        shutil.copytree(record["extracted_dir"], raw)
+        # Successful workflow layout may retain campaign/export diagnostics at
+        # the parent, but upload/finalization authority is raw alone.
+        (artifact_root / "campaign-output").mkdir()
+        (artifact_root / "campaign-output" / "campaign-log.json").write_text(
+            "{}", encoding="utf-8",
+        )
+        (artifact_root / "exported-hybrid-packet.json").write_text(
+            "{}", encoding="utf-8",
+        )
+        assert gate.finalize_pipeline_artifact(
+            output_dir=artifact_root, stage="hybrid",
+            head_sha=request["hybrid_implementation_head"], run_id=record["run_id"],
+            run_attempt=record["run_attempt"], job_key="phase07-hybrid", job_status="success",
+        ) == 0
+        assert {path.name for path in raw.iterdir() if path.is_file()} == expected_files
+        assert not list(artifact_root.rglob("*-rejection.json"))
+        assert (artifact_root / "campaign-output" / "campaign-log.json").is_file()
+        assert (artifact_root / "exported-hybrid-packet.json").is_file()
+        record["extracted_dir"] = str(raw)
+        record["archive_sha256"] = _zip_hybrid_artifact(raw, Path(record["archive"]))
         with zipfile.ZipFile(record["archive"]) as archive:
             assert {member.filename for member in archive.infolist()} == expected_files
             assert all(not member.is_dir() for member in archive.infolist())
@@ -1739,15 +1763,8 @@ def test_hybrid_partial_retry_is_not_two_independent_first_attempt_packets(
     assert _operator_main_exit_code(gate, [
         "hybrid-collection-request", "--request-file", str(request_file),
         "--downloads-file", str(downloads), "--ledger-file", str(collection),
-    ]) == 0
-    with pytest.raises(ValueError, match="attempt|retry|independent"):
-        gate.collect_hybrid_provenance(
-            request_file=collection, output=tmp_path / "manifest.json",
-            provenance_dir=tmp_path / "provenance", token="fixture-read-token",
-            client=_HybridGitHubFixtureClient(
-                head=request["hybrid_implementation_head"], records=records,
-            ),
-        )
+    ]) == 1
+    assert not collection.exists(), "partial retry must be rejected before API collection"
 
 
 @pytest.mark.parametrize(
@@ -1798,7 +1815,14 @@ def test_hybrid_workflow_binds_runner_context_without_image_fallbacks_and_raw_ho
         )
 
 
-@pytest.mark.parametrize("mutation", ("manifest-provenance-replay", "provenance-raw-candidate"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "manifest-provenance-replay", "provenance-raw-candidate",
+        "runner-self-hosted", "runner-wrong-group",
+        "runner-arm64-label", "runner-missing-ubuntu-label",
+    ),
+)
 def test_hybrid_postcollection_identity_mutation_or_replay_is_rejected_by_reconcile_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
 ) -> None:
@@ -1827,10 +1851,24 @@ def test_hybrid_postcollection_identity_mutation_or_replay_is_rejected_by_reconc
     evidence = json.loads(manifest.read_text(encoding="utf-8"))
     if mutation == "manifest-provenance-replay":
         evidence["evidence"][1]["provenance"] = evidence["evidence"][0]["provenance"]
-    else:
+    elif mutation == "provenance-raw-candidate":
         provenance_path = Path(evidence["evidence"][0]["provenance"])
         provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
         provenance_document["evidence"][0]["candidate"] = deepcopy(evidence["evidence"][1]["candidate"])
+        provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
+        provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
+    else:
+        provenance_path = Path(evidence["evidence"][0]["provenance"])
+        provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+        runner = provenance_document["evidence"][0]["runner"]
+        if mutation == "runner-self-hosted":
+            runner["name"] = "self-hosted runner"
+        elif mutation == "runner-wrong-group":
+            runner["group"] = "self-hosted"
+        elif mutation == "runner-arm64-label":
+            runner["labels"] = ["ubuntu-latest", "ARM64"]
+        else:
+            runner["labels"] = ["X64"]
         provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
         provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
     evidence["record_self_sha256"] = reconcile_ann_gate.canonical_digest(evidence)
