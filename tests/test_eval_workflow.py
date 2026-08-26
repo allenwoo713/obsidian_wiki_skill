@@ -1687,6 +1687,36 @@ def test_hybrid_finalizer_failure_removes_partial_raw_and_seals_only_one_rejecti
     assert rejection["status"] == "reject-evidence"
 
 
+def test_hybrid_success_finalizer_rejects_stale_head_and_replaces_raw_with_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A success status cannot preserve raw numeric evidence from another head."""
+    import phase07_operator_gate as gate
+
+    _request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    record = records[0]
+    output = tmp_path / "hybrid-artifact"
+    raw = output / "raw"
+    shutil.copytree(record["extracted_dir"], raw)
+    # These fixture packets are internally bound to the actual generated head,
+    # not the stale value supplied below.
+    result = json.loads((raw / "hybrid-result.json").read_text(encoding="utf-8"))
+    assert result["head_sha"] != "0" * 40
+    (output / "campaign-output").mkdir()
+    (output / "campaign-output" / "measurement.json").write_text("{}", encoding="utf-8")
+    (output / "exported-hybrid-packet.json").write_text("{}", encoding="utf-8")
+
+    assert gate.finalize_pipeline_artifact(
+        output_dir=output, stage="hybrid", head_sha="0" * 40,
+        run_id=record["run_id"], run_attempt=record["run_attempt"],
+        job_key="phase07-hybrid", job_status="success",
+    ) == 0
+    files = [path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()]
+    assert files == ["raw/hybrid-pipeline-rejection.json"]
+    rejection = json.loads((output / files[0]).read_text(encoding="utf-8"))
+    assert rejection["status"] == "reject-evidence"
+
+
 @pytest.mark.parametrize(
     ("created_at", "expires_at", "api_mutation", "accepted"),
     (
