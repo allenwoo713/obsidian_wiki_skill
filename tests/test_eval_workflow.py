@@ -1277,7 +1277,7 @@ def _phase07_hybrid_workflow_section() -> tuple[dict, str]:
 
 
 def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> None:
-    """Task 2: only a sealed two-member hybrid request can select this job."""
+    """Only a sealed baseline/m20/m32 role bundle can select this one job."""
     source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(
         encoding="utf-8"
     )
@@ -1300,13 +1300,15 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
     job, hybrid = _phase07_hybrid_workflow_section()
     assert job["runs-on"] == "ubuntu-latest"
     assert job["permissions"] == {"contents": "read", "actions": "read"}
-    assert job["timeout-minutes"] not in ("", "0", 0)
+    assert job["timeout-minutes"] == "45"
     assert "workflow_dispatch" in job["if"]
     assert "inputs.workflow_inputs" in hybrid
     assert "phase07-hybrid" in hybrid
     assert "hybrid-allocation" in hybrid
     assert "python -m eval.phase07_operator_gate hybrid-dispatch" in hybrid
     assert "python -m eval.phase07_ann_campaign export-hybrid-packet" in hybrid
+    assert 'PYTHONUNBUFFERED: "1"' in hybrid
+    assert "sealed-role hybrid campaign with live progress" in hybrid
     assert "finalize --output-dir .review-tmp/phase07/hybrid-artifact --stage hybrid" in hybrid
     assert "if: ${{ always() }}" in hybrid
     assert "representative" not in hybrid.lower()
@@ -1459,14 +1461,19 @@ class _HybridGitHubFixtureClient:
         raise AssertionError(path)
 
 
-def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[dict], object]:
-    """Return an exact m20/m32 request plus real raw trees and API records."""
+def _three_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[dict], object]:
+    """Return baseline/m20/m32 role trees and their independent API records."""
     fixture = _phase07_hybrid_fixture_module()
     plan_root = tmp_path / "plan"
     plan_root.mkdir()
     plan, _ = fixture._build_test_hybrid_plan(plan_root, monkeypatch)
     records: list[dict] = []
     identities = {
+        16: {
+            "run_id": 700, "run_attempt": 1, "job_id": 800, "artifact_id": 900,
+            "api_run_id_mismatch": 1700, "api_run_attempt_mismatch": 10,
+            "api_job_id_mismatch": 1800, "api_artifact_id_mismatch": 1900,
+        },
         20: {
             "run_id": 701, "run_attempt": 1, "job_id": 801, "artifact_id": 901,
             "api_run_id_mismatch": 1701, "api_run_attempt_mismatch": 11,
@@ -1481,16 +1488,17 @@ def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             "api_job_id_mismatch": 1802, "api_artifact_id_mismatch": 1902,
         },
     }
-    for m in (20, 32):
+    for role, m in (("baseline", 16), ("candidate", 20), ("candidate", 32)):
         identity = identities[m]
         run_id, attempt, job_id, artifact_id = (
             identity["run_id"], identity["run_attempt"], identity["job_id"], identity["artifact_id"],
         )
         allocation = {
             "run_id": run_id, "run_attempt": attempt, "job_id": job_id,
-            "job_key": "phase07-hybrid", "job_allocation_nonce": ("a" if m == 20 else "b") * 32,
+            "job_key": "phase07-hybrid",
+            "job_allocation_nonce": {16: "a", 20: "b", 32: "c"}[m] * 32,
         }
-        dispatch_bundle = fixture._hybrid_dispatch_bundle(plan, m=m)
+        dispatch_bundle = fixture._hybrid_dispatch_bundle(plan, role=role, m=m)
         # Hosted workflow records `${ImageOS} ${ImageVersion}`.  Keep this
         # integration fixture production-shaped without changing the shared
         # raw-tree fixture used by unrelated campaign tests.
@@ -1503,7 +1511,7 @@ def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         archive = tmp_path / f"m{m}.zip"
         records.append({
             **identity, **allocation, "artifact_id": artifact_id,
-            "candidate": deepcopy(dispatch_bundle["workflow_input"]["candidate"]),
+            "role": role, "config": deepcopy(dispatch_bundle["workflow_input"]["config"]),
             "bundle_sha256": dispatch_bundle["workflow_input"]["record_self_sha256"],
             "archive": str(archive),
             "extracted_dir": str(tree), "archive_sha256": _zip_hybrid_artifact(tree, archive),
@@ -1517,7 +1525,7 @@ def _hybrid_evidence_seed(tmp_path_factory: pytest.TempPathFactory):
     patch = pytest.MonkeyPatch()
     root = tmp_path_factory.mktemp("phase07-hybrid-seed")
     try:
-        yield _two_download_hybrid_evidence(root, patch)
+        yield _three_download_hybrid_evidence(root, patch)
     finally:
         patch.undo()
 
@@ -1526,9 +1534,10 @@ def _clone_hybrid_evidence(seed: tuple[dict, list[dict], object], tmp_path: Path
     request, source_records, fixture = seed
     records = []
     for record in source_records:
-        m = json.loads((Path(record["extracted_dir"]) / "hybrid-result.json").read_text(encoding="utf-8"))["candidate"]["m"]
-        extracted = tmp_path / f"m{m}-raw"
-        archive = tmp_path / f"m{m}.zip"
+        result = json.loads((Path(record["extracted_dir"]) / "hybrid-result.json").read_text(encoding="utf-8"))
+        role, m = result["role"], result["config"]["m"]
+        extracted = tmp_path / f"{role}-m{m}-raw"
+        archive = tmp_path / f"{role}-m{m}.zip"
         shutil.copytree(record["extracted_dir"], extracted)
         shutil.copy2(record["archive"], archive)
         records.append({**deepcopy(record), "archive": str(archive), "extracted_dir": str(extracted)})
@@ -1538,7 +1547,7 @@ def _clone_hybrid_evidence(seed: tuple[dict, list[dict], object], tmp_path: Path
 def _write_hybrid_downloads(path: Path, records: list[dict], *, secret: bool = False) -> None:
     rows = [
         {name: deepcopy(record[name]) for name in (
-            "run_id", "run_attempt", "job_id", "artifact_id", "candidate",
+            "run_id", "run_attempt", "job_id", "artifact_id", "role", "config",
             "bundle_sha256", "archive", "extracted_dir",
         )}
         for record in records
@@ -1557,7 +1566,7 @@ def test_hybrid_collection_request_rejects_unsealed_download_manifest(
     """The local download manifest is self-authenticating before raw paths are read."""
     import phase07_operator_gate as gate
 
-    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     downloads_file = tmp_path / "downloads.json"
     _write_hybrid_downloads(downloads_file, records)
     downloads = json.loads(downloads_file.read_text(encoding="utf-8"))
@@ -1582,14 +1591,14 @@ def _operator_main_exit_code(gate, argv: list[str]) -> int:
         return int(exc.code)
 
 
-def test_hybrid_two_download_collection_provenance_and_postdownload_reconstructs_both_packets(
+def test_hybrid_three_download_collection_provenance_and_postdownload_reconstructs_all_roles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise the real Task 2 evidence chain from downloaded bytes to ledger."""
+    """Exercise the three-role evidence chain from downloaded bytes to ledger."""
     import phase07_operator_gate as gate
     import reconcile_ann_gate
 
-    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     request_file, downloads_file = tmp_path / "hybrid-request.json", tmp_path / "downloads.json"
     request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
     _write_hybrid_downloads(downloads_file, records)
@@ -1610,7 +1619,12 @@ def test_hybrid_two_download_collection_provenance_and_postdownload_reconstructs
     ) == 0
     evidence = json.loads(manifest.read_text(encoding="utf-8"))
     assert evidence["record_self_sha256"] == reconcile_ann_gate.canonical_digest(evidence)
+    assert [(row["role"], row["config"]["m"]) for row in evidence["evidence"]] == [
+        ("baseline", 16), ("candidate", 20), ("candidate", 32),
+    ]
+    assert all(row["run_attempt"] == 1 for row in evidence["evidence"])
     ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
+    assert ledger["baseline_record"]["config"]["m"] == 16
     assert [record["candidate"]["m"] for record in ledger["candidate_records"]] == [20, 32]
     assert all(record["status"] in {"numeric-success", "rejected-candidate"}
                for record in ledger["candidate_records"])
@@ -1630,15 +1644,15 @@ def test_hybrid_success_uses_raw_upload_envelope_and_roundtrips_through_producti
     assert "path: .review-tmp/phase07/hybrid-artifact\n" not in upload
     assert "export-hybrid-packet" not in upload
 
-    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     expected_files = {
         "hybrid-request.json", "hybrid-ledger.json", "hybrid-result.json",
         "dispatch-bundle.json", "locked-execution.json", "allocation.json",
         "hybrid-packet.json",
     }
     for record in records:
-        candidate_m = record["candidate"]["m"]
-        artifact_root = tmp_path / f"hybrid-artifact-m{candidate_m}"
+        role, config = record["role"], record["config"]
+        artifact_root = tmp_path / f"hybrid-artifact-{role}-m{config['m']}"
         raw = artifact_root / "raw"
         shutil.copytree(record["extracted_dir"], raw)
         # Successful workflow layout may retain campaign/export diagnostics at
@@ -1720,7 +1734,7 @@ def test_hybrid_success_finalizer_rejects_stale_head_and_replaces_raw_with_rejec
     """A success status cannot preserve raw numeric evidence from another head."""
     import phase07_operator_gate as gate
 
-    _request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    _request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     record = records[0]
     output = tmp_path / "hybrid-artifact"
     raw = output / "raw"
@@ -1764,7 +1778,7 @@ def test_hybrid_provenance_retention_is_anchored_to_artifact_creation_and_not_ru
     """Retention accepts only artifact.created_at + 90 days, never run.created_at."""
     import phase07_operator_gate as gate
 
-    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     for record in records:
         record["artifact_created_at"] = created_at
         record["artifact_expires_at"] = expires_at
@@ -1795,13 +1809,13 @@ def test_hybrid_provenance_retention_is_anchored_to_artifact_creation_and_not_ru
         assert not output.exists()
 
 
-def test_hybrid_partial_retry_is_not_two_independent_first_attempt_packets(
+def test_hybrid_partial_retry_is_not_three_independent_first_attempt_packets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One candidate cannot be re-run within a workflow and passed off as peer evidence."""
+    """One role cannot be retried and passed off as independent peer evidence."""
     import phase07_operator_gate as gate
 
-    request, records, fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     retried = records[1]
     raw = Path(retried["extracted_dir"])
     allocation = json.loads((raw / "allocation.json").read_text(encoding="utf-8"))
@@ -1843,7 +1857,7 @@ def test_hybrid_workflow_binds_runner_context_without_image_fallbacks_and_raw_ho
     assert "os.environ.get('ImageOS'" not in workflow
     assert "os.environ.get('ImageVersion'" not in workflow
 
-    request, records, fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     raw = Path(records[0]["extracted_dir"])
     execution = json.loads((raw / "locked-execution.json").read_text(encoding="utf-8"))
     execution["host"][field] = value
@@ -1875,7 +1889,7 @@ def test_hybrid_workflow_binds_runner_context_without_image_fallbacks_and_raw_ho
 @pytest.mark.parametrize(
     "mutation",
     (
-        "manifest-provenance-replay", "provenance-raw-candidate",
+        "manifest-provenance-replay", "provenance-raw-role",
         "runner-self-hosted", "runner-wrong-group",
         "runner-arm64-label", "runner-missing-ubuntu-label",
     ),
@@ -1887,7 +1901,7 @@ def test_hybrid_postcollection_identity_mutation_or_replay_is_rejected_by_reconc
     import phase07_operator_gate as gate
     import reconcile_ann_gate
 
-    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     request_file, downloads, collection, manifest = (
         tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
         tmp_path / "manifest.json",
@@ -1908,10 +1922,11 @@ def test_hybrid_postcollection_identity_mutation_or_replay_is_rejected_by_reconc
     evidence = json.loads(manifest.read_text(encoding="utf-8"))
     if mutation == "manifest-provenance-replay":
         evidence["evidence"][1]["provenance"] = evidence["evidence"][0]["provenance"]
-    elif mutation == "provenance-raw-candidate":
+    elif mutation == "provenance-raw-role":
         provenance_path = Path(evidence["evidence"][0]["provenance"])
         provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
-        provenance_document["evidence"][0]["candidate"] = deepcopy(evidence["evidence"][1]["candidate"])
+        provenance_document["evidence"][0]["role"] = evidence["evidence"][1]["role"]
+        provenance_document["evidence"][0]["config"] = deepcopy(evidence["evidence"][1]["config"])
         provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
         provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
     else:
@@ -1946,7 +1961,7 @@ def test_hybrid_postdownload_rejects_retention_provenance_tamper_after_collectio
     import phase07_operator_gate as gate
     import reconcile_ann_gate
 
-    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
     request_file, downloads, collection, manifest = (
         tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
         tmp_path / "manifest.json",
@@ -1982,18 +1997,18 @@ def test_hybrid_postdownload_rejects_retention_provenance_tamper_after_collectio
 @pytest.mark.parametrize(
     "mutation",
     (
-        "missing-candidate", "duplicate-candidate", "candidate-mismatch", "bundle-mismatch",
+        "missing-role", "duplicate-role", "config-mismatch", "bundle-mismatch",
         "user-candidate", "user-scale",
         "non-success", "replacement", "stale-head", "expired", "run-mismatch",
         "attempt-mismatch", "job-mismatch", "artifact-mismatch", "archive-digest",
         "extracted-tree", "packet-digest", "missing-original-row", "missing-30k-row",
-        "query-tamper", "generator-tamper", "threshold-tamper", "secret",
+        "query-tamper", "generator-tamper", "precomputed-gate", "secret",
     ),
 )
 def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
     tmp_path: Path, _hybrid_evidence_seed, mutation: str,
 ) -> None:
-    """One altered input is enough to make the entire two-candidate batch invalid."""
+    """One altered input invalidates the complete three-role evidence batch."""
     import phase07_operator_gate as gate
 
     request, records, fixture = _clone_hybrid_evidence(_hybrid_evidence_seed, tmp_path)
@@ -2007,14 +2022,14 @@ def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
     }
     request_mutations = {"user-candidate", "user-scale"}
 
-    if mutation == "missing-candidate":
+    if mutation == "missing-role":
         records.pop()
-    elif mutation == "duplicate-candidate":
-        records[1]["candidate"] = deepcopy(records[0]["candidate"])
-    elif mutation == "candidate-mismatch":
-        records[0]["candidate"] = {
-            "index_type": "hnsw_sq", "m": 20,
-            "ef_construction": 300, "query_ef": 100,
+    elif mutation == "duplicate-role":
+        records[1]["role"] = records[0]["role"]
+        records[1]["config"] = deepcopy(records[0]["config"])
+    elif mutation == "config-mismatch":
+        records[0]["config"] = {
+            "index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 300,
         }
     elif mutation == "bundle-mismatch":
         records[0]["bundle_sha256"] = "0" * 64
@@ -2038,18 +2053,18 @@ def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
         packet = json.loads((raw / "hybrid-packet.json").read_text(encoding="utf-8"))
         packet["raw_tree_sha256"] = "0" * 64
         (raw / "hybrid-packet.json").write_text(json.dumps(packet, sort_keys=True), encoding="utf-8")
-    elif mutation in {"missing-original-row", "missing-30k-row", "query-tamper", "generator-tamper", "threshold-tamper"}:
+    elif mutation in {"missing-original-row", "missing-30k-row", "query-tamper", "generator-tamper", "precomputed-gate"}:
         result = json.loads((raw / "hybrid-result.json").read_text(encoding="utf-8"))
         if mutation == "missing-original-row":
-            result["original_absolute_observations"].pop()
+            result["original_observations"].pop()
         elif mutation == "missing-30k-row":
-            result["expanded_paired_observations"].pop()
+            result["expanded_observations"].pop()
         elif mutation == "query-tamper":
-            result["original_absolute_observations"][0]["query_sha256"] = "0" * 64
+            result["original_observations"][0]["query_sha256"] = "0" * 64
         elif mutation == "generator-tamper":
             result["generator_recipe"]["target_size"] = 1
         else:
-            result["original_absolute_gate"]["candidate_metrics"]["page_recall_at_5"] = 0.0
+            result["candidate_verdict"] = "numeric-success"
         (raw / "hybrid-result.json").write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
         fixture._reseal_test_hybrid_raw_tree(raw)
     _write_hybrid_downloads(downloads_file, records, secret=mutation == "secret")
@@ -2059,7 +2074,7 @@ def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
         "--downloads-file", str(downloads_file), "--ledger-file", str(collection),
     ])
     if mutation in request_mutations | {
-        "missing-candidate", "duplicate-candidate", "candidate-mismatch", "bundle-mismatch", "secret",
+        "missing-role", "duplicate-role", "config-mismatch", "bundle-mismatch", "secret",
     }:
         assert collection_code == 1
         assert not collection.exists()
@@ -2118,7 +2133,7 @@ def test_hybrid_postdownload_cli_rejects_incomplete_or_untyped_evidence_before_t
 
 
 def test_hybrid_reconciler_has_no_generic_or_representative_authority() -> None:
-    """Task 2's reconciler needs a separate reconstruction path for both packets."""
+    """The reconciler requires the dedicated three-role reconstruction path."""
     import reconcile_ann_gate
 
     assert hasattr(reconcile_ann_gate, "reconcile_hybrid_postdownload")
@@ -2129,7 +2144,8 @@ def test_hybrid_reconciler_has_no_generic_or_representative_authority() -> None:
     assert "--hybrid-evidence-manifest" in source
     assert "hybrid-postdownload" in source
     assert "validate_hybrid_artifact_tree" in source
-    assert "exactly two" in source.lower()
+    assert "exactly-three" in source.lower()
+    assert "_pair_hybrid_role_observations" in source
 
 
 @pytest.mark.parametrize("init_baseline", [False, True])

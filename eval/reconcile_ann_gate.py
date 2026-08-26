@@ -540,11 +540,11 @@ _HYBRID_PROVENANCE_FIELDS = frozenset({
     "run_id", "run_attempt", "job_id", "job_key", "job_name", "artifact_id", "artifact_name",
     "status", "conclusion", "head_branch", "head_sha", "event", "runner", "run_created_at",
     "artifact_created_at", "artifact_expires_at", "api_archive_sha256", "local_archive_sha256",
-    "candidate", "bundle_sha256",
+    "role", "config", "bundle_sha256",
     "archive", "extracted_dir",
 })
 _HYBRID_MANIFEST_EVIDENCE_FIELDS = frozenset({
-    "run_id", "run_attempt", "job_id", "artifact_id", "candidate", "bundle_sha256",
+    "run_id", "run_attempt", "job_id", "artifact_id", "role", "config", "bundle_sha256",
     "archive", "extracted_dir", "provenance",
 })
 _HYBRID_ARTIFACT_FILES = frozenset({
@@ -581,9 +581,11 @@ def _validate_hybrid_provenance(value: Any) -> dict[str, Any]:
             or value["job_name"] != "Phase 07 independent hybrid campaign" \
             or value["status"] != "completed" or value["conclusion"] != "success":
         raise ValueError("hybrid API run/job/artifact status")
-    if not isinstance(value["candidate"], dict) or not isinstance(value["bundle_sha256"], str) \
+    from eval.phase07_operator_gate import HYBRID_ROLE_CONFIGS
+    if (value.get("role"), value.get("config")) not in HYBRID_ROLE_CONFIGS \
+            or not isinstance(value["bundle_sha256"], str) \
             or not _HEX64.fullmatch(value["bundle_sha256"]):
-        raise ValueError("hybrid provenance candidate/bundle identity")
+        raise ValueError("hybrid provenance role/config/bundle identity")
     if not isinstance(value["head_branch"], str) or value["head_branch"] in {"", "main", "master"} \
             or not isinstance(value["head_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["head_sha"]) \
             or value["event"] != "workflow_dispatch" \
@@ -648,9 +650,9 @@ def _read_hybrid_artifact(root: Path, provenance: dict[str, Any], request: dict[
     if result["hybrid_request_sha256"] != request["record_self_sha256"] \
             or member["hybrid_request_sha256"] != request["record_self_sha256"]:
         raise ValueError("hybrid artifact/request binding")
-    if member.get("candidate") != provenance["candidate"] \
+    if member.get("role") != provenance["role"] or member.get("config") != provenance["config"] \
             or member.get("record_self_sha256") != provenance["bundle_sha256"]:
-        raise ValueError("hybrid packet/API candidate bundle mismatch")
+        raise ValueError("hybrid packet/API role/config bundle mismatch")
     if any(allocation[name] != provenance[name] for name in ("run_id", "run_attempt", "job_id")):
         raise ValueError("hybrid packet/API allocation identity mismatch")
     host = result["locked_execution"].get("host")
@@ -661,10 +663,9 @@ def _read_hybrid_artifact(root: Path, provenance: dict[str, Any], request: dict[
     if result.get("head_sha") != provenance["head_sha"]:
         raise ValueError("hybrid packet/API head binding")
     return {
-        "candidate": member["candidate"], "status": result["candidate_verdict"],
-        "original_absolute_gate": result["original_absolute_gate"],
-        "paired_30k_non_regression_gate": result["paired_30k_non_regression_gate"],
-        "aggregate_metrics": result["aggregate_metrics"],
+        "role": member["role"], "config": member["config"],
+        "original_observations": result["original_observations"],
+        "expanded_observations": result["expanded_observations"],
         "packet_identity": {
             "raw_tree_sha256": validated["raw_tree_sha256"],
             "packet_self_sha256": validated["wrapper"]["record_self_sha256"],
@@ -681,16 +682,40 @@ def _read_hybrid_artifact(root: Path, provenance: dict[str, Any], request: dict[
     }
 
 
-def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
-    """Fail closed unless exactly two m20/m32 30k hybrid evidence packets survive.
+def _pair_hybrid_role_observations(
+    *, baseline: list[dict[str, Any]], candidate: list[dict[str, Any]], label: str,
+) -> list[dict[str, Any]]:
+    """Join two independently hosted role streams by exact ordinal/query digest."""
+    if not isinstance(baseline, list) or not isinstance(candidate, list) \
+            or len(baseline) != 105 or len(candidate) != 105:
+        raise ValueError(f"complete hybrid {label} role evidence required")
+    paired: list[dict[str, Any]] = []
+    for ordinal, (baseline_row, candidate_row) in enumerate(zip(baseline, candidate, strict=True)):
+        fields = {"ordinal", "query_sha256", "observation"}
+        if not isinstance(baseline_row, dict) or not isinstance(candidate_row, dict) \
+                or set(baseline_row) != fields or set(candidate_row) != fields \
+                or baseline_row["ordinal"] != ordinal or candidate_row["ordinal"] != ordinal \
+                or baseline_row["query_sha256"] != candidate_row["query_sha256"]:
+            raise ValueError(f"hybrid {label} ordinal/query join mismatch")
+        paired.append({
+            "ordinal": ordinal, "query_sha256": baseline_row["query_sha256"],
+            "baseline": baseline_row["observation"], "candidate": candidate_row["observation"],
+        })
+    return paired
 
-    Both an accepted numeric result and a correctly measured rejected candidate
-    are evidence.  A hosted failure, a stale/expired artifact, or any replay is
-    not evidence and invalidates the whole two-candidate batch.
+
+def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
+    """Recompute gates from one baseline plus exact m20/m32 role packets.
+
+    Pairing happens only here, after all three independent first-attempt hosted
+    artifacts pass byte, API, runner, source, query and allocation validation.
     """
     from eval.phase07_operator_gate import (
-        HYBRID_CANDIDATES, _validate_hybrid_request, canonical_digest as operator_digest,
+        HYBRID_BASELINE, HYBRID_CANDIDATES, HYBRID_ROLE_CONFIGS,
+        _validate_hybrid_request, canonical_digest as operator_digest,
+        recompute_hybrid_gate_verdicts,
     )
+    from eval.run_eval import aggregate_hybrid_serialized_metrics
 
     _reject_hybrid_secrets(request, "hybrid request")
     if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
@@ -702,17 +727,17 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
     _reject_hybrid_secrets(manifest, "hybrid evidence manifest")
     if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "evidence", "record_self_sha256"} \
             or manifest.get("schema_version") != 1 or manifest.get("record_self_sha256") != canonical_digest(manifest) \
-            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) != 2:
-        raise ValueError("strict exactly-two hybrid provenance manifest")
+            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) != 3:
+        raise ValueError("strict exactly-three hybrid provenance manifest")
 
-    candidate_records: list[dict[str, Any]] = []
-    seen_runs, seen_jobs, seen_artifacts, seen_archives, seen_bundles, seen_candidates = (set() for _ in range(6))
+    role_records: list[dict[str, Any]] = []
+    seen_runs, seen_jobs, seen_artifacts, seen_archives, seen_bundles, seen_roles = (set() for _ in range(6))
     for row in manifest["evidence"]:
         if not isinstance(row, dict) or set(row) != _HYBRID_MANIFEST_EVIDENCE_FIELDS \
                 or any(not isinstance(row[name], int) or isinstance(row[name], bool) or row[name] <= 0
                        for name in ("run_id", "run_attempt", "job_id", "artifact_id")) \
                 or row["run_attempt"] != 1 \
-                or not isinstance(row["candidate"], dict) \
+                or (row.get("role"), row.get("config")) not in HYBRID_ROLE_CONFIGS \
                 or not isinstance(row["bundle_sha256"], str) or not _HEX64.fullmatch(row["bundle_sha256"]) \
                 or not all(isinstance(row[name], str) and row[name]
                            for name in ("archive", "extracted_dir", "provenance")):
@@ -731,7 +756,7 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         provenance = _validate_hybrid_provenance(provenance_document["evidence"][0])
         if provenance["head_sha"] != head:
             raise ValueError("hybrid API/request head mismatch")
-        cross_bound = ("run_id", "run_attempt", "job_id", "artifact_id", "candidate", "bundle_sha256")
+        cross_bound = ("run_id", "run_attempt", "job_id", "artifact_id", "role", "config", "bundle_sha256")
         if any(row[name] != provenance[name] for name in cross_bound) \
                 or Path(row["archive"]).resolve() != Path(provenance["archive"]).resolve() \
                 or Path(row["extracted_dir"]).resolve() != Path(provenance["extracted_dir"]).resolve():
@@ -745,22 +770,53 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         seen_runs.add(run_identity); seen_jobs.add(provenance["job_id"])
         seen_artifacts.add(provenance["artifact_id"]); seen_archives.add(archive_identity)
         record = _read_hybrid_artifact(artifact_dir, provenance, request)
-        candidate = record["candidate"]
-        candidate_m = candidate.get("m") if isinstance(candidate, dict) else None
-        if candidate != row["candidate"] or record["packet_identity"]["bundle_sha256"] != row["bundle_sha256"] \
-                or candidate not in HYBRID_CANDIDATES or candidate_m in seen_candidates:
-            raise ValueError("duplicate or unapproved hybrid candidate")
-        if record["status"] not in {"numeric-success", "rejected-candidate"}:
-            raise ValueError("hybrid result is not eligible evidence")
+        role_identity = (record["role"], canonical_digest(record["config"]))
+        if record["role"] != row["role"] or record["config"] != row["config"] \
+                or record["packet_identity"]["bundle_sha256"] != row["bundle_sha256"] \
+                or (record["role"], record["config"]) not in HYBRID_ROLE_CONFIGS \
+                or role_identity in seen_roles:
+            raise ValueError("duplicate or unapproved hybrid role/config")
         if record["packet_identity"]["bundle_sha256"] in seen_bundles:
             raise ValueError("duplicate hybrid dispatch bundle")
-        seen_candidates.add(candidate_m); seen_bundles.add(record["packet_identity"]["bundle_sha256"])
-        candidate_records.append(record)
-    observed_candidates = {canonical_digest(record["candidate"]) for record in candidate_records}
-    expected_candidates = {canonical_digest(dict(row)) for row in HYBRID_CANDIDATES}
-    if observed_candidates != expected_candidates:
-        raise ValueError("exact m20/m32 hybrid candidate evidence required")
-    candidate_records.sort(key=lambda item: item["candidate"]["m"])
+        seen_roles.add(role_identity); seen_bundles.add(record["packet_identity"]["bundle_sha256"])
+        role_records.append(record)
+    observed_roles = {(record["role"], canonical_digest(record["config"])) for record in role_records}
+    expected_roles = {(role, canonical_digest(dict(config))) for role, config in HYBRID_ROLE_CONFIGS}
+    if observed_roles != expected_roles:
+        raise ValueError("exact baseline/m20/m32 hybrid role evidence required")
+    baseline_record = next(record for record in role_records
+                           if record["role"] == "baseline" and record["config"] == HYBRID_BASELINE)
+    queries_path = Path(__file__).resolve().parent / "queries.jsonl"
+    queries = [json.loads(line) for line in queries_path.read_text(encoding="utf-8").splitlines() if line]
+    candidate_records: list[dict[str, Any]] = []
+    for candidate_record in sorted(
+            (record for record in role_records if record["role"] == "candidate"),
+            key=lambda record: record["config"]["m"]):
+        original_paired = _pair_hybrid_role_observations(
+            baseline=baseline_record["original_observations"],
+            candidate=candidate_record["original_observations"], label="original")
+        expanded_paired = _pair_hybrid_role_observations(
+            baseline=baseline_record["expanded_observations"],
+            candidate=candidate_record["expanded_observations"], label="expanded")
+        aggregate_metrics = {
+            "original_absolute": aggregate_hybrid_serialized_metrics(
+                specifications=queries, observations=original_paired),
+            "paired_30k": aggregate_hybrid_serialized_metrics(
+                specifications=queries, observations=expanded_paired),
+        }
+        gates = recompute_hybrid_gate_verdicts(
+            original_absolute=aggregate_metrics["original_absolute"],
+            expanded_paired=aggregate_metrics["paired_30k"], committed_baseline=None,
+            baselines_sha256=candidate_record["packet_identity"]["baselines_sha256"],
+        )
+        candidate_records.append({
+            "candidate": candidate_record["config"], "status": gates["candidate_verdict"],
+            "original_absolute_gate": gates["original_absolute_gate"],
+            "paired_30k_non_regression_gate": gates["paired_30k_non_regression_gate"],
+            "aggregate_metrics": aggregate_metrics,
+            "packet_identity": candidate_record["packet_identity"],
+            "provenance": candidate_record["provenance"],
+        })
     ledger = {
         "schema_version": 1, "campaign_stage": "hybrid", "authorization": "none",
         "hybrid_request_sha256": request["record_self_sha256"],
@@ -768,6 +824,11 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         "hybrid_implementation_head": head, "baseline": request["baseline"],
         "candidates": request["candidates"], "scale": request["scale"], "query_count": request["query_count"],
         "evidence_manifest_sha256": manifest["record_self_sha256"],
+        "baseline_record": {
+            "config": baseline_record["config"],
+            "packet_identity": baseline_record["packet_identity"],
+            "provenance": baseline_record["provenance"],
+        },
         "candidate_records": candidate_records,
     }
     ledger["record_self_sha256"] = canonical_digest(ledger)

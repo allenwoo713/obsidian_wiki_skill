@@ -650,7 +650,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions: {contents: read, actions: read}
-    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2"}
+    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2", PYTHONUNBUFFERED: "1"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -693,7 +693,7 @@ jobs:
           RUNNER_ARCH: ${{ runner.arch }}
         run: >
           python -c "import hashlib,importlib.metadata as metadata,json,os,pathlib,sys; d=pathlib.Path('.review-tmp/phase07'); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); assert os.environ['RUNNER_OS']=='Linux' and os.environ['RUNNER_ARCH']=='X64'; assert os.environ['ImageOS'] and os.environ['ImageVersion']; cpu=next((line.split(':',1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown-cpu'); runtime={'python':f'{sys.version_info.major}.{sys.version_info.minor}','lancedb':metadata.version('lancedb'),'numpy':metadata.version('numpy'),'pyarrow':metadata.version('pyarrow'),'omp_num_threads':2,'openblas_num_threads':2,'mkl_num_threads':2}; source={'requirements_sha256':h('requirements.txt'),'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; host={'os':os.environ['RUNNER_OS'],'architecture':os.environ['RUNNER_ARCH'],'image':os.environ['ImageOS']+' '+os.environ['ImageVersion'],'hostname':os.uname().nodename,'cpu_count':os.cpu_count() or 1,'cpu_model':cpu}; (d/'hybrid-execution.json').write_text(json.dumps({'head_sha':os.environ['HEAD'],'runtime':runtime,'source_digests':source,'host':host},sort_keys=True))"
-      - name: Invoke the real fixed-candidate hybrid campaign
+      - name: Invoke the real sealed-role hybrid campaign with live progress
         run: >
           python -m eval.phase07_operator_gate hybrid-dispatch
           --dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json
