@@ -25,6 +25,7 @@ from obsidian_wiki.domain.index_models import (  # noqa: E402
     VectorIndexConfig,
 )
 from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
+from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir  # noqa: E402
 from obsidian_wiki.infrastructure import lancedb_index_repository as repository_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
     LanceDbIndexRepository,
@@ -76,6 +77,20 @@ def _embed384(seed: int = 0):
         return out
 
     return embed
+
+
+class _FacadeEmbedder:
+    """Small deterministic embedder that still exercises WikiIndex's public build path."""
+
+    def __init__(self) -> None:
+        self._encode = _embed384()
+        self.tokenizer = lambda text, **_kwargs: {"input_ids": list(range(max(1, len(text) // 4)))}
+
+    def get_embedding_dimension(self) -> int:
+        return 384
+
+    def encode(self, texts, **_kwargs):
+        return self._encode(texts)
 
 
 def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> None:
@@ -198,6 +213,73 @@ def test_real_lancedb_has_no_storage_mutation_after_final_seal(
         if event in {"persist", "create_vector_index"}
     )
     assert final_mutation < final_seal, f"storage 在最终 seal 后仍被修改: {events}"
+
+
+def test_wikiindex_post_publication_marker_failure_preserves_published_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final timing write can reject the caller without relabelling a published build failed."""
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "# Timing\n\nPOSTPUBLICATIONMARKERTERM\n")
+    index = WikiIndex(index_dir)
+    index._embedder = _FacadeEmbedder()
+    import build_index as build_index_module
+
+    real_storage_contract = build_index_module.build_storage_contract
+    forwarded_sinks: list[object] = []
+
+    def capture_storage_contract(*args, **kwargs):
+        forwarded_sinks.append(kwargs.get("progress_sink"))
+        return real_storage_contract(*args, **kwargs)
+
+    monkeypatch.setattr(build_index_module, "build_storage_contract", capture_storage_contract)
+    stages: list[str] = []
+
+    def fail_only_after_publication(stage: str) -> None:
+        stages.append(stage)
+        if stage == "validation_seal_publication":
+            raise BrokenPipeError("timing marker transport closed")
+
+    with pytest.raises(BrokenPipeError, match="timing marker transport closed"):
+        index.build(wiki, full_rebuild=True, progress_sink=fail_only_after_publication)
+
+    assert forwarded_sinks == [fail_only_after_publication]
+    assert stages == [
+        "scan_chunk", "dense_embedding", "lance_fts_persist",
+        "hnsw_create_index", "validation_seal_publication",
+    ]
+    active_lance = resolve_active_lance_dir(index_dir)
+    published_build = active_lance.parent
+    assert published_build.parent == index_dir / "builds"
+    assert not (published_build / ".failed").exists()
+    assert not list((index_dir / "builds").glob("*/.failed"))
+    assert not (index_dir / "campaign-success.json").exists()
+    assert not (index_dir / "authorization.json").exists()
+
+
+def test_wikiindex_hnsw_failure_emits_no_later_timing_markers_or_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HNSW failures stay pre-publication and cannot emit a complete timing boundary."""
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "# Timing\n\nHNSWMUTATIONMARKERTERM\n")
+    index = WikiIndex(index_dir)
+    index._embedder = _FacadeEmbedder()
+    stages: list[str] = []
+
+    def fail_hnsw(*_args, **_kwargs):
+        raise RuntimeError("forced HNSW mutation failure")
+
+    monkeypatch.setattr(LanceDbIndexRepository, "create_vector_index", fail_hnsw)
+    with pytest.raises(RuntimeError, match="forced HNSW mutation failure"):
+        index.build(wiki, full_rebuild=True, progress_sink=stages.append)
+
+    assert "lance_fts_persist" in stages
+    assert "hnsw_create_index" not in stages
+    assert "validation_seal_publication" not in stages
+    assert not (index_dir / "ACTIVE_INDEX").exists()
 
 
 def test_legacy_manifest_requires_rebuild(tmp_path: Path) -> None:
