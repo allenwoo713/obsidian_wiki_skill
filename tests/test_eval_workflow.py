@@ -5,8 +5,11 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import zipfile
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -315,6 +318,7 @@ def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -
         "preflight": {"phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"},
         "screening": {"phase07-screening"},
         "confirmation": {"phase07-confirmation"},
+        "hybrid": {"phase07-hybrid"},
     }
     for stage, allowed in expected.items():
         selected = {
@@ -348,10 +352,10 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
 
     assert set(dispatch) == {"campaign_stage", "workflow_inputs"}
     assert dispatch["campaign_stage"]["options"] == [
-        "preflight", "screening", "confirmation",
+        "preflight", "screening", "confirmation", "hybrid",
     ]
     assert dispatch["workflow_inputs"]["description"] == (
-        "Sealed generated Phase 07 ordinal confirmation input bundle"
+        "Sealed generated Phase 07 campaign dispatch bundle"
     )
 
     selected = {
@@ -364,6 +368,7 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
         "phase07-entitlement-preflight-windows",
         "phase07-screening",
         "phase07-confirmation",
+        "phase07-hybrid",
     }
 
 
@@ -535,7 +540,7 @@ def test_hosted_preflight_module_entrypoint_seals_rejection(tmp_path: Path) -> N
 
 def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key() -> None:
     workflow = yaml.load((SKILL_ROOT / ".github/workflows/eval.yml").read_text(), Loader=yaml.BaseLoader)
-    for name in ("phase07-screening", "phase07-confirmation"):
+    for name in ("phase07-screening", "phase07-confirmation", "phase07-hybrid"):
         assert workflow["jobs"][name]["env"] == {"OMP_NUM_THREADS":"2", "OPENBLAS_NUM_THREADS":"2", "MKL_NUM_THREADS":"2"}
     confirmation = json.dumps(workflow["jobs"]["phase07-confirmation"], sort_keys=True)
     source = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
@@ -1252,6 +1257,444 @@ def test_confirmation_workflow_locks_runtime_sources_and_host_measurements_befor
         "ImageVersion",
     ):
         assert required in confirmation
+
+
+def _phase07_hybrid_workflow_section() -> tuple[dict, str]:
+    """Return the parsed job and its isolated source section.
+
+    This deliberately consumes the real workflow rather than an in-memory
+    facsimile: a green test must describe the hosted production route.
+    """
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(
+        encoding="utf-8"
+    )
+    document = yaml.load(source, Loader=yaml.BaseLoader)
+    assert "phase07-hybrid" in document["jobs"], "missing dedicated hybrid job"
+    return document["jobs"]["phase07-hybrid"], source.split(
+        "  phase07-hybrid:", 1
+    )[1].split("  phase07-pr-acceptance-gate:", 1)[0]
+
+
+def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> None:
+    """Task 2: only a sealed two-member hybrid request can select this job."""
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(
+        encoding="utf-8"
+    )
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    dispatch = workflow["on"]["workflow_dispatch"]["inputs"]
+
+    assert dispatch["campaign_stage"]["options"] == [
+        "preflight", "screening", "confirmation", "hybrid",
+    ]
+    assert dispatch["workflow_inputs"]["description"] == (
+        "Sealed generated Phase 07 campaign dispatch bundle"
+    )
+
+    selected = {
+        name
+        for name, spec in workflow["jobs"].items()
+        if "inputs.campaign_stage == 'hybrid'" in spec.get("if", "")
+    }
+    assert selected == {"phase07-hybrid"}
+    job, hybrid = _phase07_hybrid_workflow_section()
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    assert job["timeout-minutes"] not in ("", "0", 0)
+    assert "workflow_dispatch" in job["if"]
+    assert "inputs.workflow_inputs" in hybrid
+    assert "phase07-hybrid" in hybrid
+    assert "hybrid-allocation" in hybrid
+    assert "python -m eval.phase07_operator_gate hybrid-dispatch" in hybrid
+    assert "python -m eval.phase07_ann_campaign export-hybrid-packet" in hybrid
+    assert "finalize --output-dir .review-tmp/phase07/hybrid-artifact --stage hybrid" in hybrid
+    assert "if: ${{ always() }}" in hybrid
+    assert "representative" not in hybrid.lower()
+    assert "generic campaign" not in hybrid.lower()
+
+
+def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
+    """The distinct job is model-backed, finite, and never publishes secrets."""
+    _job, hybrid = _phase07_hybrid_workflow_section()
+    for required in (
+        "python-version: '3.13'",
+        "lancedb':'0.34.0",
+        "numpy':'2.2.6",
+        "pyarrow':'25.0.0",
+        "OMP_NUM_THREADS: \"2\"",
+        "OPENBLAS_NUM_THREADS: \"2\"",
+        "MKL_NUM_THREADS: \"2\"",
+        "Hydrate exact immutable model only on cache miss",
+        "Validate immutable cached model tree",
+        "validate_model_tree",
+        "/attempts/{run_attempt}/jobs",
+        "phase07-hybrid-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path: .review-tmp/phase07/hybrid-artifact",
+        "retention-days: 90",
+    ):
+        assert required in hybrid
+    assert hybrid.count("uses: actions/upload-artifact@v4") == 1
+    assert "if: ${{ always() }}" in hybrid.split(
+        "uses: actions/upload-artifact@v4", 1
+    )[0]
+    for forbidden in ("GITHUB_TOKEN=", "Authorization:", "Bearer ", "echo $GITHUB_TOKEN"):
+        assert forbidden not in hybrid
+
+
+def test_hybrid_allocation_and_collection_interfaces_are_typed_and_fail_closed() -> None:
+    """No confirmation/generic allocation can be relabelled as hybrid evidence."""
+    import phase07_operator_gate as gate
+
+    assert hasattr(gate, "seal_hybrid_allocation")
+    assert hasattr(gate, "build_hybrid_collection_request")
+    assert hasattr(gate, "collect_hybrid_provenance")
+    valid = {
+        "run_id": 701, "run_attempt": 2, "job_id": 703,
+        "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32,
+    }
+    assert gate.validate_hybrid_allocation(valid) == valid
+    for field, value in (
+        ("run_id", True),
+        ("run_attempt", 0),
+        ("job_id", "703"),
+        ("job_key", "phase07-confirmation"),
+        ("job_allocation_nonce", "a" * 31),
+    ):
+        malformed = {**valid, field: value}
+        with pytest.raises(ValueError):
+            gate.validate_hybrid_allocation(malformed)
+
+
+def _phase07_hybrid_fixture_module():
+    """Load only the test-owned Phase 07 raw-evidence fixture helpers.
+
+    The fixture module makes complete raw files with the public serializer
+    shape.  It does not call any exporter/collector under test, so it cannot
+    manufacture a passing production artifact on their behalf.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "phase07_hybrid_evidence_fixture",
+        SKILL_ROOT / "tests" / "test_phase07_ann_campaign.py",
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _zip_hybrid_artifact(raw_root: Path, archive: Path) -> str:
+    """Create the downloaded-artifact envelope whose bytes the API binds."""
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for path in sorted(raw_root.iterdir()):
+            if path.is_file():
+                output.write(path, arcname=path.name)
+    return hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+class _HybridGitHubFixtureClient:
+    """Narrow attempt-scoped GitHub API fixture; no token is retained."""
+
+    def __init__(self, *, head: str, records: list[dict], mutation: str | None = None) -> None:
+        self.head = head
+        self.records = {record["run_id"]: record for record in records}
+        self.mutation = mutation
+
+    def get_json(self, path: str, _token: str) -> dict:
+        run_id = next((value for value in self.records if f"/runs/{value}" in path), None)
+        assert run_id is not None, path
+        record = self.records[run_id]
+        if path.endswith(f"/runs/{run_id}"):
+            response = {
+                "id": run_id, "run_attempt": record["run_attempt"],
+                "head_sha": self.head, "head_branch": "feature/issue-50-dense-ann-recall",
+                "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                "created_at": "2026-08-25T00:00:00Z",
+            }
+            if self.mutation == "non-success":
+                response["conclusion"] = "failure"
+            if self.mutation == "stale-head":
+                response["head_sha"] = "0" * 40
+            if self.mutation == "run-mismatch":
+                response["id"] = run_id + 1
+            if self.mutation == "attempt-mismatch":
+                response["run_attempt"] = record["run_attempt"] + 1
+            return response
+        if path.endswith(f"/attempts/{record['run_attempt']}/jobs"):
+            job = {
+                "id": record["job_id"], "run_id": run_id,
+                "run_attempt": record["run_attempt"],
+                "name": "Phase 07 independent hybrid campaign",
+                "status": "completed", "conclusion": "success",
+                "runner_name": "GitHub Actions 42", "runner_group_name": "GitHub Actions",
+                "labels": ["ubuntu-latest", "X64"],
+            }
+            if self.mutation == "job-mismatch":
+                job["id"] += 1
+            return {"jobs": [job]}
+        if path.endswith(f"/runs/{run_id}/artifacts"):
+            artifact = {
+                "id": record["artifact_id"],
+                "name": f"phase07-hybrid-{run_id}-{record['run_attempt']}",
+                "expired": False, "expires_at": "2026-11-23T00:00:00Z",
+                "digest": f"sha256:{record['archive_sha256']}",
+                "workflow_run": {
+                    "id": run_id, "head_branch": "feature/issue-50-dense-ann-recall",
+                    "head_sha": self.head,
+                },
+            }
+            if self.mutation == "artifact-mismatch":
+                artifact["id"] += 1
+            if self.mutation == "expired":
+                artifact["expired"] = True
+            if self.mutation == "archive-digest":
+                artifact["digest"] = "sha256:" + "0" * 64
+            return {"artifacts": [artifact]}
+        raise AssertionError(path)
+
+
+def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[dict], object]:
+    """Return an exact m20/m32 request plus real raw trees and API records."""
+    fixture = _phase07_hybrid_fixture_module()
+    plan_root = tmp_path / "plan"
+    plan_root.mkdir()
+    plan, _ = fixture._build_test_hybrid_plan(plan_root, monkeypatch)
+    records: list[dict] = []
+    for offset, m in enumerate((20, 32), start=1):
+        run_id, attempt, job_id, artifact_id = 700 + offset, offset, 800 + offset, 900 + offset
+        allocation = {
+            "run_id": run_id, "run_attempt": attempt, "job_id": job_id,
+            "job_key": "phase07-hybrid", "job_allocation_nonce": f"{offset:x}" * 32,
+        }
+        tree = fixture._make_valid_test_hybrid_raw_tree(
+            tmp_path / f"m{m}-raw", dispatch_bundle=fixture._hybrid_dispatch_bundle(plan, m=m),
+            locked_execution=fixture._locked_confirmation_environment(), allocation=allocation,
+        )
+        archive = tmp_path / f"m{m}.zip"
+        records.append({
+            **allocation, "artifact_id": artifact_id, "archive": str(archive),
+            "extracted_dir": str(tree), "archive_sha256": _zip_hybrid_artifact(tree, archive),
+        })
+    return plan["hybrid_request"], records, fixture
+
+
+@pytest.fixture(scope="module")
+def _hybrid_evidence_seed(tmp_path_factory: pytest.TempPathFactory):
+    """Build two expensive but test-owned packets once for the tamper matrix."""
+    patch = pytest.MonkeyPatch()
+    root = tmp_path_factory.mktemp("phase07-hybrid-seed")
+    try:
+        yield _two_download_hybrid_evidence(root, patch)
+    finally:
+        patch.undo()
+
+
+def _clone_hybrid_evidence(seed: tuple[dict, list[dict], object], tmp_path: Path) -> tuple[dict, list[dict], object]:
+    request, source_records, fixture = seed
+    records = []
+    for record in source_records:
+        m = json.loads((Path(record["extracted_dir"]) / "hybrid-result.json").read_text(encoding="utf-8"))["candidate"]["m"]
+        extracted = tmp_path / f"m{m}-raw"
+        archive = tmp_path / f"m{m}.zip"
+        shutil.copytree(record["extracted_dir"], extracted)
+        shutil.copy2(record["archive"], archive)
+        records.append({**record, "archive": str(archive), "extracted_dir": str(extracted)})
+    return deepcopy(request), records, fixture
+
+
+def _write_hybrid_downloads(path: Path, records: list[dict], *, secret: bool = False) -> None:
+    rows = [
+        {name: record[name] for name in ("run_id", "run_attempt", "archive", "extracted_dir")}
+        for record in records
+    ]
+    if secret:
+        rows[0]["token"] = "fixture-secret"
+    path.write_text(json.dumps({"schema_version": 1, "downloads": rows}, sort_keys=True), encoding="utf-8")
+
+
+def _operator_main_exit_code(gate, argv: list[str]) -> int:
+    """Normalize argparse's pre-route exit into an assertion-friendly code."""
+    try:
+        return gate.main(argv)
+    except SystemExit as exc:
+        return int(exc.code)
+
+
+def test_hybrid_two_download_collection_provenance_and_postdownload_reconstructs_both_packets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the real Task 2 evidence chain from downloaded bytes to ledger."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    request_file, downloads_file = tmp_path / "hybrid-request.json", tmp_path / "downloads.json"
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads_file, records)
+    collection = tmp_path / "collection-request.json"
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads_file), "--ledger-file", str(collection),
+    ]) == 0
+    assert collection.is_file()
+    collected = json.loads(collection.read_text(encoding="utf-8"))
+    assert collected["record_self_sha256"] == gate.canonical_digest(collected)
+
+    provenance_dir, manifest = tmp_path / "provenance", tmp_path / "evidence-manifest.json"
+    client = _HybridGitHubFixtureClient(head=request["hybrid_implementation_head"], records=records)
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=provenance_dir,
+        token="fixture-read-token", client=client,
+    ) == 0
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    assert evidence["record_self_sha256"] == reconcile_ann_gate.canonical_digest(evidence)
+    ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
+    assert [record["candidate"]["m"] for record in ledger["candidate_records"]] == [20, 32]
+    assert all(record["status"] in {"numeric-success", "rejected-candidate"}
+               for record in ledger["candidate_records"])
+    assert ledger["record_self_sha256"] == reconcile_ann_gate.canonical_digest(ledger)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-candidate", "duplicate-candidate", "user-candidate", "user-scale",
+        "non-success", "replacement", "stale-head", "expired", "run-mismatch",
+        "attempt-mismatch", "job-mismatch", "artifact-mismatch", "archive-digest",
+        "extracted-tree", "packet-digest", "missing-original-row", "missing-30k-row",
+        "query-tamper", "generator-tamper", "threshold-tamper", "secret",
+    ),
+)
+def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
+    tmp_path: Path, _hybrid_evidence_seed, mutation: str,
+) -> None:
+    """One altered input is enough to make the entire two-candidate batch invalid."""
+    import phase07_operator_gate as gate
+
+    request, records, fixture = _clone_hybrid_evidence(_hybrid_evidence_seed, tmp_path)
+    request_file, downloads_file = tmp_path / "request.json", tmp_path / "downloads.json"
+    collection = tmp_path / "collection.json"
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    raw = Path(records[0]["extracted_dir"])
+    api_mutations = {
+        "non-success", "stale-head", "expired", "run-mismatch", "attempt-mismatch",
+        "job-mismatch", "artifact-mismatch", "archive-digest",
+    }
+    request_mutations = {"user-candidate", "user-scale"}
+
+    if mutation == "missing-candidate":
+        records.pop()
+    elif mutation == "duplicate-candidate":
+        records[1]["archive"] = records[0]["archive"]
+        records[1]["extracted_dir"] = records[0]["extracted_dir"]
+    elif mutation == "user-candidate":
+        request["candidates"][0]["m"] = 99
+        request["record_self_sha256"] = gate.canonical_digest(request)
+        request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    elif mutation == "user-scale":
+        request["scale"] = 1
+        request["record_self_sha256"] = gate.canonical_digest(request)
+        request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    elif mutation == "replacement":
+        dispatch = json.loads((raw / "dispatch-bundle.json").read_text(encoding="utf-8"))
+        dispatch["replacement_for_run_id"] = 1
+        dispatch["record_self_sha256"] = gate.canonical_digest(dispatch)
+        (raw / "dispatch-bundle.json").write_text(json.dumps(dispatch, sort_keys=True), encoding="utf-8")
+        fixture._reseal_test_hybrid_raw_tree(raw)
+    elif mutation == "extracted-tree":
+        (raw / "unexpected.json").write_text("{}", encoding="utf-8")
+    elif mutation == "packet-digest":
+        packet = json.loads((raw / "hybrid-packet.json").read_text(encoding="utf-8"))
+        packet["raw_tree_sha256"] = "0" * 64
+        (raw / "hybrid-packet.json").write_text(json.dumps(packet, sort_keys=True), encoding="utf-8")
+    elif mutation in {"missing-original-row", "missing-30k-row", "query-tamper", "generator-tamper", "threshold-tamper"}:
+        result = json.loads((raw / "hybrid-result.json").read_text(encoding="utf-8"))
+        if mutation == "missing-original-row":
+            result["original_absolute_observations"].pop()
+        elif mutation == "missing-30k-row":
+            result["expanded_paired_observations"].pop()
+        elif mutation == "query-tamper":
+            result["original_absolute_observations"][0]["query_sha256"] = "0" * 64
+        elif mutation == "generator-tamper":
+            result["generator_recipe"]["target_size"] = 1
+        else:
+            result["original_absolute_gate"]["candidate_metrics"]["page_recall_at_5"] = 0.0
+        (raw / "hybrid-result.json").write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+        fixture._reseal_test_hybrid_raw_tree(raw)
+    _write_hybrid_downloads(downloads_file, records, secret=mutation == "secret")
+
+    collection_code = _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads_file), "--ledger-file", str(collection),
+    ])
+    if mutation in request_mutations | {"missing-candidate", "duplicate-candidate", "secret"}:
+        assert collection_code == 1
+        assert not collection.exists()
+        return
+    assert collection_code == 0
+    with pytest.raises(ValueError):
+        gate.collect_hybrid_provenance(
+            request_file=collection, output=tmp_path / "manifest.json",
+            provenance_dir=tmp_path / "provenance", token="fixture-read-token",
+            client=_HybridGitHubFixtureClient(
+                head=request["hybrid_implementation_head"], records=records,
+                mutation=mutation if mutation in api_mutations else None,
+            ),
+        )
+
+
+def test_hybrid_operator_cli_exposes_only_typed_collection_and_provenance_routes(
+    tmp_path: Path,
+) -> None:
+    """Malformed generated authority must seal rejection, not enter a generic route."""
+    import phase07_operator_gate as gate
+
+    request = tmp_path / "forged-hybrid-request.json"
+    request.write_text(json.dumps({"campaign_stage": "representative"}), encoding="utf-8")
+    output = tmp_path / "collection.json"
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request),
+        "--downloads-file", str(tmp_path / "missing-downloads.json"),
+        "--ledger-file", str(output),
+    ]) == 1
+    assert not output.exists(), "invalid collection authority must not be sealed"
+
+
+def test_hybrid_postdownload_cli_rejects_incomplete_or_untyped_evidence_before_trust(
+    tmp_path: Path,
+) -> None:
+    """This hits the production CLI boundary, not a helper-only validator."""
+    request = tmp_path / "hybrid-request.json"
+    manifest = tmp_path / "hybrid-evidence.json"
+    output = tmp_path / "hybrid-ledger.json"
+    request.write_text(json.dumps({"campaign_stage": "hybrid"}), encoding="utf-8")
+    manifest.write_text(json.dumps({"evidence": []}), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "eval.reconcile_ann_gate",
+            "--hybrid-request", str(request),
+            "--hybrid-evidence-manifest", str(manifest),
+            "--output", str(output), "--mode", "hybrid-postdownload",
+        ],
+        cwd=SKILL_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 1
+    assert "unrecognized arguments" not in completed.stderr
+    assert not output.exists(), "invalid hybrid evidence must not become a ledger"
+
+
+def test_hybrid_reconciler_has_no_generic_or_representative_authority() -> None:
+    """Task 2's reconciler needs a separate reconstruction path for both packets."""
+    import reconcile_ann_gate
+
+    assert hasattr(reconcile_ann_gate, "reconcile_hybrid_postdownload")
+    signature = inspect.signature(reconcile_ann_gate.reconcile_hybrid_postdownload)
+    assert set(signature.parameters) == {"request", "manifest"}
+    source = (SKILL_ROOT / "eval" / "reconcile_ann_gate.py").read_text(encoding="utf-8")
+    assert "--hybrid-request" in source
+    assert "--hybrid-evidence-manifest" in source
+    assert "hybrid-postdownload" in source
+    assert "validate_hybrid_artifact_tree" in source
+    assert "exactly two" in source.lower()
 
 
 @pytest.mark.parametrize("init_baseline", [False, True])
