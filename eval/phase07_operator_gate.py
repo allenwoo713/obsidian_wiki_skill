@@ -60,7 +60,10 @@ CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
     "slot", "post_task0_head", "d25_binding",
     "d25_binding_sha256", "dispatch_identity", "record_self_sha256",
 })
-JOB_DISPLAY_NAMES = {"phase07-confirmation": "Phase 07 independent confirmation campaign"}
+JOB_DISPLAY_NAMES = {
+    "phase07-confirmation": "Phase 07 independent confirmation campaign",
+    "phase07-hybrid": "Phase 07 independent hybrid campaign",
+}
 CONFIRMATION_DOWNLOAD_FIELDS = frozenset({"run_id", "run_attempt", "archive", "extracted_dir"})
 DENSE_LEDGER_DIGEST = "71335b6bfa03f24368414ae56a22fd8896d4479c6bfbe871c36a14b26e3b211b"
 DENSE_SOURCE_HEAD = "2f15d6a4fef54dda9b0f4a258e78898e2ef6ea57"
@@ -450,6 +453,12 @@ def validate_hybrid_workflow_input(record: dict[str, Any], *, expected_head: str
 
 
 def _validate_hybrid_request(request: object, *, expected_head: str) -> dict[str, Any]:
+    # Direct-file and package execution can coexist in Python's module cache.
+    # They are the same checked-in source, but tests intentionally patch the
+    # package module's sealed fixture digest.  Resolve that one source value
+    # rather than silently validating two divergent copies of this file.
+    package_gate = sys.modules.get("eval.phase07_operator_gate")
+    expected_dense_digest = getattr(package_gate, "DENSE_LEDGER_DIGEST", DENSE_LEDGER_DIGEST)
     fields = {
         "schema_version", "campaign_stage", "dense_ledger_sha256", "dense_source_head",
         "hybrid_implementation_head", "dense_ordinal_identities", "baseline", "candidates",
@@ -459,7 +468,7 @@ def _validate_hybrid_request(request: object, *, expected_head: str) -> dict[str
     if not isinstance(request, dict) or set(request) != fields \
             or request.get("record_self_sha256") != canonical_digest(request) \
             or request.get("campaign_stage") != "hybrid" \
-            or request.get("dense_ledger_sha256") != DENSE_LEDGER_DIGEST \
+            or request.get("dense_ledger_sha256") != expected_dense_digest \
             or request.get("dense_source_head") != DENSE_SOURCE_HEAD \
             or request.get("hybrid_implementation_head") != expected_head \
             or request.get("dense_ordinal_identities") != [dict(row) for row in HYBRID_DENSE_ORDINAL_IDENTITIES] \
@@ -525,12 +534,21 @@ def build_hybrid_preflight(bundle: dict[str, Any], *, expected_head: str) -> dic
 def _validate_hybrid_allocation(value: object) -> dict[str, Any]:
     required = {"run_id", "run_attempt", "job_id", "job_key", "job_allocation_nonce"}
     if not isinstance(value, dict) or set(value) != required \
-            or not all(isinstance(value[name], int) and value[name] > 0 for name in ("run_id", "run_attempt", "job_id")) \
+            or not all(not isinstance(value[name], bool) and isinstance(value[name], int) and value[name] > 0 for name in ("run_id", "run_attempt", "job_id")) \
+            or value.get("run_attempt") != 1 \
             or value.get("job_key") != "phase07-hybrid" \
             or not isinstance(value.get("job_allocation_nonce"), str) or len(value["job_allocation_nonce"]) != 32 \
             or any(char not in "0123456789abcdef" for char in value["job_allocation_nonce"]):
         raise ValueError("hybrid allocation identity")
     return value
+
+
+# Public on purpose: the hosted workflow and post-download collector must use
+# the same narrow allocation schema.  Keeping a private implementation lets
+# the capability boundary below remain explicit without creating a second,
+# weaker parser for the CLI route.
+def validate_hybrid_allocation(value: object) -> dict[str, Any]:
+    return _validate_hybrid_allocation(value)
 
 
 _HYBRID_CAPABILITY_ISSUER = object()
@@ -750,6 +768,249 @@ def allocate_confirmation_job(client: Any, *, repository: str, run_id: int, run_
     return {"run_id": run_id, "run_attempt": run_attempt, "job_id": matches[0]["id"], "job_key": job_key, "job_allocation_nonce": nonce}
 
 
+_HYBRID_DOWNLOAD_FIELDS = frozenset({
+    "run_id", "run_attempt", "job_id", "artifact_id", "candidate", "bundle_sha256",
+    "archive", "extracted_dir",
+})
+_HYBRID_COLLECTION_FIELDS = frozenset({
+    "schema_version", "campaign_stage", "repository", "head_sha", "hybrid_request",
+    "hybrid_request_sha256", "downloads", "record_self_sha256",
+})
+
+
+def seal_hybrid_allocation(*, workflow_inputs: dict[str, Any], output: Path, repository: str,
+                           run_id: int, run_attempt: int, job_key: str, head_sha: str,
+                           token: str, client: Any | None = None) -> int:
+    """Seal the exact `phase07-hybrid` Jobs-API allocation before a 30k build."""
+    record: dict[str, Any] = {"schema_version": 1, "campaign_stage": "hybrid"}
+    try:
+        if run_attempt != 1:
+            raise ValueError("hybrid evidence permits only first-attempt runs")
+        validate_hybrid_dispatch_bundle(workflow_inputs, expected_head=head_sha)
+        allocation = _validate_hybrid_allocation(allocate_confirmation_job(
+            client or GitHubActionsClient(), repository=repository, run_id=run_id,
+            run_attempt=run_attempt, job_key=job_key, token=token,
+        ))
+        record.update(status="success", allocation=allocation)
+        _write_ledger(output, record)
+        return 0
+    except Exception:
+        # No exception text: API exceptions can include transport details and
+        # must never become a token-adjacent hosted artifact.
+        record.update(status="reject-evidence", failure_class="attempt_scoped_hybrid_job_or_nonce")
+        _write_ledger(output, record)
+        return 1
+
+
+def _parse_utc_timestamp(value: object, *, label: str) -> dt.datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"hybrid {label} timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"hybrid {label} timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"hybrid {label} timestamp timezone")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads: dict[str, Any]) -> dict[str, Any]:
+    """Bind exactly m20/m32 downloaded archives to their sealed request.
+
+    This stage deliberately does not trust a local raw packet as API evidence;
+    it only derives the candidate identities needed to request the exact API
+    records.  Tree/digest verification happens in `collect_hybrid_provenance`.
+    """
+    _reject_secrets(hybrid_request); _reject_secrets(downloads)
+    head = hybrid_request.get("hybrid_implementation_head") if isinstance(hybrid_request, dict) else ""
+    request = _validate_hybrid_request(hybrid_request, expected_head=head)
+    if not isinstance(downloads, dict) or set(downloads) != {"schema_version", "downloads"} \
+            or downloads.get("schema_version") != 1 or not isinstance(downloads.get("downloads"), list):
+        raise ValueError("strict hybrid downloads manifest")
+    if len(downloads["downloads"]) != 2:
+        raise ValueError("hybrid collection requires exactly two downloads")
+
+    selected: list[dict[str, Any]] = []
+    seen_runs: set[tuple[int, int]] = set()
+    seen_paths: set[tuple[Path, Path]] = set()
+    seen_candidates: set[int] = set()
+    for value in downloads["downloads"]:
+        if not isinstance(value, dict) or set(value) != _HYBRID_DOWNLOAD_FIELDS:
+            raise ValueError("strict hybrid download record")
+        run_id, run_attempt = value["run_id"], value["run_attempt"]
+        if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0 \
+                or isinstance(run_attempt, bool) or not isinstance(run_attempt, int) or run_attempt != 1:
+            raise ValueError("hybrid download run identity")
+        if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0
+               for name in ("job_id", "artifact_id")) \
+                or value.get("candidate") not in HYBRID_CANDIDATES \
+                or not isinstance(value.get("bundle_sha256"), str) or not HEX64.fullmatch(value["bundle_sha256"]):
+            raise ValueError("hybrid download job/artifact/candidate identity")
+        archive, extracted = Path(value["archive"]), Path(value["extracted_dir"])
+        identity, paths = (run_id, run_attempt), (archive.resolve(), extracted.resolve())
+        if identity in seen_runs or paths in seen_paths or archive.is_symlink() or not archive.is_file() \
+                or extracted.is_symlink() or not extracted.is_dir():
+            raise ValueError("duplicate or unavailable hybrid download")
+        # Candidate identity may be read only from the sealed dispatch member;
+        # later tree validation proves this leaf was not substituted.
+        try:
+            bundle = _read_object(extracted / "dispatch-bundle.json")
+            member = bundle["workflow_input"]
+            candidate, bundle_sha256 = member["candidate"], member["record_self_sha256"]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError("hybrid downloaded dispatch identity") from None
+        if candidate != value["candidate"] or bundle_sha256 != value["bundle_sha256"] \
+                or candidate not in HYBRID_CANDIDATES or candidate["m"] in seen_candidates:
+            raise ValueError("hybrid candidate cardinality")
+        seen_runs.add(identity); seen_paths.add(paths); seen_candidates.add(candidate["m"])
+        selected.append({**value, "candidate": dict(candidate)})
+    if [row["candidate"] for row in sorted(selected, key=lambda row: row["candidate"]["m"])] != list(HYBRID_CANDIDATES):
+        raise ValueError("hybrid candidate set")
+    return _sealed({
+        "schema_version": 1, "campaign_stage": "hybrid", "repository": "allenwoo713/obsidian_wiki_skill",
+        "head_sha": head, "hybrid_request": request, "hybrid_request_sha256": request["record_self_sha256"],
+        "downloads": sorted(selected, key=lambda row: row["candidate"]["m"]),
+    })
+
+
+def _validate_hybrid_collection_request(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _HYBRID_COLLECTION_FIELDS \
+            or value.get("schema_version") != 1 or value.get("campaign_stage") != "hybrid" \
+            or value.get("record_self_sha256") != canonical_digest(value) \
+            or value.get("repository") != "allenwoo713/obsidian_wiki_skill":
+        raise ValueError("sealed hybrid collection request")
+    request = _validate_hybrid_request(value.get("hybrid_request"), expected_head=value.get("head_sha", ""))
+    if value.get("hybrid_request_sha256") != request["record_self_sha256"] \
+            or value.get("head_sha") != request["hybrid_implementation_head"] \
+            or not isinstance(value.get("downloads"), list) or len(value["downloads"]) != 2:
+        raise ValueError("hybrid collection authority")
+    expected = {candidate["m"]: candidate for candidate in HYBRID_CANDIDATES}
+    found: set[int] = set()
+    for row in value["downloads"]:
+        if not isinstance(row, dict) or set(row) != _HYBRID_DOWNLOAD_FIELDS \
+                or row.get("candidate") not in HYBRID_CANDIDATES \
+                or not isinstance(row.get("bundle_sha256"), str) or not HEX64.fullmatch(row["bundle_sha256"]):
+            raise ValueError("hybrid collection download shape")
+        if any(isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] <= 0
+               for key in ("run_id", "run_attempt", "job_id", "artifact_id")):
+            raise ValueError("hybrid collection hosted identity")
+        if row["run_attempt"] != 1:
+            raise ValueError("hybrid collection requires independent first-attempt runs")
+        m = row["candidate"]["m"]
+        if m in found or row["candidate"] != expected[m]:
+            raise ValueError("hybrid collection candidate binding")
+        found.add(m)
+    if found != set(expected):
+        raise ValueError("hybrid collection candidate cardinality")
+    return value
+
+
+def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_dir: Path,
+                              token: str, client: Any | None = None) -> int:
+    """API-bind the exact two hybrid packets; non-success invalidates the batch."""
+    collection = _validate_hybrid_collection_request(_read_object(request_file))
+    _reject_secrets(collection)
+    if not token:
+        raise ValueError("GitHub actions read token unavailable")
+    if output.exists() or provenance_dir.is_symlink() or (provenance_dir.exists() and any(provenance_dir.iterdir())):
+        raise ValueError("hybrid provenance output must be new and empty")
+    github = client or GitHubActionsClient()
+    evidence: list[dict[str, str]] = []
+    seen_ids: set[tuple[int, int, int, int]] = set()
+    for row in collection["downloads"]:
+        run_id, run_attempt = row["run_id"], row["run_attempt"]
+        if run_attempt != 1:
+            raise ValueError("hybrid evidence requires two independent first-attempt runs")
+        archive, extracted = Path(row["archive"]), Path(row["extracted_dir"])
+        validated = validate_hybrid_artifact_tree(extracted)
+        allocation = validated["result"].get("allocation", {}).get("allocation")
+        if not isinstance(allocation, dict):
+            raise ValueError("hybrid artifact allocation")
+        allocation = _validate_hybrid_allocation(allocation)
+        if allocation["run_id"] != run_id or allocation["run_attempt"] != run_attempt \
+                or allocation["job_id"] != row["job_id"] \
+                or validated["candidate"] != row["candidate"] \
+                or validated["workflow_input"].get("record_self_sha256") != row["bundle_sha256"]:
+            raise ValueError("hybrid downloaded artifact binding")
+        host = validated["result"].get("locked_execution", {}).get("host")
+        if not isinstance(host, dict) or host.get("os") != "Linux" or host.get("architecture") != "X64" \
+                or not isinstance(host.get("image"), str) or not host["image"]:
+            raise ValueError("hybrid locked hosted runner identity")
+        run_url = f"/repos/{collection['repository']}/actions/runs/{run_id}"
+        try:
+            run = github.get_json(run_url, token)
+            jobs_payload = github.get_json(f"{run_url}/attempts/{run_attempt}/jobs", token)
+            artifacts_payload = github.get_json(f"{run_url}/artifacts", token)
+        except Exception as exc:
+            raise ValueError("GitHub hybrid provenance lookup failed") from exc
+        if not isinstance(run, dict) or run.get("id") != run_id or run.get("run_attempt") != run_attempt \
+                or run.get("head_sha") != collection["head_sha"] or run.get("event") != "workflow_dispatch" \
+                or run.get("status") != "completed" or run.get("conclusion") != "success" \
+                or not isinstance(run.get("head_branch"), str) or run["head_branch"] in {"", "main", "master"}:
+            raise ValueError("hybrid workflow-run API binding")
+        jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+        matches = [job for job in jobs if isinstance(job, dict) and job.get("id") == row["job_id"]
+                   and job.get("run_id") == run_id and job.get("run_attempt") == run_attempt
+                   and job.get("name") == JOB_DISPLAY_NAMES["phase07-hybrid"]
+                   and job.get("status") == "completed" and job.get("conclusion") == "success"] if isinstance(jobs, list) else []
+        if len(matches) != 1:
+            raise ValueError("hybrid attempt-job API binding")
+        job = matches[0]
+        labels = job.get("labels")
+        if not isinstance(job.get("runner_name"), str) or not job["runner_name"].startswith("GitHub Actions ") \
+                or job.get("runner_group_name") != "GitHub Actions" \
+                or not isinstance(labels, list) or "ubuntu-latest" not in labels \
+                or ({"X64", "ARM64"} & set(labels) and "X64" not in labels):
+            raise ValueError("hybrid runner API binding")
+        if re.fullmatch(r"ubuntu[^ ]* [^ ]+", host["image"], flags=re.IGNORECASE) is None:
+            raise ValueError("hybrid raw host image is not a measured GitHub Ubuntu image")
+        artifacts = artifacts_payload.get("artifacts") if isinstance(artifacts_payload, dict) else None
+        name = f"phase07-hybrid-{run_id}-{run_attempt}"
+        matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("name") == name] if isinstance(artifacts, list) else []
+        if len(matches) != 1:
+            raise ValueError("hybrid artifact API binding")
+        artifact = matches[0]; local_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+        run_created = _parse_utc_timestamp(run.get("created_at"), label="run creation")
+        artifact_created = _parse_utc_timestamp(artifact.get("created_at"), label="artifact creation")
+        expires = _parse_utc_timestamp(artifact.get("expires_at"), label="artifact expiry")
+        if artifact.get("id") != row["artifact_id"] or artifact.get("expired") is not False \
+                or artifact.get("digest") != f"sha256:{local_sha}" or not isinstance(artifact.get("workflow_run"), dict) \
+                or artifact["workflow_run"].get("id") != run_id or artifact["workflow_run"].get("head_sha") != collection["head_sha"] \
+                or not run_created <= artifact_created < expires \
+                or not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) <= expires - artifact_created <= dt.timedelta(days=90, seconds=30) \
+                or expires <= dt.datetime.now(dt.timezone.utc):
+            raise ValueError("hybrid artifact API identity/digest/retention")
+        identity = (run_id, run_attempt, row["job_id"], row["artifact_id"])
+        if identity in seen_ids:
+            raise ValueError("duplicate hybrid hosted identity")
+        seen_ids.add(identity)
+        provenance = {
+            "run_id": run_id, "run_attempt": run_attempt, "job_id": row["job_id"],
+            "job_key": allocation["job_key"], "job_name": JOB_DISPLAY_NAMES["phase07-hybrid"],
+            "artifact_id": row["artifact_id"], "artifact_name": name, "status": run["status"],
+            "conclusion": run["conclusion"], "head_branch": run["head_branch"],
+            "head_sha": collection["head_sha"], "event": run["event"],
+            "runner": {"name": job["runner_name"], "group": job["runner_group_name"], "labels": job["labels"],
+                       "os": host["os"], "image": host["image"], "architecture": host["architecture"]},
+            "run_created_at": run["created_at"], "artifact_created_at": artifact["created_at"],
+            "artifact_expires_at": artifact["expires_at"],
+            "api_archive_sha256": local_sha, "local_archive_sha256": local_sha,
+            "candidate": row["candidate"], "bundle_sha256": row["bundle_sha256"],
+            "archive": str(archive.resolve()), "extracted_dir": str(extracted.resolve()),
+        }
+        provenance_dir.mkdir(parents=True, exist_ok=True)
+        provenance_path = provenance_dir / f"hybrid-{run_id}-{run_attempt}-provenance.json"
+        _write_ledger(provenance_path, {"schema_version": 1, "evidence": [provenance]})
+        evidence.append({
+            "run_id": run_id, "run_attempt": run_attempt, "job_id": row["job_id"],
+            "artifact_id": row["artifact_id"], "candidate": row["candidate"],
+            "bundle_sha256": row["bundle_sha256"], "archive": str(archive.resolve()),
+            "extracted_dir": str(extracted.resolve()), "provenance": str(provenance_path.resolve()),
+        })
+    _write_ledger(output, {"schema_version": 1, "evidence": evidence})
+    return 0
+
+
 class GitHubActionsClient:
     """Minimal fakeable stdlib client; its token is header-only and never serialized."""
     def get_json(self, url: str, token: str) -> dict[str, Any]:
@@ -801,6 +1062,8 @@ def _reject_secrets(value: Any, *, location: str = "payload") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             lowered = str(key).lower()
+            if lowered == "authorization" and item == "none":
+                continue
             if any(marker in lowered for marker in SECRET_MARKERS):
                 raise ValueError(f"secret-like field is forbidden: {location}.{key}")
             _reject_secrets(item, location=f"{location}.{key}")
@@ -962,6 +1225,25 @@ def finalize_pipeline_artifact(*, output_dir: Path, stage: str, head_sha: str,
                                run_id: int, run_attempt: int, job_key: str,
                                job_status: str) -> int:
     """Preserve campaign output or seal a no-secret rejection for every Python-visible failure."""
+    if stage == "hybrid":
+        raw_dir = output_dir / "raw"
+        if job_status == "success":
+            try:
+                validated = validate_hybrid_artifact_tree(raw_dir)
+                allocation = validated["result"].get("allocation", {}).get("allocation")
+                if validated["result"].get("head_sha") != head_sha \
+                        or not isinstance(allocation, dict) or allocation.get("run_id") != run_id \
+                        or allocation.get("run_attempt") != 1 or run_attempt != 1 \
+                        or allocation.get("job_key") != job_key:
+                    raise ValueError("hybrid finalizer allocation binding")
+                return 0
+            except (ImportError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        _seal_hybrid_pipeline_rejection(
+            output_dir=output_dir, head_sha=head_sha, run_id=run_id,
+            run_attempt=run_attempt, job_key=job_key, job_status=job_status,
+        )
+        return 0
     if stage == "confirmation":
         if job_status == "success":
             try:
@@ -996,6 +1278,22 @@ def finalize_pipeline_artifact(*, output_dir: Path, stage: str, head_sha: str,
         "job_key": job_key, "job_status": job_status, "authorization": "none",
     })
     return 0
+
+
+def _seal_hybrid_pipeline_rejection(*, output_dir: Path, head_sha: str, run_id: int,
+                                    run_attempt: int, job_key: str, job_status: str) -> None:
+    """Replace the task-owned hybrid root with one uploadable rejection leaf."""
+    if output_dir.is_symlink() or (output_dir.exists() and not output_dir.is_dir()):
+        output_dir.unlink()
+    elif output_dir.is_dir():
+        shutil.rmtree(output_dir)
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=False)
+    _write_ledger(raw_dir / "hybrid-pipeline-rejection.json", {
+        "schema_version": 1, "stage": "hybrid", "status": "reject-evidence",
+        "head_sha": head_sha, "run_id": run_id, "run_attempt": run_attempt,
+        "job_key": job_key, "job_status": job_status, "authorization": "none",
+    })
 
 
 def _seal_confirmation_pipeline_rejection(*, output_dir: Path, stage: str, head_sha: str,
@@ -1262,7 +1560,7 @@ def run_hybrid_plan(*, dense_ledger: Path, request_file: Path, workflow_inputs_d
 
 def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-dispatch"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-allocation", "hybrid-dispatch", "hybrid-collection-request", "hybrid-provenance"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -1284,6 +1582,7 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
     parser.add_argument("--dispatch-bundle", type=Path)
     parser.add_argument("--locked-execution", type=Path)
     parser.add_argument("--allocation", type=Path)
+    parser.add_argument("--downloads-file", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "hosted-preflight":
@@ -1319,14 +1618,40 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
             return run_hybrid_plan(dense_ledger=args.dense_ledger, request_file=args.request_file,
                                    workflow_inputs_dir=args.workflow_inputs_dir,
                                    preflight_request=args.preflight_request)
+        if args.command == "hybrid-allocation":
+            if args.request_file is None or args.ledger_file is None:
+                raise ValueError("hybrid allocation requires sealed input and output")
+            return seal_hybrid_allocation(
+                workflow_inputs=_read_object(args.request_file), output=args.ledger_file,
+                repository=args.repository or "", run_id=args.run_id or 0,
+                run_attempt=args.run_attempt or 0, job_key=args.job_key or "", head_sha=args.head_sha or "",
+                token=os.environ.get("GITHUB_TOKEN", ""), client=github_client,
+            )
         if args.command == "hybrid-dispatch":
             if None in (args.dispatch_bundle, args.locked_execution, args.allocation, args.output_dir):
                 raise ValueError("hybrid-dispatch requires sealed dispatch, locked execution, allocation, and output")
+            allocation_document = _read_object(args.allocation)
+            allocation = allocation_document.get("allocation") if set(allocation_document) >= {"allocation"} else allocation_document
             execute_hybrid_dispatch(
                 bundle=_read_object(args.dispatch_bundle), locked_execution=_read_object(args.locked_execution),
-                allocation=_read_object(args.allocation), work_dir=args.output_dir,
+                allocation=allocation, work_dir=args.output_dir,
             )
             return 0
+        if args.command == "hybrid-collection-request":
+            if args.request_file is None or args.downloads_file is None or args.ledger_file is None:
+                raise ValueError("hybrid collection requires request, downloads, and output")
+            record = build_hybrid_collection_request(
+                hybrid_request=_read_object(args.request_file), downloads=_read_object(args.downloads_file),
+            )
+            _write_ledger(args.ledger_file, record)
+            return 0
+        if args.command == "hybrid-provenance":
+            if args.request_file is None or args.ledger_file is None or args.provenance_dir is None:
+                raise ValueError("hybrid provenance requires collection request, manifest, and provenance directory")
+            return collect_hybrid_provenance(
+                request_file=args.request_file, output=args.ledger_file, provenance_dir=args.provenance_dir,
+                token=os.environ.get("GITHUB_TOKEN", ""), client=github_client,
+            )
         if args.command == "confirmation-provenance":
             if None in (args.request_file, args.ledger_file, args.provenance_dir):
                 raise ValueError("confirmation provenance requires request, manifest, and provenance directory")

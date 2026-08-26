@@ -17,9 +17,9 @@ on:
         required: false
         default: preflight
         type: choice
-        options: [preflight, screening, confirmation]
+        options: [preflight, screening, confirmation, hybrid]
       workflow_inputs:
-        description: "Sealed generated Phase 07 ordinal confirmation input bundle"
+        description: "Sealed generated Phase 07 campaign dispatch bundle"
         required: false
         type: string
 
@@ -641,6 +641,80 @@ jobs:
         with:
           name: phase07-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
           path: .review-tmp/phase07/confirmation-artifact
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-hybrid:
+    name: "Phase 07 independent hybrid campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'hybrid' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - id: phase07-model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Hydrate exact immutable model only on cache miss
+        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
+        run: python scripts/download_embedding_model.py
+      - name: Validate immutable cached model tree
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Assert locked hybrid runtime and thread settings
+        run: >
+          python -c "import importlib.metadata as metadata, os, sys;
+          expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'python':f'{sys.version_info.major}.{sys.version_info.minor}', 'lancedb':metadata.version('lancedb'), 'numpy':metadata.version('numpy'), 'pyarrow':metadata.version('pyarrow')};
+          threads={key:os.environ.get(key) for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')};
+          assert actual == expected and threads == {'OMP_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'2', 'MKL_NUM_THREADS':'2'}, (actual, threads)"
+      - name: Materialize only the sealed generated hybrid dispatch bundle
+        env:
+          WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
+        run: >
+          python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); v=json.loads(os.environ['WORKFLOW_INPUTS']); (d/'hybrid-dispatch.json').write_text(json.dumps(v,sort_keys=True))"
+      - name: Bind this attempt to exactly one hybrid job before any index build
+        # The operator queries the exact attempt-scoped /attempts/{run_attempt}/jobs API.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -m eval.phase07_operator_gate hybrid-allocation --request-file .review-tmp/phase07/hybrid-dispatch.json --ledger-file .review-tmp/phase07/hybrid-allocation.json --repository "${{ github.repository }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --head-sha "${{ github.sha }}" --job-key phase07-hybrid
+      - name: Construct locked hybrid execution binding
+        env:
+          HEAD: ${{ github.sha }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: >
+          python -c "import hashlib,importlib.metadata as metadata,json,os,pathlib,sys; d=pathlib.Path('.review-tmp/phase07'); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); assert os.environ['RUNNER_OS']=='Linux' and os.environ['RUNNER_ARCH']=='X64'; assert os.environ['ImageOS'] and os.environ['ImageVersion']; cpu=next((line.split(':',1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown-cpu'); runtime={'python':f'{sys.version_info.major}.{sys.version_info.minor}','lancedb':metadata.version('lancedb'),'numpy':metadata.version('numpy'),'pyarrow':metadata.version('pyarrow'),'omp_num_threads':2,'openblas_num_threads':2,'mkl_num_threads':2}; source={'requirements_sha256':h('requirements.txt'),'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; host={'os':os.environ['RUNNER_OS'],'architecture':os.environ['RUNNER_ARCH'],'image':os.environ['ImageOS']+' '+os.environ['ImageVersion'],'hostname':os.uname().nodename,'cpu_count':os.cpu_count() or 1,'cpu_model':cpu}; (d/'hybrid-execution.json').write_text(json.dumps({'head_sha':os.environ['HEAD'],'runtime':runtime,'source_digests':source,'host':host},sort_keys=True))"
+      - name: Invoke the real fixed-candidate hybrid campaign
+        run: >
+          python -m eval.phase07_operator_gate hybrid-dispatch
+          --dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json
+          --locked-execution .review-tmp/phase07/hybrid-execution.json
+          --allocation .review-tmp/phase07/hybrid-allocation.json
+          --output-dir .review-tmp/phase07/hybrid-artifact
+      - name: Export the sealed hybrid packet from raw production output
+        if: ${{ success() }}
+        run: >
+          python -m eval.phase07_ann_campaign export-hybrid-packet
+          --artifact-dir .review-tmp/phase07/hybrid-artifact/raw
+          --output .review-tmp/phase07/hybrid-artifact/exported-hybrid-packet.json
+      - name: Seal missing numeric output as a pipeline rejection
+        if: ${{ always() }}
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/hybrid-artifact --stage hybrid --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-hybrid --job-status "${{ job.status }}"
+      - name: Upload sealed hybrid evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-hybrid-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/hybrid-artifact/raw
           if-no-files-found: error
           retention-days: 90
 

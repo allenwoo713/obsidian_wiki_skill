@@ -532,6 +532,248 @@ def reconcile_confirmation_postdownload(request: dict, manifest: dict) -> dict:
     return ledger
 
 
+# Hybrid evidence is deliberately reconciled separately from confirmation.  A
+# complete 30k hybrid packet has a different authority chain (one fixed
+# candidate per hosted run) and neither a generic packet nor a confirmation
+# packet can be relabelled into this path.
+_HYBRID_PROVENANCE_FIELDS = frozenset({
+    "run_id", "run_attempt", "job_id", "job_key", "job_name", "artifact_id", "artifact_name",
+    "status", "conclusion", "head_branch", "head_sha", "event", "runner", "run_created_at",
+    "artifact_created_at", "artifact_expires_at", "api_archive_sha256", "local_archive_sha256",
+    "candidate", "bundle_sha256",
+    "archive", "extracted_dir",
+})
+_HYBRID_MANIFEST_EVIDENCE_FIELDS = frozenset({
+    "run_id", "run_attempt", "job_id", "artifact_id", "candidate", "bundle_sha256",
+    "archive", "extracted_dir", "provenance",
+})
+_HYBRID_ARTIFACT_FILES = frozenset({
+    "hybrid-request.json", "hybrid-ledger.json", "hybrid-result.json", "dispatch-bundle.json",
+    "locked-execution.json", "allocation.json", "hybrid-packet.json",
+})
+
+
+def _reject_hybrid_secrets(value: Any, location: str = "hybrid") -> None:
+    """Reject secret material while admitting the sealed `authorization: none` marker."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "authorization" and item == "none":
+                continue
+            if any(marker in str(key).lower() for marker in _SECRET_MARKERS):
+                raise ValueError(f"secret-like hybrid field: {location}.{key}")
+            _reject_hybrid_secrets(item, f"{location}.{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _reject_hybrid_secrets(item, location)
+    elif isinstance(value, str) and any(marker in value.lower() for marker in ("ghp_", "github_pat_", "bearer ")):
+        raise ValueError("secret-like hybrid value")
+
+
+def _validate_hybrid_provenance(value: Any) -> dict[str, Any]:
+    """Validate one API-bound hybrid download before reading its JSON tree."""
+    _reject_hybrid_secrets(value, "hybrid provenance")
+    if not isinstance(value, dict) or set(value) != _HYBRID_PROVENANCE_FIELDS:
+        raise ValueError("strict hybrid API provenance schema")
+    if not all(isinstance(value[name], int) and not isinstance(value[name], bool) and value[name] > 0
+               for name in ("run_id", "run_attempt", "job_id", "artifact_id")) \
+            or value["run_attempt"] != 1 \
+            or value["job_key"] != "phase07-hybrid" \
+            or value["job_name"] != "Phase 07 independent hybrid campaign" \
+            or value["status"] != "completed" or value["conclusion"] != "success":
+        raise ValueError("hybrid API run/job/artifact status")
+    if not isinstance(value["candidate"], dict) or not isinstance(value["bundle_sha256"], str) \
+            or not _HEX64.fullmatch(value["bundle_sha256"]):
+        raise ValueError("hybrid provenance candidate/bundle identity")
+    if not isinstance(value["head_branch"], str) or value["head_branch"] in {"", "main", "master"} \
+            or not isinstance(value["head_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["head_sha"]) \
+            or value["event"] != "workflow_dispatch" \
+            or value["artifact_name"] != f"phase07-hybrid-{value['run_id']}-{value['run_attempt']}":
+        raise ValueError("hybrid API head/event/artifact binding")
+    runner = value["runner"]
+    if not isinstance(runner, dict) or set(runner) != {"name", "group", "labels", "os", "image", "architecture"} \
+            or not isinstance(runner["name"], str) or not runner["name"].startswith("GitHub Actions ") \
+            or runner["group"] != "GitHub Actions" \
+            or not isinstance(runner["labels"], list) \
+            or not all(isinstance(label, str) and label for label in runner["labels"]) \
+            or "ubuntu-latest" not in runner["labels"] or "ARM64" in runner["labels"] \
+            or runner["os"] != "Linux" or runner["architecture"] != "X64" \
+            or not isinstance(runner["image"], str) \
+            or re.fullmatch(r"ubuntu[^ ]* [^ ]+", runner["image"], flags=re.IGNORECASE) is None:
+        raise ValueError("hybrid runner identity")
+    run_created = _stage1_timestamp(value["run_created_at"], label="hybrid workflow-run creation")
+    artifact_created = _stage1_timestamp(value["artifact_created_at"], label="hybrid artifact creation")
+    expires = _stage1_timestamp(value["artifact_expires_at"], label="hybrid artifact expiry")
+    retention = expires - artifact_created
+    if not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) <= retention <= dt.timedelta(days=90, seconds=30):
+        raise ValueError("hybrid artifact retention interval")
+    if run_created > artifact_created or artifact_created >= expires \
+            or expires <= dt.datetime.now(dt.timezone.utc):
+        raise ValueError("expired hybrid artifact evidence")
+    for field in ("api_archive_sha256", "local_archive_sha256"):
+        if not isinstance(value[field], str) or not _HEX64.fullmatch(value[field]):
+            raise ValueError("hybrid archive digest schema")
+    archive, extracted = Path(value["archive"]), Path(value["extracted_dir"])
+    if archive.is_symlink() or not archive.is_file() or extracted.is_symlink() or not extracted.is_dir():
+        raise ValueError("hybrid downloaded archive/extraction unavailable")
+    local_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if value["api_archive_sha256"] != local_digest or value["local_archive_sha256"] != local_digest:
+        raise ValueError("hybrid API/local archive digest mismatch")
+    try:
+        with zipfile.ZipFile(archive) as compressed:
+            members = compressed.infolist()
+            names = [member.filename for member in members]
+            if len(names) != len(_HYBRID_ARTIFACT_FILES) or len(set(names)) != len(names) \
+                    or set(names) != _HYBRID_ARTIFACT_FILES \
+                    or any(member.is_dir() or stat.S_ISLNK(member.external_attr >> 16) for member in members):
+                raise ValueError("strict hybrid archive allowlist")
+            for name in _HYBRID_ARTIFACT_FILES:
+                destination = extracted / name
+                if destination.is_symlink() or not destination.is_file() \
+                        or compressed.read(name) != destination.read_bytes():
+                    raise ValueError("hybrid archive/extracted content mismatch")
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise ValueError("invalid hybrid downloaded archive") from exc
+    return value
+
+
+def _read_hybrid_artifact(root: Path, provenance: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct an exact packet and bind it to the GitHub API record."""
+    from eval.phase07_ann_campaign import validate_hybrid_artifact_tree
+
+    validated = validate_hybrid_artifact_tree(root)
+    member, result = validated["workflow_input"], validated["result"]
+    allocation = result.get("allocation", {}).get("allocation") if isinstance(result.get("allocation"), dict) else None
+    if not isinstance(allocation, dict):
+        raise ValueError("hybrid artifact allocation")
+    if result["hybrid_request_sha256"] != request["record_self_sha256"] \
+            or member["hybrid_request_sha256"] != request["record_self_sha256"]:
+        raise ValueError("hybrid artifact/request binding")
+    if member.get("candidate") != provenance["candidate"] \
+            or member.get("record_self_sha256") != provenance["bundle_sha256"]:
+        raise ValueError("hybrid packet/API candidate bundle mismatch")
+    if any(allocation[name] != provenance[name] for name in ("run_id", "run_attempt", "job_id")):
+        raise ValueError("hybrid packet/API allocation identity mismatch")
+    host = result["locked_execution"].get("host")
+    if not isinstance(host, dict) or {name: provenance["runner"][name] for name in ("os", "image", "architecture")} != {
+        name: host.get(name) for name in ("os", "image", "architecture")
+    }:
+        raise ValueError("hybrid runner/locked-host provenance mismatch")
+    if result.get("head_sha") != provenance["head_sha"]:
+        raise ValueError("hybrid packet/API head binding")
+    return {
+        "candidate": member["candidate"], "status": result["candidate_verdict"],
+        "original_absolute_gate": result["original_absolute_gate"],
+        "paired_30k_non_regression_gate": result["paired_30k_non_regression_gate"],
+        "aggregate_metrics": result["aggregate_metrics"],
+        "packet_identity": {
+            "raw_tree_sha256": validated["raw_tree_sha256"],
+            "packet_self_sha256": validated["wrapper"]["record_self_sha256"],
+            "raw_result_sha256": hashlib.sha256((root / "hybrid-result.json").read_bytes()).hexdigest(),
+            "raw_ledger_sha256": hashlib.sha256((root / "hybrid-ledger.json").read_bytes()).hexdigest(),
+            "bundle_sha256": member["record_self_sha256"],
+            "allocation_nonce": allocation["job_allocation_nonce"],
+            "expanded_content_tree_sha256": result["expanded_content_tree_sha256"],
+            "expanded_member_count": result["expanded_member_count"],
+            "queries_sha256": result["queries_sha256"],
+            "baselines_sha256": result["baselines_sha256"],
+        },
+        "provenance": dict(provenance),
+    }
+
+
+def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
+    """Fail closed unless exactly two m20/m32 30k hybrid evidence packets survive.
+
+    Both an accepted numeric result and a correctly measured rejected candidate
+    are evidence.  A hosted failure, a stale/expired artifact, or any replay is
+    not evidence and invalidates the whole two-candidate batch.
+    """
+    from eval.phase07_operator_gate import (
+        HYBRID_CANDIDATES, _validate_hybrid_request, canonical_digest as operator_digest,
+    )
+
+    _reject_hybrid_secrets(request, "hybrid request")
+    if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
+        raise ValueError("sealed hybrid request")
+    head = request.get("hybrid_implementation_head")
+    if not isinstance(head, str):
+        raise ValueError("hybrid implementation head")
+    _validate_hybrid_request(request, expected_head=head)
+    _reject_hybrid_secrets(manifest, "hybrid evidence manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {"schema_version", "evidence", "record_self_sha256"} \
+            or manifest.get("schema_version") != 1 or manifest.get("record_self_sha256") != canonical_digest(manifest) \
+            or not isinstance(manifest.get("evidence"), list) or len(manifest["evidence"]) != 2:
+        raise ValueError("strict exactly-two hybrid provenance manifest")
+
+    candidate_records: list[dict[str, Any]] = []
+    seen_runs, seen_jobs, seen_artifacts, seen_archives, seen_bundles, seen_candidates = (set() for _ in range(6))
+    for row in manifest["evidence"]:
+        if not isinstance(row, dict) or set(row) != _HYBRID_MANIFEST_EVIDENCE_FIELDS \
+                or any(not isinstance(row[name], int) or isinstance(row[name], bool) or row[name] <= 0
+                       for name in ("run_id", "run_attempt", "job_id", "artifact_id")) \
+                or row["run_attempt"] != 1 \
+                or not isinstance(row["candidate"], dict) \
+                or not isinstance(row["bundle_sha256"], str) or not _HEX64.fullmatch(row["bundle_sha256"]) \
+                or not all(isinstance(row[name], str) and row[name]
+                           for name in ("archive", "extracted_dir", "provenance")):
+            raise ValueError("strict hybrid evidence record")
+        provenance_path = Path(row["provenance"])
+        if provenance_path.is_symlink() or not provenance_path.is_file():
+            raise ValueError("hybrid per-artifact provenance document unavailable")
+        provenance_document = _read_json(provenance_path)
+        _reject_hybrid_secrets(provenance_document, "hybrid per-artifact provenance")
+        if set(provenance_document) != {"schema_version", "evidence", "record_self_sha256"} \
+                or provenance_document.get("schema_version") != 1 \
+                or provenance_document.get("record_self_sha256") != canonical_digest(provenance_document) \
+                or not isinstance(provenance_document.get("evidence"), list) \
+                or len(provenance_document["evidence"]) != 1:
+            raise ValueError("strict per-artifact hybrid API provenance document")
+        provenance = _validate_hybrid_provenance(provenance_document["evidence"][0])
+        if provenance["head_sha"] != head:
+            raise ValueError("hybrid API/request head mismatch")
+        cross_bound = ("run_id", "run_attempt", "job_id", "artifact_id", "candidate", "bundle_sha256")
+        if any(row[name] != provenance[name] for name in cross_bound) \
+                or Path(row["archive"]).resolve() != Path(provenance["archive"]).resolve() \
+                or Path(row["extracted_dir"]).resolve() != Path(provenance["extracted_dir"]).resolve():
+            raise ValueError("hybrid manifest/API provenance identity mismatch")
+        artifact_dir = Path(row["extracted_dir"])
+        run_identity = (provenance["run_id"], provenance["run_attempt"])
+        archive_identity = provenance["local_archive_sha256"]
+        if run_identity in seen_runs or provenance["job_id"] in seen_jobs \
+                or provenance["artifact_id"] in seen_artifacts or archive_identity in seen_archives:
+            raise ValueError("duplicate hybrid run/job/artifact/archive provenance")
+        seen_runs.add(run_identity); seen_jobs.add(provenance["job_id"])
+        seen_artifacts.add(provenance["artifact_id"]); seen_archives.add(archive_identity)
+        record = _read_hybrid_artifact(artifact_dir, provenance, request)
+        candidate = record["candidate"]
+        candidate_m = candidate.get("m") if isinstance(candidate, dict) else None
+        if candidate != row["candidate"] or record["packet_identity"]["bundle_sha256"] != row["bundle_sha256"] \
+                or candidate not in HYBRID_CANDIDATES or candidate_m in seen_candidates:
+            raise ValueError("duplicate or unapproved hybrid candidate")
+        if record["status"] not in {"numeric-success", "rejected-candidate"}:
+            raise ValueError("hybrid result is not eligible evidence")
+        if record["packet_identity"]["bundle_sha256"] in seen_bundles:
+            raise ValueError("duplicate hybrid dispatch bundle")
+        seen_candidates.add(candidate_m); seen_bundles.add(record["packet_identity"]["bundle_sha256"])
+        candidate_records.append(record)
+    observed_candidates = {canonical_digest(record["candidate"]) for record in candidate_records}
+    expected_candidates = {canonical_digest(dict(row)) for row in HYBRID_CANDIDATES}
+    if observed_candidates != expected_candidates:
+        raise ValueError("exact m20/m32 hybrid candidate evidence required")
+    candidate_records.sort(key=lambda item: item["candidate"]["m"])
+    ledger = {
+        "schema_version": 1, "campaign_stage": "hybrid", "authorization": "none",
+        "hybrid_request_sha256": request["record_self_sha256"],
+        "dense_ledger_sha256": request["dense_ledger_sha256"], "dense_source_head": request["dense_source_head"],
+        "hybrid_implementation_head": head, "baseline": request["baseline"],
+        "candidates": request["candidates"], "scale": request["scale"], "query_count": request["query_count"],
+        "evidence_manifest_sha256": manifest["record_self_sha256"],
+        "candidate_records": candidate_records,
+    }
+    ledger["record_self_sha256"] = canonical_digest(ledger)
+    return ledger
+
+
 def _recall_family_confirms(
     comparisons: list[dict[str, Any]], adjusted_p_values: list[float],
 ) -> bool:
@@ -1223,11 +1465,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--confirmation-request", type=Path)
     parser.add_argument("--confirmation-ledger", type=Path)
     parser.add_argument("--confirmation-evidence-manifest", type=Path)
+    parser.add_argument("--hybrid-request", type=Path)
+    parser.add_argument("--hybrid-evidence-manifest", type=Path)
     parser.add_argument("--continuation-request-output", type=Path)
     parser.add_argument("--continuation-preflight-output", type=Path)
     parser.add_argument("--no-continuation-output", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.hybrid_evidence_manifest is not None or args.hybrid_request is not None:
+            if args.hybrid_request is None or args.hybrid_evidence_manifest is None \
+                    or args.output is None or args.mode != "hybrid-postdownload":
+                raise ValueError("post-download hybrid reconciliation requires request, manifest, output, and mode")
+            result = reconcile_hybrid_postdownload(
+                _read_json(args.hybrid_request), _read_json(args.hybrid_evidence_manifest),
+            )
+            if args.output.exists() or args.output.is_symlink():
+                raise ValueError("refusing to overwrite hybrid evidence ledger")
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print("[PASS] post-download hybrid ANN reconciliation", file=sys.stderr)
+            return 0
         if args.confirmation_evidence_manifest is not None:
             if args.confirmation_request is None or args.output is None or args.mode != "confirmation-postdownload":
                 raise ValueError("post-download confirmation reconciliation requires request, manifest, output, and mode")
