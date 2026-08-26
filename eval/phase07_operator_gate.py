@@ -824,8 +824,10 @@ def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads
     _reject_secrets(hybrid_request); _reject_secrets(downloads)
     head = hybrid_request.get("hybrid_implementation_head") if isinstance(hybrid_request, dict) else ""
     request = _validate_hybrid_request(hybrid_request, expected_head=head)
-    if not isinstance(downloads, dict) or set(downloads) != {"schema_version", "downloads"} \
-            or downloads.get("schema_version") != 1 or not isinstance(downloads.get("downloads"), list):
+    if not isinstance(downloads, dict) or set(downloads) != {"schema_version", "downloads", "record_self_sha256"} \
+            or downloads.get("schema_version") != 1 \
+            or downloads.get("record_self_sha256") != canonical_digest(downloads) \
+            or not isinstance(downloads.get("downloads"), list):
         raise ValueError("strict hybrid downloads manifest")
     if len(downloads["downloads"]) != 2:
         raise ValueError("hybrid collection requires exactly two downloads")
@@ -1123,6 +1125,15 @@ def validate_feature_worktree_preflight(request: dict[str, Any], *, root: Path |
         raise ValueError("wrong feature branch")
     if _git("rev-parse", "HEAD") != request["head_sha"]:
         raise ValueError("wrong immutable head")
+    if "require_upstream_head" in request and not isinstance(request["require_upstream_head"], bool):
+        raise ValueError("invalid upstream head requirement")
+    if request.get("require_upstream_head"):
+        try:
+            upstream_head = _git("rev-parse", "--verify", "@{upstream}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("unresolved upstream head") from exc
+        if not SHA.fullmatch(upstream_head) or upstream_head != request["head_sha"]:
+            raise ValueError("upstream head differs from immutable head")
     status = _git("status", "--porcelain=v1").splitlines()
     dirty = sorted(line[3:] for line in status if len(line) >= 4)
     if set(dirty) - set(request["allowed_dirty_paths"]):
