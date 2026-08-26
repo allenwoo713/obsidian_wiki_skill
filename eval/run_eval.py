@@ -756,14 +756,16 @@ def run_phase07_representative_campaign(
 
 def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir: Path, embed=None,
                                                   query_limit: int | None = None) -> dict:
-    """Run one sealed D-25 hybrid candidate with an operator-minted capability.
+    """Run one sealed hybrid *role* with an operator-minted capability.
 
-    This deliberately does not reuse the representative/ANN authority: the
-    public call has no candidate parameter and both original and expanded
-    searches are performed on independently built WikiIndex instances.
-    ``embed`` plus ``query_limit`` is a pytest-only finite integration seam;
-    normal execution always materializes the sealed 30k corpus and all 105
-    committed queries.
+    A role is either the shared baseline or one candidate.  It builds exactly
+    two independent indexes (the committed fixture and its expanded corpus),
+    then makes one normal public ``hybrid_search`` call per query against each.
+    Pairing, metric aggregation, and gate decisions happen only after the
+    three sealed role artifacts are reconciled; this runner never has both
+    sides of a comparison in memory.  ``embed`` plus ``query_limit`` is a
+    pytest-only finite integration seam; normal execution materializes the
+    sealed 30k corpus and evaluates all 105 committed queries.
     """
     from eval.phase07_operator_gate import _consume_hybrid_execution_capability
 
@@ -773,7 +775,8 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
     if query_limit is not None and (embed is None or not os.environ.get("PYTEST_CURRENT_TEST")
                                     or not isinstance(query_limit, int) or not 1 <= query_limit < 105):
         raise ValueError("hybrid query limit is pytest-only")
-    root = Path(work_dir) / f"hybrid-m{bundle['candidate']['m']}"
+    role, config = bundle["role"], bundle["config"]
+    root = Path(work_dir) / f"hybrid-{role}-m{config['m']}"
     if root.exists():
         shutil.rmtree(root)
     original_wiki, expanded_wiki = root / "original" / "Wiki", root / "expanded" / "Wiki"
@@ -805,15 +808,13 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         index.load()
         return index
 
-    original_baseline = build_candidate("original-baseline", bundle["baseline"], original_wiki)
-    original_candidate = build_candidate("original-candidate", bundle["candidate"], original_wiki)
-    expanded_baseline = build_candidate("expanded-baseline", bundle["baseline"], expanded_wiki)
-    expanded_candidate = build_candidate("expanded-candidate", bundle["candidate"], expanded_wiki)
+    original_index = build_candidate("original", config, original_wiki)
+    expanded_index = build_candidate("expanded", config, expanded_wiki)
     if embed is not None:
         class _InjectedEncoder:
             def encode(self, texts, **_kwargs):
                 return embed(texts)
-        for index in (original_baseline, original_candidate, expanded_baseline, expanded_candidate):
+        for index in (original_index, expanded_index):
             index._embedder = _InjectedEncoder()
     queries = load_queries(HERE / "queries.jsonl")
     if len(queries) != bundle["query_count"]:
@@ -829,48 +830,27 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         return ({"result": payload, "duration_ms": round((time.perf_counter() - started) * 1000, 6)}, result)
 
     original, expanded = [], []
-    original_baseline_results, original_candidate_results = [], []
-    expanded_baseline_results, expanded_candidate_results = [], []
     for ordinal, item in enumerate(queries):
         query = item["query"]
         query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
-        original_base, original_base_live = observe(original_baseline, query, original_wiki)
-        original_candidate_row, original_candidate_live = observe(original_candidate, query, original_wiki)
-        expanded_base, expanded_base_live = observe(expanded_baseline, query, expanded_wiki)
-        expanded_candidate_row, expanded_candidate_live = observe(expanded_candidate, query, expanded_wiki)
-        original.append({"ordinal": ordinal, "query_sha256": query_sha256,
-                         "baseline": original_base, "candidate": original_candidate_row})
-        expanded.append({"ordinal": ordinal, "query_sha256": query_sha256,
-                         "baseline": expanded_base, "candidate": expanded_candidate_row})
-        original_baseline_results.append(original_base_live); original_candidate_results.append(original_candidate_live)
-        expanded_baseline_results.append(expanded_base_live); expanded_candidate_results.append(expanded_candidate_live)
-    from eval.phase07_operator_gate import committed_hybrid_baseline, recompute_hybrid_gate_verdicts
-
-    original_aggregate = aggregate_hybrid_result_metrics(
-        specifications=queries, baseline_results=original_baseline_results, candidate_results=original_candidate_results)
-    paired_aggregate = aggregate_hybrid_result_metrics(
-        specifications=queries, baseline_results=expanded_baseline_results, candidate_results=expanded_candidate_results)
-    floors, baselines_sha256 = committed_hybrid_baseline()
-    gates = recompute_hybrid_gate_verdicts(
-        original_absolute=original_aggregate, expanded_paired=paired_aggregate,
-        committed_baseline=floors, baselines_sha256=baselines_sha256,
-    )
+        original_row, _ = observe(original_index, query, original_wiki)
+        expanded_row, _ = observe(expanded_index, query, expanded_wiki)
+        original.append({"ordinal": ordinal, "query_sha256": query_sha256, "observation": original_row})
+        expanded.append({"ordinal": ordinal, "query_sha256": query_sha256, "observation": expanded_row})
     return {
         "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": bundle["record_self_sha256"],
-        "baseline": bundle["baseline"], "candidate": bundle["candidate"],
+        "role": role, "config": config,
         "planned_scale": bundle["scale"], "executed_scale": target_size,
         **expanded_identity,
         "query_count": len(queries), "authorization": "none",
-        "original_absolute_observations": original,
-        "expanded_paired_observations": expanded,
-        "aggregate_metrics": {"original_absolute": original_aggregate, "paired_30k": paired_aggregate},
-        "original_absolute_gate": gates["original_absolute_gate"],
-        "paired_30k_non_regression_gate": gates["paired_30k_non_regression_gate"],
-        "candidate_verdict": gates["candidate_verdict"],
+        "original_observations": original,
+        "expanded_observations": expanded,
         "hybrid_invocation": {
             "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
-            "original_baseline_calls": len(original), "original_candidate_calls": len(original),
-            "expanded_baseline_calls": len(expanded), "expanded_candidate_calls": len(expanded),
+            "original_calls": len(original), "expanded_calls": len(expanded),
+        },
+        "campaign_progress": {
+            "role": role, "original_completed": len(original), "expanded_completed": len(expanded),
         },
     }
 
