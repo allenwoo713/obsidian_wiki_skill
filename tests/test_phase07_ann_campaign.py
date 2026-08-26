@@ -579,7 +579,7 @@ def test_hybrid_dispatch_bundle_is_exact_current_head_authority_before_any_build
     with pytest.raises(ValueError):
         operator.validate_hybrid_dispatch_bundle(stale, expected_head=HEAD)
     forged = deepcopy(bundle)
-    forged["workflow_input"]["candidate"] = {
+    forged["workflow_input"]["config"] = {
         "index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100,
     }
     forged["workflow_input"]["record_self_sha256"] = operator.canonical_digest(forged["workflow_input"])
@@ -1126,8 +1126,8 @@ def test_export_hybrid_packet_rejects_legacy_direct_result_and_workflow_fallback
     )
     result = json.loads((tree / "hybrid-result.json").read_text(encoding="utf-8"))
     legacy = {key: result[key] for key in {
-        "schema_version", "campaign_stage", "bundle_sha256", "baseline", "candidate", "planned_scale", "executed_scale",
-        "query_count", "authorization", "original_absolute_observations", "expanded_paired_observations", "hybrid_invocation",
+        "schema_version", "campaign_stage", "bundle_sha256", "role", "config", "planned_scale", "executed_scale",
+        "query_count", "authorization", "original_observations", "expanded_observations", "hybrid_invocation",
     }}
     result_file, member_file = tmp_path / "legacy-result.json", tmp_path / "member.json"
     result_file.write_text(json.dumps(legacy), encoding="utf-8")
@@ -1180,17 +1180,16 @@ def test_hybrid_artifact_payload_is_exact_production_serializer_shape_without_du
     )
     result_path = tree / "hybrid-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    for rows in (result["original_absolute_observations"], result["expanded_paired_observations"]):
+    for rows in (result["original_observations"], result["expanded_observations"]):
         for row in rows:
-            for role in ("baseline", "candidate"):
-                observation = row[role]
-                payload = observation["result"]
-                assert set(payload) == {"query", "plan", "pages", "items", "context_sha256", "context_text", "token_count", "budget"}
-                assert set(observation) == {"result", "duration_ms"}
-                assert all("inclusion_reason" in item for item in payload["items"])
+            observation = row["observation"]
+            payload = observation["result"]
+            assert set(payload) == {"query", "plan", "pages", "items", "context_sha256", "context_text", "token_count", "budget"}
+            assert set(observation) == {"result", "duration_ms"}
+            assert all("inclusion_reason" in item for item in payload["items"])
     result_path.write_text(json.dumps(result), encoding="utf-8")
     _reseal_test_hybrid_raw_tree(tree)
-    assert campaign.validate_hybrid_artifact_tree(tree)["result"]["candidate_verdict"] == "numeric-success"
+    assert campaign.validate_hybrid_artifact_tree(tree)["config"]["m"] == 20
 
 
 def test_hybrid_payload_validator_requires_exact_single_raw_schema_and_rejects_resealed_field_mutations() -> None:
@@ -1238,37 +1237,20 @@ def test_full_hybrid_artifact_accepts_legal_empty_community_and_normal_payloads_
     )
     result_path = tree / "hybrid-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    for rows in (result["original_absolute_observations"], result["expanded_paired_observations"]):
-        for row in rows:
-            for role in ("baseline", "candidate"):
-                payload = row[role]["result"]
-    target = result["original_absolute_observations"][0]["candidate"]["result"]
+    target = result["original_observations"][0]["observation"]["result"]
     if kind == "empty":
         target.update({"pages": [], "items": [], "context_text": "", "context_sha256": hashlib.sha256(b"").hexdigest(), "token_count": 0})
     elif kind == "community":
         text = "community report"
         target.update({"pages": [], "items": [{"page_id": "community", "path": "community/report", "scope": "report", "inclusion_reason": "global_community_report", "evidence": [], "graph_paths": []}], "context_text": text, "context_sha256": hashlib.sha256(text.encode()).hexdigest()})
-    # normal is the production-shaped fixture payload unchanged.
-    specifications = [json.loads(line) for line in (ROOT / "eval" / "queries.jsonl").read_text(encoding="utf-8").splitlines() if line]
-    result["aggregate_metrics"] = {
-        "original_absolute": run_eval.aggregate_hybrid_serialized_metrics(specifications=specifications, observations=result["original_absolute_observations"]),
-        "paired_30k": run_eval.aggregate_hybrid_serialized_metrics(specifications=specifications, observations=result["expanded_paired_observations"]),
-    }
-    gates = operator.recompute_hybrid_gate_verdicts(
-        original_absolute=result["aggregate_metrics"]["original_absolute"], expanded_paired=result["aggregate_metrics"]["paired_30k"],
-        committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
-    )
-    result.update({"original_absolute_gate": gates["original_absolute_gate"],
-                   "paired_30k_non_regression_gate": gates["paired_30k_non_regression_gate"],
-                   "candidate_verdict": gates["candidate_verdict"]})
+    # Normal is the production-shaped fixture payload unchanged.  Role
+    # artifacts intentionally carry no aggregate or verdict authority.
     result_path.write_text(json.dumps(result), encoding="utf-8")
     _reseal_test_hybrid_raw_tree(tree)
-    # The candidate may be numerically rejected; legal payload shape itself is
-    # never a malformed-artifact rejection.
-    assert campaign.validate_hybrid_artifact_tree(tree)["result"]["candidate_verdict"] in {"numeric-success", "rejected-candidate"}
+    assert campaign.validate_hybrid_artifact_tree(tree)["role"] == "candidate"
 
 
-@pytest.mark.parametrize("mutation", ("context", "budget", "inclusion_reason", "graph_paths"))
+@pytest.mark.parametrize("mutation", ("budget", "inclusion_reason", "graph_paths"))
 def test_resealed_single_payload_evidence_mutations_fail_the_full_hybrid_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
 ) -> None:
@@ -1283,15 +1265,9 @@ def test_resealed_single_payload_evidence_mutations_fail_the_full_hybrid_artifac
     )
     result_path = tree / "hybrid-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    for rows in (result["original_absolute_observations"], result["expanded_paired_observations"]):
-        for row in rows:
-            for role in ("baseline", "candidate"):
-                payload = row[role]["result"]
-    payload = result["original_absolute_observations"][0]["candidate"]["result"]
-    if mutation == "context":
-        payload["context_text"] = "resealed but unsupported"; payload["context_sha256"] = hashlib.sha256(payload["context_text"].encode()).hexdigest()
-    elif mutation == "budget":
-        payload["budget"]["max_context_tokens"] = payload["budget"]["effective_budget_tokens"] + 1
+    payload = result["original_observations"][0]["observation"]["result"]
+    if mutation == "budget":
+        payload["budget"]["hard_max_tokens"] = -1
     elif mutation == "inclusion_reason":
         payload["items"][0]["inclusion_reason"] = ""
     else:
@@ -1302,10 +1278,10 @@ def test_resealed_single_payload_evidence_mutations_fail_the_full_hybrid_artifac
         campaign.validate_hybrid_artifact_tree(tree)
 
 
-def test_hybrid_artifact_recomputes_aggregate_from_serialized_query_evidence_after_full_reseal(
+def test_hybrid_role_artifact_rejects_smuggled_aggregate_evidence_after_full_reseal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A re-signed aggregate cannot disagree with query-level context/budget/graph evidence."""
+    """Pairwise gates are reconciliation-only and cannot appear in one role artifact."""
     from eval import phase07_ann_campaign as campaign
 
     plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
@@ -1314,18 +1290,10 @@ def test_hybrid_artifact_recomputes_aggregate_from_serialized_query_evidence_aft
         locked_execution=_locked_confirmation_environment(),
         allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
     )
-    assert campaign.validate_hybrid_artifact_tree(tree)["result"]["candidate_verdict"] == "numeric-success"
+    assert campaign.validate_hybrid_artifact_tree(tree)["role"] == "candidate"
     result_path = tree / "hybrid-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
-    result["aggregate_metrics"]["original_absolute"]["candidate"]["evidence_recall_at_10"] = 0.0
-    gates = operator.recompute_hybrid_gate_verdicts(
-        original_absolute=result["aggregate_metrics"]["original_absolute"],
-        expanded_paired=result["aggregate_metrics"]["paired_30k"],
-        committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
-    )
-    result["original_absolute_gate"] = gates["original_absolute_gate"]
-    result["paired_30k_non_regression_gate"] = gates["paired_30k_non_regression_gate"]
-    result["candidate_verdict"] = gates["candidate_verdict"]
+    result["aggregate_metrics"] = {"forged": "quality authority"}
     result_path.write_text(json.dumps(result), encoding="utf-8")
     _reseal_test_hybrid_raw_tree(tree)
     with pytest.raises(ValueError):
@@ -1375,7 +1343,7 @@ def test_raw_hybrid_artifact_binds_expanded_content_identity_and_member_count_af
     result.update(expected)
     result_path.write_text(json.dumps(result), encoding="utf-8")
     _reseal_test_hybrid_raw_tree(tree)
-    assert campaign.validate_hybrid_artifact_tree(tree)["candidate"]["m"] == 20
+    assert campaign.validate_hybrid_artifact_tree(tree)["config"]["m"] == 20
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["expanded_content_tree_sha256"] = canonical_digest({"label": "30k-expanded"})
     result_path.write_text(json.dumps(result), encoding="utf-8")
@@ -1503,18 +1471,20 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
         fixture_root=ROOT / "tests" / "fixtures" / "wiki", target_size=30000)["expanded_content_tree_sha256"]
     rows = []
     for ordinal, specification in enumerate(queries):
-        row = {"ordinal": ordinal, "query_sha256": hashlib.sha256(specification["query"].encode("utf-8")).hexdigest()}
-        for role in ("baseline", "candidate"):
-            payload = _strict_test_hybrid_payload(query=specification["query"], ordinal=ordinal, variant=role)
-            if specification.get("relevant_pages"):
-                payload["pages"] = list(specification["relevant_pages"])[:10]
-            context = " ".join(specification.get("required_facts") or ()) + " " + " ".join(
-                f"[来源: {item['path']}]" for item in payload["items"])
-            payload["context_text"] = context
-            payload["context_sha256"] = hashlib.sha256(context.encode("utf-8")).hexdigest()
-            row[role] = {"result": payload, "duration_ms": 1.0}
-        rows.append(row)
-    reconstructed_metrics = aggregate_hybrid_serialized_metrics(specifications=queries, observations=rows)
+        payload = _strict_test_hybrid_payload(
+            query=specification["query"], ordinal=ordinal, variant=workflow_input["role"],
+        )
+        if specification.get("relevant_pages"):
+            payload["pages"] = list(specification["relevant_pages"])[:10]
+        context = " ".join(specification.get("required_facts") or ()) + " " + " ".join(
+            f"[来源: {item['path']}]" for item in payload["items"])
+        payload["context_text"] = context
+        payload["context_sha256"] = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        rows.append({
+            "ordinal": ordinal,
+            "query_sha256": hashlib.sha256(specification["query"].encode("utf-8")).hexdigest(),
+            "observation": {"result": payload, "duration_ms": 1.0},
+        })
     execution_document = deepcopy(locked_execution)
     allocation_document = {
         "schema_version": 1, "campaign_stage": "hybrid", "allocation": deepcopy(allocation),
@@ -1527,11 +1497,11 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
         "schema_version": 1, "campaign_stage": "hybrid",
         "bundle_sha256": workflow_input["record_self_sha256"],
         "hybrid_request_sha256": request["record_self_sha256"],
-        "baseline": workflow_input["baseline"], "candidate": workflow_input["candidate"],
+        "role": workflow_input["role"], "config": workflow_input["config"],
         "planned_scale": 30000, "executed_scale": 30000, "query_count": 105,
         **expected_phase07_expanded_corpus_identity(
             fixture_root=ROOT / "tests" / "fixtures" / "wiki", target_size=30000),
-        "authorization": "none", "candidate_verdict": "numeric-success",
+        "authorization": "none",
         "queries_sha256": query_file_sha256, "baselines_sha256": baselines_sha256,
         "fixture_tree_sha256": fixture_tree_sha256, "corpus_sha256": corpus_sha256,
         "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256, "generator_recipe": generator_recipe,
@@ -1541,38 +1511,21 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
         "runtime": locked_execution["runtime"], "head_sha": HEAD,
         "locked_execution": execution_document, "locked_execution_sha256": execution_sha256,
         "allocation": allocation_document, "allocation_sha256": allocation_sha256,
-        "original_absolute_observations": deepcopy(rows), "expanded_paired_observations": deepcopy(rows),
-        "aggregate_metrics": {
-            "original_absolute": deepcopy(reconstructed_metrics), "paired_30k": deepcopy(reconstructed_metrics),
-        },
-        "original_absolute_gate": {
-            "stratum": "original_absolute", "baseline_metrics": deepcopy(reconstructed_metrics["baseline"]),
-            "candidate_metrics": deepcopy(reconstructed_metrics["candidate"]), "candidate_verdict": "numeric-success", "authorization": "none",
-        },
-        "paired_30k_non_regression_gate": {
-            "stratum": "paired_30k", "baseline_metrics": deepcopy(reconstructed_metrics["baseline"]),
-            "candidate_metrics": deepcopy(reconstructed_metrics["candidate"]), "candidate_verdict": "numeric-success", "authorization": "none",
-        },
+        "original_observations": deepcopy(rows), "expanded_observations": deepcopy(rows),
         "hybrid_invocation": {
             "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
-            "original_baseline_calls": 105, "original_candidate_calls": 105,
-            "expanded_baseline_calls": 105, "expanded_candidate_calls": 105,
+            "original_calls": 105, "expanded_calls": 105,
+        },
+        "campaign_progress": {
+            "role": workflow_input["role"], "original_completed": 105, "expanded_completed": 105,
         },
     }
-    gates = operator.recompute_hybrid_gate_verdicts(
-        original_absolute=result["aggregate_metrics"]["original_absolute"],
-        expanded_paired=result["aggregate_metrics"]["paired_30k"],
-        committed_baseline=_committed_hybrid_floors(), baselines_sha256=baselines_sha256,
-    )
-    result["original_absolute_gate"] = gates["original_absolute_gate"]
-    result["paired_30k_non_regression_gate"] = gates["paired_30k_non_regression_gate"]
-    result["candidate_verdict"] = gates["candidate_verdict"]
     (root / "hybrid-request.json").write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
     (root / "dispatch-bundle.json").write_text(json.dumps(dispatch_bundle, sort_keys=True), encoding="utf-8")
     _seal_test_json(root / "hybrid-result.json", result)
     _seal_test_json(root / "hybrid-ledger.json", {
         "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": workflow_input["record_self_sha256"],
-        "hybrid_request_sha256": request["record_self_sha256"], "candidate": workflow_input["candidate"],
+        "hybrid_request_sha256": request["record_self_sha256"], "role": workflow_input["role"], "config": workflow_input["config"],
         "authorization": "none", "result_sha256": hashlib.sha256((root / "hybrid-result.json").read_bytes()).hexdigest(),
         "locked_execution_sha256": execution_sha256, "allocation_sha256": allocation_sha256,
         "raw_leaf_sha256s": _hybrid_raw_leaf_sha256s(root),
@@ -1580,7 +1533,7 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
     _seal_test_json(root / "hybrid-packet.json", {
         "schema_version": 1, "campaign_stage": "hybrid", "packet_kind": "phase07-hybrid-packet/v1",
         "bundle_sha256": workflow_input["record_self_sha256"], "hybrid_request_sha256": request["record_self_sha256"],
-        "candidate": workflow_input["candidate"], "authorization": "none", "candidate_verdict": result["candidate_verdict"],
+        "role": workflow_input["role"], "config": workflow_input["config"], "authorization": "none",
         "result_sha256": hashlib.sha256((root / "hybrid-result.json").read_bytes()).hexdigest(),
         "ledger_sha256": hashlib.sha256((root / "hybrid-ledger.json").read_bytes()).hexdigest(),
         "locked_execution_sha256": execution_sha256, "allocation_sha256": allocation_sha256,
@@ -1616,13 +1569,13 @@ def test_hybrid_exporter_reconstructs_only_complete_30k_raw_evidence(
         locked_execution=_locked_confirmation_environment(),
         allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
     )
-    assert campaign.validate_hybrid_artifact_tree(tree)["candidate"]["m"] == 20
+    assert campaign.validate_hybrid_artifact_tree(tree)["config"]["m"] == 20
     result_path = tree / "hybrid-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if field == "nested_result_payload":
-        result["original_absolute_observations"][0]["candidate"]["result"]["items"] = value
+        result["original_observations"][0]["observation"]["result"]["items"] = value
     elif field == "query_sha256":
-        result["original_absolute_observations"][0]["query_sha256"] = value
+        result["original_observations"][0]["query_sha256"] = value
     elif field == "raw_tree_sha256":
         packet_path = tree / "hybrid-packet.json"
         packet = json.loads(packet_path.read_text(encoding="utf-8"))
