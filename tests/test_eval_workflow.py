@@ -1565,6 +1565,11 @@ def test_hybrid_collection_request_rejects_unsealed_download_manifest(
         downloads.pop("record_self_sha256")
     else:
         downloads["record_self_sha256"] = "0" * 64
+    def unexpected_path(*_args, **_kwargs):
+        raise AssertionError("unsealed downloads reached filesystem")
+
+    monkeypatch.setattr(gate, "Path", unexpected_path)
+    monkeypatch.setattr(gate, "_read_object", lambda *_args, **_kwargs: pytest.fail("unsealed downloads reached raw reader"))
     with pytest.raises(ValueError, match="downloads manifest"):
         gate.build_hybrid_collection_request(hybrid_request=request, downloads=downloads)
 

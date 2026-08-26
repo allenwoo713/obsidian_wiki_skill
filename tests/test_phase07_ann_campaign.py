@@ -619,6 +619,81 @@ def test_feature_worktree_preflight_requires_exact_resolved_upstream_head(
         operator.validate_feature_worktree_preflight(preflight)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "remote_reply"),
+    (
+        ("missing-remote", None),
+        ("missing-merge", None),
+        ("remote-command-failure", None),
+        ("remote-empty", ""),
+        ("remote-multiple-lines", f"{HEAD}\trefs/heads/feature/issue-50-dense-ann-recall\n{HEAD}\trefs/heads/other"),
+        ("remote-non-sha", "not-a-sha\trefs/heads/feature/issue-50-dense-ann-recall"),
+        ("remote-different", f"{'0' * 40}\trefs/heads/feature/issue-50-dense-ann-recall"),
+    ),
+)
+def test_feature_worktree_preflight_requires_live_configured_remote_head(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, remote_reply: str | None,
+) -> None:
+    """A local tracking ref is insufficient without one matching live configured ref."""
+    branch = "feature/issue-50-dense-ann-recall"
+    merge_ref = f"refs/heads/{branch}"
+    preflight = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "branch": branch,
+        "worktree_root": str(ROOT), "head_sha": HEAD, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "hybrid", "require_upstream_head": True,
+    }
+
+    def fake_git(*args: str) -> str:
+        replies = {
+            ("rev-parse", "--show-toplevel"): str(ROOT),
+            ("branch", "--show-current"): branch,
+            ("rev-parse", "HEAD"): HEAD,
+            ("rev-parse", "--verify", "@{upstream}"): HEAD,
+            ("status", "--porcelain=v1"): "",
+            ("config", "--get", f"branch.{branch}.remote"): "origin",
+            ("config", "--get", f"branch.{branch}.merge"): merge_ref,
+            ("ls-remote", "--exit-code", "--refs", "origin", merge_ref): f"{HEAD}\t{merge_ref}",
+        }
+        if mutation == "missing-remote" and args == ("config", "--get", f"branch.{branch}.remote"):
+            return ""
+        if mutation == "missing-merge" and args == ("config", "--get", f"branch.{branch}.merge"):
+            return ""
+        if mutation == "remote-command-failure" and args[:1] == ("ls-remote",):
+            raise subprocess.CalledProcessError(2, ["git", *args])
+        if args[:1] == ("ls-remote",):
+            return remote_reply if remote_reply is not None else replies[args]
+        return replies[args]
+
+    monkeypatch.setattr(operator, "_git", fake_git)
+    with pytest.raises(ValueError, match="upstream"):
+        operator.validate_feature_worktree_preflight(preflight)
+
+
+def test_feature_worktree_preflight_accepts_only_matching_live_configured_remote_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accepted path binds local HEAD, local upstream, and remote ref to one SHA."""
+    branch = "feature/issue-50-dense-ann-recall"
+    merge_ref = f"refs/heads/{branch}"
+    replies = {
+        ("rev-parse", "--show-toplevel"): str(ROOT),
+        ("branch", "--show-current"): branch,
+        ("rev-parse", "HEAD"): HEAD,
+        ("rev-parse", "--verify", "@{upstream}"): HEAD,
+        ("status", "--porcelain=v1"): "",
+        ("config", "--get", f"branch.{branch}.remote"): "origin",
+        ("config", "--get", f"branch.{branch}.merge"): merge_ref,
+        ("ls-remote", "--exit-code", "--refs", "origin", merge_ref): f"{HEAD}\t{merge_ref}",
+    }
+    monkeypatch.setattr(operator, "_git", lambda *args: replies[args])
+    request = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "branch": branch,
+        "worktree_root": str(ROOT), "head_sha": HEAD, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "hybrid", "require_upstream_head": True,
+    }
+    assert operator.validate_feature_worktree_preflight(request)["head_sha"] == HEAD
+
+
 def test_hybrid_cli_routes_sealed_dispatch_to_numeric_raw_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The module CLI is a production route, not a dormant helper collection."""
     plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
