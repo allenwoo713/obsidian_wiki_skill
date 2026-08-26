@@ -98,6 +98,23 @@ def test_committed_personal_wiki_manifest_binds_actual_fixture_and_generator_rec
     assert manifest["generator"]["rules_sha256"] == manifests.public_distractor_recipe_sha256()
 
 
+def test_corpus_tree_digest_normalizes_platform_text_line_endings(tmp_path: Path) -> None:
+    """Git LF/CRLF checkout policy must not change one corpus identity."""
+    manifests = _manifests()
+    lf_root, crlf_root = tmp_path / "lf", tmp_path / "crlf"
+    (lf_root / "nested").mkdir(parents=True)
+    (crlf_root / "nested").mkdir(parents=True)
+    (lf_root / "nested" / "note.md").write_bytes(b"# Note\nfirst\nsecond\n")
+    (crlf_root / "nested" / "note.md").write_bytes(b"# Note\r\nfirst\r\nsecond\r\n")
+
+    assert manifests.canonical_content_tree_sha256(lf_root) == \
+        manifests.canonical_content_tree_sha256(crlf_root)
+
+    (crlf_root / "nested" / "note.md").write_bytes(b"# Note\r\nfirst\r\nchanged\r\n")
+    assert manifests.canonical_content_tree_sha256(lf_root) != \
+        manifests.canonical_content_tree_sha256(crlf_root)
+
+
 def test_d10_d18_model_tree_lock_and_cache_poisoning_fail_closed(tmp_path: Path) -> None:
     """D-10/D-18: local validation is read-only and rejects mutable/poisoned trees."""
     manifests = _manifests()
