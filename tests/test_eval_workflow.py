@@ -21,6 +21,7 @@ sys.path.insert(0, str(SKILL_ROOT / "eval"))
 
 from models import ChunkHit, ContextBundle, ContextItem  # noqa: E402
 import run_eval  # noqa: E402
+import phase07_operator_gate  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
 
 
@@ -1544,7 +1545,28 @@ def _write_hybrid_downloads(path: Path, records: list[dict], *, secret: bool = F
     ]
     if secret:
         rows[0]["token"] = "fixture-secret"
-    path.write_text(json.dumps({"schema_version": 1, "downloads": rows}, sort_keys=True), encoding="utf-8")
+    manifest = {"schema_version": 1, "downloads": rows, "record_self_sha256": ""}
+    manifest["record_self_sha256"] = phase07_operator_gate.canonical_digest(manifest)
+    path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+
+@pytest.mark.parametrize("mutation", ("missing", "wrong"))
+def test_hybrid_collection_request_rejects_unsealed_download_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    """The local download manifest is self-authenticating before raw paths are read."""
+    import phase07_operator_gate as gate
+
+    request, records, _fixture = _two_download_hybrid_evidence(tmp_path, monkeypatch)
+    downloads_file = tmp_path / "downloads.json"
+    _write_hybrid_downloads(downloads_file, records)
+    downloads = json.loads(downloads_file.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        downloads.pop("record_self_sha256")
+    else:
+        downloads["record_self_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="downloads manifest"):
+        gate.build_hybrid_collection_request(hybrid_request=request, downloads=downloads)
 
 
 def _operator_main_exit_code(gate, argv: list[str]) -> int:

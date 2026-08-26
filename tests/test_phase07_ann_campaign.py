@@ -578,6 +578,47 @@ def test_hybrid_preflight_dispatch_and_export_require_a_complete_raw_tree(
         operator.validate_hybrid_artifact_tree(raw_tree)
 
 
+def test_feature_worktree_preflight_requires_exact_resolved_upstream_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A requested upstream binding rejects divergence and absent tracking refs."""
+    preflight = {
+        "repository": "allenwoo713/obsidian_wiki_skill",
+        "branch": "feature/issue-50-dense-ann-recall",
+        "worktree_root": str(ROOT), "head_sha": HEAD, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "hybrid",
+        "require_upstream_head": True,
+    }
+    real_git = operator._git
+
+    def diverged_git(*args: str) -> str:
+        if args == ("status", "--porcelain=v1"):
+            return ""
+        if args == ("rev-parse", "--verify", "@{upstream}"):
+            return "0" * 40
+        return real_git(*args)
+
+    monkeypatch.setattr(operator, "_git", diverged_git)
+    with pytest.raises(ValueError, match="upstream"):
+        operator.validate_feature_worktree_preflight(preflight)
+
+    request_file, ledger_file = tmp_path / "preflight-request.json", tmp_path / "preflight-ledger.json"
+    request_file.write_text(json.dumps({**preflight, "ledger_path": str(ledger_file.resolve())}), encoding="utf-8")
+    assert operator.main(["preflight", "--request-file", str(request_file), "--ledger-file", str(ledger_file)]) == 1
+    assert not ledger_file.exists()
+
+    def unresolved_git(*args: str) -> str:
+        if args == ("status", "--porcelain=v1"):
+            return ""
+        if args == ("rev-parse", "--verify", "@{upstream}"):
+            raise subprocess.CalledProcessError(128, ["git", *args])
+        return real_git(*args)
+
+    monkeypatch.setattr(operator, "_git", unresolved_git)
+    with pytest.raises(ValueError, match="upstream"):
+        operator.validate_feature_worktree_preflight(preflight)
+
+
 def test_hybrid_cli_routes_sealed_dispatch_to_numeric_raw_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The module CLI is a production route, not a dormant helper collection."""
     plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
