@@ -1414,9 +1414,9 @@ class _HybridGitHubFixtureClient:
             if self.mutation == "stale-head":
                 response["head_sha"] = "0" * 40
             if self.mutation == "run-mismatch":
-                response["id"] = run_id + 1
+                response["id"] = record["api_run_id_mismatch"]
             if self.mutation == "attempt-mismatch":
-                response["run_attempt"] = record["run_attempt"] + 1
+                response["run_attempt"] = record["api_run_attempt_mismatch"]
             return response
         if path.endswith(f"/attempts/{record['run_attempt']}/jobs"):
             job = {
@@ -1428,7 +1428,7 @@ class _HybridGitHubFixtureClient:
                 "labels": ["ubuntu-latest", "X64"],
             }
             if self.mutation == "job-mismatch":
-                job["id"] += 1
+                job["id"] = record["api_job_id_mismatch"]
             return {"jobs": [job]}
         if path.endswith(f"/runs/{run_id}/artifacts"):
             artifact = {
@@ -1442,7 +1442,7 @@ class _HybridGitHubFixtureClient:
                 },
             }
             if self.mutation == "artifact-mismatch":
-                artifact["id"] += 1
+                artifact["id"] = record["api_artifact_id_mismatch"]
             if self.mutation == "expired":
                 artifact["expired"] = True
             if self.mutation == "archive-digest":
@@ -1458,19 +1458,38 @@ def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     plan_root.mkdir()
     plan, _ = fixture._build_test_hybrid_plan(plan_root, monkeypatch)
     records: list[dict] = []
-    for offset, m in enumerate((20, 32), start=1):
-        run_id, attempt, job_id, artifact_id = 700 + offset, offset, 800 + offset, 900 + offset
+    identities = {
+        20: {
+            "run_id": 701, "run_attempt": 1, "job_id": 801, "artifact_id": 901,
+            "api_run_id_mismatch": 1701, "api_run_attempt_mismatch": 11,
+            "api_job_id_mismatch": 1801, "api_artifact_id_mismatch": 1901,
+        },
+        32: {
+            "run_id": 702, "run_attempt": 2, "job_id": 802, "artifact_id": 902,
+            "api_run_id_mismatch": 1702, "api_run_attempt_mismatch": 12,
+            "api_job_id_mismatch": 1802, "api_artifact_id_mismatch": 1902,
+        },
+    }
+    for m in (20, 32):
+        identity = identities[m]
+        run_id, attempt, job_id, artifact_id = (
+            identity["run_id"], identity["run_attempt"], identity["job_id"], identity["artifact_id"],
+        )
         allocation = {
             "run_id": run_id, "run_attempt": attempt, "job_id": job_id,
-            "job_key": "phase07-hybrid", "job_allocation_nonce": f"{offset:x}" * 32,
+            "job_key": "phase07-hybrid", "job_allocation_nonce": ("a" if m == 20 else "b") * 32,
         }
+        dispatch_bundle = fixture._hybrid_dispatch_bundle(plan, m=m)
         tree = fixture._make_valid_test_hybrid_raw_tree(
-            tmp_path / f"m{m}-raw", dispatch_bundle=fixture._hybrid_dispatch_bundle(plan, m=m),
+            tmp_path / f"m{m}-raw", dispatch_bundle=dispatch_bundle,
             locked_execution=fixture._locked_confirmation_environment(), allocation=allocation,
         )
         archive = tmp_path / f"m{m}.zip"
         records.append({
-            **allocation, "artifact_id": artifact_id, "archive": str(archive),
+            **identity, **allocation, "artifact_id": artifact_id,
+            "candidate": deepcopy(dispatch_bundle["workflow_input"]["candidate"]),
+            "bundle_sha256": dispatch_bundle["workflow_input"]["record_self_sha256"],
+            "archive": str(archive),
             "extracted_dir": str(tree), "archive_sha256": _zip_hybrid_artifact(tree, archive),
         })
     return plan["hybrid_request"], records, fixture
@@ -1496,13 +1515,16 @@ def _clone_hybrid_evidence(seed: tuple[dict, list[dict], object], tmp_path: Path
         archive = tmp_path / f"m{m}.zip"
         shutil.copytree(record["extracted_dir"], extracted)
         shutil.copy2(record["archive"], archive)
-        records.append({**record, "archive": str(archive), "extracted_dir": str(extracted)})
+        records.append({**deepcopy(record), "archive": str(archive), "extracted_dir": str(extracted)})
     return deepcopy(request), records, fixture
 
 
 def _write_hybrid_downloads(path: Path, records: list[dict], *, secret: bool = False) -> None:
     rows = [
-        {name: record[name] for name in ("run_id", "run_attempt", "archive", "extracted_dir")}
+        {name: deepcopy(record[name]) for name in (
+            "run_id", "run_attempt", "job_id", "artifact_id", "candidate",
+            "bundle_sha256", "archive", "extracted_dir",
+        )}
         for record in records
     ]
     if secret:
@@ -1556,7 +1578,8 @@ def test_hybrid_two_download_collection_provenance_and_postdownload_reconstructs
 @pytest.mark.parametrize(
     "mutation",
     (
-        "missing-candidate", "duplicate-candidate", "user-candidate", "user-scale",
+        "missing-candidate", "duplicate-candidate", "candidate-mismatch", "bundle-mismatch",
+        "user-candidate", "user-scale",
         "non-success", "replacement", "stale-head", "expired", "run-mismatch",
         "attempt-mismatch", "job-mismatch", "artifact-mismatch", "archive-digest",
         "extracted-tree", "packet-digest", "missing-original-row", "missing-30k-row",
@@ -1583,8 +1606,14 @@ def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
     if mutation == "missing-candidate":
         records.pop()
     elif mutation == "duplicate-candidate":
-        records[1]["archive"] = records[0]["archive"]
-        records[1]["extracted_dir"] = records[0]["extracted_dir"]
+        records[1]["candidate"] = deepcopy(records[0]["candidate"])
+    elif mutation == "candidate-mismatch":
+        records[0]["candidate"] = {
+            "index_type": "hnsw_sq", "m": 20,
+            "ef_construction": 300, "query_ef": 100,
+        }
+    elif mutation == "bundle-mismatch":
+        records[0]["bundle_sha256"] = "0" * 64
     elif mutation == "user-candidate":
         request["candidates"][0]["m"] = 99
         request["record_self_sha256"] = gate.canonical_digest(request)
@@ -1625,7 +1654,9 @@ def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
         "hybrid-collection-request", "--request-file", str(request_file),
         "--downloads-file", str(downloads_file), "--ledger-file", str(collection),
     ])
-    if mutation in request_mutations | {"missing-candidate", "duplicate-candidate", "secret"}:
+    if mutation in request_mutations | {
+        "missing-candidate", "duplicate-candidate", "candidate-mismatch", "bundle-mismatch", "secret",
+    }:
         assert collection_code == 1
         assert not collection.exists()
         return
