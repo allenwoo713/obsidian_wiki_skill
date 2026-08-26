@@ -1101,6 +1101,29 @@ def _git(*args: str) -> str:
     return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
 
 
+def _configured_live_upstream_head(branch: str) -> str:
+    """Resolve the one configured tracking ref directly from its remote."""
+    try:
+        remote = _git("config", "--get", f"branch.{branch}.remote")
+        merge_ref = _git("config", "--get", f"branch.{branch}.merge")
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("unresolved configured upstream") from None
+    if len(remote.splitlines()) != 1 or len(merge_ref.splitlines()) != 1 \
+            or not remote or not merge_ref or not merge_ref.startswith("refs/"):
+        raise ValueError("invalid configured upstream")
+    try:
+        reply = _git("ls-remote", "--exit-code", "--refs", remote, merge_ref)
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("unresolved configured upstream") from None
+    lines = reply.splitlines()
+    if len(lines) != 1:
+        raise ValueError("invalid configured upstream")
+    fields = lines[0].split("\t")
+    if len(fields) != 2 or fields[1] != merge_ref or not SHA.fullmatch(fields[0]):
+        raise ValueError("invalid configured upstream")
+    return fields[0]
+
+
 def validate_feature_worktree_preflight(request: dict[str, Any], *, root: Path | None = None) -> dict[str, Any]:
     """Validate exact feature worktree identity and its explicit dirty policy."""
     allowed = {"repository", "branch", "worktree_root", "head_sha", "allowed_dirty_paths", "workflow_name", "campaign_stage", "continuation_binding", "require_upstream_head", "ledger_path", "evidence_packet"}
@@ -1134,6 +1157,8 @@ def validate_feature_worktree_preflight(request: dict[str, Any], *, root: Path |
             raise ValueError("unresolved upstream head") from exc
         if not SHA.fullmatch(upstream_head) or upstream_head != request["head_sha"]:
             raise ValueError("upstream head differs from immutable head")
+        if _configured_live_upstream_head(request["branch"]) != request["head_sha"]:
+            raise ValueError("configured upstream differs from immutable head")
     status = _git("status", "--porcelain=v1").splitlines()
     dirty = sorted(line[3:] for line in status if len(line) >= 4)
     if set(dirty) - set(request["allowed_dirty_paths"]):

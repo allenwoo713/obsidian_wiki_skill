@@ -550,7 +550,9 @@ def test_hybrid_preflight_dispatch_and_export_require_a_complete_raw_tree(
     preflight = operator.build_hybrid_preflight(bundle, expected_head=HEAD)
     assert preflight["allowed_dirty_paths"] == []
     real_git = operator._git
-    monkeypatch.setattr(operator, "_git", lambda *args: "" if args == ("status", "--porcelain=v1") else HEAD if args == ("rev-parse", "--verify", "@{upstream}") else real_git(*args))
+    branch = "feature/issue-50-dense-ann-recall"
+    merge_ref = f"refs/heads/{branch}"
+    monkeypatch.setattr(operator, "_git", lambda *args: "" if args == ("status", "--porcelain=v1") else HEAD if args == ("rev-parse", "--verify", "@{upstream}") else "origin" if args == ("config", "--get", f"branch.{branch}.remote") else merge_ref if args == ("config", "--get", f"branch.{branch}.merge") else f"{HEAD}\t{merge_ref}" if args == ("ls-remote", "--exit-code", "--refs", "origin", merge_ref) else real_git(*args))
     assert operator.validate_feature_worktree_preflight(preflight)["head_sha"] == HEAD
     calls: list[dict] = []
     result = operator.execute_hybrid_dispatch(
