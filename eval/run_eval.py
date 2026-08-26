@@ -37,6 +37,7 @@ import sys
 import tempfile
 import time
 import tracemalloc
+from types import SimpleNamespace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 HERE = Path(__file__).resolve().parent
@@ -57,6 +58,7 @@ from obsidian_wiki.domain.index_models import CandidateBuildPolicy  # noqa: E402
 from eval.ann_corpus_manifest import (  # noqa: E402
     canonical_content_tree_sha256,
     PHASE07_CURRENT_BASELINE,
+    public_distractor_recipe,
     validate_indexed_query_digest_separation,
 )
 from query_planner import DefaultQueryPlanner  # noqa: E402
@@ -284,6 +286,7 @@ def _candidate_result_payload(result) -> dict:
                 "page_id": item.page_id,
                 "path": str(item.path),
                 "scope": item.scope,
+                "inclusion_reason": item.inclusion_reason,
                 "evidence": [hit.chunk_id for hit in item.evidence],
                 "graph_paths": [
                     {
@@ -296,8 +299,185 @@ def _candidate_result_payload(result) -> dict:
             for item in bundle.items
         ],
         "context_sha256": hashlib.sha256((bundle.context_text or "").encode("utf-8")).hexdigest(),
+        "context_text": bundle.context_text or "",
         "token_count": bundle.token_count,
+        "budget": bundle.budget_to_json(),
     }
+
+
+def _finite_number(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"finite {name}")
+    return float(value)
+
+
+def _is_lookup_specification(specification: dict) -> bool:
+    intent = specification.get("intent", specification.get("query_type", "lookup"))
+    return intent == "lookup"
+
+
+def _page_id_hit(page_id: str, gold_pages: object) -> bool:
+    """Serialized page identities use exactly the live ``_page_hit`` rules."""
+    if not isinstance(page_id, str):
+        raise ValueError("serialized page identity")
+    return _page_hit(SimpleNamespace(page_id=page_id), gold_pages)
+
+
+def _metrics_from_result_pairs(*, specifications: list[dict], results: list) -> dict[str, float | int]:
+    if len(specifications) != len(results) or not specifications:
+        raise ValueError("complete hybrid live results")
+    page, evidence, exact_lookup, mrr, functional = [], [], [], [], []
+    citation = overflow = budget = graph_unsupported = 0
+    for specification, result in zip(specifications, results, strict=True):
+        bundle = result.bundle
+        candidates = list(result.candidates[:10])
+        gold = set(specification.get("relevant_pages", []))
+        hits = [position for position, candidate in enumerate(candidates, 1) if _page_hit(candidate, gold)]
+        page.append(min(1.0, sum(_page_hit(candidate, gold) for candidate in candidates[:5]) / max(1, len(gold))))
+        functional.append(min(1.0, sum(_page_hit(candidate, gold) for candidate in candidates) / max(1, len(gold))))
+        required = specification.get("required_facts") or []
+        context = bundle.context_text or ""
+        evidence.append(sum(fact in context for fact in required) / len(required) if required else 1.0)
+        if _is_lookup_specification(specification):
+            exact_lookup.append(1.0 if any(position <= 3 for position in hits) else 0.0)
+        mrr.append(1.0 / hits[0] if hits else 0.0)
+        citation += len(_citation_violations(bundle))
+        overflow += int(bundle.token_count > bundle.effective_budget_tokens)
+        budget += int(bool(bundle.budget_contract_violations()))
+        graph_unsupported += sum(1 for item in bundle.items
+                                 if item.inclusion_reason == "graph_expansion" and not item.evidence)
+    values: dict[str, float | int] = {
+        FUNCTIONAL_FINAL_RETRIEVAL_METRIC: statistics.mean(functional),
+        "page_recall_at_5": statistics.mean(page),
+        "evidence_recall_at_10": statistics.mean(evidence),
+        "exact_lookup_hit_at_3": statistics.mean(exact_lookup) if exact_lookup else 1.0,
+        "mrr_at_10": statistics.mean(mrr),
+        "citation_violation_count": citation, "context_overflow_count": overflow,
+        "budget_violation_count": budget, "graph_unsupported_count": graph_unsupported,
+    }
+    for name, value in values.items():
+        _finite_number(name, value)
+    return values
+
+
+def aggregate_hybrid_result_metrics(*, specifications: list[dict], baseline_results: list,
+                                    candidate_results: list) -> dict[str, dict[str, float | int]]:
+    """Aggregate live public ``HybridResult`` objects without metric aliases."""
+    return {
+        "baseline": _metrics_from_result_pairs(specifications=specifications, results=baseline_results),
+        "candidate": _metrics_from_result_pairs(specifications=specifications, results=candidate_results),
+    }
+
+
+def aggregate_hybrid_serialized_metrics(*, specifications: list[dict], observations: list[dict]) -> dict[str, dict[str, float | int]]:
+    """Recompute gates from serialized query evidence in an uploaded raw tree."""
+    if len(specifications) != len(observations) or not observations:
+        raise ValueError("complete serialized hybrid observations")
+    def metrics(role: str) -> dict[str, float | int]:
+        page = []; evidence = []; exact = []; mrr = []; functional = []
+        citation = overflow = budget = graph = 0
+        for specification, row in zip(specifications, observations, strict=True):
+            observation = row.get(role)
+            if not isinstance(observation, dict) or set(observation) != {"result", "duration_ms"}:
+                raise ValueError("complete serialized hybrid observation")
+            payload = observation["result"]
+            duration = observation["duration_ms"]
+            if not isinstance(payload, dict) or isinstance(duration, bool) \
+                    or not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or duration < 0:
+                raise ValueError("serialized hybrid evidence")
+            required_payload = {"query", "plan", "pages", "items", "context_text", "context_sha256", "token_count", "budget"}
+            if set(payload) != required_payload:
+                raise ValueError("serialized hybrid payload schema")
+            context = payload["context_text"]
+            if not isinstance(context, str) or hashlib.sha256(context.encode("utf-8")).hexdigest() != payload.get("context_sha256"):
+                raise ValueError("serialized hybrid context")
+            raw = payload["budget"]
+            budget_fields = {"requested_base_budget_tokens", "budget_multiplier", "effective_budget_tokens", "hard_max_tokens", "budget_policy", "max_context_tokens"}
+            if not isinstance(raw, dict) or set(raw) != budget_fields:
+                raise ValueError("serialized hybrid raw budget")
+            token_count = payload.get("token_count")
+            effective, maximum, hard = raw["effective_budget_tokens"], raw["max_context_tokens"], raw["hard_max_tokens"]
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (token_count, effective, maximum)) \
+                    or (hard is not None and (isinstance(hard, bool) or not isinstance(hard, int) or hard < 0)) \
+                    or maximum != effective or token_count > effective or (hard is not None and effective > hard):
+                budget += 1
+            overflow += int(isinstance(token_count, int) and isinstance(effective, int) and token_count > effective)
+            gold = set(specification.get("relevant_pages", [])); pages = payload.get("pages")
+            if not isinstance(pages, list) or not all(isinstance(item, str) for item in pages):
+                raise ValueError("serialized hybrid pages")
+            hits = [position for position, page_id in enumerate(pages[:10], 1) if _page_id_hit(page_id, gold)]
+            page.append(min(1.0, sum(_page_id_hit(page_id, gold) for page_id in pages[:5]) / max(1, len(gold))))
+            functional.append(min(1.0, sum(_page_id_hit(page_id, gold) for page_id in pages[:10]) / max(1, len(gold))))
+            required = specification.get("required_facts") or []
+            evidence.append(sum(fact in context for fact in required) / len(required) if required else 1.0)
+            if _is_lookup_specification(specification): exact.append(1.0 if any(hit <= 3 for hit in hits) else 0.0)
+            mrr.append(1.0 / hits[0] if hits else 0.0)
+            items = payload.get("items", [])
+            if not isinstance(items, list):
+                raise ValueError("serialized hybrid items")
+            citation += len(_citation_violations(SimpleNamespace(
+                context_text=context,
+                items=[SimpleNamespace(page_id=item.get("page_id"), path=item.get("path"),
+                                       inclusion_reason=item.get("inclusion_reason", "dense_retrieval"))
+                       for item in items if isinstance(item, dict)],
+            )))
+            for item in items:
+                if not isinstance(item, dict): raise ValueError("serialized hybrid item")
+                reason, path, item_evidence = item.get("inclusion_reason"), item.get("path"), item.get("evidence")
+                if reason == "graph_expansion" and not item_evidence:
+                    graph += 1
+        return {FUNCTIONAL_FINAL_RETRIEVAL_METRIC: statistics.mean(functional),
+                "page_recall_at_5": statistics.mean(page), "evidence_recall_at_10": statistics.mean(evidence),
+                "exact_lookup_hit_at_3": statistics.mean(exact) if exact else 1.0, "mrr_at_10": statistics.mean(mrr),
+                "citation_violation_count": citation, "context_overflow_count": overflow,
+                "budget_violation_count": budget, "graph_unsupported_count": graph}
+    return {"baseline": metrics("baseline"), "candidate": metrics("candidate")}
+
+
+def expected_phase07_expanded_corpus_identity(*, fixture_root: Path, target_size: int,
+                                              test_only: bool = False) -> dict[str, object]:
+    """Compute deterministic public-corpus identity from fixed inputs, not a label.
+
+    This mirrors ``canonical_content_tree_sha256`` without needing a retained
+    30k tree.  The small-target escape hatch is intentionally pytest-only.
+    """
+    if target_size != 30000 and not (test_only and os.environ.get("PYTEST_CURRENT_TEST")):
+        raise ValueError("phase07 expanded target must be 30000")
+    root = Path(fixture_root)
+    sources = sorted((path for path in root.rglob("*.md") if path.is_file()),
+                     key=lambda path: path.relative_to(root).as_posix())
+    if not sources or target_size < len(sources):
+        raise ValueError("phase07 deterministic corpus source")
+    entries = {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    recipe = public_distractor_recipe()
+    for ordinal in range(target_size - len(sources)):
+        entries[f"phase07_distractors/hybrid-{ordinal:05d}.md"] = (
+            sources[ordinal % len(sources)].read_bytes()
+            + f"\n\n{recipe['content_suffix'].format(ordinal=ordinal)}\n".encode("utf-8")
+        )
+    digest = hashlib.sha256()
+    for name in sorted(entries):
+        digest.update(name.encode("utf-8")); digest.update(b"\0")
+        digest.update(entries[name]); digest.update(b"\0")
+    return {"expanded_content_tree_sha256": digest.hexdigest(), "expanded_member_count": len(entries)}
+
+
+def _materialize_phase07_expanded_corpus(*, fixture_root: Path, output_root: Path, target_size: int,
+                                         test_only: bool) -> dict[str, object]:
+    shutil.copytree(fixture_root, output_root)
+    sources = sorted(output_root.rglob("*.md"))
+    expected = expected_phase07_expanded_corpus_identity(
+        fixture_root=fixture_root, target_size=target_size, test_only=test_only,
+    )
+    for ordinal in range(target_size - len(sources)):
+        target = output_root / "phase07_distractors" / f"hybrid-{ordinal:05d}.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(sources[ordinal % len(sources)].read_bytes() + f"\n\nphase07 hybrid distractor {ordinal}\n".encode("utf-8"))
+    actual = {"expanded_content_tree_sha256": canonical_content_tree_sha256(output_root),
+              "expanded_member_count": sum(1 for item in output_root.rglob("*") if item.is_file())}
+    if actual != expected:
+        raise ValueError("phase07 expanded corpus materialization identity")
+    return actual
 
 
 def _percentile(values: list[float], percentile: int) -> float:
@@ -568,6 +748,127 @@ def run_phase07_representative_campaign(
         "personal_wiki_ann_exact": {"query_count": len(ann_rows), **separation, "rows": ann_rows},
         "hybrid_invocation": {"entrypoint": "query.hybrid_search", "original_baseline_calls": len(original_observations), "baseline_calls": len(expanded_observations), "finalist_calls": len(expanded_observations)},
         "authorization": authorization,
+    }
+
+
+def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir: Path, embed=None,
+                                                  query_limit: int | None = None) -> dict:
+    """Run one sealed D-25 hybrid candidate with an operator-minted capability.
+
+    This deliberately does not reuse the representative/ANN authority: the
+    public call has no candidate parameter and both original and expanded
+    searches are performed on independently built WikiIndex instances.
+    ``embed`` plus ``query_limit`` is a pytest-only finite integration seam;
+    normal execution always materializes the sealed 30k corpus and all 105
+    committed queries.
+    """
+    from eval.phase07_operator_gate import _consume_hybrid_execution_capability
+
+    bundle = _consume_hybrid_execution_capability(capability)
+    if embed is not None and not os.environ.get("PYTEST_CURRENT_TEST"):
+        raise ValueError("injected hybrid encoder is pytest-only")
+    if query_limit is not None and (embed is None or not os.environ.get("PYTEST_CURRENT_TEST")
+                                    or not isinstance(query_limit, int) or not 1 <= query_limit < 105):
+        raise ValueError("hybrid query limit is pytest-only")
+    root = Path(work_dir) / f"hybrid-m{bundle['candidate']['m']}"
+    if root.exists():
+        shutil.rmtree(root)
+    original_wiki, expanded_wiki = root / "original" / "Wiki", root / "expanded" / "Wiki"
+    shutil.copytree(FIXTURES_WIKI, original_wiki)
+    # A local test exercises the production topology but not a 30k benchmark.
+    source_count = sum(1 for page in FIXTURES_WIKI.rglob("*.md") if page.is_file())
+    target_size = source_count + 2 if embed is not None else bundle["scale"]
+    expanded_identity = _materialize_phase07_expanded_corpus(
+        fixture_root=FIXTURES_WIKI, output_root=expanded_wiki, target_size=target_size,
+        test_only=embed is not None,
+    )
+
+    def build_candidate(name: str, config: dict, wiki: Path):
+        policy = CandidateQueryPolicy(
+            candidate="ivf-hnsw-sq", query_ef=config["query_ef"],
+            build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=config["m"], ef_construction=config["ef_construction"]),
+        )
+        index_dir = root / name / ".index"
+        if embed is None:
+            index = WikiIndex(index_dir)
+            index.build(wiki, full_rebuild=True, candidate_query_policy=policy)
+        else:
+            from build_index import build_storage_contract
+            build_storage_contract(wiki, index_dir, embed=embed, candidate_query_policy=policy)
+            index = WikiIndex(index_dir)
+        # ``hybrid_search`` consumes the graph sidecar through the public
+        # index path; all four independently built indexes require one.
+        write_graph_artifact(wiki, index_dir)
+        index.load()
+        return index
+
+    original_baseline = build_candidate("original-baseline", bundle["baseline"], original_wiki)
+    original_candidate = build_candidate("original-candidate", bundle["candidate"], original_wiki)
+    expanded_baseline = build_candidate("expanded-baseline", bundle["baseline"], expanded_wiki)
+    expanded_candidate = build_candidate("expanded-candidate", bundle["candidate"], expanded_wiki)
+    if embed is not None:
+        class _InjectedEncoder:
+            def encode(self, texts, **_kwargs):
+                return embed(texts)
+        for index in (original_baseline, original_candidate, expanded_baseline, expanded_candidate):
+            index._embedder = _InjectedEncoder()
+    queries = load_queries(HERE / "queries.jsonl")
+    if len(queries) != bundle["query_count"]:
+        raise ValueError("sealed hybrid original query manifest")
+    queries = queries[:query_limit] if query_limit is not None else queries
+    planner = DefaultQueryPlanner(project_root=root)
+
+    def observe(index, query: str, wiki: Path) -> tuple[dict, object]:
+        started = time.perf_counter()
+        result = hybrid_search(index, query, planner, k=10, max_tokens=4096, wiki_dir=wiki,
+                               intent_override="auto", allow_local_fallback=True)
+        payload = _candidate_result_payload(result)
+        return ({"result": payload, "duration_ms": round((time.perf_counter() - started) * 1000, 6)}, result)
+
+    original, expanded = [], []
+    original_baseline_results, original_candidate_results = [], []
+    expanded_baseline_results, expanded_candidate_results = [], []
+    for ordinal, item in enumerate(queries):
+        query = item["query"]
+        query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        original_base, original_base_live = observe(original_baseline, query, original_wiki)
+        original_candidate_row, original_candidate_live = observe(original_candidate, query, original_wiki)
+        expanded_base, expanded_base_live = observe(expanded_baseline, query, expanded_wiki)
+        expanded_candidate_row, expanded_candidate_live = observe(expanded_candidate, query, expanded_wiki)
+        original.append({"ordinal": ordinal, "query_sha256": query_sha256,
+                         "baseline": original_base, "candidate": original_candidate_row})
+        expanded.append({"ordinal": ordinal, "query_sha256": query_sha256,
+                         "baseline": expanded_base, "candidate": expanded_candidate_row})
+        original_baseline_results.append(original_base_live); original_candidate_results.append(original_candidate_live)
+        expanded_baseline_results.append(expanded_base_live); expanded_candidate_results.append(expanded_candidate_live)
+    from eval.phase07_operator_gate import committed_hybrid_baseline, recompute_hybrid_gate_verdicts
+
+    original_aggregate = aggregate_hybrid_result_metrics(
+        specifications=queries, baseline_results=original_baseline_results, candidate_results=original_candidate_results)
+    paired_aggregate = aggregate_hybrid_result_metrics(
+        specifications=queries, baseline_results=expanded_baseline_results, candidate_results=expanded_candidate_results)
+    floors, baselines_sha256 = committed_hybrid_baseline()
+    gates = recompute_hybrid_gate_verdicts(
+        original_absolute=original_aggregate, expanded_paired=paired_aggregate,
+        committed_baseline=floors, baselines_sha256=baselines_sha256,
+    )
+    return {
+        "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": bundle["record_self_sha256"],
+        "baseline": bundle["baseline"], "candidate": bundle["candidate"],
+        "planned_scale": bundle["scale"], "executed_scale": target_size,
+        **expanded_identity,
+        "query_count": len(queries), "authorization": "none",
+        "original_absolute_observations": original,
+        "expanded_paired_observations": expanded,
+        "aggregate_metrics": {"original_absolute": original_aggregate, "paired_30k": paired_aggregate},
+        "original_absolute_gate": gates["original_absolute_gate"],
+        "paired_30k_non_regression_gate": gates["paired_30k_non_regression_gate"],
+        "candidate_verdict": gates["candidate_verdict"],
+        "hybrid_invocation": {
+            "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
+            "original_baseline_calls": len(original), "original_candidate_calls": len(original),
+            "expanded_baseline_calls": len(expanded), "expanded_candidate_calls": len(expanded),
+        },
     }
 
 

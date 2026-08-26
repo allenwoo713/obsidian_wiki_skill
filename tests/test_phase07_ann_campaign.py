@@ -869,7 +869,7 @@ def test_export_hybrid_packet_rejects_legacy_direct_result_and_workflow_fallback
     result_file, member_file = tmp_path / "legacy-result.json", tmp_path / "member.json"
     result_file.write_text(json.dumps(legacy), encoding="utf-8")
     member_file.write_text(json.dumps(plan["workflow_inputs"][0]), encoding="utf-8")
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         campaign.export_hybrid_packet(result_file=result_file, workflow_input_file=member_file, output=tmp_path / "packet.json")
 
 

@@ -15,6 +15,14 @@ PHASE07_CURRENT_BASELINE = {
     "candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300,
     "query_ef": 100, "refine_factor": None,
 }
+_PUBLIC_DISTRACTOR_RECIPE = {
+    "version": "public-distractor-v1",
+    "seed": "phase07-public-corpus",
+    "target_size": 30_000,
+    "source_selection": "sorted-round-robin-markdown",
+    "content_suffix": "phase07 hybrid distractor {ordinal}",
+    "query_injection": False,
+}
 
 
 def phase07_current_baseline_sha256() -> str:
@@ -25,6 +33,16 @@ def canonical_sha256(value: Mapping[str, object]) -> str:
     payload = dict(value)
     payload.pop("record_self_sha256", None)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def public_distractor_recipe_sha256() -> str:
+    """Identity of the fixed, deterministic 30k public-corpus generator."""
+    return canonical_sha256(_PUBLIC_DISTRACTOR_RECIPE)
+
+
+def public_distractor_recipe() -> dict[str, object]:
+    """Return a copy of the fixed recipe; callers may seal it into evidence."""
+    return dict(_PUBLIC_DISTRACTOR_RECIPE)
 
 
 def _digest(name: str, value: object) -> str:
@@ -108,6 +126,27 @@ def canonical_content_tree_sha256(root: Path) -> str:
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(relative); digest.update(b"\0"); digest.update(path.read_bytes()); digest.update(b"\0")
     return digest.hexdigest()
+
+
+def validate_committed_personal_wiki_manifest(path: Path, *, fixture_root: Path) -> dict[str, object]:
+    """Bind the small committed manifest to its real fixture and fixed recipe.
+
+    Shape-only SHA strings are not evidence: this check is intentionally used at
+    the production campaign boundary before a 30k corpus can be materialized.
+    """
+    manifest = load_manifest(path)
+    if set(manifest) != {"schema_version", "generator", "record_self_sha256"} \
+            or manifest.get("schema_version") != 1 or not isinstance(manifest.get("generator"), dict):
+        raise ValueError("personal wiki manifest schema")
+    generator = manifest["generator"]
+    expected = {
+        "version": "public-distractor-v1", "seed": "phase07-public-corpus",
+        "source_fixture_sha256": canonical_content_tree_sha256(fixture_root),
+        "rules_sha256": public_distractor_recipe_sha256(),
+    }
+    if generator != expected:
+        raise ValueError("personal wiki fixture/generator identity")
+    return manifest
 
 
 def validate_indexed_query_digest_separation(*, indexed_row_digests: Iterable[str], query_row_digests: Iterable[str]) -> dict[str, object]:

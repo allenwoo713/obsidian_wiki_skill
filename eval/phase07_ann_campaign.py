@@ -32,7 +32,15 @@ from eval.ann_frontier_statistics import (
     validate_declared_family,
 )
 from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256
-from eval.phase07_operator_gate import CONFIRMATION_WORKFLOW_INPUT_FIELDS, canonical_digest as operator_digest, validate_confirmation_workflow_input, validate_stage1_screening_runtime
+from eval.phase07_operator_gate import (
+    CONFIRMATION_WORKFLOW_INPUT_FIELDS,
+    HEX64,
+    HYBRID_WORKFLOW_INPUT_FIELDS,
+    canonical_digest as operator_digest,
+    validate_confirmation_workflow_input,
+    validate_hybrid_workflow_input,
+    validate_stage1_screening_runtime,
+)
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_", "github_pat_")
@@ -529,6 +537,316 @@ def confirmation_packet_from_result(*, result: dict[str, Any], workflow_inputs: 
     return packet
 
 
+def export_hybrid_packet(*, artifact_dir: Path, output: Path) -> None:
+    """Export only a packet reconstructed from the strict raw campaign tree."""
+    validated = validate_hybrid_artifact_tree(artifact_dir)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(validated["wrapper"], sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+_HYBRID_RAW_FILES = (
+    "hybrid-request.json", "hybrid-ledger.json", "hybrid-result.json", "dispatch-bundle.json",
+    "locked-execution.json", "allocation.json",
+)
+_HYBRID_ARTIFACT_FILES = frozenset(_HYBRID_RAW_FILES) | {"hybrid-packet.json"}
+
+
+def hybrid_raw_tree_sha256(root: Path, *, require_wrapper: bool = False) -> str:
+    expected = _HYBRID_ARTIFACT_FILES if require_wrapper else frozenset(_HYBRID_RAW_FILES)
+    if root.is_symlink() or not root.is_dir() or {path.name for path in root.iterdir()} != expected:
+        raise ValueError("strict hybrid artifact allowlist")
+    digest = hashlib.sha256()
+    for name in _HYBRID_RAW_FILES:
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("strict hybrid artifact member")
+        digest.update(name.encode("utf-8")); digest.update(b"\0")
+        digest.update(path.read_bytes()); digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _sealed_hybrid_json(path: Path, *, expected: str) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"invalid {expected}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {expected}") from exc
+    if not isinstance(value, dict) or value.get("record_self_sha256") != canonical_digest(value):
+        raise ValueError(f"unsealed {expected}")
+    return value
+
+
+def _validate_hybrid_result_payload(value: object, *, query: str) -> None:
+    fields = {"query", "plan", "pages", "items", "context_text", "context_sha256", "token_count", "budget"}
+    if not isinstance(value, dict) or set(value) != fields or value.get("query") != query \
+            or not isinstance(value.get("plan"), dict) or not isinstance(value.get("pages"), list) \
+            or not all(isinstance(page, str) for page in value["pages"]) \
+            or not isinstance(value.get("items"), list) \
+            or not isinstance(value.get("context_sha256"), str) or not HEX64.fullmatch(value["context_sha256"]) \
+            or isinstance(value.get("token_count"), bool) or not isinstance(value.get("token_count"), int) or value["token_count"] < 0:
+        raise ValueError("strict hybrid public result payload")
+    if not isinstance(value["context_text"], str) \
+            or hashlib.sha256(value["context_text"].encode("utf-8")).hexdigest() != value["context_sha256"]:
+        raise ValueError("strict hybrid context evidence")
+    budget = value["budget"]
+    required_budget = {"requested_base_budget_tokens", "budget_multiplier", "effective_budget_tokens", "hard_max_tokens", "budget_policy", "max_context_tokens"}
+    if not isinstance(budget, dict) or set(budget) != required_budget \
+            or any(isinstance(budget[key], bool) or not isinstance(budget[key], int) or budget[key] < 0
+                   for key in ("requested_base_budget_tokens", "effective_budget_tokens", "max_context_tokens")) \
+            or isinstance(budget["budget_multiplier"], bool) or not isinstance(budget["budget_multiplier"], (int, float)) \
+            or not math.isfinite(float(budget["budget_multiplier"])) \
+            or not isinstance(budget["budget_policy"], str) or not budget["budget_policy"] \
+            or (budget["hard_max_tokens"] is not None and (isinstance(budget["hard_max_tokens"], bool) or not isinstance(budget["hard_max_tokens"], int) or budget["hard_max_tokens"] < 0)):
+        raise ValueError("strict hybrid budget evidence")
+    for item in value["items"]:
+        if not isinstance(item, dict) or set(item) != {"page_id", "path", "scope", "inclusion_reason", "evidence", "graph_paths"} \
+                or not all(isinstance(item[key], str) and item[key] for key in ("page_id", "path", "scope")) \
+                or not isinstance(item["inclusion_reason"], str) or not item["inclusion_reason"] \
+                or not isinstance(item["evidence"], list) or not all(isinstance(hit, str) and hit for hit in item["evidence"]) \
+                or not isinstance(item["graph_paths"], list):
+            raise ValueError("strict hybrid public result item")
+        for graph_path in item["graph_paths"]:
+            if not isinstance(graph_path, dict) or set(graph_path) != {"source", "target", "signals"} \
+                    or not all(isinstance(graph_path[key], str) and graph_path[key] for key in ("source", "target")) \
+                    or not isinstance(graph_path["signals"], list):
+                raise ValueError("strict hybrid graph evidence")
+
+
+def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
+    """Reconstruct one complete hybrid packet from the finite raw campaign tree."""
+    from eval.ann_corpus_manifest import (
+        canonical_content_tree_sha256, public_distractor_recipe_sha256,
+        validate_committed_personal_wiki_manifest,
+    )
+    from eval.run_eval import expected_phase07_expanded_corpus_identity, aggregate_hybrid_serialized_metrics
+    from eval.phase07_operator_gate import (
+        _validate_hybrid_allocation, recompute_hybrid_gate_verdicts,
+        validate_hybrid_dispatch_bundle,
+    )
+
+    raw_tree_sha256 = hybrid_raw_tree_sha256(root, require_wrapper=True)
+    request = _sealed_hybrid_json(root / "hybrid-request.json", expected="hybrid request")
+    dispatch = _sealed_hybrid_json(root / "dispatch-bundle.json", expected="hybrid dispatch")
+    head = request.get("hybrid_implementation_head") if isinstance(request, dict) else ""
+    member = validate_hybrid_dispatch_bundle(dispatch, expected_head=head)
+    if dispatch["hybrid_request"] != request:
+        raise ValueError("hybrid dispatch/request binding")
+    execution = _sealed_hybrid_json(root / "locked-execution.json", expected="hybrid locked execution")
+    execution_identity = dict(execution); execution_identity.pop("record_self_sha256", None)
+    validate_confirmation_execution(execution_identity)
+    if execution_identity.get("head_sha") != head:
+        raise ValueError("hybrid locked execution head")
+    allocation_record = _sealed_hybrid_json(root / "allocation.json", expected="hybrid allocation")
+    if set(allocation_record) != {"schema_version", "campaign_stage", "allocation", "record_self_sha256"} \
+            or allocation_record.get("schema_version") != 1 or allocation_record.get("campaign_stage") != "hybrid":
+        raise ValueError("strict hybrid allocation record")
+    allocation = _validate_hybrid_allocation(allocation_record.get("allocation"))
+    result = _sealed_hybrid_json(root / "hybrid-result.json", expected="hybrid result")
+    result_fields = {
+        "schema_version", "campaign_stage", "bundle_sha256", "hybrid_request_sha256", "baseline", "candidate",
+            "planned_scale", "executed_scale", "query_count", "authorization", "candidate_verdict", "queries_sha256",
+        "baselines_sha256", "fixture_tree_sha256", "corpus_sha256", "corpus_manifest_sha256", "generator_recipe",
+        "generator_sha256", "model_manifest_sha256", "source_digests", "runtime", "head_sha", "locked_execution",
+        "locked_execution_sha256", "allocation", "allocation_sha256", "original_absolute_observations",
+            "expanded_paired_observations", "aggregate_metrics", "original_absolute_gate", "paired_30k_non_regression_gate",
+            "hybrid_invocation", "expanded_content_tree_sha256", "expanded_member_count", "record_self_sha256",
+    }
+    if set(result) != result_fields or result.get("schema_version") != 1 or result.get("campaign_stage") != "hybrid" \
+            or result.get("bundle_sha256") != member["record_self_sha256"] \
+            or result.get("hybrid_request_sha256") != request["record_self_sha256"] \
+            or result.get("baseline") != member["baseline"] or result.get("candidate") != member["candidate"] \
+            or result.get("planned_scale") != 30000 or result.get("executed_scale") != 30000 \
+            or result.get("query_count") != 105 or result.get("authorization") != "none" \
+            or result.get("head_sha") != head or result.get("runtime") != execution_identity["runtime"] \
+            or result.get("locked_execution") != execution \
+            or result.get("locked_execution_sha256") != hashlib.sha256((root / "locked-execution.json").read_bytes()).hexdigest() \
+            or result.get("allocation") != allocation_record \
+            or result.get("allocation_sha256") != hashlib.sha256((root / "allocation.json").read_bytes()).hexdigest():
+        raise ValueError("strict complete hybrid result identity")
+    repo_root = Path(__file__).resolve().parent.parent
+    query_file, baseline_file = repo_root / "eval" / "queries.jsonl", repo_root / "eval" / "baselines.json"
+    queries = [json.loads(line) for line in query_file.read_text(encoding="utf-8").splitlines() if line]
+    if len(queries) != 105 or result.get("queries_sha256") != hashlib.sha256(query_file.read_bytes()).hexdigest() \
+            or result.get("baselines_sha256") != hashlib.sha256(baseline_file.read_bytes()).hexdigest():
+        raise ValueError("hybrid committed query/baseline identity")
+    fixture_root = repo_root / "tests" / "fixtures" / "wiki"
+    manifest = validate_committed_personal_wiki_manifest(repo_root / "eval" / "personal-wiki-corpus-manifest.json", fixture_root=fixture_root)
+    fixture_sha = canonical_content_tree_sha256(fixture_root)
+    recipe = result.get("generator_recipe")
+    if not isinstance(recipe, dict) or recipe.get("record_self_sha256") != canonical_digest(recipe) \
+            or recipe.get("record_self_sha256") != result.get("generator_sha256") \
+            or result.get("fixture_tree_sha256") != fixture_sha \
+            or result.get("corpus_manifest_sha256") != hashlib.sha256((repo_root / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest() \
+            or recipe["record_self_sha256"] != public_distractor_recipe_sha256() \
+            or manifest["generator"]["rules_sha256"] != public_distractor_recipe_sha256():
+        raise ValueError("hybrid corpus/generator identity")
+    corpus_identity = {"schema_version": 1, "target_size": 30000, "fixture_tree_sha256": fixture_sha,
+                       "generator_recipe_sha256": recipe["record_self_sha256"],
+                       "corpus_manifest_sha256": result["corpus_manifest_sha256"]}
+    expected_expanded = expected_phase07_expanded_corpus_identity(fixture_root=fixture_root, target_size=30000)
+    if result.get("corpus_sha256") != expected_expanded["expanded_content_tree_sha256"] \
+            or result.get("model_manifest_sha256") != hashlib.sha256((repo_root / "eval" / "model-manifest.json").read_bytes()).hexdigest() \
+            or result.get("source_digests") != {**execution_identity["source_digests"], "queries_sha256": result["queries_sha256"], "baselines_sha256": result["baselines_sha256"]}:
+        raise ValueError("hybrid source identity")
+    if result.get("expanded_content_tree_sha256") != expected_expanded["expanded_content_tree_sha256"] \
+            or result.get("expanded_member_count") != expected_expanded["expanded_member_count"]:
+        raise ValueError("hybrid expanded corpus content identity")
+    for ordinal, (absolute, paired, specification) in enumerate(zip(
+            result["original_absolute_observations"], result["expanded_paired_observations"], queries, strict=True)):
+        digest = hashlib.sha256(specification["query"].encode("utf-8")).hexdigest()
+        for row in (absolute, paired):
+            if not isinstance(row, dict) or set(row) != {"ordinal", "query_sha256", "baseline", "candidate"} \
+                    or row.get("ordinal") != ordinal or row.get("query_sha256") != digest:
+                raise ValueError("hybrid query row identity")
+            for role in ("baseline", "candidate"):
+                observation = row[role]
+                if not isinstance(observation, dict) or set(observation) != {"result", "duration_ms"} \
+                        or isinstance(observation["duration_ms"], bool) \
+                        or not isinstance(observation["duration_ms"], (int, float)) \
+                        or not math.isfinite(float(observation["duration_ms"])) or observation["duration_ms"] < 0:
+                    raise ValueError("hybrid query observation")
+                _validate_hybrid_result_payload(observation["result"], query=specification["query"])
+    expected_invocation = {"entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
+                           "original_baseline_calls": 105, "original_candidate_calls": 105,
+                           "expanded_baseline_calls": 105, "expanded_candidate_calls": 105}
+    if result.get("hybrid_invocation") != expected_invocation:
+        raise ValueError("hybrid public invocation identity")
+    aggregates = result.get("aggregate_metrics")
+    if not isinstance(aggregates, dict) or set(aggregates) != {"original_absolute", "paired_30k"}:
+        raise ValueError("hybrid aggregate identity")
+    reconstructed = {
+        "original_absolute": aggregate_hybrid_serialized_metrics(
+            specifications=queries, observations=result["original_absolute_observations"]),
+        "paired_30k": aggregate_hybrid_serialized_metrics(
+            specifications=queries, observations=result["expanded_paired_observations"]),
+    }
+    if aggregates != reconstructed:
+        raise ValueError("hybrid aggregate/raw evidence mismatch")
+    gates = recompute_hybrid_gate_verdicts(
+        original_absolute=aggregates["original_absolute"], expanded_paired=aggregates["paired_30k"],
+        committed_baseline=None, baselines_sha256=result["baselines_sha256"],
+    )
+    if result.get("original_absolute_gate") != gates["original_absolute_gate"] \
+            or result.get("paired_30k_non_regression_gate") != gates["paired_30k_non_regression_gate"] \
+            or result.get("candidate_verdict") != gates["candidate_verdict"]:
+        raise ValueError("hybrid recomputable gate identity")
+    ledger = _sealed_hybrid_json(root / "hybrid-ledger.json", expected="hybrid ledger")
+    leaf_files = {name for name in _HYBRID_RAW_FILES if name != "hybrid-ledger.json"}
+    expected_leaves = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in leaf_files}
+    if set(ledger) != {"schema_version", "campaign_stage", "bundle_sha256", "hybrid_request_sha256", "candidate", "authorization", "result_sha256", "locked_execution_sha256", "allocation_sha256", "raw_leaf_sha256s", "record_self_sha256"} \
+            or ledger.get("schema_version") != 1 or ledger.get("campaign_stage") != "hybrid" \
+            or ledger.get("bundle_sha256") != member["record_self_sha256"] \
+            or ledger.get("hybrid_request_sha256") != request["record_self_sha256"] \
+            or ledger.get("candidate") != member["candidate"] or ledger.get("authorization") != "none" \
+            or ledger.get("result_sha256") != hashlib.sha256((root / "hybrid-result.json").read_bytes()).hexdigest() \
+            or ledger.get("locked_execution_sha256") != result["locked_execution_sha256"] \
+            or ledger.get("allocation_sha256") != result["allocation_sha256"] \
+            or ledger.get("raw_leaf_sha256s") != expected_leaves:
+        raise ValueError("hybrid raw ledger identity")
+    wrapper = _sealed_hybrid_json(root / "hybrid-packet.json", expected="hybrid packet")
+    expected_files = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in _HYBRID_RAW_FILES}
+    wrapper_fields = {"schema_version", "campaign_stage", "packet_kind", "bundle_sha256", "hybrid_request_sha256", "candidate", "authorization", "candidate_verdict", "result_sha256", "ledger_sha256", "locked_execution_sha256", "allocation_sha256", "raw_file_sha256s", "raw_tree_sha256", "record_self_sha256"}
+    if set(wrapper) != wrapper_fields or wrapper.get("schema_version") != 1 \
+            or wrapper.get("campaign_stage") != "hybrid" or wrapper.get("packet_kind") != "phase07-hybrid-packet/v1" \
+            or wrapper.get("bundle_sha256") != member["record_self_sha256"] \
+            or wrapper.get("hybrid_request_sha256") != request["record_self_sha256"] \
+            or wrapper.get("candidate") != member["candidate"] or wrapper.get("authorization") != "none" \
+            or wrapper.get("candidate_verdict") != result["candidate_verdict"] \
+            or wrapper.get("result_sha256") != ledger["result_sha256"] \
+            or wrapper.get("ledger_sha256") != hashlib.sha256((root / "hybrid-ledger.json").read_bytes()).hexdigest() \
+            or wrapper.get("locked_execution_sha256") != result["locked_execution_sha256"] \
+            or wrapper.get("allocation_sha256") != result["allocation_sha256"] \
+            or wrapper.get("raw_file_sha256s") != expected_files or wrapper.get("raw_tree_sha256") != raw_tree_sha256:
+        raise ValueError("hybrid packet wrapper identity")
+    return {"request": request, "workflow_input": member, "result": result, "ledger": ledger,
+            "wrapper": wrapper, "candidate": member["candidate"], "raw_tree_sha256": raw_tree_sha256}
+
+
+def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bundle: dict[str, Any],
+                                locked_execution: dict[str, Any], allocation: dict[str, Any], output_dir: Path) -> None:
+    """Seal an uploadable tree from an actual 30k/105 public-search campaign.
+
+    This is an exporter, not a fixture fabricator: it accepts the real campaign
+    result only after the dispatch, runtime and allocation boundaries validate.
+    """
+    from eval.ann_corpus_manifest import canonical_content_tree_sha256, public_distractor_recipe
+    from eval.run_eval import expected_phase07_expanded_corpus_identity
+    from eval.phase07_operator_gate import _validate_hybrid_allocation, validate_hybrid_dispatch_bundle
+
+    head = locked_execution.get("head_sha") if isinstance(locked_execution, dict) else ""
+    member = validate_hybrid_dispatch_bundle(dispatch_bundle, expected_head=head)
+    validate_confirmation_execution(locked_execution)
+    _validate_hybrid_allocation(allocation)
+    if output_dir.exists() and (output_dir.is_symlink() or any(output_dir.iterdir())):
+        raise ValueError("hybrid artifact destination must be empty")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = Path(__file__).resolve().parent.parent
+    request = dispatch_bundle["hybrid_request"]
+    query_file, baseline_file = repo_root / "eval" / "queries.jsonl", repo_root / "eval" / "baselines.json"
+    fixture_sha = canonical_content_tree_sha256(repo_root / "tests" / "fixtures" / "wiki")
+    recipe = public_distractor_recipe(); recipe["record_self_sha256"] = canonical_digest(recipe)
+    corpus_manifest_sha256 = hashlib.sha256((repo_root / "eval" / "personal-wiki-corpus-manifest.json").read_bytes()).hexdigest()
+    corpus_identity = {"schema_version": 1, "target_size": 30000, "fixture_tree_sha256": fixture_sha,
+                       "generator_recipe_sha256": recipe["record_self_sha256"],
+                       "corpus_manifest_sha256": corpus_manifest_sha256}
+    expanded_identity = expected_phase07_expanded_corpus_identity(
+        fixture_root=repo_root / "tests" / "fixtures" / "wiki", target_size=30000)
+    if {"expanded_content_tree_sha256": campaign_result.get("expanded_content_tree_sha256"),
+        "expanded_member_count": campaign_result.get("expanded_member_count")} != expanded_identity:
+        raise ValueError("actual hybrid expanded corpus identity")
+    execution_record = dict(locked_execution); execution_record["record_self_sha256"] = canonical_digest(execution_record)
+    allocation_record = {"schema_version": 1, "campaign_stage": "hybrid", "allocation": dict(allocation)}
+    allocation_record["record_self_sha256"] = canonical_digest(allocation_record)
+    execution_sha = hashlib.sha256(json.dumps(execution_record, sort_keys=True, indent=2).encode("utf-8") + b"\n").hexdigest()
+    allocation_sha = hashlib.sha256(json.dumps(allocation_record, sort_keys=True, indent=2).encode("utf-8") + b"\n").hexdigest()
+    result = {
+        "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": member["record_self_sha256"],
+        "hybrid_request_sha256": request["record_self_sha256"], "baseline": member["baseline"], "candidate": member["candidate"],
+        "planned_scale": 30000, "executed_scale": campaign_result.get("executed_scale"), "query_count": campaign_result.get("query_count"),
+        "expanded_content_tree_sha256": campaign_result.get("expanded_content_tree_sha256"),
+        "expanded_member_count": campaign_result.get("expanded_member_count"),
+        "authorization": "none", "candidate_verdict": campaign_result.get("candidate_verdict"),
+        "queries_sha256": hashlib.sha256(query_file.read_bytes()).hexdigest(),
+        "baselines_sha256": hashlib.sha256(baseline_file.read_bytes()).hexdigest(), "fixture_tree_sha256": fixture_sha,
+        "corpus_sha256": expanded_identity["expanded_content_tree_sha256"], "corpus_manifest_sha256": corpus_manifest_sha256,
+        "generator_recipe": recipe, "generator_sha256": recipe["record_self_sha256"],
+        "model_manifest_sha256": hashlib.sha256((repo_root / "eval" / "model-manifest.json").read_bytes()).hexdigest(),
+        "source_digests": {**locked_execution["source_digests"], "queries_sha256": hashlib.sha256(query_file.read_bytes()).hexdigest(), "baselines_sha256": hashlib.sha256(baseline_file.read_bytes()).hexdigest()},
+        "runtime": locked_execution["runtime"], "head_sha": head, "locked_execution": execution_record,
+        "locked_execution_sha256": execution_sha, "allocation": allocation_record, "allocation_sha256": allocation_sha,
+        "original_absolute_observations": campaign_result.get("original_absolute_observations"),
+        "expanded_paired_observations": campaign_result.get("expanded_paired_observations"),
+        "aggregate_metrics": campaign_result.get("aggregate_metrics"),
+        "original_absolute_gate": campaign_result.get("original_absolute_gate"),
+        "paired_30k_non_regression_gate": campaign_result.get("paired_30k_non_regression_gate"),
+        "hybrid_invocation": campaign_result.get("hybrid_invocation"),
+    }
+    _write(output_dir / "hybrid-request.json", request)
+    _write(output_dir / "dispatch-bundle.json", dispatch_bundle)
+    _write(output_dir / "locked-execution.json", locked_execution)
+    _write(output_dir / "allocation.json", allocation_record)
+    _write(output_dir / "hybrid-result.json", result)
+    # The first five files are leaves; their digests can be sealed by the ledger.
+    leaves = {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest()
+              for name in _HYBRID_RAW_FILES if name != "hybrid-ledger.json"}
+    ledger = {"schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": member["record_self_sha256"],
+              "hybrid_request_sha256": request["record_self_sha256"], "candidate": member["candidate"], "authorization": "none",
+              "result_sha256": hashlib.sha256((output_dir / "hybrid-result.json").read_bytes()).hexdigest(),
+              "locked_execution_sha256": hashlib.sha256((output_dir / "locked-execution.json").read_bytes()).hexdigest(),
+              "allocation_sha256": hashlib.sha256((output_dir / "allocation.json").read_bytes()).hexdigest(), "raw_leaf_sha256s": leaves}
+    _write(output_dir / "hybrid-ledger.json", ledger)
+    files = {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest() for name in _HYBRID_RAW_FILES}
+    wrapper = {"schema_version": 1, "campaign_stage": "hybrid", "packet_kind": "phase07-hybrid-packet/v1",
+               "bundle_sha256": member["record_self_sha256"], "hybrid_request_sha256": request["record_self_sha256"],
+               "candidate": member["candidate"], "authorization": "none", "candidate_verdict": result["candidate_verdict"],
+               "result_sha256": ledger["result_sha256"], "ledger_sha256": hashlib.sha256((output_dir / "hybrid-ledger.json").read_bytes()).hexdigest(),
+               "locked_execution_sha256": ledger["locked_execution_sha256"], "allocation_sha256": ledger["allocation_sha256"],
+               "raw_file_sha256s": files, "raw_tree_sha256": hybrid_raw_tree_sha256(output_dir)}
+    _write(output_dir / "hybrid-packet.json", wrapper)
+    validate_hybrid_artifact_tree(output_dir)
+
+
 _CONFIRMATION_RAW_FILES = frozenset({
     "confirmation-request.json", "confirmation-ledger.json", "confirmation-result.json",
     "dispatch-bundle.json", "allocation.json",
@@ -817,6 +1135,18 @@ def execute(request: dict[str, Any], output_dir: Path, *, runner: Callable[[dict
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "export-hybrid-packet":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("command")
+        parser.add_argument("--artifact-dir", type=Path, required=True)
+        parser.add_argument("--output", type=Path, required=True)
+        args = parser.parse_args()
+        try:
+            export_hybrid_packet(artifact_dir=args.artifact_dir, output=args.output)
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[FAIL] hybrid packet export: {exc}", file=os.sys.stderr)
+            return 1
     if len(sys.argv) > 1 and sys.argv[1] == "export-confirmation-packet":
         parser = argparse.ArgumentParser()
         parser.add_argument("command")

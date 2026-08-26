@@ -7,8 +7,10 @@ can push, dispatch, or rely on an artifact.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -30,7 +32,7 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
-STAGES = frozenset({"preflight", "screening", "confirmation", "continuation", "pr-acceptance"})
+STAGES = frozenset({"preflight", "screening", "confirmation", "continuation", "pr-acceptance", "hybrid"})
 INFRA_FAILURES = frozenset({"github_infrastructure", "hosted_runner_unavailable", "artifact_service"})
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -60,6 +62,27 @@ CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
 })
 JOB_DISPLAY_NAMES = {"phase07-confirmation": "Phase 07 independent confirmation campaign"}
 CONFIRMATION_DOWNLOAD_FIELDS = frozenset({"run_id", "run_attempt", "archive", "extracted_dir"})
+DENSE_LEDGER_DIGEST = "71335b6bfa03f24368414ae56a22fd8896d4479c6bfbe871c36a14b26e3b211b"
+DENSE_SOURCE_HEAD = "2f15d6a4fef54dda9b0f4a258e78898e2ef6ea57"
+HYBRID_BASELINE = {"index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100}
+HYBRID_CANDIDATES = (
+    {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300},
+    {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300},
+)
+HYBRID_WORKFLOW_INPUT_FIELDS = frozenset({
+    "schema_version", "campaign_stage", "hybrid_request_sha256", "dense_source_head",
+    "hybrid_implementation_head", "baseline", "candidate", "scale", "query_count",
+    "authorization", "retention_days", "replacement_for_run_id", "dispatch_identity",
+    "record_self_sha256",
+})
+HYBRID_DENSE_ORDINAL_IDENTITIES = (
+    {"ordinal": 1, "run_id": 32801985769, "run_attempt": 1, "job_id": 97664517767, "artifact_id": 9546915747,
+     "build_ids": ["078cc8451c21e17dfac726d6a26aa7519375756d1ec71c38ce7ecf8bc5f256dc", "d550c98e3aff255c53d459b0ffe19b00d19d6afa702023e37558777fe9223e73", "bb0b4a1fd23cbdfab4845a4975a0119f4d9963fc65bf1d6afd825d4ba6d2b42a"]},
+    {"ordinal": 2, "run_id": 32802007002, "run_attempt": 1, "job_id": 97664580321, "artifact_id": 9546916208,
+     "build_ids": ["45d772249ce3790b85955ca68cbea16d5a003e8db34177609bb18f3a9536fd02", "42aaee989e396e3b9030bdd099b183a1903b80f8fcd1d0d07c9694828e2f8744", "2674f4dd7caba0744a0cf499fece5d8bf0b2c7841b22cc8b62113e3a976a87c4"]},
+    {"ordinal": 3, "run_id": 32802027355, "run_attempt": 1, "job_id": 97664640212, "artifact_id": 9546924769,
+     "build_ids": ["825c1a3f523e62affe8385443f628aa3d0638db7468f8c6871e76a9038ef44c0", "b6f66e475137e3e58c7554d503b0714586df6a0558b5ab9c22b2118cf28ea4e4", "95194274760a8b9f083c629250e4437d4199efe633241a0ae02bb161300b848f"]},
+)
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -216,6 +239,490 @@ def validate_confirmation_workflow_input(record: dict[str, Any], *, expected_hea
     if record.get("campaign_stage") != "confirmation" or record.get("post_task0_head") != expected_head or not isinstance(record.get("confirmation_request_sha256"), str) or not HEX64.fullmatch(record["confirmation_request_sha256"]) or record.get("d25_binding") != binding or record.get("d25_binding_sha256") != canonical_digest(binding) or record.get("dispatch_identity") != f"phase07-confirmation/ordinal/{slot['ordinal']}":
         raise ValueError("confirmation input/request/head/binding mismatch")
     return record
+
+
+def _validate_dense_ledger(dense_ledger: Path) -> list[dict[str, Any]]:
+    """Validate the three hosted D-25 ordinals before hybrid work can exist."""
+    ledger = _read_object(dense_ledger)
+    required = {
+        "schema_version", "campaign_stage", "confirmation_plan_sha256",
+        "eligible_evidence_runs", "all_physical_workflow_runs",
+        "paired_ordinal_families", "record_self_sha256",
+    }
+    if set(ledger) != required or ledger.get("schema_version") != 1 \
+            or ledger.get("campaign_stage") != "confirmation" \
+            or ledger.get("record_self_sha256") != canonical_digest(ledger) \
+            or ledger.get("record_self_sha256") != DENSE_LEDGER_DIGEST:
+        raise ValueError("sealed exact 07-05 dense ledger")
+    records = ledger.get("eligible_evidence_runs")
+    physical = ledger.get("all_physical_workflow_runs")
+    if not isinstance(records, list) or len(records) != 3 or not isinstance(physical, list) or len(physical) != 3:
+        raise ValueError("exact three dense ordinal records")
+    expected_ids = (
+        (1, 32801985769, 1, 97664517767, 9546915747),
+        (2, 32802007002, 1, 97664580321, 9546916208),
+        (3, 32802027355, 1, 97664640212, 9546924769),
+    )
+    seen_builds: set[str] = set()
+    for record, (ordinal, run_id, run_attempt, job_id, artifact_id) in zip(records, expected_ids, strict=True):
+        # Reconciliation enriches the packet with API provenance, so this
+        # retained packet digest is intentionally not a digest of the enriched
+        # ledger record.  The enclosing ledger self-digest seals that join.
+        if not isinstance(record, dict) or not isinstance(record.get("record_self_sha256"), str) \
+                or not HEX64.fullmatch(record["record_self_sha256"]):
+            raise ValueError("sealed dense ordinal record")
+        if record.get("slot") != {"ordinal": ordinal} \
+                or record.get("run_id") != run_id or record.get("run_attempt") != run_attempt \
+                or record.get("job_id") != job_id or record.get("job_key") != "phase07-confirmation" \
+                or record.get("status") != "numeric-success" or record.get("failure_class") is not None \
+                or record.get("replacement_for_run_id") is not None or record.get("retention_days") != 90:
+            raise ValueError("dense ordinal run identity")
+        measurements, provenance = record.get("validated_measurements"), record.get("validated_provenance")
+        expires_at = provenance.get("artifact_expires_at") if isinstance(provenance, dict) else None
+        try:
+            expiry = dt.datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("dense artifact expiry") from exc
+        if expiry.tzinfo is None or expiry <= dt.datetime.now(dt.timezone.utc):
+            raise ValueError("dense artifact expiry")
+        if not isinstance(measurements, dict) or measurements.get("authorization") != "none" \
+                or not isinstance(provenance, dict) or provenance.get("head_sha") != DENSE_SOURCE_HEAD \
+                or provenance.get("run_id") != run_id or provenance.get("run_attempt") != run_attempt \
+                or provenance.get("job_id") != job_id or provenance.get("artifact_id") != artifact_id \
+                or provenance.get("status") != "completed" or provenance.get("conclusion") != "success" \
+                or provenance.get("job_key") != "phase07-confirmation":
+            raise ValueError("dense ordinal API provenance")
+        builds = record.get("builds")
+        if not isinstance(builds, list) or len(builds) != 3:
+            raise ValueError("dense ordinal build cardinality")
+        expected_builds = ((16, [100]), (20, [300]), (32, [300]))
+        ids: dict[int, str] = {}
+        for build, (m, query_ef) in zip(builds, expected_builds, strict=True):
+            if not isinstance(build, dict) or build.get("m") != m \
+                    or build.get("ef_construction") != 300 or build.get("query_ef") != query_ef \
+                    or not isinstance(build.get("build_id"), str) or not HEX64.fullmatch(build["build_id"]):
+                raise ValueError("dense ordinal D-25 build policy")
+            ids[m] = build["build_id"]
+            if build["build_id"] in seen_builds:
+                raise ValueError("dense ordinal builds must be pairwise disjoint")
+            seen_builds.add(build["build_id"])
+        measured_builds = measurements.get("builds")
+        if not isinstance(measured_builds, list) or len(measured_builds) != 3 \
+                or measurements.get("build_count") != 3 \
+                or measurements.get("baseline_build_id") != ids[16] \
+                or measurements.get("candidate_build_ids") != {"20": ids[20], "32": ids[32]}:
+            raise ValueError("dense ordinal measurement/build binding")
+        for measured, compact in zip(measured_builds, builds, strict=True):
+            card = measured.get("build", measured) if isinstance(measured, dict) else None
+            query_ef = measured.get("query_ef") if isinstance(measured, dict) else None
+            if query_ef is None and isinstance(measured, dict) and isinstance(measured.get("queries"), list):
+                query_ef = [row.get("query_ef") for row in measured["queries"] if isinstance(row, dict)]
+            if not isinstance(measured, dict) or measured.get("build_id") != compact["build_id"] \
+                    or not isinstance(card, dict) or card.get("m") != compact["m"] \
+                    or card.get("ef_construction") != 300 or query_ef != compact["query_ef"]:
+                raise ValueError("dense measured build policy")
+    physical_ids = [
+        (row.get("slot", {}).get("ordinal"), row.get("run_id"), row.get("run_attempt"), row.get("job_id"))
+        if isinstance(row, dict) else None
+        for row in physical
+    ]
+    eligible_ids = [
+        (row["slot"]["ordinal"], row["run_id"], row["run_attempt"], row["job_id"])
+        for row in records
+    ]
+    if physical_ids != eligible_ids:
+        raise ValueError("dense physical/eligible ordinal lineage")
+    if _hybrid_ordinal_identities(records) != [dict(item) for item in HYBRID_DENSE_ORDINAL_IDENTITIES]:
+        raise ValueError("dense immutable build identity")
+    return records
+
+
+def _hybrid_ordinal_identities(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ordinal": record["slot"]["ordinal"], "run_id": record["run_id"],
+            "run_attempt": record["run_attempt"], "job_id": record["job_id"],
+            "artifact_id": record["validated_provenance"]["artifact_id"],
+            "build_ids": [build["build_id"] for build in record["builds"]],
+        }
+        for record in records
+    ]
+
+
+def build_hybrid_plan(dense_ledger: Path, *, post_implementation_head: str) -> dict[str, Any]:
+    """Derive the only D-25 hybrid inputs from the sealed dense evidence."""
+    if not SHA.fullmatch(post_implementation_head):
+        raise ValueError("hybrid requires exact implementation head")
+    records = _validate_dense_ledger(dense_ledger)
+    identities = _hybrid_ordinal_identities(records)
+    request = _sealed({
+        "schema_version": 1, "campaign_stage": "hybrid",
+        "dense_ledger_sha256": DENSE_LEDGER_DIGEST, "dense_source_head": DENSE_SOURCE_HEAD,
+        "hybrid_implementation_head": post_implementation_head,
+        "dense_ordinal_identities": identities, "baseline": dict(HYBRID_BASELINE),
+        "candidates": [dict(row) for row in HYBRID_CANDIDATES], "scale": 30000,
+        "query_count": 105, "authorization": "none", "retention_days": 90,
+        "replacement_for_run_id": None,
+    })
+    inputs = [
+        _sealed({
+            "schema_version": 1, "campaign_stage": "hybrid",
+            "hybrid_request_sha256": request["record_self_sha256"],
+            "dense_source_head": DENSE_SOURCE_HEAD,
+            "hybrid_implementation_head": post_implementation_head,
+            "baseline": dict(HYBRID_BASELINE), "candidate": dict(candidate),
+            "scale": 30000, "query_count": 105, "authorization": "none",
+            "retention_days": 90, "replacement_for_run_id": None,
+            "dispatch_identity": f"phase07-hybrid/m{candidate['m']}",
+        })
+        for candidate in HYBRID_CANDIDATES
+    ]
+    return _sealed({"schema_version": 1, "hybrid_request": request, "workflow_inputs": inputs})
+
+
+def validate_hybrid_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict) or set(plan) != {"schema_version", "hybrid_request", "workflow_inputs", "record_self_sha256"} \
+            or plan.get("schema_version") != 1 or plan.get("record_self_sha256") != canonical_digest(plan):
+        raise ValueError("sealed hybrid plan")
+    request, inputs = plan["hybrid_request"], plan["workflow_inputs"]
+    request_fields = {
+        "schema_version", "campaign_stage", "dense_ledger_sha256", "dense_source_head",
+        "hybrid_implementation_head", "dense_ordinal_identities", "baseline", "candidates",
+        "scale", "query_count", "authorization", "retention_days", "replacement_for_run_id",
+        "record_self_sha256",
+    }
+    if not isinstance(request, dict) or set(request) != request_fields \
+            or request.get("record_self_sha256") != canonical_digest(request) \
+            or request.get("campaign_stage") != "hybrid" \
+            or request.get("dense_ledger_sha256") != DENSE_LEDGER_DIGEST \
+            or request.get("dense_source_head") != DENSE_SOURCE_HEAD \
+            or not SHA.fullmatch(request.get("hybrid_implementation_head", "")) \
+            or request.get("baseline") != HYBRID_BASELINE \
+            or request.get("candidates") != list(HYBRID_CANDIDATES) \
+            or request.get("scale") != 30000 or request.get("query_count") != 105 \
+            or request.get("authorization") != "none" or request.get("retention_days") != 90 \
+            or request.get("replacement_for_run_id") is not None:
+        raise ValueError("hybrid request authority")
+    identities = request.get("dense_ordinal_identities")
+    if not isinstance(identities, list) or len(identities) != 3:
+        raise ValueError("hybrid dense ordinal identity")
+    expected = ((1, 32801985769, 1, 97664517767, 9546915747), (2, 32802007002, 1, 97664580321, 9546916208), (3, 32802027355, 1, 97664640212, 9546924769))
+    if [tuple(row.get(name) for name in ("ordinal", "run_id", "run_attempt", "job_id", "artifact_id")) if isinstance(row, dict) else () for row in identities] != list(expected) \
+            or any(not isinstance(row.get("build_ids"), list) or len(row["build_ids"]) != 3 for row in identities):
+        raise ValueError("hybrid dense ordinal identity")
+    if not isinstance(inputs, list) or len(inputs) != 2:
+        raise ValueError("exactly two hybrid candidate bundles")
+    for record, candidate in zip(inputs, HYBRID_CANDIDATES, strict=True):
+        if not isinstance(record, dict) or set(record) != HYBRID_WORKFLOW_INPUT_FIELDS \
+                or record.get("record_self_sha256") != canonical_digest(record) \
+                or record.get("campaign_stage") != "hybrid" \
+                or record.get("hybrid_request_sha256") != request["record_self_sha256"] \
+                or record.get("dense_source_head") != DENSE_SOURCE_HEAD \
+                or record.get("hybrid_implementation_head") != request["hybrid_implementation_head"] \
+                or record.get("baseline") != HYBRID_BASELINE or record.get("candidate") != candidate \
+                or record.get("scale") != 30000 or record.get("query_count") != 105 \
+                or record.get("authorization") != "none" or record.get("retention_days") != 90 \
+                or record.get("replacement_for_run_id") is not None \
+                or record.get("dispatch_identity") != f"phase07-hybrid/m{candidate['m']}":
+            raise ValueError("sealed hybrid workflow input")
+    return plan
+
+
+def validate_hybrid_workflow_input(record: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
+    if not SHA.fullmatch(expected_head) or not isinstance(record, dict) \
+            or set(record) != HYBRID_WORKFLOW_INPUT_FIELDS \
+            or record.get("record_self_sha256") != canonical_digest(record) \
+            or record.get("hybrid_implementation_head") != expected_head:
+        raise ValueError("hybrid generated workflow input")
+    # The sealed fixed member still rejects every retired or user-selected
+    # configuration before it can reach an expensive model/index path.
+    if record.get("candidate") not in HYBRID_CANDIDATES \
+            or record.get("dense_source_head") != DENSE_SOURCE_HEAD \
+            or record.get("baseline") != HYBRID_BASELINE \
+            or record.get("scale") != 30000 or record.get("query_count") != 105 \
+            or record.get("authorization") != "none" or record.get("retention_days") != 90 \
+            or record.get("replacement_for_run_id") is not None \
+            or record.get("dispatch_identity") != f"phase07-hybrid/m{record['candidate']['m']}" \
+            or not isinstance(record.get("hybrid_request_sha256"), str) \
+            or not HEX64.fullmatch(record["hybrid_request_sha256"]):
+        raise ValueError("hybrid candidate authority")
+    return record
+
+
+def _validate_hybrid_request(request: object, *, expected_head: str) -> dict[str, Any]:
+    fields = {
+        "schema_version", "campaign_stage", "dense_ledger_sha256", "dense_source_head",
+        "hybrid_implementation_head", "dense_ordinal_identities", "baseline", "candidates",
+        "scale", "query_count", "authorization", "retention_days", "replacement_for_run_id",
+        "record_self_sha256",
+    }
+    if not isinstance(request, dict) or set(request) != fields \
+            or request.get("record_self_sha256") != canonical_digest(request) \
+            or request.get("campaign_stage") != "hybrid" \
+            or request.get("dense_ledger_sha256") != DENSE_LEDGER_DIGEST \
+            or request.get("dense_source_head") != DENSE_SOURCE_HEAD \
+            or request.get("hybrid_implementation_head") != expected_head \
+            or request.get("dense_ordinal_identities") != [dict(row) for row in HYBRID_DENSE_ORDINAL_IDENTITIES] \
+            or request.get("baseline") != HYBRID_BASELINE \
+            or request.get("candidates") != list(HYBRID_CANDIDATES) \
+            or request.get("scale") != 30000 or request.get("query_count") != 105 \
+            or request.get("authorization") != "none" or request.get("retention_days") != 90 \
+            or request.get("replacement_for_run_id") is not None:
+        raise ValueError("exact sealed hybrid request authority")
+    return request
+
+
+def validate_hybrid_dispatch_bundle(bundle: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
+    """Fail closed before any 30k build unless this is one exact generated member."""
+    fields = {"schema_version", "hybrid_request", "workflow_input", "replacement_for_run_id", "record_self_sha256"}
+    if not SHA.fullmatch(expected_head) or _git("rev-parse", "HEAD") != expected_head \
+            or not isinstance(bundle, dict) or set(bundle) != fields \
+            or bundle.get("schema_version") != 1 or bundle.get("record_self_sha256") != canonical_digest(bundle) \
+            or bundle.get("replacement_for_run_id") is not None:
+        raise ValueError("typed sealed hybrid dispatch bundle")
+    request = _validate_hybrid_request(bundle.get("hybrid_request"), expected_head=expected_head)
+    member = bundle.get("workflow_input")
+    validate_hybrid_workflow_input(member, expected_head=expected_head)
+    if member.get("hybrid_request_sha256") != request["record_self_sha256"] \
+            or member.get("candidate") not in HYBRID_CANDIDATES:
+        raise ValueError("hybrid dispatch membership")
+    return member
+
+
+def validate_hybrid_workflow_inputs_dir(path: Path, *, expected_head: str) -> list[dict[str, Any]]:
+    """Generated workflow input directories are an exact two-member allowlist."""
+    expected_names = {"hybrid-m20.json", "hybrid-m32.json"}
+    if path.is_symlink() or not path.is_dir() or {item.name for item in path.iterdir()} != expected_names:
+        raise ValueError("strict hybrid generated input allowlist")
+    records = []
+    for name, m in (("hybrid-m20.json", 20), ("hybrid-m32.json", 32)):
+        item = path / name
+        if item.is_symlink() or not item.is_file():
+            raise ValueError("strict hybrid generated input member")
+        try:
+            bundle = json.loads(item.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid hybrid generated input") from exc
+        member = validate_hybrid_dispatch_bundle(bundle, expected_head=expected_head)
+        if member["candidate"]["m"] != m:
+            raise ValueError("hybrid generated input membership")
+        records.append(member)
+    return records
+
+
+def build_hybrid_preflight(bundle: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
+    """Produce the typed worktree request only after exact dispatch validation."""
+    member = validate_hybrid_dispatch_bundle(bundle, expected_head=expected_head)
+    root = Path(_git("rev-parse", "--show-toplevel")).resolve()
+    return {
+        "repository": "allenwoo713/obsidian_wiki_skill", "branch": _git("branch", "--show-current"),
+        "worktree_root": str(root), "head_sha": expected_head, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "hybrid",
+        "continuation_binding": bundle["record_self_sha256"], "require_upstream_head": True,
+    }
+
+
+def _validate_hybrid_allocation(value: object) -> dict[str, Any]:
+    required = {"run_id", "run_attempt", "job_id", "job_key", "job_allocation_nonce"}
+    if not isinstance(value, dict) or set(value) != required \
+            or not all(isinstance(value[name], int) and value[name] > 0 for name in ("run_id", "run_attempt", "job_id")) \
+            or value.get("job_key") != "phase07-hybrid" \
+            or not isinstance(value.get("job_allocation_nonce"), str) or len(value["job_allocation_nonce"]) != 32 \
+            or any(char not in "0123456789abcdef" for char in value["job_allocation_nonce"]):
+        raise ValueError("hybrid allocation identity")
+    return value
+
+
+_HYBRID_CAPABILITY_ISSUER = object()
+
+
+class _HybridExecutionCapability:
+    """Opaque, process-local authority for one already-validated dispatch.
+
+    It is intentionally neither JSON serializable nor a mapping.  The public
+    boundary below is the only minting site; the evaluator consumes it through
+    the companion private verifier instead of accepting a workflow member.
+    """
+
+    __slots__ = ("_issuer", "_bundle", "_locked_execution", "_allocation", "_dispatch_sha256")
+
+    def __init__(self, *, issuer: object, bundle: dict[str, Any], locked_execution: dict[str, Any],
+                 allocation: dict[str, Any], dispatch_sha256: str) -> None:
+        self._issuer = issuer
+        self._bundle = bundle
+        self._locked_execution = locked_execution
+        self._allocation = allocation
+        self._dispatch_sha256 = dispatch_sha256
+
+
+def _mint_hybrid_execution_capability(*, bundle: dict[str, Any], locked_execution: dict[str, Any],
+                                      allocation: dict[str, Any], dispatch_sha256: str) -> _HybridExecutionCapability:
+    # Detach the capability's facts from caller-owned mutable JSON before it
+    # crosses the production runner boundary.
+    copied = json.loads(json.dumps({"bundle": bundle, "execution": locked_execution, "allocation": allocation},
+                                   sort_keys=True))
+    return _HybridExecutionCapability(
+        issuer=_HYBRID_CAPABILITY_ISSUER, bundle=copied["bundle"], locked_execution=copied["execution"],
+        allocation=copied["allocation"], dispatch_sha256=dispatch_sha256,
+    )
+
+
+def _consume_hybrid_execution_capability(value: object) -> dict[str, Any]:
+    """Return a detached member only for a token minted by this module."""
+    if type(value) is not _HybridExecutionCapability or value._issuer is not _HYBRID_CAPABILITY_ISSUER:
+        raise ValueError("unminted hybrid execution capability")
+    bundle, execution, allocation = value._bundle, value._locked_execution, value._allocation
+    if not isinstance(bundle, dict) or not isinstance(execution, dict) or not isinstance(allocation, dict) \
+            or not isinstance(value._dispatch_sha256, str) or not HEX64.fullmatch(value._dispatch_sha256):
+        raise ValueError("invalid hybrid execution capability")
+    # Revalidate the preserved facts: a private type alone must not become an
+    # alternate authority path.
+    head = _git("rev-parse", "HEAD")
+    if bundle.get("record_self_sha256") != value._dispatch_sha256:
+        raise ValueError("hybrid capability dispatch digest")
+    member = validate_hybrid_dispatch_bundle(bundle, expected_head=head)
+    from eval.phase07_ann_campaign import validate_confirmation_execution
+    validate_confirmation_execution(execution)
+    if execution.get("head_sha") != head:
+        raise ValueError("hybrid capability locked execution head")
+    _validate_hybrid_allocation(allocation)
+    return json.loads(json.dumps(member, sort_keys=True))
+
+
+def execute_hybrid_dispatch(*, bundle: dict[str, Any], locked_execution: dict[str, Any], allocation: dict[str, Any],
+                            work_dir: Path, runner: Any | None = None) -> dict[str, Any]:
+    """The single build boundary; validate all authority before invoking the runner."""
+    head = _git("rev-parse", "HEAD")
+    member = validate_hybrid_dispatch_bundle(bundle, expected_head=head)
+    from eval.phase07_ann_campaign import validate_confirmation_execution
+    validate_confirmation_execution(locked_execution)
+    if locked_execution.get("head_sha") != head:
+        raise ValueError("hybrid locked execution head")
+    _validate_hybrid_allocation(allocation)
+    capability = _mint_hybrid_execution_capability(
+        bundle=bundle, locked_execution=locked_execution, allocation=allocation,
+        dispatch_sha256=bundle["record_self_sha256"],
+    )
+    production_runner = runner is None
+    if production_runner:
+        from eval.run_eval import _run_phase07_hybrid_campaign_with_capability
+        runner = _run_phase07_hybrid_campaign_with_capability
+    result = runner(capability=capability, work_dir=work_dir / "campaign" if production_runner else work_dir)
+    if not isinstance(result, dict) or result.get("authorization") != "none":
+        raise ValueError("hybrid runner produced authorizing evidence")
+    if production_runner:
+        from eval.phase07_ann_campaign import export_hybrid_artifact_tree
+        export_hybrid_artifact_tree(campaign_result=result, dispatch_bundle=bundle,
+                                    locked_execution=locked_execution, allocation=allocation, output_dir=work_dir / "raw")
+    return result
+
+
+_HYBRID_GATE_QUALITY = (
+    "functional_final_retrieval_ann_overlap_at_10", "page_recall_at_5", "evidence_recall_at_10",
+    "exact_lookup_hit_at_3", "mrr_at_10",
+)
+_HYBRID_GATE_ZERO_TOLERANCE = (
+    "citation_violation_count", "context_overflow_count", "budget_violation_count", "graph_unsupported_count",
+)
+
+
+def committed_hybrid_baseline() -> tuple[dict[str, float | int], str]:
+    """Read the one committed hybrid-quality floor set, including its bytes hash."""
+    path = _REPOSITORY_ROOT / "eval" / "baselines.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        quality = document["quality"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError("committed hybrid baseline unavailable") from exc
+    floors = {
+        "page_recall_at_5": quality.get("page_recall_at_5"),
+        "evidence_recall_at_10": quality.get("evidence_recall_at_10"),
+        "exact_lookup_hit_at_3": quality.get("exact_lookup_hit_at_3"),
+        "mrr_at_10": quality.get("mrr_at_10"),
+        **{key: 0 for key in _HYBRID_GATE_ZERO_TOLERANCE},
+    }
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
+           for value in floors.values()):
+        raise ValueError("committed hybrid baseline invalid")
+    return floors, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expanded_paired: dict[str, Any],
+                                   committed_baseline: dict[str, float | int] | None = None,
+                                   baselines_sha256: str | None = None) -> dict[str, Any]:
+    """Recompute non-authorizing absolute and paired gates from complete metrics.
+
+    The original campaign is an absolute check against the committed quality
+    floors; the expanded campaign is a paired non-regression check.  Both
+    sides are validated so a broken observed baseline cannot bless a candidate.
+    """
+    expected_floors, expected_digest = committed_hybrid_baseline()
+    if committed_baseline is None:
+        committed_baseline = expected_floors
+    if baselines_sha256 is None:
+        baselines_sha256 = expected_digest
+    if baselines_sha256 != expected_digest or committed_baseline != expected_floors:
+        raise ValueError("committed hybrid baseline identity")
+
+    required = set(_HYBRID_GATE_QUALITY) | set(_HYBRID_GATE_ZERO_TOLERANCE)
+    def valid_metric(value: object) -> bool:
+        return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
+
+    def gate(name: str, aggregate: object, *, absolute: bool) -> dict[str, Any]:
+        if not isinstance(aggregate, dict) or set(aggregate) != {"baseline", "candidate"} \
+                or not isinstance(aggregate["baseline"], dict) or not isinstance(aggregate["candidate"], dict):
+            raise ValueError("complete hybrid aggregate metrics")
+        baseline, candidate = aggregate["baseline"], aggregate["candidate"]
+        if set(baseline) != required or set(candidate) != required:
+            raise ValueError("complete hybrid aggregate metrics")
+        if not all(valid_metric(value) for value in (*baseline.values(), *candidate.values())):
+            raise ValueError("finite hybrid aggregate metrics")
+        # Counters represent observed events, never rates; reject floats and
+        # negative values before deciding whether a candidate is acceptable.
+        if any(isinstance(baseline[key], bool) or isinstance(candidate[key], bool)
+               or not isinstance(baseline[key], int) or not isinstance(candidate[key], int)
+               or baseline[key] < 0 or candidate[key] < 0 for key in _HYBRID_GATE_ZERO_TOLERANCE):
+            raise ValueError("hybrid zero-tolerance metrics")
+        rejected = False
+        if absolute:
+            # Functional retrieval deliberately has no ANN-floor alias.  It is
+            # required to be real and finite above, but is not compared to the
+            # dense ANN benchmark.
+            for key in ("page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10"):
+                rejected |= baseline[key] < committed_baseline[key] - 0.02
+                rejected |= candidate[key] < committed_baseline[key] - 0.02
+                rejected |= candidate[key] < baseline[key] - 0.02
+            rejected |= any(baseline[key] != 0 or candidate[key] != 0 for key in _HYBRID_GATE_ZERO_TOLERANCE)
+        else:
+            rejected |= any(candidate[key] < baseline[key] - 0.02 for key in _HYBRID_GATE_QUALITY)
+            # A non-zero observed baseline is an instrumentation failure, not
+            # a tolerance that a candidate may inherit.
+            rejected |= any(baseline[key] != 0 or candidate[key] != 0 for key in _HYBRID_GATE_ZERO_TOLERANCE)
+        return {"stratum": name, "baseline_metrics": baseline, "candidate_metrics": candidate,
+                "candidate_verdict": "rejected-candidate" if rejected else "numeric-success", "authorization": "none"}
+    original_gate = gate("original_absolute", original_absolute, absolute=True)
+    paired_gate = gate("paired_30k", expanded_paired, absolute=False)
+    candidate_verdict = "rejected-candidate" if "rejected-candidate" in {original_gate["candidate_verdict"], paired_gate["candidate_verdict"]} else "numeric-success"
+    return {"original_absolute_gate": original_gate, "paired_30k_non_regression_gate": paired_gate,
+            "candidate_verdict": candidate_verdict, "authorization": "none", "write_graph_artifact": True}
+
+
+def reject_retired_hybrid_authority(value: object) -> None:
+    """Retired modes are values in authority fields, never arbitrary text substrings."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"mode", "campaign_mode", "authority_mode"} and item in {"representative_ann", "continuation", "stage2", "flat", "refinement"}:
+                raise ValueError("retired hybrid authority")
+            reject_retired_hybrid_authority(item)
+    elif isinstance(value, list):
+        for item in value:
+            reject_retired_hybrid_authority(item)
+
+
+def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
+    """Operator-facing alias for the shared strict raw-tree validator."""
+    from eval.phase07_ann_campaign import validate_hybrid_artifact_tree as validate_tree
+    return validate_tree(root)
 
 
 def allocate_confirmation_job(client: Any, *, repository: str, run_id: int, run_attempt: int,
@@ -720,9 +1227,42 @@ def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_i
     return 0
 
 
+def run_hybrid_plan(*, dense_ledger: Path, request_file: Path, workflow_inputs_dir: Path,
+                    preflight_request: Path) -> int:
+    """Write exactly the two sealed hybrid bundles after dense-ledger validation."""
+    root = Path(_git("rev-parse", "--show-toplevel"))
+    head = _git("rev-parse", "HEAD")
+    plan = build_hybrid_plan(dense_ledger, post_implementation_head=head)
+    validate_hybrid_plan(plan)
+    request_file.parent.mkdir(parents=True, exist_ok=True)
+    request_file.write_text(json.dumps(plan["hybrid_request"], sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    workflow_inputs_dir.mkdir(parents=True, exist_ok=True)
+    for input_record in plan["workflow_inputs"]:
+        m = input_record["candidate"]["m"]
+        bundle = _sealed({
+            "schema_version": 1, "hybrid_request": plan["hybrid_request"], "workflow_input": input_record,
+            "replacement_for_run_id": None,
+        })
+        (workflow_inputs_dir / f"hybrid-m{m}.json").write_text(
+            json.dumps(bundle, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+    validate_hybrid_workflow_inputs_dir(workflow_inputs_dir, expected_head=head)
+    ledger_name = preflight_request.name.replace("-request.json", "-ledger.json")
+    preflight = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "branch": _git("branch", "--show-current"),
+        "worktree_root": str(root), "head_sha": head, "allowed_dirty_paths": [],
+        "workflow_name": "eval", "campaign_stage": "hybrid", "continuation_binding": "",
+        "require_upstream_head": True,
+        "ledger_path": str(preflight_request.with_name(ledger_name).resolve()),
+    }
+    preflight_request.parent.mkdir(parents=True, exist_ok=True)
+    preflight_request.write_text(json.dumps(preflight, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
 def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-dispatch"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -737,9 +1277,13 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
     parser.add_argument("--runner-architecture", default="")
     parser.add_argument("--job-status", default="unknown")
     parser.add_argument("--stage1-ledger", type=Path)
+    parser.add_argument("--dense-ledger", type=Path)
     parser.add_argument("--workflow-inputs-dir", type=Path)
     parser.add_argument("--preflight-request", type=Path)
     parser.add_argument("--provenance-dir", type=Path)
+    parser.add_argument("--dispatch-bundle", type=Path)
+    parser.add_argument("--locked-execution", type=Path)
+    parser.add_argument("--allocation", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "hosted-preflight":
@@ -769,6 +1313,20 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
                 raise ValueError("confirmation-plan requires immutable ledger and all generated output paths")
             return run_confirmation_plan(stage1_ledger=args.stage1_ledger, request_file=args.request_file,
                                          workflow_inputs_dir=args.workflow_inputs_dir, preflight_request=args.preflight_request)
+        if args.command == "hybrid-plan":
+            if None in (args.dense_ledger, args.request_file, args.workflow_inputs_dir, args.preflight_request):
+                raise ValueError("hybrid-plan requires sealed dense ledger and all generated output paths")
+            return run_hybrid_plan(dense_ledger=args.dense_ledger, request_file=args.request_file,
+                                   workflow_inputs_dir=args.workflow_inputs_dir,
+                                   preflight_request=args.preflight_request)
+        if args.command == "hybrid-dispatch":
+            if None in (args.dispatch_bundle, args.locked_execution, args.allocation, args.output_dir):
+                raise ValueError("hybrid-dispatch requires sealed dispatch, locked execution, allocation, and output")
+            execute_hybrid_dispatch(
+                bundle=_read_object(args.dispatch_bundle), locked_execution=_read_object(args.locked_execution),
+                allocation=_read_object(args.allocation), work_dir=args.output_dir,
+            )
+            return 0
         if args.command == "confirmation-provenance":
             if None in (args.request_file, args.ledger_file, args.provenance_dir):
                 raise ValueError("confirmation provenance requires request, manifest, and provenance directory")
