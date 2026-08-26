@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
@@ -486,6 +487,63 @@ def _hybrid_dispatch_bundle(plan: dict, *, m: int = 20) -> dict:
     }
     bundle["record_self_sha256"] = operator.canonical_digest(bundle)
     return bundle
+
+
+def test_hybrid_dispatch_module_cli_consumes_its_opaque_capability_before_filesystem_failure(
+    tmp_path: Path,
+) -> None:
+    """`python -m` must share the capability identity imported by the production runner."""
+    request = {
+        "schema_version": 1, "campaign_stage": "hybrid",
+        "dense_ledger_sha256": operator.DENSE_LEDGER_DIGEST,
+        "dense_source_head": operator.DENSE_SOURCE_HEAD,
+        "hybrid_implementation_head": HEAD,
+        "dense_ordinal_identities": [dict(row) for row in operator.HYBRID_DENSE_ORDINAL_IDENTITIES],
+        "baseline": dict(operator.HYBRID_BASELINE),
+        "candidates": [dict(row) for row in operator.HYBRID_CANDIDATES],
+        "scale": 30000, "query_count": 105, "authorization": "none", "retention_days": 90,
+        "replacement_for_run_id": None, "record_self_sha256": "",
+    }
+    request["record_self_sha256"] = operator.canonical_digest(request)
+    candidate = dict(operator.HYBRID_CANDIDATES[0])
+    member = {
+        "schema_version": 1, "campaign_stage": "hybrid",
+        "hybrid_request_sha256": request["record_self_sha256"],
+        "dense_source_head": operator.DENSE_SOURCE_HEAD, "hybrid_implementation_head": HEAD,
+        "baseline": dict(operator.HYBRID_BASELINE), "candidate": candidate,
+        "scale": 30000, "query_count": 105, "authorization": "none", "retention_days": 90,
+        "replacement_for_run_id": None, "dispatch_identity": "phase07-hybrid/m20",
+        "record_self_sha256": "",
+    }
+    member["record_self_sha256"] = operator.canonical_digest(member)
+    bundle = {
+        "schema_version": 1, "hybrid_request": request, "workflow_input": member,
+        "replacement_for_run_id": None, "record_self_sha256": "",
+    }
+    bundle["record_self_sha256"] = operator.canonical_digest(bundle)
+    execution = _locked_confirmation_environment()
+    allocation = {
+        "run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid",
+        "job_allocation_nonce": "a" * 32,
+    }
+    bundle_file, execution_file, allocation_file = (tmp_path / "dispatch.json", tmp_path / "execution.json",
+                                                      tmp_path / "allocation.json")
+    for path, value in ((bundle_file, bundle), (execution_file, execution), (allocation_file, allocation)):
+        path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    blocked_output = tmp_path / "blocked-output"
+    blocked_output.write_text("not a directory", encoding="utf-8")
+    env = dict(os.environ)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    env["PYTHONPATH"] = str(ROOT)
+    result = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "hybrid-dispatch",
+         "--dispatch-bundle", str(bundle_file), "--locked-execution", str(execution_file),
+         "--allocation", str(allocation_file), "--output-dir", str(blocked_output)],
+        cwd=ROOT, env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "unminted hybrid execution capability" not in result.stderr
+    assert str(blocked_output) in result.stderr
 
 
 def _reseal_hybrid_dispatch_bundle(bundle: dict) -> dict:
