@@ -1300,7 +1300,7 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
     job, hybrid = _phase07_hybrid_workflow_section()
     assert job["runs-on"] == "ubuntu-latest"
     assert job["permissions"] == {"contents": "read", "actions": "read"}
-    assert job["timeout-minutes"] == "45"
+    assert job["timeout-minutes"] == "90"
     assert "workflow_dispatch" in job["if"]
     assert "inputs.workflow_inputs" in hybrid
     assert "phase07-hybrid" in hybrid

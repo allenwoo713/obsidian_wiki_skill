@@ -1112,6 +1112,99 @@ def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
     assert "authorization" not in progress
 
 
+def test_hybrid_campaign_emits_safe_elapsed_stage_markers_through_real_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One role reports only completed production-build stages, without altering its result."""
+    import eval.run_eval as run_eval
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_eval, "write_graph_artifact", lambda *_args: None)
+    markers: list[dict] = []
+
+    def runner(*, capability: object, work_dir: Path) -> dict:
+        return run_eval._run_phase07_hybrid_campaign_with_capability(
+            capability=capability,
+            work_dir=work_dir,
+            embed=_embed384(),
+            query_limit=2,
+            progress_sink=markers.append,
+        )
+
+    result = operator.execute_hybrid_dispatch(
+        bundle=_hybrid_dispatch_bundle(plan),
+        locked_execution=_locked_confirmation_environment(),
+        allocation={"run_id": 7, "run_attempt": 1, "job_id": 8,
+                    "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+        work_dir=tmp_path,
+        runner=runner,
+    )
+
+    assert result["hybrid_invocation"] == {
+        "entrypoint": "query.hybrid_search",
+        "candidate_aware_public_arguments": False,
+        "original_calls": 2,
+        "expanded_calls": 2,
+    }
+    assert markers
+    expected_stages = [
+        "scan_chunk",
+        "dense_embedding",
+        "lance_fts_persist",
+        "hnsw_create_index",
+        "validation_seal_publication",
+        "graph_artifact",
+        "load",
+    ]
+    for corpus in ("original", "expanded"):
+        corpus_markers = [marker for marker in markers if marker["corpus"] == corpus]
+        assert [marker["stage"] for marker in corpus_markers] == expected_stages
+        assert all(set(marker) == {"role", "corpus", "stage", "state", "elapsed_ms"}
+                   for marker in corpus_markers)
+        assert all(marker["role"] == "candidate" and marker["state"] == "complete"
+                   and isinstance(marker["elapsed_ms"], (int, float))
+                   and marker["elapsed_ms"] >= 0 for marker in corpus_markers)
+        assert [marker["elapsed_ms"] for marker in corpus_markers] == sorted(
+            marker["elapsed_ms"] for marker in corpus_markers
+        )
+    forbidden = {"path", "text", "query", "model", "token", "secret", "verdict", "authorization"}
+    assert not any(forbidden & set(marker) for marker in markers)
+
+
+def test_hybrid_stage_sink_is_optional_and_propagates_instrumentation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent instrumentation remains inert; an explicit sink failure cannot authorize a run."""
+    import eval.run_eval as run_eval
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_eval, "write_graph_artifact", lambda *_args: None)
+    bundle = _hybrid_dispatch_bundle(plan)
+    allocation = {"run_id": 7, "run_attempt": 1, "job_id": 8,
+                  "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32}
+
+    def run_with_sink(sink=None) -> dict:
+        def runner(*, capability: object, work_dir: Path) -> dict:
+            kwargs = {"capability": capability, "work_dir": work_dir,
+                      "embed": _embed384(), "query_limit": 1}
+            if sink is not None:
+                kwargs["progress_sink"] = sink
+            return run_eval._run_phase07_hybrid_campaign_with_capability(**kwargs)
+
+        return operator.execute_hybrid_dispatch(
+            bundle=bundle, locked_execution=_locked_confirmation_environment(),
+            allocation=allocation, work_dir=tmp_path, runner=runner,
+        )
+
+    without_sink = run_with_sink()
+    assert without_sink["query_count"] == 1
+    assert without_sink["campaign_progress"] == {
+        "role": "candidate", "original_completed": 1, "expanded_completed": 1,
+    }
+    with pytest.raises(RuntimeError, match="timing sink failed"):
+        run_with_sink(lambda _marker: (_ for _ in ()).throw(RuntimeError("timing sink failed")))
+
+
 def test_export_hybrid_packet_rejects_legacy_direct_result_and_workflow_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
