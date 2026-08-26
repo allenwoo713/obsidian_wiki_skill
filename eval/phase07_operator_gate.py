@@ -84,9 +84,14 @@ HYBRID_CANDIDATES = (
     {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300},
     {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300},
 )
+HYBRID_ROLE_CONFIGS = (
+    ("baseline", HYBRID_BASELINE),
+    ("candidate", HYBRID_CANDIDATES[0]),
+    ("candidate", HYBRID_CANDIDATES[1]),
+)
 HYBRID_WORKFLOW_INPUT_FIELDS = frozenset({
     "schema_version", "campaign_stage", "hybrid_request_sha256", "dense_source_head",
-    "hybrid_implementation_head", "baseline", "candidate", "scale", "query_count",
+    "hybrid_implementation_head", "role", "config", "scale", "query_count",
     "authorization", "retention_days", "replacement_for_run_id", "dispatch_identity",
     "record_self_sha256",
 })
@@ -385,12 +390,12 @@ def build_hybrid_plan(dense_ledger: Path, *, post_implementation_head: str) -> d
             "hybrid_request_sha256": request["record_self_sha256"],
             "dense_source_head": DENSE_SOURCE_HEAD,
             "hybrid_implementation_head": post_implementation_head,
-            "baseline": dict(HYBRID_BASELINE), "candidate": dict(candidate),
+            "role": role, "config": dict(config),
             "scale": 30000, "query_count": 105, "authorization": "none",
             "retention_days": 90, "replacement_for_run_id": None,
-            "dispatch_identity": f"phase07-hybrid/m{candidate['m']}",
+            "dispatch_identity": "phase07-hybrid/baseline" if role == "baseline" else f"phase07-hybrid/m{config['m']}",
         })
-        for candidate in HYBRID_CANDIDATES
+        for role, config in HYBRID_ROLE_CONFIGS
     ]
     return _sealed({"schema_version": 1, "hybrid_request": request, "workflow_inputs": inputs})
 
@@ -425,20 +430,20 @@ def validate_hybrid_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if [tuple(row.get(name) for name in ("ordinal", "run_id", "run_attempt", "job_id", "artifact_id")) if isinstance(row, dict) else () for row in identities] != list(expected) \
             or any(not isinstance(row.get("build_ids"), list) or len(row["build_ids"]) != 3 for row in identities):
         raise ValueError("hybrid dense ordinal identity")
-    if not isinstance(inputs, list) or len(inputs) != 2:
-        raise ValueError("exactly two hybrid candidate bundles")
-    for record, candidate in zip(inputs, HYBRID_CANDIDATES, strict=True):
+    if not isinstance(inputs, list) or len(inputs) != 3:
+        raise ValueError("exactly one baseline and two hybrid candidate bundles")
+    for record, (role, config) in zip(inputs, HYBRID_ROLE_CONFIGS, strict=True):
         if not isinstance(record, dict) or set(record) != HYBRID_WORKFLOW_INPUT_FIELDS \
                 or record.get("record_self_sha256") != canonical_digest(record) \
                 or record.get("campaign_stage") != "hybrid" \
                 or record.get("hybrid_request_sha256") != request["record_self_sha256"] \
                 or record.get("dense_source_head") != DENSE_SOURCE_HEAD \
                 or record.get("hybrid_implementation_head") != request["hybrid_implementation_head"] \
-                or record.get("baseline") != HYBRID_BASELINE or record.get("candidate") != candidate \
+                or record.get("role") != role or record.get("config") != config \
                 or record.get("scale") != 30000 or record.get("query_count") != 105 \
                 or record.get("authorization") != "none" or record.get("retention_days") != 90 \
                 or record.get("replacement_for_run_id") is not None \
-                or record.get("dispatch_identity") != f"phase07-hybrid/m{candidate['m']}":
+                or record.get("dispatch_identity") != ("phase07-hybrid/baseline" if role == "baseline" else f"phase07-hybrid/m{config['m']}"):
             raise ValueError("sealed hybrid workflow input")
     return plan
 
@@ -451,13 +456,13 @@ def validate_hybrid_workflow_input(record: dict[str, Any], *, expected_head: str
         raise ValueError("hybrid generated workflow input")
     # The sealed fixed member still rejects every retired or user-selected
     # configuration before it can reach an expensive model/index path.
-    if record.get("candidate") not in HYBRID_CANDIDATES \
+    role, config = record.get("role"), record.get("config")
+    if (role, config) not in HYBRID_ROLE_CONFIGS \
             or record.get("dense_source_head") != DENSE_SOURCE_HEAD \
-            or record.get("baseline") != HYBRID_BASELINE \
             or record.get("scale") != 30000 or record.get("query_count") != 105 \
             or record.get("authorization") != "none" or record.get("retention_days") != 90 \
             or record.get("replacement_for_run_id") is not None \
-            or record.get("dispatch_identity") != f"phase07-hybrid/m{record['candidate']['m']}" \
+            or record.get("dispatch_identity") != ("phase07-hybrid/baseline" if role == "baseline" else f"phase07-hybrid/m{config['m']}") \
             or not isinstance(record.get("hybrid_request_sha256"), str) \
             or not HEX64.fullmatch(record["hybrid_request_sha256"]):
         raise ValueError("hybrid candidate authority")
@@ -505,18 +510,19 @@ def validate_hybrid_dispatch_bundle(bundle: dict[str, Any], *, expected_head: st
     member = bundle.get("workflow_input")
     validate_hybrid_workflow_input(member, expected_head=expected_head)
     if member.get("hybrid_request_sha256") != request["record_self_sha256"] \
-            or member.get("candidate") not in HYBRID_CANDIDATES:
+            or (member.get("role"), member.get("config")) not in HYBRID_ROLE_CONFIGS:
         raise ValueError("hybrid dispatch membership")
     return member
 
 
 def validate_hybrid_workflow_inputs_dir(path: Path, *, expected_head: str) -> list[dict[str, Any]]:
-    """Generated workflow input directories are an exact two-member allowlist."""
-    expected_names = {"hybrid-m20.json", "hybrid-m32.json"}
+    """Generated workflow input directories are an exact three-member allowlist."""
+    expected_names = {"hybrid-baseline.json", "hybrid-m20.json", "hybrid-m32.json"}
     if path.is_symlink() or not path.is_dir() or {item.name for item in path.iterdir()} != expected_names:
         raise ValueError("strict hybrid generated input allowlist")
     records = []
-    for name, m in (("hybrid-m20.json", 20), ("hybrid-m32.json", 32)):
+    expected_members = (("hybrid-baseline.json", "baseline", 16), ("hybrid-m20.json", "candidate", 20), ("hybrid-m32.json", "candidate", 32))
+    for name, role, m in expected_members:
         item = path / name
         if item.is_symlink() or not item.is_file():
             raise ValueError("strict hybrid generated input member")
@@ -525,7 +531,7 @@ def validate_hybrid_workflow_inputs_dir(path: Path, *, expected_head: str) -> li
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("invalid hybrid generated input") from exc
         member = validate_hybrid_dispatch_bundle(bundle, expected_head=expected_head)
-        if member["candidate"]["m"] != m:
+        if member["role"] != role or member["config"]["m"] != m:
             raise ValueError("hybrid generated input membership")
         records.append(member)
     return records
@@ -781,7 +787,7 @@ def allocate_confirmation_job(client: Any, *, repository: str, run_id: int, run_
 
 
 _HYBRID_DOWNLOAD_FIELDS = frozenset({
-    "run_id", "run_attempt", "job_id", "artifact_id", "candidate", "bundle_sha256",
+    "run_id", "run_attempt", "job_id", "artifact_id", "role", "config", "bundle_sha256",
     "archive", "extracted_dir",
 })
 _HYBRID_COLLECTION_FIELDS = frozenset({
@@ -827,7 +833,7 @@ def _parse_utc_timestamp(value: object, *, label: str) -> dt.datetime:
 
 
 def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads: dict[str, Any]) -> dict[str, Any]:
-    """Bind exactly m20/m32 downloaded archives to their sealed request.
+    """Bind exactly one baseline plus m20/m32 archives to their sealed request.
 
     This stage deliberately does not trust a local raw packet as API evidence;
     it only derives the candidate identities needed to request the exact API
@@ -841,13 +847,13 @@ def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads
             or downloads.get("record_self_sha256") != canonical_digest(downloads) \
             or not isinstance(downloads.get("downloads"), list):
         raise ValueError("strict hybrid downloads manifest")
-    if len(downloads["downloads"]) != 2:
-        raise ValueError("hybrid collection requires exactly two downloads")
+    if len(downloads["downloads"]) != 3:
+        raise ValueError("hybrid collection requires exactly three downloads")
 
     selected: list[dict[str, Any]] = []
     seen_runs: set[tuple[int, int]] = set()
     seen_paths: set[tuple[Path, Path]] = set()
-    seen_candidates: set[int] = set()
+    seen_roles: set[tuple[str, int]] = set()
     for value in downloads["downloads"]:
         if not isinstance(value, dict) or set(value) != _HYBRID_DOWNLOAD_FIELDS:
             raise ValueError("strict hybrid download record")
@@ -857,7 +863,7 @@ def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads
             raise ValueError("hybrid download run identity")
         if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0
                for name in ("job_id", "artifact_id")) \
-                or value.get("candidate") not in HYBRID_CANDIDATES \
+                or (value.get("role"), value.get("config")) not in HYBRID_ROLE_CONFIGS \
                 or not isinstance(value.get("bundle_sha256"), str) or not HEX64.fullmatch(value["bundle_sha256"]):
             raise ValueError("hybrid download job/artifact/candidate identity")
         archive, extracted = Path(value["archive"]), Path(value["extracted_dir"])
@@ -870,20 +876,22 @@ def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads
         try:
             bundle = _read_object(extracted / "dispatch-bundle.json")
             member = bundle["workflow_input"]
-            candidate, bundle_sha256 = member["candidate"], member["record_self_sha256"]
+            role, config, bundle_sha256 = member["role"], member["config"], member["record_self_sha256"]
         except (ValueError, KeyError, TypeError):
             raise ValueError("hybrid downloaded dispatch identity") from None
-        if candidate != value["candidate"] or bundle_sha256 != value["bundle_sha256"] \
-                or candidate not in HYBRID_CANDIDATES or candidate["m"] in seen_candidates:
-            raise ValueError("hybrid candidate cardinality")
-        seen_runs.add(identity); seen_paths.add(paths); seen_candidates.add(candidate["m"])
-        selected.append({**value, "candidate": dict(candidate)})
-    if [row["candidate"] for row in sorted(selected, key=lambda row: row["candidate"]["m"])] != list(HYBRID_CANDIDATES):
-        raise ValueError("hybrid candidate set")
+        role_identity = (role, config.get("m") if isinstance(config, dict) else -1)
+        if role != value["role"] or config != value["config"] or bundle_sha256 != value["bundle_sha256"] \
+                or (role, config) not in HYBRID_ROLE_CONFIGS or role_identity in seen_roles:
+            raise ValueError("hybrid role cardinality")
+        seen_runs.add(identity); seen_paths.add(paths); seen_roles.add(role_identity)
+        selected.append({**value, "role": role, "config": dict(config)})
+    expected_roles = {("baseline", 16), ("candidate", 20), ("candidate", 32)}
+    if seen_roles != expected_roles:
+        raise ValueError("hybrid role set")
     return _sealed({
         "schema_version": 1, "campaign_stage": "hybrid", "repository": "allenwoo713/obsidian_wiki_skill",
         "head_sha": head, "hybrid_request": request, "hybrid_request_sha256": request["record_self_sha256"],
-        "downloads": sorted(selected, key=lambda row: row["candidate"]["m"]),
+        "downloads": sorted(selected, key=lambda row: (row["role"] != "baseline", row["config"]["m"])),
     })
 
 
@@ -896,13 +904,13 @@ def _validate_hybrid_collection_request(value: object) -> dict[str, Any]:
     request = _validate_hybrid_request(value.get("hybrid_request"), expected_head=value.get("head_sha", ""))
     if value.get("hybrid_request_sha256") != request["record_self_sha256"] \
             or value.get("head_sha") != request["hybrid_implementation_head"] \
-            or not isinstance(value.get("downloads"), list) or len(value["downloads"]) != 2:
+            or not isinstance(value.get("downloads"), list) or len(value["downloads"]) != 3:
         raise ValueError("hybrid collection authority")
-    expected = {candidate["m"]: candidate for candidate in HYBRID_CANDIDATES}
-    found: set[int] = set()
+    expected = {("baseline", 16): HYBRID_BASELINE, ("candidate", 20): HYBRID_CANDIDATES[0], ("candidate", 32): HYBRID_CANDIDATES[1]}
+    found: set[tuple[str, int]] = set()
     for row in value["downloads"]:
         if not isinstance(row, dict) or set(row) != _HYBRID_DOWNLOAD_FIELDS \
-                or row.get("candidate") not in HYBRID_CANDIDATES \
+                or (row.get("role"), row.get("config")) not in HYBRID_ROLE_CONFIGS \
                 or not isinstance(row.get("bundle_sha256"), str) or not HEX64.fullmatch(row["bundle_sha256"]):
             raise ValueError("hybrid collection download shape")
         if any(isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] <= 0
@@ -910,18 +918,18 @@ def _validate_hybrid_collection_request(value: object) -> dict[str, Any]:
             raise ValueError("hybrid collection hosted identity")
         if row["run_attempt"] != 1:
             raise ValueError("hybrid collection requires independent first-attempt runs")
-        m = row["candidate"]["m"]
-        if m in found or row["candidate"] != expected[m]:
-            raise ValueError("hybrid collection candidate binding")
-        found.add(m)
+        identity = (row["role"], row["config"]["m"])
+        if identity in found or row["config"] != expected[identity]:
+            raise ValueError("hybrid collection role binding")
+        found.add(identity)
     if found != set(expected):
-        raise ValueError("hybrid collection candidate cardinality")
+        raise ValueError("hybrid collection role cardinality")
     return value
 
 
 def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_dir: Path,
                               token: str, client: Any | None = None) -> int:
-    """API-bind the exact two hybrid packets; non-success invalidates the batch."""
+    """API-bind the exact three role packets; non-success invalidates the batch."""
     collection = _validate_hybrid_collection_request(_read_object(request_file))
     _reject_secrets(collection)
     if not token:
@@ -934,7 +942,7 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
     for row in collection["downloads"]:
         run_id, run_attempt = row["run_id"], row["run_attempt"]
         if run_attempt != 1:
-            raise ValueError("hybrid evidence requires two independent first-attempt runs")
+            raise ValueError("hybrid evidence requires three independent first-attempt runs")
         archive, extracted = Path(row["archive"]), Path(row["extracted_dir"])
         validated = validate_hybrid_artifact_tree(extracted)
         allocation = validated["result"].get("allocation", {}).get("allocation")
@@ -943,7 +951,7 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
         allocation = _validate_hybrid_allocation(allocation)
         if allocation["run_id"] != run_id or allocation["run_attempt"] != run_attempt \
                 or allocation["job_id"] != row["job_id"] \
-                or validated["candidate"] != row["candidate"] \
+                or validated["role"] != row["role"] or validated["config"] != row["config"] \
                 or validated["workflow_input"].get("record_self_sha256") != row["bundle_sha256"]:
             raise ValueError("hybrid downloaded artifact binding")
         host = validated["result"].get("locked_execution", {}).get("host")
@@ -1009,7 +1017,7 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
             "run_created_at": run["created_at"], "artifact_created_at": artifact["created_at"],
             "artifact_expires_at": artifact["expires_at"],
             "api_archive_sha256": local_sha, "local_archive_sha256": local_sha,
-            "candidate": row["candidate"], "bundle_sha256": row["bundle_sha256"],
+            "role": row["role"], "config": row["config"], "bundle_sha256": row["bundle_sha256"],
             "archive": str(archive.resolve()), "extracted_dir": str(extracted.resolve()),
         }
         provenance_dir.mkdir(parents=True, exist_ok=True)
@@ -1017,7 +1025,7 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
         _write_ledger(provenance_path, {"schema_version": 1, "evidence": [provenance]})
         evidence.append({
             "run_id": run_id, "run_attempt": run_attempt, "job_id": row["job_id"],
-            "artifact_id": row["artifact_id"], "candidate": row["candidate"],
+            "artifact_id": row["artifact_id"], "role": row["role"], "config": row["config"],
             "bundle_sha256": row["bundle_sha256"], "archive": str(archive.resolve()),
             "extracted_dir": str(extracted.resolve()), "provenance": str(provenance_path.resolve()),
         })
@@ -1575,7 +1583,7 @@ def run_confirmation_plan(*, stage1_ledger: Path, request_file: Path, workflow_i
 
 def run_hybrid_plan(*, dense_ledger: Path, request_file: Path, workflow_inputs_dir: Path,
                     preflight_request: Path) -> int:
-    """Write exactly the two sealed hybrid bundles after dense-ledger validation."""
+    """Write one baseline and two candidate bundles after ledger validation."""
     root = Path(_git("rev-parse", "--show-toplevel"))
     head = _git("rev-parse", "HEAD")
     plan = build_hybrid_plan(dense_ledger, post_implementation_head=head)
@@ -1584,12 +1592,12 @@ def run_hybrid_plan(*, dense_ledger: Path, request_file: Path, workflow_inputs_d
     request_file.write_text(json.dumps(plan["hybrid_request"], sort_keys=True, indent=2) + "\n", encoding="utf-8")
     workflow_inputs_dir.mkdir(parents=True, exist_ok=True)
     for input_record in plan["workflow_inputs"]:
-        m = input_record["candidate"]["m"]
+        suffix = "baseline" if input_record["role"] == "baseline" else f"m{input_record['config']['m']}"
         bundle = _sealed({
             "schema_version": 1, "hybrid_request": plan["hybrid_request"], "workflow_input": input_record,
             "replacement_for_run_id": None,
         })
-        (workflow_inputs_dir / f"hybrid-m{m}.json").write_text(
+        (workflow_inputs_dir / f"hybrid-{suffix}.json").write_text(
             json.dumps(bundle, sort_keys=True, indent=2) + "\n", encoding="utf-8"
         )
     validate_hybrid_workflow_inputs_dir(workflow_inputs_dir, expected_head=head)
