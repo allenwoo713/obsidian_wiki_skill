@@ -1196,11 +1196,24 @@ def test_hybrid_stage_sink_is_optional_and_propagates_instrumentation_failure(
             allocation=allocation, work_dir=tmp_path, runner=runner,
         )
 
+    printed: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        run_eval,
+        "print",
+        lambda *args, **kwargs: printed.append((args, kwargs)),
+        raising=False,
+    )
     without_sink = run_with_sink()
     assert without_sink["query_count"] == 1
     assert without_sink["campaign_progress"] == {
         "role": "candidate", "original_completed": 1, "expanded_completed": 1,
     }
+    marker_prints = [
+        (args, kwargs) for args, kwargs in printed
+        if args and str(args[0]).startswith("[phase07-hybrid-progress] ")
+    ]
+    assert len(marker_prints) == 14
+    assert all(kwargs.get("flush") is True for _args, kwargs in marker_prints)
     with pytest.raises(RuntimeError, match="timing sink failed"):
         run_with_sink(lambda _marker: (_ for _ in ()).throw(RuntimeError("timing sink failed")))
 

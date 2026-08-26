@@ -64,6 +64,7 @@ from obsidian_wiki.ports.incremental_index import (
 
 Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 BenchmarkObserver = Callable[[IndexStats], BenchmarkObservation]
+BuildProgressSink = Callable[[str], None]
 # #39 (review)：持锁后运行的分块回调，返回 (sparse_chunks, page_metadata)。
 PlanProvider = Callable[
     [Path], tuple[Sequence["SparseChunk"], "list[dict] | None"]
@@ -151,6 +152,7 @@ class IndexBuildService:
         build_mode: str = "snapshot",
         build_mode_policy: BuildModePolicyLoad | None = None,
         outer_lock_held: bool = False,
+        progress_sink: BuildProgressSink | None = None,
     ) -> StorageArtifact:
         """#21/#34 单写者构建：最外层传入或创建一次 BuildContext，锁 metadata、
         build 目录、manifest、pointer 与返回 artifact 共用同一个 build_id；
@@ -221,6 +223,7 @@ class IndexBuildService:
                 plan_provider=None, mode_requested=build_mode,
                 selection_reason=selection.reason,
                 build_mode_policy_sha256=selection.policy_sha256,
+                progress_sink=progress_sink,
             )
         finally:
             if lock is not None:
@@ -235,6 +238,7 @@ class IndexBuildService:
         mode_requested: str = "snapshot",
         selection_reason: str = "explicit_snapshot",
         build_mode_policy_sha256: str | None = None,
+        progress_sink: BuildProgressSink | None = None,
     ) -> StorageArtifact:
         build_started = time.perf_counter()
         # #39 (review)：持锁后再分块。显式 sparse_chunks > plan_provider > 回退整页 plan。
@@ -246,6 +250,8 @@ class IndexBuildService:
         sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
             raise RuntimeError("No canonical Wiki Markdown pages were available to index")
+        if progress_sink is not None:
+            progress_sink("scan_chunk")
         # issue #47：canonical 计划同时含 sparse+dense 两种 kind；严格分离后再落两表。
         lexical_chunks = tuple(chunk for chunk in sparse_chunks if chunk.chunk_kind == "sparse")
         dense_sources = tuple(chunk for chunk in sparse_chunks if chunk.chunk_kind == "dense")
@@ -256,6 +262,8 @@ class IndexBuildService:
         embed_started = time.perf_counter()
         vectors = embed([chunk.text for chunk in dense_sources])
         embedding_cache_miss_ms = (time.perf_counter() - embed_started) * 1000
+        if progress_sink is not None:
+            progress_sink("dense_embedding")
         if len(vectors) != len(dense_sources):
             raise RuntimeError("Embedder returned a vector count different from the dense chunk plan")
         dense_chunks = tuple(
@@ -294,6 +302,8 @@ class IndexBuildService:
             write_started = time.perf_counter()
             self._storage.persist(lance_dir, lexical_chunks, dense_chunks, self._fts_config)
             serialization_write_ms = (time.perf_counter() - write_started) * 1000
+            if progress_sink is not None:
+                progress_sink("lance_fts_persist")
             # #36 follow-up：所有 storage mutation（persist / create_vector_index）都
             # 必须在最终 seal 之前完成——vector index 创建会改写 LanceDB，故 seal
             # 不能放在 persist 后（当前已修复：先建索引，再最终 seal）。
@@ -327,6 +337,8 @@ class IndexBuildService:
             index_started = time.perf_counter()
             reopened.create_vector_index(vector_config)
             index_build_ms = (time.perf_counter() - index_started) * 1000
+            if progress_sink is not None:
+                progress_sink("hnsw_create_index")
             # issue #47: the exact-term validation probes the FTS (sparse) table,
             # so the sampled term must come from the lexical corpus that is
             # actually indexed there — not from a dense chunk that never enters FTS.
@@ -457,6 +469,8 @@ class IndexBuildService:
                 prepared_at=datetime.now(timezone.utc).isoformat(),
             ))
             publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
+            if progress_sink is not None:
+                progress_sink("validation_seal_publication")
             return StorageArtifact(
                 lance_dir, manifest_path, len(lexical_chunks), len(dense_chunks),
                 build_id=ctx.build_id, generation=generation,

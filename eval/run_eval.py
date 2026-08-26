@@ -755,7 +755,8 @@ def run_phase07_representative_campaign(
 
 
 def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir: Path, embed=None,
-                                                  query_limit: int | None = None) -> dict:
+                                                  query_limit: int | None = None,
+                                                  progress_sink=None) -> dict:
     """Run one sealed hybrid *role* with an operator-minted capability.
 
     A role is either the shared baseline or one candidate.  It builds exactly
@@ -790,6 +791,21 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
     )
 
     def build_candidate(name: str, config: dict, wiki: Path):
+        corpus_started = time.perf_counter()
+
+        def emit_stage(stage: str) -> None:
+            marker = {
+                "role": role,
+                "corpus": name,
+                "stage": stage,
+                "state": "complete",
+                "elapsed_ms": round((time.perf_counter() - corpus_started) * 1000, 6),
+            }
+            if progress_sink is None:
+                print(f"[phase07-hybrid-progress] {json.dumps(marker, sort_keys=True)}", flush=True)
+            else:
+                progress_sink(marker)
+
         policy = CandidateQueryPolicy(
             candidate="ivf-hnsw-sq", query_ef=config["query_ef"],
             build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=config["m"], ef_construction=config["ef_construction"]),
@@ -797,15 +813,23 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         index_dir = root / name / ".index"
         if embed is None:
             index = WikiIndex(index_dir)
-            index.build(wiki, full_rebuild=True, candidate_query_policy=policy)
+            index.build(
+                wiki, full_rebuild=True, candidate_query_policy=policy,
+                progress_sink=emit_stage,
+            )
         else:
             from build_index import build_storage_contract
-            build_storage_contract(wiki, index_dir, embed=embed, candidate_query_policy=policy)
+            build_storage_contract(
+                wiki, index_dir, embed=embed, candidate_query_policy=policy,
+                progress_sink=emit_stage,
+            )
             index = WikiIndex(index_dir)
         # ``hybrid_search`` consumes the graph sidecar through the public
         # index path; all four independently built indexes require one.
         write_graph_artifact(wiki, index_dir)
+        emit_stage("graph_artifact")
         index.load()
+        emit_stage("load")
         return index
 
     original_index = build_candidate("original", config, original_wiki)

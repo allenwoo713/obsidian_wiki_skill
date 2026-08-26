@@ -134,7 +134,8 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
                            candidate_query_policy: CandidateQueryPolicy | None = None,
                            build_mode: str = "snapshot",
                            build_mode_policy=None,
-                           outer_lock_held: bool = False):
+                           outer_lock_held: bool = False,
+                           progress_sink=None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -202,7 +203,8 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
         Path(wiki_dir), Path(index_dir), embed=embed, sparse_chunks=sparse_chunks,
         page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx,
         plan_provider=plan_provider, build_mode=build_mode,
-        build_mode_policy=build_mode_policy, outer_lock_held=outer_lock_held)
+        build_mode_policy=build_mode_policy, outer_lock_held=outer_lock_held,
+        progress_sink=progress_sink)
     # #37：pointer commit 之后执行 post-commit（可观察、可重试；失败保留 PREPARED）。
     post_commit_status, warnings = _run_post_commit(Path(index_dir), composed.journal, artifact)
     # #34：outcome 的 build_id/generation 必须来自 artifact（单一事实来源），
@@ -435,7 +437,7 @@ class WikiIndex:
                candidate_query_policy: CandidateQueryPolicy | None = None,
                build_mode: str = "snapshot",
                build_mode_policy_path: Path | None = None,
-               build_mode_policy=None):
+               build_mode_policy=None, progress_sink=None):
         """Build a snapshot, staged incremental candidate, or evidence-gated auto mode.
 
         无论增量与否都写入全新 builds/<id>/lance_db（删除页自然不入表 → 无残留），
@@ -472,14 +474,16 @@ class WikiIndex:
             return self._build(wiki_dir, full_rebuild=full_rebuild,
                                allow_partial_index=allow_partial_index, ctx=ctx,
                                candidate_query_policy=candidate_query_policy,
-                               build_mode=build_mode, build_mode_policy=policy_load)
+                               build_mode=build_mode, build_mode_policy=policy_load,
+                               progress_sink=progress_sink)
         finally:
             lock.release()
 
     def _build(self, wiki_dir: Path, full_rebuild: bool = False,
                allow_partial_index: bool = False, ctx=None,
                candidate_query_policy: CandidateQueryPolicy | None = None,
-               build_mode: str = "snapshot", build_mode_policy=None):
+               build_mode: str = "snapshot", build_mode_policy=None,
+               progress_sink=None):
         """build() 的锁内主体。"""
         # Keep the long-standing public call signature, but route every actual
         # build through the D-01 service.  #22 incremental/publisher work and
@@ -566,6 +570,7 @@ class WikiIndex:
             build_mode=build_mode,
             build_mode_policy=build_mode_policy,
             outer_lock_held=True,
+            progress_sink=progress_sink,
         )
         published_manifest = json.loads(
             outcome.artifact.manifest_path.read_text(encoding="utf-8")
