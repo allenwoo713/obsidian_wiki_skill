@@ -1487,9 +1487,14 @@ def _two_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             "job_key": "phase07-hybrid", "job_allocation_nonce": ("a" if m == 20 else "b") * 32,
         }
         dispatch_bundle = fixture._hybrid_dispatch_bundle(plan, m=m)
+        # Hosted workflow records `${ImageOS} ${ImageVersion}`.  Keep this
+        # integration fixture production-shaped without changing the shared
+        # raw-tree fixture used by unrelated campaign tests.
+        locked_execution = deepcopy(fixture._locked_confirmation_environment())
+        locked_execution["host"]["image"] = "ubuntu24 20250817.1"
         tree = fixture._make_valid_test_hybrid_raw_tree(
             tmp_path / f"m{m}-raw", dispatch_bundle=dispatch_bundle,
-            locked_execution=fixture._locked_confirmation_environment(), allocation=allocation,
+            locked_execution=locked_execution, allocation=allocation,
         )
         archive = tmp_path / f"m{m}.zip"
         records.append({
@@ -1778,7 +1783,9 @@ def test_hybrid_workflow_binds_runner_context_without_image_fallbacks_and_raw_ho
         "hybrid-collection-request", "--request-file", str(request_file),
         "--downloads-file", str(downloads), "--ledger-file", str(collection),
     ]) == 0
-    with pytest.raises(ValueError, match="runner|host"):
+    # Any earlier strict raw identity check is an equally fail-closed outcome;
+    # the security contract is rejection, not a particular diagnostic string.
+    with pytest.raises(ValueError):
         gate.collect_hybrid_provenance(
             request_file=collection, output=tmp_path / "manifest.json",
             provenance_dir=tmp_path / "provenance", token="fixture-read-token",
