@@ -1424,3 +1424,26 @@ def test_corpus_content_identity_is_root_independent_and_content_sensitive(tmp_p
     assert canonical_content_tree_sha256(first) == canonical_content_tree_sha256(second)
     (second / "distractor.md").write_text("public distractor changes corpus content", encoding="utf-8")
     assert canonical_content_tree_sha256(first) != canonical_content_tree_sha256(second)
+
+
+def test_expanded_corpus_identity_normalizes_source_line_endings(tmp_path: Path) -> None:
+    """Expected and materialized 30k-style identities are platform independent."""
+    import eval.run_eval as run_eval
+
+    lf_root, crlf_root = tmp_path / "lf-source", tmp_path / "crlf-source"
+    lf_root.mkdir(); crlf_root.mkdir()
+    (lf_root / "source.md").write_bytes(b"# Source\nbody\n")
+    (crlf_root / "source.md").write_bytes(b"# Source\r\nbody\r\n")
+
+    expected_lf = run_eval.expected_phase07_expanded_corpus_identity(
+        fixture_root=lf_root, target_size=3, test_only=True,
+    )
+    expected_crlf = run_eval.expected_phase07_expanded_corpus_identity(
+        fixture_root=crlf_root, target_size=3, test_only=True,
+    )
+    assert expected_lf == expected_crlf
+
+    materialized = run_eval._materialize_phase07_expanded_corpus(
+        fixture_root=crlf_root, output_root=tmp_path / "expanded", target_size=3, test_only=True,
+    )
+    assert materialized == expected_crlf
