@@ -298,6 +298,7 @@ class IndexBuildService:
         build_dir.mkdir(parents=True, exist_ok=False)
         # #35：build 目录创建后立即耐久写 BUILDING（missing → building）。
         record_building(build_dir, build_id=ctx.build_id, generation=generation)
+        artifact: StorageArtifact | None = None
         try:
             write_started = time.perf_counter()
             self._storage.persist(lance_dir, lexical_chunks, dense_chunks, self._fts_config)
@@ -469,9 +470,7 @@ class IndexBuildService:
                 prepared_at=datetime.now(timezone.utc).isoformat(),
             ))
             publish_pointer(index_dir, build_dir, generation=generation, build_id=ctx.build_id)
-            if progress_sink is not None:
-                progress_sink("validation_seal_publication")
-            return StorageArtifact(
+            artifact = StorageArtifact(
                 lance_dir, manifest_path, len(lexical_chunks), len(dense_chunks),
                 build_id=ctx.build_id, generation=generation,
             )
@@ -487,6 +486,14 @@ class IndexBuildService:
                 encoding="utf-8",
             )
             raise
+        # The pointer is the durable commit point.  A diagnostic write after it
+        # must still reject the caller/finalizer if it fails, but cannot relabel
+        # this published generation as a pre-publication staging failure.
+        if artifact is None:  # Defensive: every normal try exit assigns it.
+            raise RuntimeError("published build artifact missing")
+        if progress_sink is not None:
+            progress_sink("validation_seal_publication")
+        return artifact
 
     def _select_build_mode(
         self, index_dir: Path, *, build_mode: str,
