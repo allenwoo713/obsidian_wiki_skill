@@ -881,7 +881,7 @@ def test_hybrid_gate_rejection_table_covers_absolute_paired_and_zero_tolerance_c
         assert verdict["authorization"] == "none"
 
 
-def test_minted_hybrid_execution_capability_keeps_four_index_and_two_gate_contracts(
+def test_minted_hybrid_execution_capability_is_bound_to_one_two_index_role(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
@@ -890,10 +890,10 @@ def test_minted_hybrid_execution_capability_keeps_four_index_and_two_gate_contra
         bundle=_hybrid_dispatch_bundle(plan), locked_execution=_locked_confirmation_environment(),
         allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
         work_dir=tmp_path / "minted-graph",
-        runner=lambda **kwargs: captured.append(kwargs["capability"]) or {"authorization": "none", "required_index_count": 4,
-                                                                         "required_gates": {"original_absolute", "paired_30k"}},
+        runner=lambda **kwargs: captured.append(kwargs["capability"]) or {"authorization": "none", "required_index_count": 2,
+                                                                         "role": "candidate"},
     )
-    assert result["required_index_count"] == 4 and result["required_gates"] == {"original_absolute", "paired_30k"}
+    assert result["required_index_count"] == 2 and result["role"] == "candidate"
     assert len(captured) == 1 and not isinstance(captured[0], dict)
 
 
