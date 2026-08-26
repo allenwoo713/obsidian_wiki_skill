@@ -1648,7 +1648,9 @@ def test_hybrid_finalizer_failure_removes_partial_raw_and_seals_only_one_rejecti
         run_attempt=1, job_key="phase07-hybrid", job_status="failure",
     ) == 0
     files = [path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()]
-    assert files == ["hybrid-pipeline-rejection.json"]
+    assert files == ["raw/hybrid-pipeline-rejection.json"]
+    assert not (output / "campaign-output").exists()
+    assert not (output / "exported-hybrid-packet.json").exists()
     rejection = json.loads((output / files[0]).read_text(encoding="utf-8"))
     assert rejection["status"] == "reject-evidence"
 
