@@ -1342,17 +1342,127 @@ def test_phase07_frozen_prepare_is_a_separate_120_minute_non_authorizing_job() -
 
 
 def test_phase07_role_download_uses_the_exact_prepare_run_and_artifact_identity() -> None:
-    """A role cannot fall back to a latest artifact name or an inherited matrix file."""
+    """A role invokes the exact-ID REST collector, never action name selection."""
     _job, hybrid = _phase07_hybrid_workflow_section()
-    assert "actions/download-artifact@v4" in hybrid
-    assert "github-token: ${{ github.token }}" in hybrid
-    assert "repository: ${{ github.repository }}" in hybrid
     assert "Require an empty canonical root before secure artifact extraction" in hybrid
     assert "assert not root.exists()" in hybrid
-    assert "run-id: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.run_id }}" in hybrid
-    assert "artifact-ids: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.artifact_id }}" in hybrid
+    assert "python -m eval.phase07_operator_gate frozen-download" in hybrid
+    assert "--dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json" in hybrid
+    assert "--archive .review-tmp/phase07/frozen-prepare.zip" in hybrid
     assert "--frozen-dir .review-tmp/phase07/frozen-corpus" in hybrid
     assert "name: phase07-frozen-base" not in hybrid
+    assert "actions/download-artifact@v4" not in hybrid
+    assert "artifact-ids:" not in hybrid
+
+
+def _frozen_prepare_download_identity(archive: bytes, *, artifact_id: int = 73) -> dict:
+    return {
+        "repository": "allenwoo713/obsidian_wiki_skill", "head_sha": "a" * 40,
+        "run_id": 71, "run_attempt": 1, "job_id": 72, "artifact_id": artifact_id,
+        "artifact_name": "phase07-frozen-base-71-1",
+        "archive_sha256": hashlib.sha256(archive).hexdigest(), "archive_size_bytes": len(archive),
+        "descriptor_self_sha256": "b" * 64, "base_tree_sha256": "c" * 64,
+        "model_manifest_sha256": "d" * 64, "corpus_manifest_sha256": "e" * 64,
+        "generator_recipe_sha256": "f" * 64,
+        "runtime": {"python": "3.13", "numpy": "2.2.6"},
+        "artifact_created_at": "2026-08-25T00:00:00Z",
+        "artifact_expires_at": "2026-11-23T00:00:00Z",
+        "retention_days": 90, "replacement_for_run_id": None, "status": "success",
+    }
+
+
+def _frozen_zip(members: dict[str, bytes]) -> bytes:
+    from io import BytesIO
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return output.getvalue()
+
+
+class _ExactFrozenArchiveClient:
+    """Fixture API that exposes one archive endpoint and no name/list fallback."""
+
+    def __init__(self, archive: bytes) -> None:
+        self.archive = archive
+        self.calls: list[str] = []
+
+    def download_artifact(self, path: str, _token: str) -> bytes:
+        self.calls.append(path)
+        if path != "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip":
+            raise ValueError("unknown artifact ID")
+        return self.archive
+
+
+@pytest.mark.parametrize("members,accepted", (
+    ({"Wiki/page.md": b"page", "lance_db/data": b"db", ".index/state": b"state",
+      "graph.json": b"{}", "pages.json": b"[]", "frozen-base.json": b"{}"}, True),
+    ({"phase07-frozen-base-71-1/Wiki/page.md": b"subdir"}, False),
+    ({"Wiki/page.md": b"one", "wiki/PAGE.md": b"two"}, False),
+    ({"../Wiki/page.md": b"traversal"}, False),
+))
+def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: dict[str, bytes], accepted: bool,
+) -> None:
+    """The operator performs real archive bytes→ZIP→canonical-root validation."""
+    import eval.phase07_frozen_base as frozen_base
+
+    archive_bytes = _frozen_zip(members)
+    client = _ExactFrozenArchiveClient(archive_bytes)
+    validated: list[Path] = []
+
+    def validate(root: Path, *, expected_wiki_root: Path) -> str:
+        validated.append(root)
+        assert expected_wiki_root == root / "Wiki"
+        return "c" * 64
+
+    monkeypatch.setattr(frozen_base, "validate_frozen_base", validate)
+    archive, root = tmp_path / "prepare.zip", tmp_path / "frozen-corpus"
+    if accepted:
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=_frozen_prepare_download_identity(archive_bytes), token="fixture-token",
+            archive=archive, frozen_dir=root, client=client,
+        )
+        assert client.calls == ["/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"]
+        assert archive.read_bytes() == archive_bytes
+        assert (root / "Wiki" / "page.md").read_bytes() == b"page"
+        assert validated == [root]
+    else:
+        with pytest.raises(ValueError):
+            phase07_operator_gate.download_frozen_artifact(
+                frozen_prepare=_frozen_prepare_download_identity(archive_bytes), token="fixture-token",
+                archive=archive, frozen_dir=root, client=client,
+            )
+        assert not root.exists()
+
+
+def test_frozen_download_rejects_a_different_artifact_id_before_any_extraction(tmp_path: Path) -> None:
+    """A valid same-name archive cannot replace the collector-bound numeric ID."""
+    archive_bytes = _frozen_zip({"Wiki/page.md": b"page"})
+    client = _ExactFrozenArchiveClient(archive_bytes)
+    with pytest.raises(ValueError):
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=_frozen_prepare_download_identity(archive_bytes, artifact_id=74),
+            token="fixture-token", archive=tmp_path / "prepare.zip",
+            frozen_dir=tmp_path / "frozen-corpus", client=client,
+        )
+    assert not (tmp_path / "frozen-corpus").exists()
+
+
+def test_frozen_download_cli_is_a_real_module_command_and_workflow_has_no_unknown_action_input() -> None:
+    """Exercise the CLI parser and reject the unsupported artifact-ids action input."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "--help"], cwd=SKILL_ROOT,
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "frozen-download" in completed.stdout
+    workflow = yaml.load((SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            if step.get("uses") == "actions/download-artifact@v4":
+                assert "artifact-ids" not in step.get("with", {})
 
 
 def test_frozen_size_preflight_and_prepare_plan_are_reachable_real_operator_clis(tmp_path: Path) -> None:
