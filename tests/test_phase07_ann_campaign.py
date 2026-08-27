@@ -116,27 +116,31 @@ def _frozen_prepare_identity() -> dict:
     """One successful API-bound base identity shared by all frozen roles."""
     runtime = _locked_confirmation_environment()["runtime"]
     return {
+        "repository": "allenwoo713/obsidian_wiki_skill", "head_sha": HEAD,
         "run_id": 101, "run_attempt": 1, "job_id": 201, "artifact_id": 301,
+        "artifact_name": "phase07-frozen-base-101-1",
         "archive_sha256": hashlib.sha256(b"frozen archive").hexdigest(),
-        "descriptor_sha256": hashlib.sha256(b"frozen descriptor").hexdigest(),
-        "tree_sha256": hashlib.sha256(b"frozen tree").hexdigest(),
-        "head_sha": HEAD, "runtime": runtime,
+        "archive_size_bytes": 1234,
+        "descriptor_self_sha256": hashlib.sha256(b"frozen descriptor").hexdigest(),
+        "base_tree_sha256": hashlib.sha256(b"frozen tree").hexdigest(),
         "model_manifest_sha256": MODEL_MANIFEST_SHA256,
         "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
+        "generator_recipe_sha256": hashlib.sha256(b"frozen generator recipe").hexdigest(),
+        "runtime": runtime,
         "retention_days": 90, "replacement_for_run_id": None,
-        "status": "completed", "conclusion": "success",
-        "artifact_created_at": "2099-01-01T00:00:00Z",
-        "artifact_expires_at": "2099-04-01T00:00:00Z",
+        "status": "success",
+        "artifact_created_at": "2026-08-01T00:00:00Z",
+        "artifact_expires_at": "2026-10-30T00:00:00Z",
     }
 
 
 @pytest.mark.parametrize(
     "mutate",
     (
-        lambda value: value.pop("descriptor_sha256"),
+        lambda value: value.pop("descriptor_self_sha256"),
         lambda value: value.__setitem__("run_attempt", 2),
         lambda value: value.__setitem__("replacement_for_run_id", 1),
-        lambda value: value.__setitem__("conclusion", "cancelled"),
+        lambda value: value.__setitem__("status", "cancelled"),
         lambda value: value.__setitem__("artifact_expires_at", "2000-04-01T00:00:00Z"),
         lambda value: value["runtime"].__setitem__("numpy", "0.0.0"),
         lambda value: value.__setitem__("model_manifest_sha256", "0" * 64),
