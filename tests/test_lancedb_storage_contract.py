@@ -1024,9 +1024,10 @@ def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_co
     )
 
     now = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    head_sha = "b" * 40
     digest = "a" * 64
     identity = {
-        "repository": "example/obsidian-wiki-skill", "head_sha": digest,
+        "repository": "example/obsidian-wiki-skill", "head_sha": head_sha,
         "run_id": 11, "run_attempt": 1, "job_id": 12, "artifact_id": 13,
         "artifact_name": "phase07-frozen-base-11-1", "archive_sha256": digest,
         "archive_size_bytes": 99, "descriptor_self_sha256": digest,
@@ -1039,7 +1040,7 @@ def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_co
     }
     assert set(identity) == FROZEN_PREPARE_IDENTITY_FIELDS
     assert validate_frozen_prepare_identity_shape(
-        identity, expected_repository=identity["repository"], expected_head=digest, now=now,
+        identity, expected_repository=identity["repository"], expected_head=head_sha, now=now,
     ) == identity
     for key, value in (("run_attempt", 2), ("status", "completed"),
                        ("artifact_name", "latest"),
@@ -1048,5 +1049,5 @@ def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_co
         invalid = dict(identity); invalid[key] = value
         with pytest.raises(FrozenBaseError):
             validate_frozen_prepare_identity_shape(
-                invalid, expected_repository=identity["repository"], expected_head=digest, now=now,
+                invalid, expected_repository=identity["repository"], expected_head=head_sha, now=now,
             )
