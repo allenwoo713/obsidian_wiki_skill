@@ -799,9 +799,11 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
 
     wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus" / "Wiki"
-    _write_pages(wiki, 3, body_prefix="FROZENBASE")
+    _write_page(wiki, "# Frozen base\n\nFROZENBASE exact retrieval content.")
     frozen = tmp_path / "prepared"
-    descriptor = prepare_frozen_base(wiki_dir=wiki, frozen_dir=frozen, embed=_embed384())
+    descriptor = prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+    )
 
     assert descriptor["schema_version"] == 1
     assert not (frozen / "ACTIVE_INDEX").exists()
