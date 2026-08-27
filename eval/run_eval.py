@@ -771,13 +771,21 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
     """
     from eval.phase07_operator_gate import _consume_hybrid_execution_capability
 
-    bundle = _consume_hybrid_execution_capability(capability)
+    consumed = _consume_hybrid_execution_capability(capability)
+    if isinstance(consumed, dict) and set(consumed) == {"member", "frozen_prepare"}:
+        bundle = consumed["member"]
+        frozen_prepare = consumed["frozen_prepare"]
+    else:
+        # Legacy non-frozen PR topology intentionally remains member-only.
+        bundle = consumed
+        frozen_prepare = None
     if embed is not None and not os.environ.get("PYTEST_CURRENT_TEST"):
         raise ValueError("injected hybrid encoder is pytest-only")
     if query_limit is not None and (embed is None or not os.environ.get("PYTEST_CURRENT_TEST")
                                     or not isinstance(query_limit, int) or not 1 <= query_limit < 105):
         raise ValueError("hybrid query limit is pytest-only")
     role, config = bundle["role"], bundle["config"]
+    frozen_source_evidence: dict[str, object] = {}
     root = Path(work_dir) / f"hybrid-{role}-m{config['m']}"
     if root.exists():
         shutil.rmtree(root)
@@ -799,10 +807,25 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         from eval.phase07_frozen_base import validate_frozen_base
         frozen_dir = Path(frozen_dir).resolve()
         expanded_wiki = frozen_dir / "Wiki"
-        validate_frozen_base(frozen_dir, expected_wiki_root=expanded_wiki)
+        base_tree_sha256 = validate_frozen_base(frozen_dir, expected_wiki_root=expanded_wiki)
+        if not isinstance(frozen_prepare, dict):
+            raise ValueError("frozen source requires collector-bound prepare provenance")
+        descriptor = json.loads((frozen_dir / "frozen-base.json").read_text(encoding="utf-8"))
+        if descriptor.get("record_self_sha256") != frozen_prepare.get("descriptor_self_sha256") \
+                or base_tree_sha256 != frozen_prepare.get("base_tree_sha256") \
+                or descriptor.get("model_manifest_sha256") != frozen_prepare.get("model_manifest_sha256") \
+                or descriptor.get("corpus_manifest_sha256") != frozen_prepare.get("corpus_manifest_sha256") \
+                or descriptor.get("generator_recipe_sha256") != frozen_prepare.get("generator_recipe_sha256") \
+                or descriptor.get("runtime") != frozen_prepare.get("runtime"):
+            raise ValueError("frozen source collector provenance mismatch")
         expanded_identity = {
             "expanded_content_tree_sha256": canonical_content_tree_sha256(expanded_wiki),
             "expanded_member_count": sum(1 for path in expanded_wiki.rglob("*.md") if path.is_file()),
+        }
+        frozen_source_evidence = {
+            "frozen_prepare": frozen_prepare,
+            "source_before_sha256": base_tree_sha256,
+            "source_after_sha256": base_tree_sha256,
         }
 
     def build_candidate(name: str, config: dict, wiki: Path):
@@ -896,11 +919,17 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         if completed % 15 == 0 or completed == len(queries):
             print(f"[phase07-hybrid] role={role} original_queries={completed}/{len(queries)} complete", flush=True)
             print(f"[phase07-hybrid] role={role} expanded_queries={completed}/{len(queries)} complete", flush=True)
+    if frozen_dir is not None:
+        from eval.phase07_frozen_base import validate_frozen_base
+        source_after_sha256 = validate_frozen_base(frozen_dir, expected_wiki_root=expanded_wiki)
+        if source_after_sha256 != base_tree_sha256:
+            raise ValueError("frozen source mutated during private hybrid lifecycle")
+        frozen_source_evidence["source_after_sha256"] = source_after_sha256
     return {
         "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": bundle["record_self_sha256"],
         "role": role, "config": config,
         "planned_scale": bundle["scale"], "executed_scale": target_size,
-        **expanded_identity,
+        **expanded_identity, **frozen_source_evidence,
         "query_count": len(queries), "authorization": "none",
         "original_observations": original,
         "expanded_observations": expanded,

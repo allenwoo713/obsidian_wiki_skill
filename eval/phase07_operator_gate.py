@@ -743,7 +743,7 @@ def validate_hybrid_workflow_input(record: dict[str, Any], *, expected_head: str
     # The sealed fixed member still rejects every retired or user-selected
     # configuration before it can reach an expensive model/index path.
     role, config = record.get("role"), record.get("config")
-    if (role, config) not in FROZEN_HYBRID_ROLE_CONFIGS \
+    if (role, config) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS \
             or record.get("dense_source_head") != DENSE_SOURCE_HEAD \
             or record.get("scale") != 30000 or record.get("query_count") != 105 \
             or record.get("authorization") != "none" or record.get("retention_days") != 90 \
@@ -786,24 +786,33 @@ def _validate_hybrid_request(request: object, *, expected_head: str) -> dict[str
 
 def validate_hybrid_dispatch_bundle(bundle: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
     """Fail closed before any 30k build unless this is one exact generated member."""
-    fields = {"schema_version", "hybrid_request", "workflow_input", "frozen_prepare", "replacement_for_run_id", "record_self_sha256"}
+    frozen_fields = {"schema_version", "hybrid_request", "workflow_input", "frozen_prepare", "replacement_for_run_id", "record_self_sha256"}
+    generic_fields = {"schema_version", "hybrid_request", "workflow_input", "replacement_for_run_id", "record_self_sha256"}
+    fields = set(bundle) if isinstance(bundle, dict) else set()
     if not SHA.fullmatch(expected_head) or _git("rev-parse", "HEAD") != expected_head \
-            or not isinstance(bundle, dict) or set(bundle) != fields \
+            or not isinstance(bundle, dict) or (fields != frozen_fields and fields != generic_fields) \
             or bundle.get("schema_version") != 1 or bundle.get("record_self_sha256") != canonical_digest(bundle) \
             or bundle.get("replacement_for_run_id") is not None:
         raise ValueError("typed sealed hybrid dispatch bundle")
     request = _validate_hybrid_request(bundle.get("hybrid_request"), expected_head=expected_head)
-    from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
-    frozen_prepare = validate_frozen_prepare_identity_shape(
-        bundle.get("frozen_prepare"), expected_repository="allenwoo713/obsidian_wiki_skill",
-        expected_head=expected_head,
-    )
     member = bundle.get("workflow_input")
     validate_hybrid_workflow_input(member, expected_head=expected_head)
-    if member.get("hybrid_request_sha256") != request["record_self_sha256"] \
-            or (member.get("role"), member.get("config")) not in FROZEN_HYBRID_ROLE_CONFIGS \
-            or frozen_prepare["head_sha"] != member["hybrid_implementation_head"]:
+    if member.get("hybrid_request_sha256") != request["record_self_sha256"]:
         raise ValueError("hybrid dispatch membership")
+    if fields == frozen_fields:
+        from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+        frozen_prepare = validate_frozen_prepare_identity_shape(
+            bundle.get("frozen_prepare"), expected_repository="allenwoo713/obsidian_wiki_skill",
+            expected_head=expected_head,
+        )
+        if (member.get("role"), member.get("config")) not in FROZEN_HYBRID_ROLE_CONFIGS \
+                or frozen_prepare["head_sha"] != member["hybrid_implementation_head"]:
+            raise ValueError("frozen hybrid dispatch membership")
+    elif (member.get("role"), member.get("config")) not in HYBRID_ROLE_CONFIGS:
+        # Historic generic PR evidence is intentionally kept readable.  It
+        # cannot select the frozen workflow because that path requires the
+        # additional frozen_prepare field above.
+        raise ValueError("generic hybrid dispatch membership")
     return member
 
 
@@ -896,7 +905,7 @@ def _mint_hybrid_execution_capability(*, bundle: dict[str, Any], locked_executio
 
 
 def _consume_hybrid_execution_capability(value: object) -> dict[str, Any]:
-    """Return a detached member only for a token minted by this module."""
+    """Return detached role authority only for a token minted by this module."""
     if type(value) is not _HybridExecutionCapability or value._issuer is not _HYBRID_CAPABILITY_ISSUER:
         raise ValueError("unminted hybrid execution capability")
     bundle, execution, allocation = value._bundle, value._locked_execution, value._allocation
@@ -914,7 +923,15 @@ def _consume_hybrid_execution_capability(value: object) -> dict[str, Any]:
     if execution.get("head_sha") != head:
         raise ValueError("hybrid capability locked execution head")
     _validate_hybrid_allocation(allocation)
-    return json.loads(json.dumps(member, sort_keys=True))
+    if "frozen_prepare" not in bundle:
+        # Ordinary PR paths retain their established member-only capability.
+        return json.loads(json.dumps(member, sort_keys=True))
+    # Keep the collector-bound prepare fact with the opaque authority.  The
+    # runner cannot silently lose it and replace the downloaded corpus with a
+    # same-shaped local tree.
+    return json.loads(json.dumps({
+        "member": member, "frozen_prepare": bundle["frozen_prepare"],
+    }, sort_keys=True))
 
 
 def execute_hybrid_dispatch(*, bundle: dict[str, Any], locked_execution: dict[str, Any], allocation: dict[str, Any],
@@ -1163,7 +1180,7 @@ def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads
             raise ValueError("hybrid download run identity")
         if any(isinstance(value[name], bool) or not isinstance(value[name], int) or value[name] <= 0
                for name in ("job_id", "artifact_id")) \
-                or (value.get("role"), value.get("config")) not in HYBRID_ROLE_CONFIGS \
+                or (value.get("role"), value.get("config")) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS \
                 or not isinstance(value.get("bundle_sha256"), str) or not HEX64.fullmatch(value["bundle_sha256"]):
             raise ValueError("hybrid download job/artifact/candidate identity")
         archive, extracted = Path(value["archive"]), Path(value["extracted_dir"])
@@ -1181,12 +1198,13 @@ def build_hybrid_collection_request(*, hybrid_request: dict[str, Any], downloads
             raise ValueError("hybrid downloaded dispatch identity") from None
         role_identity = (role, config.get("m") if isinstance(config, dict) else -1)
         if role != value["role"] or config != value["config"] or bundle_sha256 != value["bundle_sha256"] \
-                or (role, config) not in HYBRID_ROLE_CONFIGS or role_identity in seen_roles:
+                or (role, config) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS or role_identity in seen_roles:
             raise ValueError("hybrid role cardinality")
         seen_runs.add(identity); seen_paths.add(paths); seen_roles.add(role_identity)
         selected.append({**value, "role": role, "config": dict(config)})
-    expected_roles = {("baseline", 16), ("candidate", 20), ("candidate", 32)}
-    if seen_roles != expected_roles:
+    generic_roles = {("baseline", 16), ("candidate", 20), ("candidate", 32)}
+    frozen_roles = {("baseline", 16), ("m20", 20), ("m32", 32)}
+    if seen_roles != generic_roles and seen_roles != frozen_roles:
         raise ValueError("hybrid role set")
     return _sealed({
         "schema_version": 1, "campaign_stage": "hybrid", "repository": "allenwoo713/obsidian_wiki_skill",
@@ -1206,11 +1224,13 @@ def _validate_hybrid_collection_request(value: object) -> dict[str, Any]:
             or value.get("head_sha") != request["hybrid_implementation_head"] \
             or not isinstance(value.get("downloads"), list) or len(value["downloads"]) != 3:
         raise ValueError("hybrid collection authority")
-    expected = {("baseline", 16): HYBRID_BASELINE, ("candidate", 20): HYBRID_CANDIDATES[0], ("candidate", 32): HYBRID_CANDIDATES[1]}
+    generic_expected = {("baseline", 16): HYBRID_BASELINE, ("candidate", 20): HYBRID_CANDIDATES[0], ("candidate", 32): HYBRID_CANDIDATES[1]}
+    frozen_expected = {("baseline", 16): HYBRID_BASELINE, ("m20", 20): HYBRID_CANDIDATES[0], ("m32", 32): HYBRID_CANDIDATES[1]}
+    expected = frozen_expected if any(row.get("role") in {"m20", "m32"} for row in value["downloads"] if isinstance(row, dict)) else generic_expected
     found: set[tuple[str, int]] = set()
     for row in value["downloads"]:
         if not isinstance(row, dict) or set(row) != _HYBRID_DOWNLOAD_FIELDS \
-                or (row.get("role"), row.get("config")) not in HYBRID_ROLE_CONFIGS \
+                or (row.get("role"), row.get("config")) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS \
                 or not isinstance(row.get("bundle_sha256"), str) or not HEX64.fullmatch(row["bundle_sha256"]):
             raise ValueError("hybrid collection download shape")
         if any(isinstance(row[key], bool) or not isinstance(row[key], int) or row[key] <= 0

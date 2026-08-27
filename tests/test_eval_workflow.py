@@ -1563,7 +1563,7 @@ def _three_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             "api_job_id_mismatch": 1802, "api_artifact_id_mismatch": 1902,
         },
     }
-    for role, m in (("baseline", 16), ("candidate", 20), ("candidate", 32)):
+    for role, m in (("baseline", 16), ("m20", 20), ("m32", 32)):
         identity = identities[m]
         run_id, attempt, job_id, artifact_id = (
             identity["run_id"], identity["run_attempt"], identity["job_id"], identity["artifact_id"],
@@ -1695,7 +1695,7 @@ def test_hybrid_three_download_collection_provenance_and_postdownload_reconstruc
     evidence = json.loads(manifest.read_text(encoding="utf-8"))
     assert evidence["record_self_sha256"] == reconcile_ann_gate.canonical_digest(evidence)
     assert [(row["role"], row["config"]["m"]) for row in evidence["evidence"]] == [
-        ("baseline", 16), ("candidate", 20), ("candidate", 32),
+        ("baseline", 16), ("m20", 20), ("m32", 32),
     ]
     assert all(row["run_attempt"] == 1 for row in evidence["evidence"])
     ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
