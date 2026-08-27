@@ -75,6 +75,7 @@ CONFIRMATION_WORKFLOW_INPUT_FIELDS = frozenset({
 JOB_DISPLAY_NAMES = {
     "phase07-confirmation": "Phase 07 independent confirmation campaign",
     "phase07-hybrid": "Phase 07 independent hybrid campaign",
+    "phase07-hybrid-prepare": "Phase 07 candidate-neutral frozen corpus prepare",
 }
 CONFIRMATION_DOWNLOAD_FIELDS = frozenset({"run_id", "run_attempt", "archive", "extracted_dir"})
 DENSE_LEDGER_DIGEST = "71335b6bfa03f24368414ae56a22fd8896d4479c6bfbe871c36a14b26e3b211b"
@@ -113,44 +114,19 @@ FROZEN_ROLE_CONFIGS = (
     ("m20", {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300}),
     ("m32", {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300}),
 )
-
-_FROZEN_PREPARE_IDENTITY_FIELDS = frozenset({
-    "run_id", "run_attempt", "job_id", "artifact_id", "archive_sha256",
-    "descriptor_sha256", "tree_sha256", "head_sha", "runtime",
-    "model_manifest_sha256", "corpus_manifest_sha256", "retention_days",
-    "replacement_for_run_id", "status", "conclusion", "artifact_created_at",
-    "artifact_expires_at",
-})
-
+# Generic PR evidence retains its historic candidate labels.  D-25 frozen
+# dispatches use the stricter immutable role names below.
+FROZEN_HYBRID_ROLE_CONFIGS = FROZEN_ROLE_CONFIGS
 
 def validate_frozen_prepare_identity(identity: object, *, expected_head: str,
                                      locked_execution: object) -> dict[str, Any]:
-    """Validate the completed prepare artifact before it can mint role input.
-
-    A prepare bundle deliberately has no remote identity: those identifiers do
-    not exist until its one hosted run completes.  This is the boundary where
-    that future identity becomes mandatory, including the locked source/runtime
-    facts which the three role packets must share.
-    """
-    if not SHA.fullmatch(expected_head) or not isinstance(identity, dict) \
-            or set(identity) != _FROZEN_PREPARE_IDENTITY_FIELDS:
+    """Bind A's one strict identity shape to measured locked execution facts."""
+    if not isinstance(identity, dict) or not SHA.fullmatch(expected_head):
         raise ValueError("strict frozen prepare identity")
-    if identity.get("head_sha") != expected_head or identity.get("run_attempt") != 1 \
-            or identity.get("retention_days") != 90 \
-            or identity.get("replacement_for_run_id") is not None \
-            or identity.get("status") != "completed" \
-            or identity.get("conclusion") != "success":
-        raise ValueError("frozen prepare status/attempt/head/retention")
-    if not all(isinstance(identity[name], int) and not isinstance(identity[name], bool)
-               and identity[name] > 0 for name in ("run_id", "job_id", "artifact_id")):
-        raise ValueError("frozen prepare API identity")
-    if not all(isinstance(identity[name], str) and HEX64.fullmatch(identity[name])
-               for name in ("archive_sha256", "descriptor_sha256", "tree_sha256",
-                            "model_manifest_sha256", "corpus_manifest_sha256")):
-        raise ValueError("frozen prepare digest identity")
-
-    # Reuse the production locked-execution validator.  A hand-written runtime
-    # dictionary may not be substituted for the exact checkout facts.
+    from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+    identity = validate_frozen_prepare_identity_shape(
+        identity, expected_repository=identity.get("repository"), expected_head=expected_head,
+    )
     from eval.phase07_ann_campaign import validate_confirmation_execution
     execution = validate_confirmation_execution(
         locked_execution,
@@ -159,13 +135,6 @@ def validate_frozen_prepare_identity(identity: object, *, expected_head: str,
     )
     if execution["head_sha"] != expected_head or identity["runtime"] != execution["runtime"]:
         raise ValueError("frozen prepare locked execution binding")
-
-    created = _parse_utc_timestamp(identity["artifact_created_at"], label="prepare artifact creation")
-    expires = _parse_utc_timestamp(identity["artifact_expires_at"], label="prepare artifact expiry")
-    if created >= expires or expires <= dt.datetime.now(dt.timezone.utc) \
-            or not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) \
-            <= expires - created <= dt.timedelta(days=90, seconds=30):
-        raise ValueError("frozen prepare artifact retention")
     return identity
 
 
@@ -231,6 +200,195 @@ def build_frozen_role_bundles(prepare_provenance: object, *, expected_head: str,
         _sealed({**base, "role": role, "config": dict(config), "dispatch_identity": f"phase07-hybrid/{role}"})
         for role, config in FROZEN_ROLE_CONFIGS
     ]
+
+
+def seal_frozen_size_preflight(*, request_file: Path, ledger_file: Path) -> int:
+    """Seal local-only 30k sizing evidence; this command never materializes it.
+
+    The intentionally small preflight is the only route which may mint a
+    prepare input.  In particular, it has no artifact/run fields: requiring
+    those before dispatch would be a future-ID authorization loop.
+    """
+    try:
+        local = _read_object(request_file)
+        head = local.get("head_sha") if isinstance(local, dict) else ""
+        bundle = build_frozen_prepare_bundle(local, expected_head=head)
+        _write_ledger(ledger_file, bundle)
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 1
+
+
+def run_frozen_prepare_plan(*, preflight_file: Path, workflow_input_file: Path,
+                            expected_head: str) -> int:
+    """Write the sole sealed prepare dispatch member from local preflight."""
+    bundle = validate_frozen_prepare_bundle(_read_object(preflight_file), expected_head=expected_head)
+    if workflow_input_file.exists() or workflow_input_file.is_symlink():
+        raise ValueError("frozen prepare workflow input must be new")
+    workflow_input_file.parent.mkdir(parents=True, exist_ok=True)
+    workflow_input_file.write_text(
+        json.dumps(bundle, sort_keys=True, indent=2) + "\n", encoding="utf-8",
+    )
+    return 0
+
+
+def _frozen_archive_sha256(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("frozen prepare archive is unavailable")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def collect_frozen_prepare_provenance(*, prepare_bundle: dict[str, Any], repository: str,
+                                      run_id: int, run_attempt: int, archive: Path,
+                                      frozen_dir: Path, locked_execution: dict[str, Any],
+                                      token: str, client: Any | None = None) -> dict[str, Any]:
+    """Return one API- and byte-bound frozen prepare identity.
+
+    The API is queried by the caller-provided *exact* run and attempt.  A
+    familiar artifact name is never a selector: it is accepted only when it is
+    the one artifact returned for that exact run and the local downloaded bytes
+    match GitHub's digest.  The result is the only value role planning accepts.
+    """
+    if not repository or not SHA.fullmatch(prepare_bundle.get("head_sha", "")) \
+            or not isinstance(run_id, int) or run_id <= 0 or run_attempt != 1 or not token:
+        raise ValueError("frozen prepare collection identity")
+    bundle = validate_frozen_prepare_bundle(prepare_bundle, expected_head=prepare_bundle["head_sha"])
+    from eval.phase07_ann_campaign import validate_confirmation_execution
+    execution = validate_confirmation_execution(locked_execution)
+    if execution.get("head_sha") != bundle["head_sha"]:
+        raise ValueError("frozen prepare execution head")
+    if frozen_dir.is_symlink() or not frozen_dir.is_dir():
+        raise ValueError("frozen prepare extracted root")
+    try:
+        from eval.phase07_frozen_base import validate_frozen_base
+        base_tree_sha256 = validate_frozen_base(frozen_dir, expected_wiki_root=frozen_dir / "Wiki")
+        descriptor = _read_object(frozen_dir / "frozen-base.json")
+        descriptor_self_sha256 = descriptor.get("record_self_sha256")
+        if not isinstance(descriptor_self_sha256, str) or not HEX64.fullmatch(descriptor_self_sha256):
+            raise ValueError("frozen prepare descriptor identity")
+        from eval.ann_corpus_manifest import public_distractor_recipe_sha256
+        source = execution["source_digests"]
+        expected_descriptor = {
+            "model_manifest_sha256": source["model_manifest_sha256"],
+            "corpus_manifest_sha256": source["corpus_manifest_sha256"],
+            "generator_recipe_sha256": public_distractor_recipe_sha256(),
+            "runtime": execution["runtime"],
+        }
+        if any(descriptor.get(name) != value for name, value in expected_descriptor.items()):
+            raise ValueError("frozen prepare descriptor execution binding")
+        archive_sha256 = _frozen_archive_sha256(archive)
+        github = client or GitHubActionsClient()
+        run_url = f"/repos/{repository}/actions/runs/{run_id}"
+        run = github.get_json(run_url, token)
+        jobs_payload = github.get_json(f"{run_url}/attempts/{run_attempt}/jobs", token)
+        artifacts_payload = github.get_json(f"{run_url}/artifacts", token)
+    except Exception as exc:
+        raise ValueError("frozen prepare API/download validation failed") from exc
+    if not isinstance(run, dict) or run.get("id") != run_id or run.get("run_attempt") != 1 \
+            or run.get("event") != "workflow_dispatch" or run.get("head_sha") != bundle["head_sha"] \
+            or run.get("status") != "completed" or run.get("conclusion") != "success" \
+            or not isinstance(run.get("head_branch"), str) or not run["head_branch"]:
+        raise ValueError("frozen prepare workflow run")
+    jobs = jobs_payload.get("jobs") if isinstance(jobs_payload, dict) else None
+    matches = [job for job in jobs if isinstance(job, dict) and job.get("name") == JOB_DISPLAY_NAMES["phase07-hybrid-prepare"]
+               and job.get("run_id") == run_id and job.get("run_attempt") == 1
+               and job.get("status") == "completed" and job.get("conclusion") == "success"] if isinstance(jobs, list) else []
+    if len(matches) != 1 or not isinstance(matches[0].get("id"), int) or matches[0]["id"] <= 0:
+        raise ValueError("frozen prepare exact job")
+    artifacts = artifacts_payload.get("artifacts") if isinstance(artifacts_payload, dict) else None
+    name = f"phase07-frozen-base-{run_id}-1"
+    artifacts = [item for item in artifacts if isinstance(item, dict) and item.get("name") == name] if isinstance(artifacts, list) else []
+    if len(artifacts) != 1:
+        raise ValueError("frozen prepare exact artifact")
+    artifact = artifacts[0]
+    created = _parse_utc_timestamp(artifact.get("created_at"), label="prepare artifact creation")
+    expires = _parse_utc_timestamp(artifact.get("expires_at"), label="prepare artifact expiry")
+    now = dt.datetime.now(dt.timezone.utc)
+    if not isinstance(artifact.get("id"), int) or artifact["id"] <= 0 or artifact.get("expired") is not False \
+            or artifact.get("digest") != f"sha256:{archive_sha256}" \
+            or artifact.get("size_in_bytes") != archive.stat().st_size \
+            or not isinstance(artifact.get("workflow_run"), dict) \
+            or artifact["workflow_run"].get("id") != run_id \
+            or artifact["workflow_run"].get("head_sha") != bundle["head_sha"] \
+            or not created <= now < expires \
+            or not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) <= expires - created <= dt.timedelta(days=90, seconds=30):
+        raise ValueError("frozen prepare artifact digest/retention")
+    identity = {
+        "repository": repository, "head_sha": bundle["head_sha"],
+        "run_id": run_id, "run_attempt": 1, "job_id": matches[0]["id"], "artifact_id": artifact["id"],
+        "artifact_name": name, "archive_sha256": archive_sha256, "archive_size_bytes": archive.stat().st_size,
+        "descriptor_self_sha256": descriptor_self_sha256, "base_tree_sha256": base_tree_sha256,
+        "model_manifest_sha256": source["model_manifest_sha256"],
+        "corpus_manifest_sha256": source["corpus_manifest_sha256"],
+        "generator_recipe_sha256": public_distractor_recipe_sha256(), "runtime": execution["runtime"],
+        "artifact_created_at": artifact["created_at"], "artifact_expires_at": artifact["expires_at"],
+        "retention_days": 90, "replacement_for_run_id": None, "status": "success",
+    }
+    return validate_frozen_prepare_identity(identity, expected_head=bundle["head_sha"], locked_execution=execution)
+
+
+def build_frozen_role_dispatch_bundles(*, hybrid_request: dict[str, Any],
+                                       frozen_prepare: dict[str, Any],
+                                       expected_head: str) -> list[dict[str, Any]]:
+    """Mint the one baseline/m20/m32 dispatch set from collector-only evidence.
+
+    This deliberately does not take an identity file path.  The caller must
+    have just obtained ``frozen_prepare`` from ``collect_frozen_prepare_provenance``
+    in the same command path; a hand-authored JSON identity therefore has no
+    CLI route to authorize a role plan.
+    """
+    request = _validate_hybrid_request(hybrid_request, expected_head=expected_head)
+    from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+    prepare = validate_frozen_prepare_identity_shape(
+        frozen_prepare, expected_repository="allenwoo713/obsidian_wiki_skill", expected_head=expected_head,
+    )
+    if prepare["head_sha"] != request["hybrid_implementation_head"]:
+        raise ValueError("frozen prepare/hybrid head binding")
+    bundles = []
+    for role, config in FROZEN_HYBRID_ROLE_CONFIGS:
+        member = _sealed({
+            "schema_version": 1, "campaign_stage": "hybrid",
+            "hybrid_request_sha256": request["record_self_sha256"],
+            "dense_source_head": DENSE_SOURCE_HEAD,
+            "hybrid_implementation_head": expected_head,
+            "role": role, "config": dict(config), "scale": 30000, "query_count": 105,
+            "authorization": "none", "retention_days": 90, "replacement_for_run_id": None,
+            "dispatch_identity": f"phase07-hybrid/{role}",
+        })
+        bundles.append(_sealed({
+            "schema_version": 1, "hybrid_request": request, "workflow_input": member,
+            "frozen_prepare": prepare, "replacement_for_run_id": None,
+        }))
+    return bundles
+
+
+def run_frozen_role_plan(*, prepare_bundle: Path, hybrid_request: Path, workflow_inputs_dir: Path,
+                         repository: str, run_id: int, run_attempt: int, archive: Path,
+                         frozen_dir: Path, locked_execution: Path, token: str,
+                         client: Any | None = None) -> int:
+    """Collect live prepare evidence and immediately write the exact role set."""
+    request = _read_object(hybrid_request)
+    head = request.get("hybrid_implementation_head") if isinstance(request, dict) else ""
+    prepare = collect_frozen_prepare_provenance(
+        prepare_bundle=_read_object(prepare_bundle), repository=repository, run_id=run_id,
+        run_attempt=run_attempt, archive=archive, frozen_dir=frozen_dir,
+        locked_execution=_read_object(locked_execution), token=token, client=client,
+    )
+    bundles = build_frozen_role_dispatch_bundles(
+        hybrid_request=request, frozen_prepare=prepare, expected_head=head,
+    )
+    if workflow_inputs_dir.exists() and (workflow_inputs_dir.is_symlink() or any(workflow_inputs_dir.iterdir())):
+        raise ValueError("frozen role output must be new and empty")
+    workflow_inputs_dir.mkdir(parents=True, exist_ok=True)
+    expected_names = ("hybrid-baseline.json", "hybrid-m20.json", "hybrid-m32.json")
+    for name, bundle in zip(expected_names, bundles, strict=True):
+        (workflow_inputs_dir / name).write_text(json.dumps(bundle, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    validate_hybrid_workflow_inputs_dir(workflow_inputs_dir, expected_head=head)
+    return 0
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -585,7 +743,7 @@ def validate_hybrid_workflow_input(record: dict[str, Any], *, expected_head: str
     # The sealed fixed member still rejects every retired or user-selected
     # configuration before it can reach an expensive model/index path.
     role, config = record.get("role"), record.get("config")
-    if (role, config) not in HYBRID_ROLE_CONFIGS \
+    if (role, config) not in FROZEN_HYBRID_ROLE_CONFIGS \
             or record.get("dense_source_head") != DENSE_SOURCE_HEAD \
             or record.get("scale") != 30000 or record.get("query_count") != 105 \
             or record.get("authorization") != "none" or record.get("retention_days") != 90 \
@@ -628,17 +786,23 @@ def _validate_hybrid_request(request: object, *, expected_head: str) -> dict[str
 
 def validate_hybrid_dispatch_bundle(bundle: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
     """Fail closed before any 30k build unless this is one exact generated member."""
-    fields = {"schema_version", "hybrid_request", "workflow_input", "replacement_for_run_id", "record_self_sha256"}
+    fields = {"schema_version", "hybrid_request", "workflow_input", "frozen_prepare", "replacement_for_run_id", "record_self_sha256"}
     if not SHA.fullmatch(expected_head) or _git("rev-parse", "HEAD") != expected_head \
             or not isinstance(bundle, dict) or set(bundle) != fields \
             or bundle.get("schema_version") != 1 or bundle.get("record_self_sha256") != canonical_digest(bundle) \
             or bundle.get("replacement_for_run_id") is not None:
         raise ValueError("typed sealed hybrid dispatch bundle")
     request = _validate_hybrid_request(bundle.get("hybrid_request"), expected_head=expected_head)
+    from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+    frozen_prepare = validate_frozen_prepare_identity_shape(
+        bundle.get("frozen_prepare"), expected_repository="allenwoo713/obsidian_wiki_skill",
+        expected_head=expected_head,
+    )
     member = bundle.get("workflow_input")
     validate_hybrid_workflow_input(member, expected_head=expected_head)
     if member.get("hybrid_request_sha256") != request["record_self_sha256"] \
-            or (member.get("role"), member.get("config")) not in HYBRID_ROLE_CONFIGS:
+            or (member.get("role"), member.get("config")) not in FROZEN_HYBRID_ROLE_CONFIGS \
+            or frozen_prepare["head_sha"] != member["hybrid_implementation_head"]:
         raise ValueError("hybrid dispatch membership")
     return member
 
@@ -649,7 +813,7 @@ def validate_hybrid_workflow_inputs_dir(path: Path, *, expected_head: str) -> li
     if path.is_symlink() or not path.is_dir() or {item.name for item in path.iterdir()} != expected_names:
         raise ValueError("strict hybrid generated input allowlist")
     records = []
-    expected_members = (("hybrid-baseline.json", "baseline", 16), ("hybrid-m20.json", "candidate", 20), ("hybrid-m32.json", "candidate", 32))
+    expected_members = (("hybrid-baseline.json", "baseline", 16), ("hybrid-m20.json", "m20", 20), ("hybrid-m32.json", "m32", 32))
     for name, role, m in expected_members:
         item = path / name
         if item.is_symlink() or not item.is_file():
@@ -1752,7 +1916,7 @@ def run_hybrid_plan(*, dense_ledger: Path, request_file: Path, workflow_inputs_d
 
 def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-allocation", "hybrid-dispatch", "hybrid-collection-request", "hybrid-provenance"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-allocation", "hybrid-dispatch", "hybrid-collection-request", "hybrid-provenance", "frozen-size-preflight", "prepare-plan", "frozen-prepare-provenance", "role-plan"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -1776,8 +1940,53 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
     parser.add_argument("--allocation", type=Path)
     parser.add_argument("--downloads-file", type=Path)
     parser.add_argument("--frozen-dir", type=Path)
+    parser.add_argument("--workflow-input-file", type=Path)
+    parser.add_argument("--prepare-bundle", type=Path)
+    parser.add_argument("--archive", type=Path)
+    parser.add_argument("--hybrid-request", type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == "frozen-size-preflight":
+            if args.request_file is None or args.ledger_file is None:
+                raise ValueError("frozen-size-preflight requires local preflight and ledger")
+            return seal_frozen_size_preflight(request_file=args.request_file, ledger_file=args.ledger_file)
+        if args.command == "prepare-plan":
+            if args.request_file is None or args.workflow_input_file is None or not args.head_sha:
+                raise ValueError("prepare-plan requires preflight, output, and exact head")
+            return run_frozen_prepare_plan(
+                preflight_file=args.request_file, workflow_input_file=args.workflow_input_file,
+                expected_head=args.head_sha,
+            )
+        if args.command == "frozen-prepare-provenance":
+            if None in (args.prepare_bundle, args.ledger_file, args.archive, args.frozen_dir, args.locked_execution):
+                raise ValueError("frozen prepare provenance requires sealed input, archive, root, execution, and output")
+            identity = collect_frozen_prepare_provenance(
+                prepare_bundle=_read_object(args.prepare_bundle), repository=args.repository or "",
+                run_id=args.run_id or 0, run_attempt=args.run_attempt or 0, archive=args.archive,
+                frozen_dir=args.frozen_dir, locked_execution=_read_object(args.locked_execution),
+                token=os.environ.get("GITHUB_TOKEN", ""), client=github_client,
+            )
+            # This is an audit copy of the collector's *exact* shared
+            # identity shape.  Do not add a second self-digest/envelope: that
+            # would create a competing schema which role code could mistake
+            # for API provenance.
+            args.ledger_file.parent.mkdir(parents=True, exist_ok=True)
+            args.ledger_file.write_text(
+                json.dumps(identity, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return 0
+        if args.command == "role-plan":
+            if None in (args.prepare_bundle, args.hybrid_request, args.workflow_inputs_dir,
+                        args.archive, args.frozen_dir, args.locked_execution):
+                raise ValueError("role-plan requires API-bound prepare, request, root, execution, and output")
+            return run_frozen_role_plan(
+                prepare_bundle=args.prepare_bundle, hybrid_request=args.hybrid_request,
+                workflow_inputs_dir=args.workflow_inputs_dir, repository=args.repository or "",
+                run_id=args.run_id or 0, run_attempt=args.run_attempt or 0, archive=args.archive,
+                frozen_dir=args.frozen_dir, locked_execution=args.locked_execution,
+                token=os.environ.get("GITHUB_TOKEN", ""), client=github_client,
+            )
         if args.command == "hosted-preflight":
             if args.ledger_file is None:
                 raise ValueError("hosted preflight requires --ledger-file")

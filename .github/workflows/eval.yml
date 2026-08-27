@@ -655,8 +655,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.13'}
+      - id: phase07-model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
       - name: Install exact numeric dependencies and validate the pinned local model
         run: python -m pip install -r requirements.txt pytest
+      - name: Hydrate exact immutable model only on cache miss
+        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
+        run: python scripts/download_embedding_model.py
+      - name: Validate immutable cached model tree
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
       - name: Materialize only the sealed prepare bundle
         env:
           WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
@@ -667,12 +677,12 @@ jobs:
           python -c "from pathlib import Path; from eval.run_eval import FIXTURES_WIKI,_materialize_phase07_expanded_corpus; _materialize_phase07_expanded_corpus(fixture_root=FIXTURES_WIKI,output_root=Path('.review-tmp/phase07/frozen-corpus/Wiki'),target_size=30000)"
       - name: Prepare and seal only reusable source data
         run: >
-          python -m eval.phase07_frozen_base prepare --wiki-dir .review-tmp/phase07/frozen-corpus/Wiki --frozen-dir .review-tmp/phase07/frozen-base --prepare-bundle .review-tmp/phase07/prepare-bundle.json
+          python -m eval.phase07_frozen_base prepare --wiki-dir .review-tmp/phase07/frozen-corpus/Wiki --frozen-dir .review-tmp/phase07/frozen-corpus --prepare-bundle .review-tmp/phase07/prepare-bundle.json
       - name: Upload sealed frozen base, never a candidate packet
         uses: actions/upload-artifact@v4
         with:
           name: phase07-frozen-base-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .review-tmp/phase07/frozen-base
+          path: .review-tmp/phase07/frozen-corpus
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
@@ -713,6 +723,9 @@ jobs:
           WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
         run: >
           python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); v=json.loads(os.environ['WORKFLOW_INPUTS']); (d/'hybrid-dispatch.json').write_text(json.dumps(v,sort_keys=True))"
+      - name: Require an empty canonical root before secure artifact extraction
+        run: >
+          python -c "from pathlib import Path; root=Path('.review-tmp/phase07/frozen-corpus'); assert not root.exists(), root"
       - name: Download one explicit successful frozen prepare artifact
         # Cross-run evidence may never be selected by latest name.  The sealed
         # role bundle carries both IDs and the source is extracted into the one
@@ -720,8 +733,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: ${{ fromJSON(inputs.workflow_inputs).prepare.run_id }}
-          artifact-ids: ${{ fromJSON(inputs.workflow_inputs).prepare.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.run_id }}
+          artifact-ids: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.artifact_id }}
           path: .review-tmp/phase07/frozen-corpus
       - name: Validate the empty-root frozen extraction before private cloning
         run: >
