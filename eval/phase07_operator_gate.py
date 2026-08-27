@@ -53,6 +53,12 @@ STAGES = frozenset({"preflight", "screening", "confirmation", "continuation", "p
 INFRA_FAILURES = frozenset({"github_infrastructure", "hosted_runner_unavailable", "artifact_service"})
 SECRET_MARKERS = ("token", "secret", "password", "authorization", "private_key", "ghp_")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_EXACT_ARTIFACT_DOWNLOAD_PATH = re.compile(
+    r"^/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/artifacts/[1-9][0-9]*/zip$"
+)
+_ACTIONS_RESULTS_BLOB_HOST = re.compile(
+    r"^productionresultssa[0-9]+\.blob\.core\.windows\.net$"
+)
 STAGE1_RUNTIME_FIELDS = frozenset({
     "branch", "workflow_path", "head_sha", "run_id", "run_attempt", "job_key", "job_allocation_nonce", "runtime",
 })
@@ -143,10 +149,13 @@ def _safe_frozen_archive_member(name: object, *, seen: set[str], folded: set[str
     return pure
 
 
-def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: str) -> None:
+def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: str,
+                            test_expected_corpus_identity: object | None = None) -> None:
     """Extract only regular ZIP members into a newly-created canonical root."""
     if archive.is_symlink() or not archive.is_file() or root.exists() or root.is_symlink():
         raise ValueError("frozen archive extraction root")
+    if test_expected_corpus_identity is not None and not os.environ.get("PYTEST_CURRENT_TEST"):
+        raise ValueError("test-only frozen corpus identity")
     root.parent.mkdir(parents=True, exist_ok=True)
     if root.parent.is_symlink():
         raise ValueError("frozen archive extraction parent")
@@ -171,7 +180,10 @@ def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: 
                 with source.open(member, "r") as input_stream, destination.open("xb") as output_stream:
                     shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
         from eval.phase07_frozen_base import validate_frozen_base
-        actual_tree_sha256 = validate_frozen_base(root, expected_wiki_root=root / "Wiki")
+        actual_tree_sha256 = validate_frozen_base(
+            root, expected_wiki_root=root / "Wiki",
+            expected_corpus_identity=test_expected_corpus_identity,
+        )
         if actual_tree_sha256 != expected_tree_sha256:
             raise ValueError("frozen archive tree digest")
     except Exception:
@@ -182,7 +194,8 @@ def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: 
 
 
 def download_frozen_artifact(*, frozen_prepare: object, token: str, archive: Path,
-                             frozen_dir: Path, client: Any | None = None) -> None:
+                             frozen_dir: Path, client: Any | None = None,
+                             test_expected_corpus_identity: object | None = None) -> None:
     """Fetch exactly one sealed artifact ID and securely unpack its verified ZIP.
 
     Artifact names, latest-run endpoints, and artifact-list selection are
@@ -214,6 +227,7 @@ def download_frozen_artifact(*, frozen_prepare: object, token: str, archive: Pat
         _extract_frozen_archive(
             archive=archive, root=frozen_dir,
             expected_tree_sha256=prepare["base_tree_sha256"],
+            test_expected_corpus_identity=test_expected_corpus_identity,
         )
     except Exception:
         archive.unlink(missing_ok=True)
@@ -1481,6 +1495,44 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
     return 0
 
 
+def _safe_https_url(value: object) -> urllib.parse.SplitResult | None:
+    """Parse a no-userinfo, no-port HTTPS URL without normalizing aliases."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        # Accessing ``port`` validates malformed ``:port`` spellings too.
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.username is not None or parsed.password is not None or port is not None:
+        return None
+    return parsed
+
+
+def _is_exact_artifact_api_url(value: object) -> bool:
+    """Recognize the one allowed authenticated GitHub Actions artifact URL."""
+    parsed = _safe_https_url(value)
+    return bool(
+        parsed is not None
+        and (parsed.hostname or "").lower() == "api.github.com"
+        and not parsed.query
+        and not parsed.fragment
+        and _EXACT_ARTIFACT_DOWNLOAD_PATH.fullmatch(parsed.path)
+    )
+
+
+def _is_actions_results_blob_url(value: object) -> bool:
+    """Recognize GitHub Actions' narrow production Results Blob account family."""
+    parsed = _safe_https_url(value)
+    return bool(
+        parsed is not None
+        and _ACTIONS_RESULTS_BLOB_HOST.fullmatch((parsed.hostname or "").lower())
+        and parsed.path.startswith("/")
+        and not parsed.fragment
+    )
+
+
 class GitHubActionsClient:
     """Minimal fakeable stdlib client; its token is header-only and never serialized."""
     def get_json(self, url: str, token: str) -> dict[str, Any]:
@@ -1499,19 +1551,21 @@ class GitHubActionsClient:
         return value
 
     def download_artifact(self, path: str, token: str) -> bytes:
-        """Read one archive endpoint, allowing only GitHub-owned HTTPS redirects."""
-        if not isinstance(path, str) or not path.startswith("/repos/") or not token:
+        """Read one exact artifact ID, with one credential-free Results storage hop."""
+        if not isinstance(path, str) or not _EXACT_ARTIFACT_DOWNLOAD_PATH.fullmatch(path) or not token:
             raise ValueError("exact artifact download request")
 
-        class _GitHubOnlyRedirect(urllib.request.HTTPRedirectHandler):
+        class _ActionsResultsRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
-                parsed = urllib.parse.urlparse(newurl)
-                host = (parsed.hostname or "").lower()
-                if parsed.scheme != "https" or not (host == "github.com" or host.endswith(".github.com")
-                                                     or host == "githubusercontent.com" or host.endswith(".githubusercontent.com")):
-                    raise urllib.error.HTTPError(newurl, code, "non-GitHub artifact redirect", headers, fp)
-                # Redirect targets are signed URLs.  Deliberately do not forward
-                # Authorization outside api.github.com.
+                # Only the authenticated API request may redirect.  As the
+                # returned request cannot satisfy this exact API predicate, a
+                # second cross-origin redirect fails closed.
+                if code not in {301, 302, 303, 307, 308} or not _is_exact_artifact_api_url(request.full_url) \
+                        or not _is_actions_results_blob_url(newurl):
+                    raise urllib.error.HTTPError(newurl, code, "unsafe artifact redirect", headers, fp)
+                # Results URLs are signed capabilities.  Construct a fresh GET
+                # request with only a content-negotiation header so bearer,
+                # cookie, and any other credentials cannot cross origins.
                 return urllib.request.Request(newurl, headers={"Accept": "application/octet-stream"})
 
         request = urllib.request.Request(
@@ -1519,7 +1573,7 @@ class GitHubActionsClient:
             headers={"Accept": "application/octet-stream", "Authorization": f"Bearer {token}"},
         )
         try:
-            opener = urllib.request.build_opener(_GitHubOnlyRedirect())
+            opener = urllib.request.build_opener(_ActionsResultsRedirect())
             with opener.open(request, timeout=30) as response:
                 if getattr(response, "status", response.getcode()) != 200:
                     raise ValueError("exact artifact download status")

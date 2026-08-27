@@ -1356,13 +1356,15 @@ def test_phase07_role_download_uses_the_exact_prepare_run_and_artifact_identity(
     assert "artifact-ids:" not in hybrid
 
 
-def _frozen_prepare_download_identity(archive: bytes, *, artifact_id: int = 73) -> dict:
+def _frozen_prepare_download_identity(
+    archive: bytes, *, artifact_id: int = 73, base_tree_sha256: str = "c" * 64,
+) -> dict:
     return {
         "repository": "allenwoo713/obsidian_wiki_skill", "head_sha": "a" * 40,
         "run_id": 71, "run_attempt": 1, "job_id": 72, "artifact_id": artifact_id,
         "artifact_name": "phase07-frozen-base-71-1",
         "archive_sha256": hashlib.sha256(archive).hexdigest(), "archive_size_bytes": len(archive),
-        "descriptor_self_sha256": "b" * 64, "base_tree_sha256": "c" * 64,
+        "descriptor_self_sha256": "b" * 64, "base_tree_sha256": base_tree_sha256,
         "model_manifest_sha256": "d" * 64, "corpus_manifest_sha256": "e" * 64,
         "generator_recipe_sha256": "f" * 64,
         "runtime": {"python": "3.13", "numpy": "2.2.6"},
@@ -1380,6 +1382,42 @@ def _frozen_zip(members: dict[str, bytes]) -> bytes:
         for name, content in members.items():
             archive.writestr(name, content)
     return output.getvalue()
+
+
+def _real_tiny_frozen_archive(root: Path) -> tuple[bytes, str, dict[str, object]]:
+    """Produce a real sealed tiny corpus at its eventual extraction root."""
+    from io import BytesIO
+
+    from eval.phase07_frozen_base import prepare_frozen_base
+    from eval.run_eval import expected_phase07_expanded_corpus_identity
+
+    wiki = root / "Wiki"
+    page = wiki / "concepts" / "redirect.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\ntype: concept\ntitle: Redirect corpus\nsources: []\ntags: []\nrelated: []\n---\n\n"
+        "# Redirect corpus\n\nSEALEDREDIRECT unique frozen validation text.\n",
+        encoding="utf-8",
+    )
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    expected_corpus_identity = expected_phase07_expanded_corpus_identity(
+        fixture_root=wiki, target_size=1, test_only=True,
+    )
+    descriptor = prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=root, embed=embed,
+        tokenizer=lambda text, **_kwargs: {"input_ids": list(range(max(1, len(text) // 4)))},
+        expected_corpus_identity=expected_corpus_identity,
+    )
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+            if member.is_file():
+                archive.write(member, member.relative_to(root).as_posix())
+    shutil.rmtree(root)
+    return output.getvalue(), str(descriptor["frozen_tree_sha256"]), expected_corpus_identity
 
 
 class _ExactFrozenArchiveClient:
@@ -1478,6 +1516,31 @@ def test_github_actions_client_rejects_noncanonical_artifact_endpoint(path: str)
         phase07_operator_gate.GitHubActionsClient().download_artifact(path, "fixture-token")
 
 
+@pytest.mark.parametrize("redirects", (
+    ["http://productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed"],
+    ["https://not-results.blob.core.windows.net/actions-results/archive?sig=sealed"],
+    ["https://user@productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed"],
+    ["https://productionresultssa0.blob.core.windows.net:443/actions-results/archive?sig=sealed"],
+    ["https://productionresultssa0.blob.core.windows.net.evil.test/actions-results/archive?sig=sealed"],
+    [
+        "https://productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed",
+        "https://productionresultssa1.blob.core.windows.net/actions-results/archive?sig=second",
+    ],
+), ids=("http", "non-actions-azure", "userinfo", "port", "hostname-alias", "second-redirect"))
+def test_github_actions_client_rejects_unsafe_artifact_redirects(
+    monkeypatch: pytest.MonkeyPatch, redirects: list[str],
+) -> None:
+    """No generic Azure target, credential URL alias, or second hop is accepted."""
+    def build_opener(handler: object) -> _RedirectingArtifactOpener:
+        return _RedirectingArtifactOpener(handler, redirects, b"should-not-arrive")
+
+    monkeypatch.setattr(phase07_operator_gate.urllib.request, "build_opener", build_opener)
+    with pytest.raises(ValueError, match="exact artifact download unavailable"):
+        phase07_operator_gate.GitHubActionsClient().download_artifact(
+            "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip", "fixture-token",
+        )
+
+
 @pytest.mark.parametrize("members,accepted", (
     ({"Wiki/page.md": b"page", "lance_db/data": b"db", ".index/state": b"state",
       "graph.json": b"{}", "pages.json": b"[]", "frozen-base.json": b"{}"}, True),
@@ -1495,9 +1558,11 @@ def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
     client = _ExactFrozenArchiveClient(archive_bytes)
     validated: list[Path] = []
 
-    def validate(root: Path, *, expected_wiki_root: Path) -> str:
+    def validate(root: Path, *, expected_wiki_root: Path,
+                 expected_corpus_identity: object | None = None) -> str:
         validated.append(root)
         assert expected_wiki_root == root / "Wiki"
+        assert expected_corpus_identity is None
         return "c" * 64
 
     monkeypatch.setattr(frozen_base, "validate_frozen_base", validate)
@@ -1518,6 +1583,64 @@ def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
                 archive=archive, frozen_dir=root, client=client,
             )
         assert not root.exists()
+
+
+def test_frozen_download_real_tiny_zip_extracts_and_validates_canonical_base(tmp_path: Path) -> None:
+    """The collector validates an actual sealed ZIP through the real frozen-base verifier."""
+    payload, tree_sha256, expected_corpus_identity = _real_tiny_frozen_archive(tmp_path / "frozen-corpus")
+    client = _ExactFrozenArchiveClient(payload)
+    phase07_operator_gate.download_frozen_artifact(
+        frozen_prepare=_frozen_prepare_download_identity(payload, base_tree_sha256=tree_sha256),
+        token="fixture-token", archive=tmp_path / "prepare.zip",
+        frozen_dir=tmp_path / "frozen-corpus", client=client,
+        test_expected_corpus_identity=expected_corpus_identity,
+    )
+
+    from eval.phase07_frozen_base import validate_frozen_base
+
+    assert client.calls == ["/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"]
+    assert validate_frozen_base(
+        tmp_path / "frozen-corpus", expected_wiki_root=tmp_path / "frozen-corpus" / "Wiki",
+        expected_corpus_identity=expected_corpus_identity,
+    ) == tree_sha256
+
+
+@pytest.mark.parametrize("field,value", (
+    ("archive_sha256", "0" * 64),
+    ("archive_size_bytes", 1),
+), ids=("digest", "size"))
+def test_frozen_download_rejects_wrong_sealed_archive_digest_or_size(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    payload, tree_sha256, _expected_corpus_identity = _real_tiny_frozen_archive(tmp_path / "frozen-corpus")
+    identity = _frozen_prepare_download_identity(payload, base_tree_sha256=tree_sha256)
+    identity[field] = value
+    with pytest.raises(ValueError, match="archive digest/size"):
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=identity, token="fixture-token", archive=tmp_path / "prepare.zip",
+            frozen_dir=tmp_path / "frozen-corpus", client=_ExactFrozenArchiveClient(payload),
+        )
+    assert not (tmp_path / "prepare.zip").exists()
+    assert not (tmp_path / "frozen-corpus").exists()
+
+
+def test_frozen_download_rejects_casefold_alias_before_real_base_validation(tmp_path: Path) -> None:
+    payload, tree_sha256, _expected_corpus_identity = _real_tiny_frozen_archive(tmp_path / "frozen-corpus")
+    from io import BytesIO
+
+    source, aliased = BytesIO(payload), BytesIO()
+    with zipfile.ZipFile(source) as input_zip, zipfile.ZipFile(aliased, "w") as output_zip:
+        for member in input_zip.infolist():
+            output_zip.writestr(member, input_zip.read(member))
+        output_zip.writestr("wiki/CONCEPTS/REDIRECT.md", b"casefold alias")
+    archive = aliased.getvalue()
+    with pytest.raises(ValueError, match="ambiguous frozen archive member"):
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=_frozen_prepare_download_identity(archive, base_tree_sha256=tree_sha256),
+            token="fixture-token", archive=tmp_path / "prepare.zip",
+            frozen_dir=tmp_path / "frozen-corpus", client=_ExactFrozenArchiveClient(archive),
+        )
+    assert not (tmp_path / "frozen-corpus").exists()
 
 
 def test_frozen_download_rejects_a_different_artifact_id_before_any_extraction(tmp_path: Path) -> None:
