@@ -105,13 +105,10 @@ def test_frozen_prepare_has_no_future_id_gate_and_failed_prepare_emits_zero_role
     assert bundle["campaign_stage"] == "hybrid-prepare"
     assert "artifact_id" not in bundle["local_preflight"]
     assert operator.build_frozen_role_bundles({"status": "cancelled"}, expected_head=HEAD) == []
-    provenance = {
-        "status": "success", "head_sha": HEAD, "run_id": 10, "run_attempt": 1, "job_id": 11,
-        "artifact_id": 12, "archive_sha256": hashlib.sha256(b"archive").hexdigest(),
-        "descriptor_sha256": preflight["descriptor_sha256"], "tree_sha256": preflight["tree_sha256"],
-        "uploaded_bytes": 8, "retention_days": 90, "replacement_for_run_id": None,
-    }
-    roles = operator.build_frozen_role_bundles(provenance, expected_head=HEAD)
+    roles = operator.build_frozen_role_bundles(
+        _frozen_prepare_identity(), expected_head=HEAD,
+        locked_execution=_locked_confirmation_environment(),
+    )
     assert [(row["role"], row["config"]["m"]) for row in roles] == [("baseline", 16), ("m20", 20), ("m32", 32)]
 
 

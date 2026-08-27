@@ -114,6 +114,60 @@ FROZEN_ROLE_CONFIGS = (
     ("m32", {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300}),
 )
 
+_FROZEN_PREPARE_IDENTITY_FIELDS = frozenset({
+    "run_id", "run_attempt", "job_id", "artifact_id", "archive_sha256",
+    "descriptor_sha256", "tree_sha256", "head_sha", "runtime",
+    "model_manifest_sha256", "corpus_manifest_sha256", "retention_days",
+    "replacement_for_run_id", "status", "conclusion", "artifact_created_at",
+    "artifact_expires_at",
+})
+
+
+def validate_frozen_prepare_identity(identity: object, *, expected_head: str,
+                                     locked_execution: object) -> dict[str, Any]:
+    """Validate the completed prepare artifact before it can mint role input.
+
+    A prepare bundle deliberately has no remote identity: those identifiers do
+    not exist until its one hosted run completes.  This is the boundary where
+    that future identity becomes mandatory, including the locked source/runtime
+    facts which the three role packets must share.
+    """
+    if not SHA.fullmatch(expected_head) or not isinstance(identity, dict) \
+            or set(identity) != _FROZEN_PREPARE_IDENTITY_FIELDS:
+        raise ValueError("strict frozen prepare identity")
+    if identity.get("head_sha") != expected_head or identity.get("run_attempt") != 1 \
+            or identity.get("retention_days") != 90 \
+            or identity.get("replacement_for_run_id") is not None \
+            or identity.get("status") != "completed" \
+            or identity.get("conclusion") != "success":
+        raise ValueError("frozen prepare status/attempt/head/retention")
+    if not all(isinstance(identity[name], int) and not isinstance(identity[name], bool)
+               and identity[name] > 0 for name in ("run_id", "job_id", "artifact_id")):
+        raise ValueError("frozen prepare API identity")
+    if not all(isinstance(identity[name], str) and HEX64.fullmatch(identity[name])
+               for name in ("archive_sha256", "descriptor_sha256", "tree_sha256",
+                            "model_manifest_sha256", "corpus_manifest_sha256")):
+        raise ValueError("frozen prepare digest identity")
+
+    # Reuse the production locked-execution validator.  A hand-written runtime
+    # dictionary may not be substituted for the exact checkout facts.
+    from eval.phase07_ann_campaign import validate_confirmation_execution
+    execution = validate_confirmation_execution(
+        locked_execution,
+        model_manifest_sha256=identity["model_manifest_sha256"],
+        corpus_manifest_sha256=identity["corpus_manifest_sha256"],
+    )
+    if execution["head_sha"] != expected_head or identity["runtime"] != execution["runtime"]:
+        raise ValueError("frozen prepare locked execution binding")
+
+    created = _parse_utc_timestamp(identity["artifact_created_at"], label="prepare artifact creation")
+    expires = _parse_utc_timestamp(identity["artifact_expires_at"], label="prepare artifact expiry")
+    if created >= expires or expires <= dt.datetime.now(dt.timezone.utc) \
+            or not dt.timedelta(days=89, hours=23, minutes=59, seconds=30) \
+            <= expires - created <= dt.timedelta(days=90, seconds=30):
+        raise ValueError("frozen prepare artifact retention")
+    return identity
+
 
 def build_frozen_prepare_bundle(local_preflight: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
     """Mint the sole non-authorizing prepare bundle from measured local facts.
@@ -154,29 +208,24 @@ def validate_frozen_prepare_bundle(value: object, *, expected_head: str) -> dict
     return value
 
 
-def build_frozen_role_bundles(prepare_provenance: object, *, expected_head: str) -> list[dict[str, Any]]:
+def build_frozen_role_bundles(prepare_provenance: object, *, expected_head: str,
+                              locked_execution: object | None = None) -> list[dict[str, Any]]:
     """Return exactly three role bundles only after one successful API-bound prepare.
 
     Rejected, pending, retry, replacement, expired, or malformed prepare evidence
     has one safe output: zero role bundles.
     """
-    fields = {
-        "status", "head_sha", "run_id", "run_attempt", "job_id", "artifact_id", "archive_sha256",
-        "descriptor_sha256", "tree_sha256", "uploaded_bytes", "retention_days", "replacement_for_run_id",
-    }
-    if not isinstance(prepare_provenance, dict) or set(prepare_provenance) != fields \
-            or prepare_provenance.get("status") != "success" or prepare_provenance.get("head_sha") != expected_head \
-            or prepare_provenance.get("run_attempt") != 1 or prepare_provenance.get("retention_days") != 90 \
-            or prepare_provenance.get("replacement_for_run_id") is not None:
+    if locked_execution is None:
         return []
-    if not all(isinstance(prepare_provenance.get(name), int) and not isinstance(prepare_provenance[name], bool) and prepare_provenance[name] > 0
-               for name in ("run_id", "job_id", "artifact_id", "uploaded_bytes")) \
-            or not all(isinstance(prepare_provenance.get(name), str) and HEX64.fullmatch(prepare_provenance[name])
-                       for name in ("archive_sha256", "descriptor_sha256", "tree_sha256")):
+    try:
+        prepare = validate_frozen_prepare_identity(
+            prepare_provenance, expected_head=expected_head, locked_execution=locked_execution,
+        )
+    except ValueError:
         return []
     base = {
         "schema_version": 1, "campaign_stage": "hybrid", "head_sha": expected_head,
-        "prepare": dict(prepare_provenance), "authorization": "none", "retention_days": 90,
+        "prepare": dict(prepare), "authorization": "none", "retention_days": 90,
     }
     return [
         _sealed({**base, "role": role, "config": dict(config), "dispatch_identity": f"phase07-hybrid/{role}"})
