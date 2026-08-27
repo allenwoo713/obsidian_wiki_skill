@@ -81,6 +81,17 @@ def _embed384(seed: int = 0):
     return embed
 
 
+def _phase07_test_corpus_identity(wiki: Path) -> dict[str, object]:
+    """The only small-corpus seam is an explicit pytest-only identity."""
+    from eval.run_eval import expected_phase07_expanded_corpus_identity
+
+    return expected_phase07_expanded_corpus_identity(
+        fixture_root=wiki,
+        target_size=sum(1 for path in wiki.rglob("*.md") if path.is_file()),
+        test_only=True,
+    )
+
+
 class _FacadeEmbedder:
     """Small deterministic embedder that still exercises WikiIndex's public build path."""
 
@@ -804,6 +815,7 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     frozen = tmp_path / "prepared"
     descriptor = prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
     )
 
     assert descriptor["schema_version"] == 1
@@ -841,6 +853,7 @@ def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_pat
     frozen = tmp_path / "frozen"
     prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=300,
@@ -887,6 +900,7 @@ def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_reloca
     _write_page(wiki, "# Canonical root\n\nCANONICALROOTTERM\n")
     prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=root_a, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
     )
     assert validate_frozen_base(root_a, expected_wiki_root=root_a / "Wiki")
 
@@ -994,6 +1008,7 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
     prepare_frozen_base(
         wiki_dir=frozen / "Wiki", frozen_dir=frozen,
         embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(frozen / "Wiki"),
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=100,
@@ -1013,6 +1028,77 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
     )
     assert writes == [Path(result["manifest_path"])]
     assert (index_dir / "ACTIVE_INDEX").is_file()
+
+
+def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nested_sidecars_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#6: a descriptor may not bless a tiny/self-reported source or hidden policy file."""
+    from eval.phase07_frozen_base import FrozenBaseError, finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Canonical corpus\n\nCANONICALCORPUSIDENTITYTERM\n")
+    with pytest.raises(FrozenBaseError, match="corpus identity"):
+        prepare_frozen_base(
+            wiki_dir=wiki, frozen_dir=tmp_path / "default-rejects-tiny",
+            embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        )
+
+    frozen = tmp_path / "frozen"
+    descriptor = prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+    )
+    assert descriptor["expected_corpus_identity"] == _phase07_test_corpus_identity(wiki)
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    (frozen / "Wiki" / "nested" / "candidate-policy.json").parent.mkdir(parents=True)
+    (frozen / "Wiki" / "nested" / "candidate-policy.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("untrusted frozen tree reached clone"),
+    )
+    with pytest.raises(FrozenBaseError):
+        finalize_private_role(
+            frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy,
+        )
+    assert not (tmp_path / "clone").exists()
+
+
+def test_phase07_private_finalizer_marks_every_pre_pointer_clone_failure_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The record/build/clone/HNSW window has one pre-commit failure outcome."""
+    from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Clone fault\n\nCLONEFAULTTERM\n")
+    frozen = tmp_path / "frozen"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(LanceDbIndexRepository, "clone_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("clone boom")))
+    target = tmp_path / "clone"
+    private = tmp_path / "private"
+    with pytest.raises(RuntimeError, match="clone boom"):
+        finalize_private_role(
+            frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, publish_index_dir=private,
+        )
+    builds = list((private / "builds").glob("*"))
+    assert len(builds) == 1
+    assert (builds[0] / ".failed").is_file()
+    assert not (private / "ACTIVE_INDEX").exists()
 
 
 def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_collector_data() -> None:
