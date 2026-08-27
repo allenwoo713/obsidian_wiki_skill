@@ -757,7 +757,8 @@ def run_phase07_representative_campaign(
 def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir: Path, embed=None,
                                                   query_limit: int | None = None,
                                                   progress_sink=None,
-                                                  frozen_dir: Path | None = None) -> dict:
+                                                  frozen_dir: Path | None = None,
+                                                  _expected_frozen_corpus_identity: dict | None = None) -> dict:
     """Run one sealed hybrid *role* with an operator-minted capability.
 
     A role is either the shared baseline or one candidate.  It builds exactly
@@ -767,7 +768,10 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
     three sealed role artifacts are reconciled; this runner never has both
     sides of a comparison in memory.  ``embed`` plus ``query_limit`` is a
     pytest-only finite integration seam; normal execution materializes the
-    sealed 30k corpus and evaluates all 105 committed queries.
+    sealed 30k corpus and evaluates all 105 committed queries.  The
+    underscored frozen-corpus identity is an internal test seam only: neither
+    dispatch nor the CLI accepts it, so default production validation remains
+    bound to the committed 30k identity.
     """
     from eval.phase07_operator_gate import _consume_hybrid_execution_capability
 
@@ -807,7 +811,10 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         from eval.phase07_frozen_base import validate_frozen_base
         frozen_dir = Path(frozen_dir).resolve()
         expanded_wiki = frozen_dir / "Wiki"
-        base_tree_sha256 = validate_frozen_base(frozen_dir, expected_wiki_root=expanded_wiki)
+        base_tree_sha256 = validate_frozen_base(
+            frozen_dir, expected_wiki_root=expanded_wiki,
+            expected_corpus_identity=_expected_frozen_corpus_identity,
+        )
         if not isinstance(frozen_prepare, dict):
             raise ValueError("frozen source requires collector-bound prepare provenance")
         descriptor = json.loads((frozen_dir / "frozen-base.json").read_text(encoding="utf-8"))
@@ -858,6 +865,7 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
                 expected_wiki_root=wiki,
                 candidate_query_policy=policy,
                 publish_index_dir=index_dir,
+                expected_corpus_identity=_expected_frozen_corpus_identity,
             )
             index = WikiIndex(Path(finalized["index_dir"]))
             index.load()
@@ -921,7 +929,10 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
             print(f"[phase07-hybrid] role={role} expanded_queries={completed}/{len(queries)} complete", flush=True)
     if frozen_dir is not None:
         from eval.phase07_frozen_base import validate_frozen_base
-        source_after_sha256 = validate_frozen_base(frozen_dir, expected_wiki_root=expanded_wiki)
+        source_after_sha256 = validate_frozen_base(
+            frozen_dir, expected_wiki_root=expanded_wiki,
+            expected_corpus_identity=_expected_frozen_corpus_identity,
+        )
         if source_after_sha256 != base_tree_sha256:
             raise ValueError("frozen source mutated during private hybrid lifecycle")
         frozen_source_evidence["source_after_sha256"] = source_after_sha256

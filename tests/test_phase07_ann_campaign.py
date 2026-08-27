@@ -586,6 +586,162 @@ def _hybrid_dispatch_bundle(plan: dict, *, role: str = "m20", m: int = 20) -> di
                 and bundle["workflow_input"]["config"]["m"] == (16 if role == "baseline" else m))
 
 
+def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 105×2 frozen role clones its source; it never rebuilds the expanded corpus."""
+    import inspect
+    import build_index
+    import eval.run_eval as run_eval
+    from eval.phase07_frozen_base import prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: PLC0415
+    from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: PLC0415
+
+    frozen = tmp_path / "frozen-source"
+    frozen_wiki = frozen / "Wiki"
+    source_identity = {
+        "expanded_content_tree_sha256": canonical_content_tree_sha256(ROOT / "tests" / "fixtures" / "wiki"),
+        "expanded_member_count": sum(1 for path in (ROOT / "tests" / "fixtures" / "wiki").rglob("*.md") if path.is_file()),
+    }
+    descriptor = prepare_frozen_base(
+        wiki_dir=ROOT / "tests" / "fixtures" / "wiki", frozen_dir=frozen,
+        embed=_embed384(), expected_corpus_identity=source_identity,
+    )
+    source_before = validate_frozen_base(
+        frozen, expected_wiki_root=frozen_wiki, expected_corpus_identity=source_identity,
+    )
+    frozen_prepare = _frozen_prepare_identity()
+    frozen_prepare.update(
+        descriptor_self_sha256=descriptor["record_self_sha256"],
+        base_tree_sha256=source_before,
+        model_manifest_sha256=descriptor["model_manifest_sha256"],
+        corpus_manifest_sha256=descriptor["corpus_manifest_sha256"],
+        generator_recipe_sha256=descriptor["generator_recipe_sha256"],
+        runtime=descriptor["runtime"],
+    )
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    # Rebuild the dispatch from the actual frozen descriptor rather than its
+    # shape-only fixture identity.
+    bundle = next(
+        item for item in operator.build_frozen_role_dispatch_bundles(
+            hybrid_request=plan["hybrid_request"], frozen_prepare=frozen_prepare, expected_head=HEAD,
+        )
+        if item["workflow_input"]["role"] == "m20"
+    )
+
+    root = tmp_path / "hybrid-m20-m20"
+    materialize_calls: list[object] = []
+    original_builds: list[Path] = []
+    scan_calls: list[Path] = []
+    embed_calls: list[int] = []
+    persist_calls: list[Path] = []
+    graph_calls: list[tuple[Path, Path]] = []
+    public_queries: list[dict] = []
+    markers: list[dict] = []
+
+    monkeypatch.setattr(
+        run_eval, "_materialize_phase07_expanded_corpus",
+        lambda **_kwargs: materialize_calls.append(_kwargs) or pytest.fail("frozen role materialized expanded corpus"),
+    )
+    real_build = build_index.build_storage_contract
+
+    def record_public_build(wiki_dir, index_dir, **kwargs):
+        assert Path(wiki_dir) != frozen_wiki
+        original_builds.append(Path(index_dir))
+        return real_build(wiki_dir, index_dir, **kwargs)
+
+    monkeypatch.setattr(build_index, "build_storage_contract", record_public_build)
+    real_sparse_plan = IndexBuildService._sparse_plan
+
+    def record_scan_chunk(wiki_dir):
+        assert Path(wiki_dir) != frozen_wiki
+        scan_calls.append(Path(wiki_dir))
+        return real_sparse_plan(wiki_dir)
+
+    monkeypatch.setattr(IndexBuildService, "_sparse_plan", staticmethod(record_scan_chunk))
+    real_persist = LanceDbIndexRepository.persist
+
+    def record_persist(self, lance_dir, *args, **kwargs):
+        assert not str(Path(lance_dir)).startswith(str(root / "expanded-private-clone"))
+        persist_calls.append(Path(lance_dir))
+        return real_persist(self, lance_dir, *args, **kwargs)
+
+    monkeypatch.setattr(LanceDbIndexRepository, "persist", record_persist)
+    real_graph_writer = run_eval.write_graph_artifact
+
+    def record_graph_writer(wiki, index_dir):
+        assert Path(wiki) != frozen_wiki
+        graph_calls.append((Path(wiki), Path(index_dir)))
+        return real_graph_writer(wiki, index_dir)
+
+    monkeypatch.setattr(run_eval, "write_graph_artifact", record_graph_writer)
+    real_hybrid_search = run_eval.hybrid_search
+
+    def record_public_hybrid_search(*args, **kwargs):
+        assert not {"candidate", "candidate_config", "candidate_aware"} & set(kwargs)
+        public_queries.append(dict(kwargs))
+        return real_hybrid_search(*args, **kwargs)
+
+    monkeypatch.setattr(run_eval, "hybrid_search", record_public_hybrid_search)
+
+    def runner_embed(texts):
+        embed_calls.append(len(texts))
+        return _embed384()(texts)
+
+    def production_runner(*, capability: object, work_dir: Path) -> dict:
+        return run_eval._run_phase07_hybrid_campaign_with_capability(
+            capability=capability, work_dir=work_dir, frozen_dir=frozen,
+            embed=runner_embed, progress_sink=markers.append,
+            _expected_frozen_corpus_identity=source_identity,
+        )
+
+    # The public dispatcher exposes no caller-controlled tiny-corpus switch;
+    # the underscored runner seam is only consumed by this integration test.
+    assert "_expected_frozen_corpus_identity" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
+    result = operator.execute_hybrid_dispatch(
+        bundle=bundle, locked_execution=_locked_confirmation_environment(),
+        allocation={"run_id": 7, "run_attempt": 1, "job_id": 8,
+                    "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+        work_dir=tmp_path, runner=production_runner,
+    )
+
+    assert materialize_calls == []
+    assert len(original_builds) == len(scan_calls) == len(persist_calls) == len(graph_calls) == 1
+    assert embed_calls and all(count > 0 for count in embed_calls)
+    assert graph_calls[0][0] == root / "original" / "Wiki"
+    assert not (root / "expanded" / "Wiki").exists()
+    assert (root / "expanded-private-clone").is_dir()
+    assert result["frozen_prepare"] == frozen_prepare
+    assert result["source_before_sha256"] == result["source_after_sha256"] == source_before
+    assert validate_frozen_base(
+        frozen, expected_wiki_root=frozen_wiki, expected_corpus_identity=source_identity,
+    ) == source_before
+    assert result["query_count"] == 105
+    assert result["hybrid_invocation"] == {
+        "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
+        "original_calls": 105, "expanded_calls": 105,
+    }
+    assert len(public_queries) == 210
+    assert {Path(row["wiki_dir"]) for row in public_queries} == {root / "original" / "Wiki", frozen_wiki}
+    assert all(row["intent_override"] == "auto" and row["allow_local_fallback"] is True for row in public_queries)
+    assert [marker["stage"] for marker in markers if marker["corpus"] == "expanded"] == [
+        "private_clone_hnsw_publish_load",
+    ]
+    assert [marker["stage"] for marker in markers if marker["corpus"] == "original"] == [
+        "scan_chunk", "dense_embedding", "lance_fts_persist", "hnsw_create_index",
+        "validation_seal_publication", "graph_artifact", "load",
+    ]
+    for observations in (result["original_observations"], result["expanded_observations"]):
+        assert len(observations) == 105
+        payloads = [row["observation"]["result"] for row in observations]
+        assert all(payload["context_text"] and payload["context_sha256"] for payload in payloads)
+        assert any(payload["items"] for payload in payloads)
+        for payload in payloads:
+            for item in payload["items"]:
+                assert item["page_id"] and item["path"] and item["evidence"]
+                assert all({"source", "target", "signals"} == set(path) for path in item["graph_paths"])
+
+
 def test_hybrid_dispatch_module_cli_consumes_its_opaque_capability_before_filesystem_failure(
     tmp_path: Path,
 ) -> None:
