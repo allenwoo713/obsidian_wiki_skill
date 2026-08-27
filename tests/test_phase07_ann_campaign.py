@@ -115,6 +115,50 @@ def test_frozen_prepare_has_no_future_id_gate_and_failed_prepare_emits_zero_role
     assert [(row["role"], row["config"]["m"]) for row in roles] == [("baseline", 16), ("m20", 20), ("m32", 32)]
 
 
+def _frozen_prepare_identity() -> dict:
+    """One successful API-bound base identity shared by all frozen roles."""
+    runtime = _locked_confirmation_environment()["runtime"]
+    return {
+        "run_id": 101, "run_attempt": 1, "job_id": 201, "artifact_id": 301,
+        "archive_sha256": hashlib.sha256(b"frozen archive").hexdigest(),
+        "descriptor_sha256": hashlib.sha256(b"frozen descriptor").hexdigest(),
+        "tree_sha256": hashlib.sha256(b"frozen tree").hexdigest(),
+        "head_sha": HEAD, "runtime": runtime,
+        "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+        "corpus_manifest_sha256": CORPUS_MANIFEST_SHA256,
+        "retention_days": 90, "replacement_for_run_id": None,
+        "status": "completed", "conclusion": "success",
+        "artifact_created_at": "2099-01-01T00:00:00Z",
+        "artifact_expires_at": "2099-04-01T00:00:00Z",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda value: value.pop("descriptor_sha256"),
+        lambda value: value.__setitem__("run_attempt", 2),
+        lambda value: value.__setitem__("replacement_for_run_id", 1),
+        lambda value: value.__setitem__("conclusion", "cancelled"),
+        lambda value: value.__setitem__("artifact_expires_at", "2000-04-01T00:00:00Z"),
+        lambda value: value["runtime"].__setitem__("numpy", "0.0.0"),
+        lambda value: value.__setitem__("model_manifest_sha256", "0" * 64),
+    ),
+)
+def test_frozen_prepare_identity_fails_closed_before_role_authorization(mutate) -> None:
+    """No missing, stale, retry, replacement, failed, or mixed base may enter a role."""
+    identity = _frozen_prepare_identity()
+    assert operator.validate_frozen_prepare_identity(
+        identity, expected_head=HEAD, locked_execution=_locked_confirmation_environment(),
+    ) == identity
+    invalid = deepcopy(identity)
+    mutate(invalid)
+    with pytest.raises(ValueError):
+        operator.validate_frozen_prepare_identity(
+            invalid, expected_head=HEAD, locked_execution=_locked_confirmation_environment(),
+        )
+
+
 def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
     request = {
         "schema_version": 1, "stage": stage, "request_id": "request-1", "environment": {},
