@@ -17,7 +17,7 @@ on:
         required: false
         default: preflight
         type: choice
-        options: [preflight, screening, confirmation, hybrid]
+        options: [preflight, screening, confirmation, hybrid-prepare, hybrid]
       workflow_inputs:
         description: "Sealed generated Phase 07 campaign dispatch bundle"
         required: false
@@ -641,6 +641,39 @@ jobs:
         with:
           name: phase07-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
           path: .review-tmp/phase07/confirmation-artifact
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-hybrid-prepare:
+    name: "Phase 07 candidate-neutral frozen corpus prepare"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'hybrid-prepare' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Install exact numeric dependencies and validate the pinned local model
+        run: python -m pip install -r requirements.txt pytest
+      - name: Materialize only the sealed prepare bundle
+        env:
+          WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
+        run: >
+          python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); (d/'prepare-bundle.json').write_text(json.dumps(json.loads(os.environ['WORKFLOW_INPUTS']),sort_keys=True))"
+      - name: Materialize the fixed candidate-neutral 30k corpus
+        run: >
+          python -c "from pathlib import Path; from eval.run_eval import FIXTURES_WIKI,_materialize_phase07_expanded_corpus; _materialize_phase07_expanded_corpus(fixture_root=FIXTURES_WIKI,output_root=Path('.review-tmp/phase07/frozen-corpus/Wiki'),target_size=30000)"
+      - name: Prepare and seal only reusable source data
+        run: >
+          python -m eval.phase07_frozen_base prepare --wiki-dir .review-tmp/phase07/frozen-corpus/Wiki --frozen-dir .review-tmp/phase07/frozen-base --prepare-bundle .review-tmp/phase07/prepare-bundle.json
+      - name: Upload sealed frozen base, never a candidate packet
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-frozen-base-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/frozen-base
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
 

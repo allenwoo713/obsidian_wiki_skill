@@ -142,6 +142,18 @@ def build_frozen_prepare_bundle(local_preflight: dict[str, Any], *, expected_hea
     })
 
 
+def validate_frozen_prepare_bundle(value: object, *, expected_head: str) -> dict[str, Any]:
+    fields = {"schema_version", "campaign_stage", "head_sha", "local_preflight", "authorization", "retention_days", "record_self_sha256"}
+    if not isinstance(value, dict) or set(value) != fields or value.get("record_self_sha256") != canonical_digest(value) \
+            or value.get("campaign_stage") != "hybrid-prepare" or value.get("head_sha") != expected_head \
+            or value.get("authorization") != "none" or value.get("retention_days") != 90:
+        raise ValueError("sealed frozen prepare bundle")
+    # Reuse the source validator rather than creating a weaker second parser.
+    if build_frozen_prepare_bundle(value["local_preflight"], expected_head=expected_head) != value:
+        raise ValueError("sealed frozen prepare bundle")
+    return value
+
+
 def build_frozen_role_bundles(prepare_provenance: object, *, expected_head: str) -> list[dict[str, Any]]:
     """Return exactly three role bundles only after one successful API-bound prepare.
 

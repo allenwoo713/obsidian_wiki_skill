@@ -15,6 +15,7 @@ import shutil
 import stat
 import tarfile
 import unicodedata
+import argparse
 from pathlib import Path
 from typing import Any, Callable
 
@@ -348,3 +349,36 @@ def validate_frozen_role_provenance(records: list[dict[str, Any]], *, expected_h
     if len(run_ids) != 3 or len(job_ids) != 3 or len(artifact_ids) != 3:
         raise ValueError("frozen roles must be distinct")
     return records
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Hosted-only prepare entry point; it creates no candidate or role evidence."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("prepare",))
+    parser.add_argument("--wiki-dir", type=Path, required=True)
+    parser.add_argument("--frozen-dir", type=Path, required=True)
+    parser.add_argument("--prepare-bundle", type=Path, required=True)
+    args = parser.parse_args(argv)
+    from build_index import WikiIndex
+    from eval.phase07_operator_gate import validate_frozen_prepare_bundle
+
+    try:
+        bundle = json.loads(args.prepare_bundle.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FrozenBaseError("prepare bundle") from exc
+    expected_head = os.popen("git rev-parse HEAD").read().strip()
+    validate_frozen_prepare_bundle(bundle, expected_head=expected_head)
+
+    probe = WikiIndex(args.frozen_dir / ".embedder-probe")
+    embedder = probe._get_embedder()
+    descriptor = prepare_frozen_base(
+        wiki_dir=args.wiki_dir, frozen_dir=args.frozen_dir,
+        embed=lambda texts: embedder.encode(list(texts), show_progress_bar=False, normalize_embeddings=False),
+        tokenizer=embedder.tokenizer,
+    )
+    print(json.dumps({"authorization": "none", "descriptor": descriptor}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -353,7 +353,7 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
 
     assert set(dispatch) == {"campaign_stage", "workflow_inputs"}
     assert dispatch["campaign_stage"]["options"] == [
-        "preflight", "screening", "confirmation", "hybrid",
+        "preflight", "screening", "confirmation", "hybrid-prepare", "hybrid",
     ]
     assert dispatch["workflow_inputs"]["description"] == (
         "Sealed generated Phase 07 campaign dispatch bundle"
@@ -1285,7 +1285,7 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
     dispatch = workflow["on"]["workflow_dispatch"]["inputs"]
 
     assert dispatch["campaign_stage"]["options"] == [
-        "preflight", "screening", "confirmation", "hybrid",
+        "preflight", "screening", "confirmation", "hybrid-prepare", "hybrid",
     ]
     assert dispatch["workflow_inputs"]["description"] == (
         "Sealed generated Phase 07 campaign dispatch bundle"
@@ -1313,6 +1313,20 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
     assert "if: ${{ always() }}" in hybrid
     assert "representative" not in hybrid.lower()
     assert "generic campaign" not in hybrid.lower()
+
+
+def test_phase07_frozen_prepare_is_a_separate_120_minute_non_authorizing_job() -> None:
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["phase07-hybrid-prepare"]
+    section = source.split("  phase07-hybrid-prepare:", 1)[1].split("  phase07-hybrid:", 1)[0]
+    assert job["timeout-minutes"] == "120"
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    assert "inputs.campaign_stage == 'hybrid-prepare'" in job["if"]
+    assert "eval.phase07_frozen_base prepare" in section
+    assert "include-hidden-files: true" in section
+    assert "retention-days: 90" in section
+    assert "phase07-hybrid" not in section
 
 
 def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
