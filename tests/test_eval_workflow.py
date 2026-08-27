@@ -10,6 +10,7 @@ import subprocess
 import sys
 import zipfile
 from copy import deepcopy
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -1393,6 +1394,88 @@ class _ExactFrozenArchiveClient:
         if path != "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip":
             raise ValueError("unknown artifact ID")
         return self.archive
+
+
+class _ArtifactRedirectResponse:
+    """Small in-memory HTTP response for the stdlib client redirect seam."""
+
+    status = 200
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self) -> bytes:
+        return self.payload
+
+
+class _RedirectingArtifactOpener:
+    """Mock transport that deliberately invokes the production redirect handler."""
+
+    def __init__(self, handler: object, redirects: list[str], payload: bytes) -> None:
+        self.handler = handler
+        self.redirects = redirects
+        self.payload = payload
+        self.requests: list[object] = []
+
+    def open(self, request: object, timeout: int) -> _ArtifactRedirectResponse:
+        del timeout
+        current = request
+        self.requests.append(current)
+        for target in self.redirects:
+            current = self.handler.redirect_request(  # type: ignore[attr-defined]
+                current, None, 302, "Found", SimpleNamespace(), target,
+            )
+            self.requests.append(current)
+        return _ArtifactRedirectResponse(self.payload)
+
+
+def test_github_actions_client_allows_one_exact_results_blob_redirect_and_strips_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real redirect handler permits only GitHub's signed results storage hop."""
+    captured: list[_RedirectingArtifactOpener] = []
+
+    def build_opener(handler: object) -> _RedirectingArtifactOpener:
+        opener = _RedirectingArtifactOpener(
+            handler,
+            ["https://productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed"],
+            b"frozen-zip",
+        )
+        captured.append(opener)
+        return opener
+
+    monkeypatch.setattr(phase07_operator_gate.urllib.request, "build_opener", build_opener)
+    payload = phase07_operator_gate.GitHubActionsClient().download_artifact(
+        "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip", "fixture-token",
+    )
+
+    assert payload == b"frozen-zip"
+    initial, redirected = captured[0].requests
+    assert initial.full_url == (
+        "https://api.github.com/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"
+    )
+    assert redirected.full_url.startswith("https://productionresultssa0.blob.core.windows.net/")
+    assert redirected.get_header("Authorization") is None
+    assert redirected.get_header("Cookie") is None
+
+
+@pytest.mark.parametrize("path", (
+    "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/0/zip",
+    "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip?alias=1",
+    "https://api.github.com/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip",
+))
+def test_github_actions_client_rejects_noncanonical_artifact_endpoint(path: str) -> None:
+    with pytest.raises(ValueError, match="exact artifact download request"):
+        phase07_operator_gate.GitHubActionsClient().download_artifact(path, "fixture-token")
 
 
 @pytest.mark.parametrize("members,accepted", (
