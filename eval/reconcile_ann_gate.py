@@ -543,6 +543,7 @@ _HYBRID_PROVENANCE_FIELDS = frozenset({
     "role", "config", "bundle_sha256",
     "archive", "extracted_dir",
 })
+_HYBRID_FROZEN_PREPARE_FIELD = "frozen_prepare"
 _HYBRID_MANIFEST_EVIDENCE_FIELDS = frozenset({
     "run_id", "run_attempt", "job_id", "artifact_id", "role", "config", "bundle_sha256",
     "archive", "extracted_dir", "provenance",
@@ -572,7 +573,8 @@ def _reject_hybrid_secrets(value: Any, location: str = "hybrid") -> None:
 def _validate_hybrid_provenance(value: Any) -> dict[str, Any]:
     """Validate one API-bound hybrid download before reading its JSON tree."""
     _reject_hybrid_secrets(value, "hybrid provenance")
-    if not isinstance(value, dict) or set(value) != _HYBRID_PROVENANCE_FIELDS:
+    fields = set(value) if isinstance(value, dict) else set()
+    if fields not in (_HYBRID_PROVENANCE_FIELDS, _HYBRID_PROVENANCE_FIELDS | {_HYBRID_FROZEN_PREPARE_FIELD}):
         raise ValueError("strict hybrid API provenance schema")
     if not all(isinstance(value[name], int) and not isinstance(value[name], bool) and value[name] > 0
                for name in ("run_id", "run_attempt", "job_id", "artifact_id")) \
@@ -581,11 +583,17 @@ def _validate_hybrid_provenance(value: Any) -> dict[str, Any]:
             or value["job_name"] != "Phase 07 independent hybrid campaign" \
             or value["status"] != "completed" or value["conclusion"] != "success":
         raise ValueError("hybrid API run/job/artifact status")
-    from eval.phase07_operator_gate import HYBRID_ROLE_CONFIGS
-    if (value.get("role"), value.get("config")) not in HYBRID_ROLE_CONFIGS \
+    from eval.phase07_operator_gate import HYBRID_ROLE_CONFIGS, FROZEN_HYBRID_ROLE_CONFIGS
+    if (value.get("role"), value.get("config")) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS \
             or not isinstance(value["bundle_sha256"], str) \
             or not _HEX64.fullmatch(value["bundle_sha256"]):
         raise ValueError("hybrid provenance role/config/bundle identity")
+    if value.get("role") in {"m20", "m32"} or _HYBRID_FROZEN_PREPARE_FIELD in value:
+        from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+        value[_HYBRID_FROZEN_PREPARE_FIELD] = validate_frozen_prepare_identity_shape(
+            value.get(_HYBRID_FROZEN_PREPARE_FIELD),
+            expected_repository="allenwoo713/obsidian_wiki_skill", expected_head=value.get("head_sha", ""),
+        )
     if not isinstance(value["head_branch"], str) or value["head_branch"] in {"", "main", "master"} \
             or not isinstance(value["head_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["head_sha"]) \
             or value["event"] != "workflow_dispatch" \
@@ -662,6 +670,13 @@ def _read_hybrid_artifact(root: Path, provenance: dict[str, Any], request: dict[
         raise ValueError("hybrid runner/locked-host provenance mismatch")
     if result.get("head_sha") != provenance["head_sha"]:
         raise ValueError("hybrid packet/API head binding")
+    frozen_prepare = validated.get("frozen_prepare")
+    if frozen_prepare is not None:
+        if provenance.get(_HYBRID_FROZEN_PREPARE_FIELD) != frozen_prepare:
+            raise ValueError("hybrid API/artifact frozen prepare mismatch")
+        if result.get("source_before_sha256") != frozen_prepare["base_tree_sha256"] \
+                or result.get("source_after_sha256") != frozen_prepare["base_tree_sha256"]:
+            raise ValueError("hybrid frozen source mutation evidence")
     return {
         "role": member["role"], "config": member["config"],
         "original_observations": result["original_observations"],
@@ -678,7 +693,7 @@ def _read_hybrid_artifact(root: Path, provenance: dict[str, Any], request: dict[
             "queries_sha256": result["queries_sha256"],
             "baselines_sha256": result["baselines_sha256"],
         },
-        "provenance": dict(provenance),
+        "provenance": dict(provenance), "frozen_prepare": frozen_prepare,
     }
 
 
@@ -711,7 +726,7 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
     artifacts pass byte, API, runner, source, query and allocation validation.
     """
     from eval.phase07_operator_gate import (
-        HYBRID_BASELINE, HYBRID_CANDIDATES, HYBRID_ROLE_CONFIGS,
+        HYBRID_BASELINE, HYBRID_CANDIDATES, HYBRID_ROLE_CONFIGS, FROZEN_HYBRID_ROLE_CONFIGS,
         _validate_hybrid_request, canonical_digest as operator_digest,
         recompute_hybrid_gate_verdicts,
     )
@@ -733,11 +748,13 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
     role_records: list[dict[str, Any]] = []
     seen_runs, seen_jobs, seen_artifacts, seen_archives, seen_bundles, seen_roles = (set() for _ in range(6))
     for row in manifest["evidence"]:
-        if not isinstance(row, dict) or set(row) != _HYBRID_MANIFEST_EVIDENCE_FIELDS \
+        row_fields = set(row) if isinstance(row, dict) else set()
+        if not isinstance(row, dict) or row_fields not in (_HYBRID_MANIFEST_EVIDENCE_FIELDS,
+                                                           _HYBRID_MANIFEST_EVIDENCE_FIELDS | {_HYBRID_FROZEN_PREPARE_FIELD}) \
                 or any(not isinstance(row[name], int) or isinstance(row[name], bool) or row[name] <= 0
                        for name in ("run_id", "run_attempt", "job_id", "artifact_id")) \
                 or row["run_attempt"] != 1 \
-                or (row.get("role"), row.get("config")) not in HYBRID_ROLE_CONFIGS \
+                or (row.get("role"), row.get("config")) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS \
                 or not isinstance(row["bundle_sha256"], str) or not _HEX64.fullmatch(row["bundle_sha256"]) \
                 or not all(isinstance(row[name], str) and row[name]
                            for name in ("archive", "extracted_dir", "provenance")):
@@ -761,6 +778,9 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
                 or Path(row["archive"]).resolve() != Path(provenance["archive"]).resolve() \
                 or Path(row["extracted_dir"]).resolve() != Path(provenance["extracted_dir"]).resolve():
             raise ValueError("hybrid manifest/API provenance identity mismatch")
+        if (_HYBRID_FROZEN_PREPARE_FIELD in row or _HYBRID_FROZEN_PREPARE_FIELD in provenance) and (
+                row.get(_HYBRID_FROZEN_PREPARE_FIELD) != provenance.get(_HYBRID_FROZEN_PREPARE_FIELD)):
+            raise ValueError("hybrid collection frozen prepare identity mismatch")
         artifact_dir = Path(row["extracted_dir"])
         run_identity = (provenance["run_id"], provenance["run_attempt"])
         archive_identity = provenance["local_archive_sha256"]
@@ -773,7 +793,7 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         role_identity = (record["role"], canonical_digest(record["config"]))
         if record["role"] != row["role"] or record["config"] != row["config"] \
                 or record["packet_identity"]["bundle_sha256"] != row["bundle_sha256"] \
-                or (record["role"], record["config"]) not in HYBRID_ROLE_CONFIGS \
+                or (record["role"], record["config"]) not in HYBRID_ROLE_CONFIGS + FROZEN_HYBRID_ROLE_CONFIGS \
                 or role_identity in seen_roles:
             raise ValueError("duplicate or unapproved hybrid role/config")
         if record["packet_identity"]["bundle_sha256"] in seen_bundles:
@@ -781,16 +801,24 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         seen_roles.add(role_identity); seen_bundles.add(record["packet_identity"]["bundle_sha256"])
         role_records.append(record)
     observed_roles = {(record["role"], canonical_digest(record["config"])) for record in role_records}
-    expected_roles = {(role, canonical_digest(dict(config))) for role, config in HYBRID_ROLE_CONFIGS}
-    if observed_roles != expected_roles:
+    generic_roles = {(role, canonical_digest(dict(config))) for role, config in HYBRID_ROLE_CONFIGS}
+    frozen_roles = {(role, canonical_digest(dict(config))) for role, config in FROZEN_HYBRID_ROLE_CONFIGS}
+    if observed_roles not in (generic_roles, frozen_roles):
         raise ValueError("exact baseline/m20/m32 hybrid role evidence required")
+    frozen_mode = observed_roles == frozen_roles
+    shared_prepare = None
+    if frozen_mode:
+        prepares = [record["frozen_prepare"] for record in role_records]
+        if any(prepare is None for prepare in prepares) or len({canonical_digest(prepare) for prepare in prepares}) != 1:
+            raise ValueError("mixed or missing frozen prepare evidence")
+        shared_prepare = prepares[0]
     baseline_record = next(record for record in role_records
                            if record["role"] == "baseline" and record["config"] == HYBRID_BASELINE)
     queries_path = Path(__file__).resolve().parent / "queries.jsonl"
     queries = [json.loads(line) for line in queries_path.read_text(encoding="utf-8").splitlines() if line]
     candidate_records: list[dict[str, Any]] = []
     for candidate_record in sorted(
-            (record for record in role_records if record["role"] == "candidate"),
+            (record for record in role_records if record["role"] != "baseline"),
             key=lambda record: record["config"]["m"]):
         original_paired = _pair_hybrid_role_observations(
             baseline=baseline_record["original_observations"],
@@ -831,6 +859,8 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         },
         "candidate_records": candidate_records,
     }
+    if frozen_mode:
+        ledger["frozen_prepare"] = shared_prepare
     ledger["record_self_sha256"] = canonical_digest(ledger)
     return ledger
 

@@ -55,6 +55,7 @@ _DESCRIPTOR_FIELDS = frozenset({
 })
 _FORBIDDEN_NAMES = frozenset({"ACTIVE_INDEX", "manifest.json", ".failed"})
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FROZEN_PAGE_FIELDS = frozenset({"page_id", "path", "title", "page_type", "sources", "links", "aliases", "sha256"})
 FROZEN_FTS_CONFIG = {
     "column": "fts_text", "base_tokenizer": "whitespace", "lower_case": False,
@@ -115,7 +116,7 @@ def validate_frozen_prepare_identity_shape(
     if not isinstance(identity, dict) or set(identity) != FROZEN_PREPARE_IDENTITY_FIELDS:
         raise FrozenBaseError("strict frozen prepare identity")
     if (not isinstance(expected_repository, str) or not expected_repository
-            or not _HEX64.fullmatch(expected_head)
+            or not _GIT_SHA.fullmatch(expected_head)
             or identity.get("repository") != expected_repository
             or identity.get("head_sha") != expected_head
             or identity.get("run_attempt") != 1

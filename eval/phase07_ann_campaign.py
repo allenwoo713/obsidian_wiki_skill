@@ -652,6 +652,13 @@ def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
     member = validate_hybrid_dispatch_bundle(dispatch, expected_head=head)
     if dispatch["hybrid_request"] != request:
         raise ValueError("hybrid dispatch/request binding")
+    frozen_prepare = None
+    if "frozen_prepare" in dispatch:
+        from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+        frozen_prepare = validate_frozen_prepare_identity_shape(
+            dispatch["frozen_prepare"], expected_repository="allenwoo713/obsidian_wiki_skill",
+            expected_head=head,
+        )
     execution = _sealed_hybrid_json(root / "locked-execution.json", expected="hybrid locked execution")
     execution_identity = dict(execution); execution_identity.pop("record_self_sha256", None)
     validate_confirmation_execution(execution_identity)
@@ -672,6 +679,8 @@ def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
             "expanded_observations", "hybrid_invocation", "campaign_progress",
             "expanded_content_tree_sha256", "expanded_member_count", "record_self_sha256",
     }
+    if frozen_prepare is not None:
+        result_fields |= {"frozen_prepare", "source_before_sha256", "source_after_sha256"}
     if set(result) != result_fields or result.get("schema_version") != 1 or result.get("campaign_stage") != "hybrid" \
             or result.get("bundle_sha256") != member["record_self_sha256"] \
             or result.get("hybrid_request_sha256") != request["record_self_sha256"] \
@@ -684,6 +693,11 @@ def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
             or result.get("allocation") != allocation_record \
             or result.get("allocation_sha256") != hashlib.sha256((root / "allocation.json").read_bytes()).hexdigest():
         raise ValueError("strict complete hybrid result identity")
+    if frozen_prepare is not None and (
+            result.get("frozen_prepare") != frozen_prepare
+            or result.get("source_before_sha256") != frozen_prepare["base_tree_sha256"]
+            or result.get("source_after_sha256") != frozen_prepare["base_tree_sha256"]):
+        raise ValueError("hybrid frozen source prepare/mutation identity")
     repo_root = Path(__file__).resolve().parent.parent
     query_file, baseline_file = repo_root / "eval" / "queries.jsonl", repo_root / "eval" / "baselines.json"
     queries = [json.loads(line) for line in query_file.read_text(encoding="utf-8").splitlines() if line]
@@ -725,7 +739,10 @@ def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
     ledger = _sealed_hybrid_json(root / "hybrid-ledger.json", expected="hybrid ledger")
     leaf_files = {name for name in _HYBRID_RAW_FILES if name != "hybrid-ledger.json"}
     expected_leaves = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in leaf_files}
-    if set(ledger) != {"schema_version", "campaign_stage", "bundle_sha256", "hybrid_request_sha256", "role", "config", "authorization", "result_sha256", "locked_execution_sha256", "allocation_sha256", "raw_leaf_sha256s", "record_self_sha256"} \
+    ledger_fields = {"schema_version", "campaign_stage", "bundle_sha256", "hybrid_request_sha256", "role", "config", "authorization", "result_sha256", "locked_execution_sha256", "allocation_sha256", "raw_leaf_sha256s", "record_self_sha256"}
+    if frozen_prepare is not None:
+        ledger_fields |= {"frozen_prepare", "source_before_sha256", "source_after_sha256"}
+    if set(ledger) != ledger_fields \
             or ledger.get("schema_version") != 1 or ledger.get("campaign_stage") != "hybrid" \
             or ledger.get("bundle_sha256") != member["record_self_sha256"] \
             or ledger.get("hybrid_request_sha256") != request["record_self_sha256"] \
@@ -736,9 +753,16 @@ def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
             or ledger.get("allocation_sha256") != result["allocation_sha256"] \
             or ledger.get("raw_leaf_sha256s") != expected_leaves:
         raise ValueError("hybrid raw ledger identity")
+    if frozen_prepare is not None and (
+            ledger.get("frozen_prepare") != frozen_prepare
+            or ledger.get("source_before_sha256") != result["source_before_sha256"]
+            or ledger.get("source_after_sha256") != result["source_after_sha256"]):
+        raise ValueError("hybrid frozen ledger binding")
     wrapper = _sealed_hybrid_json(root / "hybrid-packet.json", expected="hybrid packet")
     expected_files = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in _HYBRID_RAW_FILES}
     wrapper_fields = {"schema_version", "campaign_stage", "packet_kind", "bundle_sha256", "hybrid_request_sha256", "role", "config", "authorization", "result_sha256", "ledger_sha256", "locked_execution_sha256", "allocation_sha256", "raw_file_sha256s", "raw_tree_sha256", "record_self_sha256"}
+    if frozen_prepare is not None:
+        wrapper_fields |= {"frozen_prepare", "source_before_sha256", "source_after_sha256"}
     if set(wrapper) != wrapper_fields or wrapper.get("schema_version") != 1 \
             or wrapper.get("campaign_stage") != "hybrid" or wrapper.get("packet_kind") != "phase07-hybrid-packet/v1" \
             or wrapper.get("bundle_sha256") != member["record_self_sha256"] \
@@ -751,9 +775,14 @@ def validate_hybrid_artifact_tree(root: Path) -> dict[str, Any]:
             or wrapper.get("allocation_sha256") != result["allocation_sha256"] \
             or wrapper.get("raw_file_sha256s") != expected_files or wrapper.get("raw_tree_sha256") != raw_tree_sha256:
         raise ValueError("hybrid packet wrapper identity")
+    if frozen_prepare is not None and (
+            wrapper.get("frozen_prepare") != frozen_prepare
+            or wrapper.get("source_before_sha256") != result["source_before_sha256"]
+            or wrapper.get("source_after_sha256") != result["source_after_sha256"]):
+        raise ValueError("hybrid frozen packet binding")
     return {"request": request, "workflow_input": member, "result": result, "ledger": ledger,
             "wrapper": wrapper, "role": member["role"], "config": member["config"],
-            "raw_tree_sha256": raw_tree_sha256}
+            "raw_tree_sha256": raw_tree_sha256, "frozen_prepare": frozen_prepare}
 
 
 def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bundle: dict[str, Any],
@@ -769,6 +798,12 @@ def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bun
 
     head = locked_execution.get("head_sha") if isinstance(locked_execution, dict) else ""
     member = validate_hybrid_dispatch_bundle(dispatch_bundle, expected_head=head)
+    frozen_prepare = dispatch_bundle.get("frozen_prepare")
+    if frozen_prepare is not None:
+        from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+        frozen_prepare = validate_frozen_prepare_identity_shape(
+            frozen_prepare, expected_repository="allenwoo713/obsidian_wiki_skill", expected_head=head,
+        )
     validate_confirmation_execution(locked_execution)
     _validate_hybrid_allocation(allocation)
     if output_dir.exists() and (output_dir.is_symlink() or any(output_dir.iterdir())):
@@ -796,6 +831,11 @@ def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bun
     }
     if any(campaign_result.get(name) != value for name, value in expected_campaign_identity.items()):
         raise ValueError("actual hybrid role campaign identity")
+    if frozen_prepare is not None and (
+            campaign_result.get("frozen_prepare") != frozen_prepare
+            or campaign_result.get("source_before_sha256") != frozen_prepare["base_tree_sha256"]
+            or campaign_result.get("source_after_sha256") != frozen_prepare["base_tree_sha256"]):
+        raise ValueError("actual hybrid frozen source identity")
     execution_record = dict(locked_execution); execution_record["record_self_sha256"] = canonical_digest(execution_record)
     allocation_record = {"schema_version": 1, "campaign_stage": "hybrid", "allocation": dict(allocation)}
     allocation_record["record_self_sha256"] = canonical_digest(allocation_record)
@@ -821,6 +861,10 @@ def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bun
         "hybrid_invocation": campaign_result.get("hybrid_invocation"),
         "campaign_progress": campaign_result.get("campaign_progress"),
     }
+    if frozen_prepare is not None:
+        result.update(frozen_prepare=frozen_prepare,
+                      source_before_sha256=campaign_result["source_before_sha256"],
+                      source_after_sha256=campaign_result["source_after_sha256"])
     _write(output_dir / "hybrid-request.json", request)
     _write(output_dir / "dispatch-bundle.json", dispatch_bundle)
     _write(output_dir / "locked-execution.json", locked_execution)
@@ -835,6 +879,9 @@ def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bun
               "result_sha256": hashlib.sha256((output_dir / "hybrid-result.json").read_bytes()).hexdigest(),
               "locked_execution_sha256": hashlib.sha256((output_dir / "locked-execution.json").read_bytes()).hexdigest(),
               "allocation_sha256": hashlib.sha256((output_dir / "allocation.json").read_bytes()).hexdigest(), "raw_leaf_sha256s": leaves}
+    if frozen_prepare is not None:
+        ledger.update(frozen_prepare=frozen_prepare, source_before_sha256=result["source_before_sha256"],
+                      source_after_sha256=result["source_after_sha256"])
     _write(output_dir / "hybrid-ledger.json", ledger)
     files = {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest() for name in _HYBRID_RAW_FILES}
     wrapper = {"schema_version": 1, "campaign_stage": "hybrid", "packet_kind": "phase07-hybrid-packet/v1",
@@ -843,6 +890,9 @@ def export_hybrid_artifact_tree(*, campaign_result: dict[str, Any], dispatch_bun
                "result_sha256": ledger["result_sha256"], "ledger_sha256": hashlib.sha256((output_dir / "hybrid-ledger.json").read_bytes()).hexdigest(),
                "locked_execution_sha256": ledger["locked_execution_sha256"], "allocation_sha256": ledger["allocation_sha256"],
                "raw_file_sha256s": files, "raw_tree_sha256": hybrid_raw_tree_sha256(output_dir)}
+    if frozen_prepare is not None:
+        wrapper.update(frozen_prepare=frozen_prepare, source_before_sha256=result["source_before_sha256"],
+                       source_after_sha256=result["source_after_sha256"])
     _write(output_dir / "hybrid-packet.json", wrapper)
     validate_hybrid_artifact_tree(output_dir)
 

@@ -139,6 +139,7 @@ def _frozen_prepare_identity() -> dict:
     (
         lambda value: value.pop("descriptor_self_sha256"),
         lambda value: value.__setitem__("run_attempt", 2),
+        lambda value: value.__setitem__("head_sha", "0" * 64),
         lambda value: value.__setitem__("replacement_for_run_id", 1),
         lambda value: value.__setitem__("status", "cancelled"),
         lambda value: value.__setitem__("artifact_expires_at", "2000-04-01T00:00:00Z"),
@@ -573,18 +574,16 @@ def test_bare_sealed_workflow_member_cannot_reach_any_campaign_build_boundary(
     assert calls == []
 
 
-def _hybrid_dispatch_bundle(plan: dict, *, role: str = "candidate", m: int = 20) -> dict:
-    member = next(
-        row for row in plan["workflow_inputs"]
-        if row["role"] == role and row["config"]["m"] == (16 if role == "baseline" else m)
+def _hybrid_dispatch_bundle(plan: dict, *, role: str = "m20", m: int = 20) -> dict:
+    """Return a real B-generated frozen dispatch, never the retired generic shape."""
+    role = f"m{m}" if role == "candidate" else role
+    bundles = operator.build_frozen_role_dispatch_bundles(
+        hybrid_request=plan["hybrid_request"], frozen_prepare=_frozen_prepare_identity(),
+        expected_head=HEAD,
     )
-    bundle = {
-        "schema_version": 1,
-        "hybrid_request": plan["hybrid_request"], "workflow_input": member,
-        "replacement_for_run_id": None,
-    }
-    bundle["record_self_sha256"] = operator.canonical_digest(bundle)
-    return bundle
+    return next(bundle for bundle in bundles
+                if bundle["workflow_input"]["role"] == role
+                and bundle["workflow_input"]["config"]["m"] == (16 if role == "baseline" else m))
 
 
 def test_hybrid_dispatch_module_cli_consumes_its_opaque_capability_before_filesystem_failure(
@@ -1172,7 +1171,7 @@ def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
         work_dir=tmp_path, runner=production_test_runner,
     )
     assert len(observed_capabilities) == 1 and not isinstance(observed_capabilities[0], dict)
-    expanded = tmp_path / "hybrid-candidate-m20" / "expanded" / "Wiki"
+    expanded = tmp_path / "hybrid-m20-m20" / "expanded" / "Wiki"
     actual_digest = canonical_content_tree_sha256(expanded)
     actual_count = len([path for path in expanded.rglob("*") if path.is_file()])
     expected = run_eval.expected_phase07_expanded_corpus_identity(
@@ -1181,29 +1180,29 @@ def test_hybrid_campaign_binds_actual_expanded_tree_not_fixture_or_label_digest(
     assert expected == {"expanded_content_tree_sha256": actual_digest, "expanded_member_count": actual_count}
     assert result["expanded_content_tree_sha256"] == actual_digest
     assert result["expanded_member_count"] == actual_count
-    assert result["role"] == "candidate"
+    assert result["role"] == "m20"
     assert result["config"] == {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300}
     assert "aggregate_metrics" not in result and "candidate_verdict" not in result
     assert len(storage_builds) == 2
     assert len(hybrid_calls) == 4
     assert sum(path == expanded for path in hybrid_calls) == 2
-    original = tmp_path / "hybrid-candidate-m20" / "original" / "Wiki"
+    original = tmp_path / "hybrid-m20-m20" / "original" / "Wiki"
     assert sum(path == original for path in hybrid_calls) == 2
     assert result["hybrid_invocation"] == {
         "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
         "original_calls": 2, "expanded_calls": 2,
     }
     assert result["campaign_progress"] == {
-        "role": "candidate", "original_completed": 2, "expanded_completed": 2,
+        "role": "m20", "original_completed": 2, "expanded_completed": 2,
     }
     for observations in (result["original_observations"], result["expanded_observations"]):
         assert len(observations) == 2
         assert all(set(row) == {"ordinal", "query_sha256", "observation"} for row in observations)
     progress = capsys.readouterr().out
-    assert "[phase07-hybrid] role=candidate build=original complete" in progress
-    assert "[phase07-hybrid] role=candidate build=expanded complete" in progress
-    assert "[phase07-hybrid] role=candidate original_queries=2/2 complete" in progress
-    assert "[phase07-hybrid] role=candidate expanded_queries=2/2 complete" in progress
+    assert "[phase07-hybrid] role=m20 build=original complete" in progress
+    assert "[phase07-hybrid] role=m20 build=expanded complete" in progress
+    assert "[phase07-hybrid] role=m20 original_queries=2/2 complete" in progress
+    assert "[phase07-hybrid] role=m20 expanded_queries=2/2 complete" in progress
     assert "authorization" not in progress
 
 
@@ -1256,7 +1255,7 @@ def test_hybrid_campaign_emits_safe_elapsed_stage_markers_through_real_builds(
         assert [marker["stage"] for marker in corpus_markers] == expected_stages
         assert all(set(marker) == {"role", "corpus", "stage", "state", "elapsed_ms"}
                    for marker in corpus_markers)
-        assert all(marker["role"] == "candidate" and marker["state"] == "complete"
+        assert all(marker["role"] == "m20" and marker["state"] == "complete"
                    and isinstance(marker["elapsed_ms"], (int, float))
                    and marker["elapsed_ms"] >= 0 for marker in corpus_markers)
         assert [marker["elapsed_ms"] for marker in corpus_markers] == sorted(
@@ -1301,7 +1300,7 @@ def test_hybrid_stage_sink_is_optional_and_propagates_instrumentation_failure(
     without_sink = run_with_sink()
     assert without_sink["query_count"] == 1
     assert without_sink["campaign_progress"] == {
-        "role": "candidate", "original_completed": 1, "expanded_completed": 1,
+        "role": "m20", "original_completed": 1, "expanded_completed": 1,
     }
     marker_prints = [
         (args, kwargs) for args, kwargs in printed
@@ -1448,7 +1447,7 @@ def test_full_hybrid_artifact_accepts_legal_empty_community_and_normal_payloads_
     # artifacts intentionally carry no aggregate or verdict authority.
     result_path.write_text(json.dumps(result), encoding="utf-8")
     _reseal_test_hybrid_raw_tree(tree)
-    assert campaign.validate_hybrid_artifact_tree(tree)["role"] == "candidate"
+    assert campaign.validate_hybrid_artifact_tree(tree)["role"] == "m20"
 
 
 @pytest.mark.parametrize("mutation", ("budget", "inclusion_reason", "graph_paths"))
@@ -1491,12 +1490,44 @@ def test_hybrid_role_artifact_rejects_smuggled_aggregate_evidence_after_full_res
         locked_execution=_locked_confirmation_environment(),
         allocation={"run_id": 7, "run_attempt": 1, "job_id": 8, "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
     )
-    assert campaign.validate_hybrid_artifact_tree(tree)["role"] == "candidate"
+    assert campaign.validate_hybrid_artifact_tree(tree)["role"] == "m20"
     result_path = tree / "hybrid-result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result["aggregate_metrics"] = {"forged": "quality authority"}
     result_path.write_text(json.dumps(result), encoding="utf-8")
     _reseal_test_hybrid_raw_tree(tree)
+    with pytest.raises(ValueError):
+        campaign.validate_hybrid_artifact_tree(tree)
+
+
+@pytest.mark.parametrize("location", ("dispatch", "result", "ledger", "packet", "source-after"))
+def test_frozen_prepare_is_one_exact_object_across_production_artifact_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str,
+) -> None:
+    """A resealed role tree cannot substitute or mutate its collector-bound base."""
+    from eval import phase07_ann_campaign as campaign
+
+    plan, _ = _build_test_hybrid_plan(tmp_path, monkeypatch)
+    tree = _make_valid_test_hybrid_raw_tree(
+        tmp_path / location, dispatch_bundle=_hybrid_dispatch_bundle(plan),
+        locked_execution=_locked_confirmation_environment(),
+        allocation={"run_id": 7, "run_attempt": 1, "job_id": 8,
+                    "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
+    )
+    assert campaign.validate_hybrid_artifact_tree(tree)["frozen_prepare"] == _frozen_prepare_identity()
+    target = tree / ({
+        "dispatch": "dispatch-bundle.json", "result": "hybrid-result.json",
+        "ledger": "hybrid-ledger.json", "packet": "hybrid-packet.json",
+        "source-after": "hybrid-result.json",
+    }[location])
+    document = json.loads(target.read_text(encoding="utf-8"))
+    if location == "source-after":
+        document["source_after_sha256"] = "0" * 64
+    else:
+        document["frozen_prepare"]["base_tree_sha256"] = "0" * 64
+    _seal_test_json(target, document)
+    if location in {"dispatch", "result", "ledger"}:
+        _reseal_test_hybrid_raw_tree(tree)
     with pytest.raises(ValueError):
         campaign.validate_hybrid_artifact_tree(tree)
 
@@ -1721,17 +1752,29 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
             "role": workflow_input["role"], "original_completed": 105, "expanded_completed": 105,
         },
     }
+    frozen_prepare = dispatch_bundle.get("frozen_prepare")
+    if frozen_prepare is not None:
+        result.update(
+            frozen_prepare=deepcopy(frozen_prepare),
+            source_before_sha256=frozen_prepare["base_tree_sha256"],
+            source_after_sha256=frozen_prepare["base_tree_sha256"],
+        )
     (root / "hybrid-request.json").write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
     (root / "dispatch-bundle.json").write_text(json.dumps(dispatch_bundle, sort_keys=True), encoding="utf-8")
     _seal_test_json(root / "hybrid-result.json", result)
-    _seal_test_json(root / "hybrid-ledger.json", {
+    ledger = {
         "schema_version": 1, "campaign_stage": "hybrid", "bundle_sha256": workflow_input["record_self_sha256"],
         "hybrid_request_sha256": request["record_self_sha256"], "role": workflow_input["role"], "config": workflow_input["config"],
         "authorization": "none", "result_sha256": hashlib.sha256((root / "hybrid-result.json").read_bytes()).hexdigest(),
         "locked_execution_sha256": execution_sha256, "allocation_sha256": allocation_sha256,
         "raw_leaf_sha256s": _hybrid_raw_leaf_sha256s(root),
-    })
-    _seal_test_json(root / "hybrid-packet.json", {
+    }
+    if frozen_prepare is not None:
+        ledger.update(frozen_prepare=deepcopy(frozen_prepare),
+                      source_before_sha256=frozen_prepare["base_tree_sha256"],
+                      source_after_sha256=frozen_prepare["base_tree_sha256"])
+    _seal_test_json(root / "hybrid-ledger.json", ledger)
+    packet = {
         "schema_version": 1, "campaign_stage": "hybrid", "packet_kind": "phase07-hybrid-packet/v1",
         "bundle_sha256": workflow_input["record_self_sha256"], "hybrid_request_sha256": request["record_self_sha256"],
         "role": workflow_input["role"], "config": workflow_input["config"], "authorization": "none",
@@ -1739,7 +1782,12 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
         "ledger_sha256": hashlib.sha256((root / "hybrid-ledger.json").read_bytes()).hexdigest(),
         "locked_execution_sha256": execution_sha256, "allocation_sha256": allocation_sha256,
         "raw_file_sha256s": _hybrid_raw_file_sha256s(root), "raw_tree_sha256": _hybrid_raw_tree_sha256(root),
-    })
+    }
+    if frozen_prepare is not None:
+        packet.update(frozen_prepare=deepcopy(frozen_prepare),
+                      source_before_sha256=frozen_prepare["base_tree_sha256"],
+                      source_after_sha256=frozen_prepare["base_tree_sha256"])
+    _seal_test_json(root / "hybrid-packet.json", packet)
     return root
 
 
