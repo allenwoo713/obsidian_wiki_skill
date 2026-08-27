@@ -5,6 +5,7 @@ import inspect
 import json
 import sys
 import tarfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import lancedb
@@ -937,6 +938,34 @@ def test_phase07_frozen_prepare_loads_and_validates_model_before_creating_target
     assert not list(tmp_path.rglob(".embedder-probe"))
 
 
+def test_phase07_frozen_prepare_cli_accepts_an_external_verified_model_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful CLI prepare still builds at the already-materialized canonical root."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    target = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
+    _write_page(target / "Wiki", "# CLI success\n\nEXTERNALMODELTERM\n")
+    bundle = tmp_path / "prepare-bundle.json"
+    bundle.write_text("{}", encoding="utf-8")
+
+    class VerifiedEmbedder:
+        def __init__(self) -> None:
+            self.tokenizer = _FacadeEmbedder().tokenizer
+
+        def embed(self, texts):
+            return _embed384()(texts)
+
+    monkeypatch.setattr(frozen, "validate_frozen_prepare_bundle", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(frozen, "load_verified_frozen_embedder", lambda _model_dir: VerifiedEmbedder())
+    assert frozen.main([
+        "prepare", "--wiki-dir", str(target / "Wiki"), "--frozen-dir", str(target),
+        "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "external-model"),
+    ]) == 0
+    assert (target / "frozen-base.json").is_file()
+    assert not list(target.rglob(".embedder-probe"))
+
+
 def test_phase07_frozen_archive_rejects_noncanonical_aliases_and_extracted_tree_is_revalidated(
     tmp_path: Path,
 ) -> None:
@@ -984,3 +1013,40 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
     )
     assert writes == [Path(result["manifest_path"])]
     assert (index_dir / "ACTIVE_INDEX").is_file()
+
+
+def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_collector_data() -> None:
+    """The operator shares one fail-closed, API-collector-shaped prepare identity."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        FROZEN_PREPARE_IDENTITY_FIELDS,
+        FrozenBaseError,
+        validate_frozen_prepare_identity_shape,
+    )
+
+    now = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    digest = "a" * 64
+    identity = {
+        "repository": "example/obsidian-wiki-skill", "head_sha": digest,
+        "run_id": 11, "run_attempt": 1, "job_id": 12, "artifact_id": 13,
+        "artifact_name": "phase07-frozen-base-11-1", "archive_sha256": digest,
+        "archive_size_bytes": 99, "descriptor_self_sha256": digest,
+        "base_tree_sha256": digest, "model_manifest_sha256": digest,
+        "corpus_manifest_sha256": digest, "generator_recipe_sha256": digest,
+        "runtime": {"python": "3.13"},
+        "artifact_created_at": (now - timedelta(minutes=1)).isoformat(),
+        "artifact_expires_at": (now + timedelta(days=89, hours=23, minutes=59)).isoformat(),
+        "retention_days": 90, "replacement_for_run_id": None, "status": "success",
+    }
+    assert set(identity) == FROZEN_PREPARE_IDENTITY_FIELDS
+    assert validate_frozen_prepare_identity_shape(
+        identity, expected_repository=identity["repository"], expected_head=digest, now=now,
+    ) == identity
+    for key, value in (("run_attempt", 2), ("status", "completed"),
+                       ("artifact_name", "latest"),
+                       ("artifact_created_at", (now + timedelta(seconds=1)).isoformat()),
+                       ("replacement_for_run_id", 7)):
+        invalid = dict(identity); invalid[key] = value
+        with pytest.raises(FrozenBaseError):
+            validate_frozen_prepare_identity_shape(
+                invalid, expected_repository=identity["repository"], expected_head=digest, now=now,
+            )
