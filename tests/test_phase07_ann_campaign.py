@@ -239,6 +239,31 @@ def _embed384():
     return encode
 
 
+class _DeterministicFrozenTokenizer:
+    """A tokenizer-shaped test double whose count is never char//4."""
+
+    def __call__(self, text: str, **_kwargs) -> dict[str, list[int]]:
+        return {"input_ids": list(range(len(text.split()) + 2))}
+
+
+class _DeterministicFrozenEmbedder:
+    """Verified-loader compatible encoder used only behind private test seams."""
+
+    def __init__(self) -> None:
+        self.tokenizer = _DeterministicFrozenTokenizer()
+        self.encode_calls: list[int] = []
+
+    def embed(self, texts) -> list[list[float]]:
+        self.encode_calls.append(len(texts))
+        return _embed384()(texts)
+
+    def encode(self, texts, **_kwargs) -> list[list[float]]:
+        return self.embed(texts)
+
+    def get_embedding_dimension(self) -> int:
+        return 384
+
+
 def _write_sealed_dense_ledger(tmp_path: Path) -> Path:
     """Materialize the real 07-05 ledger shape without a developer-machine path.
 
@@ -589,27 +614,41 @@ def _hybrid_dispatch_bundle(plan: dict, *, role: str = "m20", m: int = 20) -> di
 def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The 105×2 frozen role clones its source; it never rebuilds the expanded corpus."""
+    """The production dispatcher exports one real frozen 30k/105 role packet."""
     import inspect
     import build_index
     import eval.run_eval as run_eval
+    from eval import phase07_ann_campaign as campaign  # noqa: PLC0415
+    from eval import phase07_frozen_base as frozen_base  # noqa: PLC0415
     from eval.phase07_frozen_base import prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
-    from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: PLC0415
     from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: PLC0415
 
     frozen = tmp_path / "frozen-source"
     frozen_wiki = frozen / "Wiki"
+    shutil.copytree(ROOT / "tests" / "fixtures" / "wiki", frozen_wiki)
     source_identity = {
-        "expanded_content_tree_sha256": canonical_content_tree_sha256(ROOT / "tests" / "fixtures" / "wiki"),
-        "expanded_member_count": sum(1 for path in (ROOT / "tests" / "fixtures" / "wiki").rglob("*.md") if path.is_file()),
+        "expanded_content_tree_sha256": canonical_content_tree_sha256(frozen_wiki),
+        "expanded_member_count": sum(1 for path in frozen_wiki.rglob("*.md") if path.is_file()),
     }
+    # These private dependencies are the only test authority for a tiny
+    # source.  Neither the dispatch bundle nor the CLI can set either seam.
+    monkeypatch.setattr(
+        frozen_base, "_expected_corpus_identity",
+        lambda value, *, allow_explicit=False: dict(source_identity),
+    )
+    monkeypatch.setattr(
+        run_eval, "expected_phase07_expanded_corpus_identity",
+        lambda **_kwargs: dict(source_identity),
+    )
+    frozen_embedder = _DeterministicFrozenEmbedder()
     descriptor = prepare_frozen_base(
-        wiki_dir=ROOT / "tests" / "fixtures" / "wiki", frozen_dir=frozen,
-        embed=_embed384(), expected_corpus_identity=source_identity,
+        wiki_dir=frozen_wiki, frozen_dir=frozen, embed=frozen_embedder.embed,
+        tokenizer=frozen_embedder.tokenizer,
     )
     source_before = validate_frozen_base(
-        frozen, expected_wiki_root=frozen_wiki, expected_corpus_identity=source_identity,
+        frozen, expected_wiki_root=frozen_wiki, tokenizer=frozen_embedder.tokenizer,
     )
+    frozen_embedder.encode_calls.clear()
     frozen_prepare = _frozen_prepare_identity()
     frozen_prepare.update(
         descriptor_self_sha256=descriptor["record_self_sha256"],
@@ -629,36 +668,47 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
         if item["workflow_input"]["role"] == "m20"
     )
 
-    root = tmp_path / "hybrid-m20-m20"
+    root = tmp_path / "campaign" / "hybrid-m20-m20"
     materialize_calls: list[object] = []
     original_builds: list[Path] = []
     scan_calls: list[Path] = []
+    chunk_calls: list[Path] = []
     embed_calls: list[int] = []
     persist_calls: list[Path] = []
     graph_calls: list[tuple[Path, Path]] = []
+    loads: list[Path] = []
     public_queries: list[dict] = []
-    markers: list[dict] = []
 
     monkeypatch.setattr(
         run_eval, "_materialize_phase07_expanded_corpus",
         lambda **_kwargs: materialize_calls.append(_kwargs) or pytest.fail("frozen role materialized expanded corpus"),
     )
-    real_build = build_index.build_storage_contract
+    real_index_build = run_eval.WikiIndex.build
 
-    def record_public_build(wiki_dir, index_dir, **kwargs):
+    def record_public_build(self, wiki_dir, **kwargs):
         assert Path(wiki_dir) != frozen_wiki
-        original_builds.append(Path(index_dir))
-        return real_build(wiki_dir, index_dir, **kwargs)
+        original_builds.append(Path(wiki_dir))
+        assert kwargs["full_rebuild"] is True
+        return real_index_build(self, wiki_dir, **kwargs)
 
-    monkeypatch.setattr(build_index, "build_storage_contract", record_public_build)
-    real_sparse_plan = IndexBuildService._sparse_plan
+    monkeypatch.setattr(run_eval.WikiIndex, "build", record_public_build)
+    real_scan_wiki = build_index.scan_wiki
 
-    def record_scan_chunk(wiki_dir):
+    def record_scan_chunk(wiki_dir, project_root):
         assert Path(wiki_dir) != frozen_wiki
         scan_calls.append(Path(wiki_dir))
-        return real_sparse_plan(wiki_dir)
+        return real_scan_wiki(wiki_dir, project_root)
 
-    monkeypatch.setattr(IndexBuildService, "_sparse_plan", staticmethod(record_scan_chunk))
+    monkeypatch.setattr(build_index, "scan_wiki", record_scan_chunk)
+    real_chunk_page = build_index.chunk_page
+
+    def record_chunk_page(*args, **kwargs):
+        page = kwargs.get("path")
+        assert page is not None and Path(page).is_relative_to(root / "original" / "Wiki")
+        chunk_calls.append(Path(page))
+        return real_chunk_page(*args, **kwargs)
+
+    monkeypatch.setattr(build_index, "chunk_page", record_chunk_page)
     real_persist = LanceDbIndexRepository.persist
 
     def record_persist(self, lance_dir, *args, **kwargs):
@@ -675,6 +725,13 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
         return real_graph_writer(wiki, index_dir)
 
     monkeypatch.setattr(run_eval, "write_graph_artifact", record_graph_writer)
+    real_load = run_eval.WikiIndex.load
+
+    def record_load(self, *args, **kwargs):
+        loads.append(Path(self.index_dir))
+        return real_load(self, *args, **kwargs)
+
+    monkeypatch.setattr(run_eval.WikiIndex, "load", record_load)
     real_hybrid_search = run_eval.hybrid_search
 
     def record_public_hybrid_search(*args, **kwargs):
@@ -683,38 +740,39 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
         return real_hybrid_search(*args, **kwargs)
 
     monkeypatch.setattr(run_eval, "hybrid_search", record_public_hybrid_search)
+    monkeypatch.setattr(frozen_base, "load_verified_frozen_embedder", lambda _path: frozen_embedder)
+    real_get_embedder = run_eval.WikiIndex._get_embedder
 
-    def runner_embed(texts):
-        embed_calls.append(len(texts))
-        return _embed384()(texts)
+    def inject_verified_embedder(self):
+        if self.index_dir == root / "original" / ".index":
+            return frozen_embedder
+        return real_get_embedder(self)
 
-    def production_runner(*, capability: object, work_dir: Path) -> dict:
-        return run_eval._run_phase07_hybrid_campaign_with_capability(
-            capability=capability, work_dir=work_dir, frozen_dir=frozen,
-            embed=runner_embed, progress_sink=markers.append,
-            _expected_frozen_corpus_identity=source_identity,
-        )
+    monkeypatch.setattr(run_eval.WikiIndex, "_get_embedder", inject_verified_embedder)
 
-    # The public dispatcher exposes no caller-controlled tiny-corpus switch;
-    # the underscored runner seam is only consumed by this integration test.
+    # The public dispatcher and CLI expose no identity, tokenizer, or encoder
+    # seam.  runner=None therefore crosses the true production export path.
     assert "_expected_frozen_corpus_identity" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
+    assert "tokenizer" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
+    assert "embed" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
     result = operator.execute_hybrid_dispatch(
         bundle=bundle, locked_execution=_locked_confirmation_environment(),
         allocation={"run_id": 7, "run_attempt": 1, "job_id": 8,
                     "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32},
-        work_dir=tmp_path, runner=production_runner,
+        work_dir=tmp_path, runner=None, frozen_dir=frozen,
     )
 
     assert materialize_calls == []
     assert len(original_builds) == len(scan_calls) == len(persist_calls) == len(graph_calls) == 1
-    assert embed_calls and all(count > 0 for count in embed_calls)
+    assert chunk_calls
+    assert frozen_embedder.encode_calls and all(count > 0 for count in frozen_embedder.encode_calls)
     assert graph_calls[0][0] == root / "original" / "Wiki"
     assert not (root / "expanded" / "Wiki").exists()
     assert (root / "expanded-private-clone").is_dir()
     assert result["frozen_prepare"] == frozen_prepare
     assert result["source_before_sha256"] == result["source_after_sha256"] == source_before
     assert validate_frozen_base(
-        frozen, expected_wiki_root=frozen_wiki, expected_corpus_identity=source_identity,
+        frozen, expected_wiki_root=frozen_wiki, tokenizer=frozen_embedder.tokenizer,
     ) == source_before
     assert result["query_count"] == 105
     assert result["hybrid_invocation"] == {
@@ -724,13 +782,13 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
     assert len(public_queries) == 210
     assert {Path(row["wiki_dir"]) for row in public_queries} == {root / "original" / "Wiki", frozen_wiki}
     assert all(row["intent_override"] == "auto" and row["allow_local_fallback"] is True for row in public_queries)
-    assert [marker["stage"] for marker in markers if marker["corpus"] == "expanded"] == [
-        "private_clone_hnsw_publish_load",
-    ]
-    assert [marker["stage"] for marker in markers if marker["corpus"] == "original"] == [
-        "scan_chunk", "dense_embedding", "lance_fts_persist", "hnsw_create_index",
-        "validation_seal_publication", "graph_artifact", "load",
-    ]
+    assert loads == [root / "original" / ".index", root / "expanded" / ".index"]
+    raw = tmp_path / "raw"
+    assert {path.name for path in raw.iterdir()} == {
+        "hybrid-request.json", "dispatch-bundle.json", "locked-execution.json", "allocation.json",
+        "hybrid-result.json", "hybrid-ledger.json", "hybrid-packet.json",
+    }
+    assert campaign.validate_hybrid_artifact_tree(raw)["result"]["frozen_prepare"] == frozen_prepare
     for observations in (result["original_observations"], result["expanded_observations"]):
         assert len(observations) == 105
         payloads = [row["observation"]["result"] for row in observations]
