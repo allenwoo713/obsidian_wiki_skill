@@ -867,3 +867,120 @@ def test_phase07_frozen_base_rejects_unsafe_archive_members(tmp_path: Path) -> N
         handle.add(payload, arcname="../escape.txt")
     with pytest.raises(FrozenBaseError, match="archive member"):
         safe_extract_frozen_base(archive, tmp_path / "extract")
+
+
+def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_relocated_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fixed absolute page IDs make a relocated base invalid before clone/HNSW."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        FrozenBaseError,
+        finalize_private_role,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    root_a = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
+    wiki = root_a / "Wiki"
+    _write_page(wiki, "# Canonical root\n\nCANONICALROOTTERM\n")
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=root_a, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+    )
+    assert validate_frozen_base(root_a, expected_wiki_root=root_a / "Wiki")
+
+    root_b = tmp_path / "relocated-frozen-corpus"
+    import shutil
+    shutil.copytree(root_a, root_b)
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("relocated frozen source reached clone"),
+    )
+    with pytest.raises(FrozenBaseError, match="resolved root"):
+        finalize_private_role(
+            frozen_dir=root_b, target_dir=tmp_path / "should-not-exist",
+            expected_wiki_root=root_b / "Wiki", candidate_query_policy=policy,
+        )
+    assert not (tmp_path / "should-not-exist").exists()
+
+
+def test_phase07_frozen_prepare_loads_and_validates_model_before_creating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI must not use a target-local probe or create a failed target."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# CLI\n\nMODELBEFORETARGETTERM\n")
+    bundle = tmp_path / "prepare-bundle.json"
+    bundle.write_text("{}", encoding="utf-8")
+    target = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
+    calls: list[Path] = []
+
+    monkeypatch.setattr(frozen, "validate_frozen_prepare_bundle", lambda *_args, **_kwargs: {}, raising=False)
+    def fail_model(model_dir: Path):
+        calls.append(Path(model_dir))
+        raise frozen.FrozenBaseError("verified model unavailable")
+    monkeypatch.setattr(frozen, "load_verified_frozen_embedder", fail_model)
+
+    with pytest.raises(frozen.FrozenBaseError, match="verified model unavailable"):
+        frozen.main([
+            "prepare", "--wiki-dir", str(wiki), "--frozen-dir", str(target),
+            "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "models" / "missing"),
+        ])
+    assert calls == [tmp_path / "models" / "missing"]
+    assert not target.exists()
+    assert not list(tmp_path.rglob(".embedder-probe"))
+
+
+def test_phase07_frozen_archive_rejects_noncanonical_aliases_and_extracted_tree_is_revalidated(
+    tmp_path: Path,
+) -> None:
+    """Archive member spelling is part of the sealed POSIX inventory."""
+    from eval.phase07_frozen_base import FrozenBaseError, safe_extract_frozen_base  # noqa: PLC0415
+
+    archive = tmp_path / "aliases.tar"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("x", encoding="utf-8")
+    with tarfile.open(archive, "w") as handle:
+        handle.add(payload, arcname="x")
+        handle.add(payload, arcname="./x")
+    with pytest.raises(FrozenBaseError, match="archive member"):
+        safe_extract_frozen_base(archive, tmp_path / "extract")
+
+
+def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private publication must preserve the production pre/post-pointer fault boundary."""
+    from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    frozen = tmp_path / "frozen"
+    _write_page(frozen / "Wiki", "# Finalizer\n\nDURABLEMANIFESTTERM\n")
+    prepare_frozen_base(
+        wiki_dir=frozen / "Wiki", frozen_dir=frozen,
+        embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    writes: list[Path] = []
+    real_write = FilesystemIndexManifest.write
+    def capture_write(self, path: Path, manifest):
+        writes.append(path)
+        return real_write(self, path, manifest)
+    monkeypatch.setattr(FilesystemIndexManifest, "write", capture_write)
+
+    index_dir = tmp_path / "private"
+    result = finalize_private_role(
+        frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+        candidate_query_policy=policy, publish_index_dir=index_dir,
+    )
+    assert writes == [Path(result["manifest_path"])]
+    assert (index_dir / "ACTIVE_INDEX").is_file()
