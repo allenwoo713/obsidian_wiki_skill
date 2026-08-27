@@ -756,7 +756,8 @@ def run_phase07_representative_campaign(
 
 def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir: Path, embed=None,
                                                   query_limit: int | None = None,
-                                                  progress_sink=None) -> dict:
+                                                  progress_sink=None,
+                                                  frozen_dir: Path | None = None) -> dict:
     """Run one sealed hybrid *role* with an operator-minted capability.
 
     A role is either the shared baseline or one candidate.  It builds exactly
@@ -780,15 +781,29 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
     root = Path(work_dir) / f"hybrid-{role}-m{config['m']}"
     if root.exists():
         shutil.rmtree(root)
-    original_wiki, expanded_wiki = root / "original" / "Wiki", root / "expanded" / "Wiki"
+    original_wiki = root / "original" / "Wiki"
     shutil.copytree(FIXTURES_WIKI, original_wiki)
     # A local test exercises the production topology but not a 30k benchmark.
     source_count = sum(1 for page in FIXTURES_WIKI.rglob("*.md") if page.is_file())
     target_size = source_count + 2 if embed is not None else bundle["scale"]
-    expanded_identity = _materialize_phase07_expanded_corpus(
-        fixture_root=FIXTURES_WIKI, output_root=expanded_wiki, target_size=target_size,
-        test_only=embed is not None,
-    )
+    if frozen_dir is None:
+        expanded_wiki = root / "expanded" / "Wiki"
+        expanded_identity = _materialize_phase07_expanded_corpus(
+            fixture_root=FIXTURES_WIKI, output_root=expanded_wiki, target_size=target_size,
+            test_only=embed is not None,
+        )
+    else:
+        # The downloaded tree is validated before a clone can be created.  It
+        # remains read-only evidence; only ``root/expanded-private`` receives
+        # an HNSW, manifest, generation record and ACTIVE_INDEX pointer.
+        from eval.phase07_frozen_base import validate_frozen_base
+        frozen_dir = Path(frozen_dir).resolve()
+        expanded_wiki = frozen_dir / "Wiki"
+        validate_frozen_base(frozen_dir, expected_wiki_root=expanded_wiki)
+        expanded_identity = {
+            "expanded_content_tree_sha256": canonical_content_tree_sha256(expanded_wiki),
+            "expanded_member_count": sum(1 for path in expanded_wiki.rglob("*.md") if path.is_file()),
+        }
 
     def build_candidate(name: str, config: dict, wiki: Path):
         corpus_started = time.perf_counter()
@@ -811,6 +826,20 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
             build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=config["m"], ef_construction=config["ef_construction"]),
         )
         index_dir = root / name / ".index"
+        if name == "expanded" and frozen_dir is not None:
+            from eval.phase07_frozen_base import finalize_private_role
+
+            finalized = finalize_private_role(
+                frozen_dir=frozen_dir,
+                target_dir=root / "expanded-private-clone",
+                expected_wiki_root=wiki,
+                candidate_query_policy=policy,
+                publish_index_dir=index_dir,
+            )
+            index = WikiIndex(Path(finalized["index_dir"]))
+            index.load()
+            emit_stage("private_clone_hnsw_publish_load")
+            return index
         if embed is None:
             index = WikiIndex(index_dir)
             index.build(

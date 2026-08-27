@@ -1329,6 +1329,16 @@ def test_phase07_frozen_prepare_is_a_separate_120_minute_non_authorizing_job() -
     assert "phase07-hybrid" not in section
 
 
+def test_phase07_role_download_uses_the_exact_prepare_run_and_artifact_identity() -> None:
+    """A role cannot fall back to a latest artifact name or an inherited matrix file."""
+    _job, hybrid = _phase07_hybrid_workflow_section()
+    assert "actions/download-artifact@v4" in hybrid
+    assert "run-id: ${{ fromJSON(inputs.workflow_inputs).prepare.run_id }}" in hybrid
+    assert "artifact-ids: ${{ fromJSON(inputs.workflow_inputs).prepare.artifact_id }}" in hybrid
+    assert "--frozen-dir .review-tmp/phase07/frozen-corpus" in hybrid
+    assert "name: phase07-frozen-base" not in hybrid
+
+
 def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
     """The distinct job is model-backed, finite, and never publishes secrets."""
     _job, hybrid = _phase07_hybrid_workflow_section()

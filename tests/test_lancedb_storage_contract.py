@@ -808,7 +808,7 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     assert descriptor["schema_version"] == 1
     assert not (frozen / "ACTIVE_INDEX").exists()
     assert not list((frozen / "lance_db").rglob("*hnsw*"))
-    source_digest = validate_frozen_base(frozen, expected_wiki_root=wiki)
+    source_digest = validate_frozen_base(frozen, expected_wiki_root=frozen / "Wiki")
     source = lancedb.connect(str(frozen / "lance_db"))
     assert set(source.table_names()) == {"sparse_chunks", "dense_chunks"}
     assert {index.name for index in source.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
@@ -821,13 +821,40 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
         )
         target = tmp_path / f"role-m{m}"
         finalized = finalize_private_role(
-            frozen_dir=frozen, target_dir=target, expected_wiki_root=wiki, candidate_query_policy=policy,
+            frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki", candidate_query_policy=policy,
         )
         assert finalized["source_tree_sha256"] == source_digest
         target_db = lancedb.connect(str(target / "lance_db"))
         assert len(target_db.open_table("dense_chunks").list_indices()) == 1
         assert {index.name for index in target_db.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
-        assert validate_frozen_base(frozen, expected_wiki_root=wiki) == source_digest
+        assert validate_frozen_base(frozen, expected_wiki_root=frozen / "Wiki") == source_digest
+
+
+def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_path: Path) -> None:
+    """The role clone follows the same ACTIVE_INDEX commit lifecycle as production."""
+    from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus-source" / "Wiki"
+    _write_page(wiki, "# Frozen lifecycle\n\nFROZENLIFECYCLE exact retrieval content.")
+    frozen = tmp_path / "frozen"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=300,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=20, ef_construction=300),
+    )
+    private_root = tmp_path / "private"
+    published = finalize_private_role(
+        frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+        candidate_query_policy=policy, publish_index_dir=private_root,
+    )
+    index = WikiIndex(private_root)
+    index.load()
+    assert (private_root / "ACTIVE_INDEX").is_file()
+    assert Path(published["manifest_path"]).is_file()
+    assert not list((private_root / "builds").glob("*/.failed"))
 
 
 def test_phase07_frozen_base_rejects_unsafe_archive_members(tmp_path: Path) -> None:

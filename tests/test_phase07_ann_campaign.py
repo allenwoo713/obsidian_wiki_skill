@@ -71,8 +71,9 @@ def test_frozen_role_provenance_requires_three_distinct_attempt_one_roles() -> N
 
     base = {
         "prepare_run_id": 101, "prepare_run_attempt": 1, "prepare_job_id": 201,
-        "prepare_artifact_id": 301, "archive_sha256": hashlib.sha256(b"archive").hexdigest(),
-        "tree_sha256": hashlib.sha256(b"tree").hexdigest(), "retention_days": 90,
+        "prepare_artifact_id": 301, "prepare_archive_sha256": hashlib.sha256(b"archive").hexdigest(),
+        "prepare_descriptor_sha256": hashlib.sha256(b"descriptor").hexdigest(),
+        "prepare_tree_sha256": hashlib.sha256(b"tree").hexdigest(), "retention_days": 90,
         "head_sha": HEAD, "runtime": _locked_confirmation_environment()["runtime"],
         "corpus_sha256": CORPUS_MANIFEST_SHA256, "model_manifest_sha256": MODEL_MANIFEST_SHA256,
     }
@@ -86,6 +87,10 @@ def test_frozen_role_provenance_requires_three_distinct_attempt_one_roles() -> N
     duplicate[2]["run_id"] = 2
     with pytest.raises(ValueError, match="distinct"):
         validate_frozen_role_provenance(duplicate, expected_head=HEAD)
+    mixed = [dict(record) for record in roles]
+    mixed[1]["prepare_descriptor_sha256"] = hashlib.sha256(b"replacement").hexdigest()
+    with pytest.raises(ValueError, match="mixed"):
+        validate_frozen_role_provenance(mixed, expected_head=HEAD)
 
 
 def test_frozen_prepare_has_no_future_id_gate_and_failed_prepare_emits_zero_roles() -> None:

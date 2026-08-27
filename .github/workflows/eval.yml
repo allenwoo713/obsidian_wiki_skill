@@ -713,6 +713,19 @@ jobs:
           WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
         run: >
           python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); v=json.loads(os.environ['WORKFLOW_INPUTS']); (d/'hybrid-dispatch.json').write_text(json.dumps(v,sort_keys=True))"
+      - name: Download one explicit successful frozen prepare artifact
+        # Cross-run evidence may never be selected by latest name.  The sealed
+        # role bundle carries both IDs and the source is extracted into the one
+        # empty canonical root whose absolute page IDs were prepared.
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ fromJSON(inputs.workflow_inputs).prepare.run_id }}
+          artifact-ids: ${{ fromJSON(inputs.workflow_inputs).prepare.artifact_id }}
+          path: .review-tmp/phase07/frozen-corpus
+      - name: Validate the empty-root frozen extraction before private cloning
+        run: >
+          python -c "from pathlib import Path; from eval.phase07_frozen_base import validate_frozen_base; root=Path('.review-tmp/phase07/frozen-corpus'); assert root.is_dir() and not root.is_symlink(); validate_frozen_base(root, expected_wiki_root=root/'Wiki')"
       - name: Bind this attempt to exactly one hybrid job before any index build
         # The operator queries the exact attempt-scoped /attempts/{run_attempt}/jobs API.
         env:
@@ -733,6 +746,7 @@ jobs:
           --locked-execution .review-tmp/phase07/hybrid-execution.json
           --allocation .review-tmp/phase07/hybrid-allocation.json
           --output-dir .review-tmp/phase07/hybrid-artifact
+          --frozen-dir .review-tmp/phase07/frozen-corpus
       - name: Export the sealed hybrid packet from raw production output
         if: ${{ success() }}
         run: >

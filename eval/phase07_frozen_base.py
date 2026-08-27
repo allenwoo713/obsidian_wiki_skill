@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tarfile
@@ -30,16 +31,24 @@ from obsidian_wiki.domain.index_models import (
     VectorIndexConfig,
 )
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
+from obsidian_wiki.application.active_index_pointer import (
+    publish_pointer,
+    record_building,
+    record_validated,
+)
+from obsidian_wiki.application.build_lock import new_build_context
+from obsidian_wiki.domain.index_models import INDEX_LAYOUT_VERSION, INDEX_MANIFEST_FORMAT_VERSION
 
 
 SCHEMA_VERSION = 1
-_TOP_LEVEL = frozenset({"Wiki", "lance_db", "graph.json", "pages.json", "frozen-base.json"})
+_TOP_LEVEL = frozenset({"Wiki", "lance_db", ".index", "graph.json", "pages.json", "frozen-base.json"})
 _DESCRIPTOR_FIELDS = frozenset({
     "schema_version", "kind", "authorization", "resolved_wiki_root", "pages_sha256",
     "graph_sha256", "source_tree_sha256", "lance_tree_sha256", "frozen_tree_sha256",
     "record_self_sha256",
 })
 _FORBIDDEN_NAMES = frozenset({"ACTIVE_INDEX", "manifest.json", ".failed"})
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class FrozenBaseError(ValueError):
@@ -166,17 +175,26 @@ def _make_chunks(wiki_dir: Path, embed: Callable[[list[str]], list[list[float]]]
 
 
 def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[list[str]], list[list[float]]],
-                        tokenizer: object) -> dict[str, object]:
+                        tokenizer: object = None) -> dict[str, object]:
     """Persist reusable data once, deliberately stopping before HNSW/publication."""
     wiki_dir, frozen_dir = Path(wiki_dir).resolve(), Path(frozen_dir)
     if frozen_dir.exists():
         raise FrozenBaseError("frozen target must be new")
-    sparse, dense, pages = _make_chunks(wiki_dir, embed, tokenizer=tokenizer)
     frozen_dir.mkdir(parents=True)
     shutil.copytree(wiki_dir, frozen_dir / "Wiki")
+    # The tables and page IDs must be created from the exact tree which is
+    # sealed into the archive.  Building from a transient source and copying
+    # it afterwards made the descriptor's absolute-root assertion cosmetic.
+    wiki_dir = (frozen_dir / "Wiki").resolve()
+    sparse, dense, pages = _make_chunks(wiki_dir, embed, tokenizer=tokenizer)
     pages_path = frozen_dir / "pages.json"
     pages_path.write_bytes(_canonical_json(pages))
-    (frozen_dir / "graph.json").write_bytes(_canonical_json(_graph_payload(wiki_dir)))
+    graph_bytes = _canonical_json(_graph_payload(wiki_dir))
+    (frozen_dir / "graph.json").write_bytes(graph_bytes)
+    # Public hybrid search resolves graph state from ``Wiki/../.index``.  Copy
+    # the already-built sealed graph there instead of rebuilding it per role.
+    (frozen_dir / ".index").mkdir()
+    (frozen_dir / ".index" / "graph.json").write_bytes(graph_bytes)
     repository = LanceDbIndexRepository(frozen_dir / "lance_db")
     repository.persist(frozen_dir / "lance_db", sparse, dense, FtsIndexConfig())
     repository.validate_reopened(
@@ -187,7 +205,7 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
     repository.seal(frozen_dir / "lance_db")
     source_tree = _tree_inventory(frozen_dir / "Wiki")[1]
     lance_tree = _tree_inventory(frozen_dir / "lance_db")[1]
-    frozen_tree = _tree_inventory(frozen_dir)[1]
+    frozen_tree = _tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))[1]
     descriptor: dict[str, object] = {
         "schema_version": SCHEMA_VERSION, "kind": "phase07-frozen-base", "authorization": "none",
         "resolved_wiki_root": str(wiki_dir), "pages_sha256": _sha256_file(pages_path),
@@ -222,14 +240,18 @@ def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path) -> str:
     ):
         raise FrozenBaseError("frozen top-level allowlist")
     expected = Path(expected_wiki_root).resolve()
-    if descriptor["resolved_wiki_root"] != str(expected):
+    if expected != (frozen_dir / "Wiki").resolve() or descriptor["resolved_wiki_root"] != str(expected):
         raise FrozenBaseError("frozen resolved root")
     if _tree_inventory(frozen_dir / "Wiki")[1] != descriptor["source_tree_sha256"] \
             or _tree_inventory(frozen_dir / "lance_db")[1] != descriptor["lance_tree_sha256"]:
         raise FrozenBaseError("frozen tree digest")
+    if _tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))[1] != descriptor["frozen_tree_sha256"]:
+        raise FrozenBaseError("frozen tree digest")
     if _sha256_file(frozen_dir / "pages.json") != descriptor["pages_sha256"] \
             or _sha256_file(frozen_dir / "graph.json") != descriptor["graph_sha256"]:
         raise FrozenBaseError("frozen sidecar digest")
+    if _sha256_file(frozen_dir / ".index" / "graph.json") != descriptor["graph_sha256"]:
+        raise FrozenBaseError("frozen public graph identity")
     try:
         pages = json.loads((frozen_dir / "pages.json").read_text(encoding="utf-8"))
         graph = json.loads((frozen_dir / "graph.json").read_text(encoding="utf-8"))
@@ -262,21 +284,84 @@ def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path) -> str:
     return str(descriptor["frozen_tree_sha256"])
 
 
+def _candidate_manifest(*, pages: list[dict[str, object]], build_id: str, generation: int,
+                        candidate_query_policy: CandidateQueryPolicy,
+                        vector_config: VectorIndexConfig) -> dict[str, object]:
+    """Construct the smallest normal load manifest for an already-validated clone.
+
+    Frozen data deliberately has no manifest.  This manifest is created only
+    after the private HNSW is reopened and validated, immediately before the
+    existing lifecycle's ``record_validated`` / ``publish_pointer`` commit.
+    """
+    return {
+        "format_version": INDEX_MANIFEST_FORMAT_VERSION,
+        "index_layout_version": INDEX_LAYOUT_VERSION,
+        "layout": "sparse_chunks+dense_chunks",
+        "build_id": build_id,
+        "generation": generation,
+        "pages": pages,
+        "candidate_query_policy": {
+            "candidate": candidate_query_policy.candidate,
+            "query_ef": candidate_query_policy.query_ef,
+            "build_policy": {
+                "candidate": candidate_query_policy.build_policy.candidate,
+                "m": candidate_query_policy.build_policy.m,
+                "ef_construction": candidate_query_policy.build_policy.ef_construction,
+            },
+        },
+        "ann_policy": {
+            "selected_index_type": candidate_query_policy.candidate,
+            "query_ef": candidate_query_policy.query_ef,
+        },
+        "vector_config": {
+            "index_type": vector_config.index_type,
+            "metric": vector_config.metric,
+            "num_partitions": vector_config.num_partitions,
+            "m": vector_config.m,
+            "ef_construction": vector_config.ef_construction,
+            "dense_chunks_count": vector_config.dense_chunks_count,
+            "index_name": vector_config.index_name,
+        },
+    }
+
+
 def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_root: Path,
-                          candidate_query_policy: CandidateQueryPolicy) -> dict[str, object]:
+                          candidate_query_policy: CandidateQueryPolicy,
+                          publish_index_dir: Path | None = None) -> dict[str, object]:
     """Clone validated tables and build exactly one candidate HNSW in that clone."""
     source_digest = validate_frozen_base(frozen_dir, expected_wiki_root=expected_wiki_root)
     target_dir = Path(target_dir)
     if target_dir.exists():
         raise FrozenBaseError("private clone target must be new")
     target_dir.mkdir(parents=True)
+    # A caller which needs the public WikiIndex path supplies an empty private
+    # index root.  The clone then lives in a normal staged build directory; the
+    # default retains the small direct-Lance seam used by storage tests.
+    index_dir = Path(publish_index_dir) if publish_index_dir is not None else None
+    if index_dir is not None:
+        if index_dir.exists() and any(index_dir.iterdir()):
+            raise FrozenBaseError("private publication target must be new")
+        index_dir.mkdir(parents=True, exist_ok=True)
+        # Reuse the lifecycle's exact timestamp + UUID build-id grammar; a
+        # bespoke frozen prefix is not a valid GenerationRecord identity.
+        build_id = new_build_context().build_id
+        generation = 1
+        build_dir = index_dir / "builds" / build_id
+        build_dir.mkdir(parents=True, exist_ok=False)
+        record_building(build_dir, build_id=build_id, generation=generation)
+        lance_dir = build_dir / "lance_db"
+    else:
+        build_id = None
+        generation = None
+        build_dir = None
+        lance_dir = target_dir / "lance_db"
     source = LanceDbIndexRepository(Path(frozen_dir) / "lance_db")
-    identities = source.clone_tables(target_dir / "lance_db")
+    identities = source.clone_tables(lance_dir)
     shutil.copy2(Path(frozen_dir) / "pages.json", target_dir / "pages.json")
     shutil.copy2(Path(frozen_dir) / "graph.json", target_dir / "graph.json")
     dense_count = next(identity.row_count for identity in identities if identity.table_name == "dense_chunks")
     policy = candidate_query_policy.build_policy
-    target = LanceDbIndexRepository(target_dir / "lance_db", eval_candidate_policy=candidate_query_policy)
+    target = LanceDbIndexRepository(lance_dir, eval_candidate_policy=candidate_query_policy)
     config = VectorIndexConfig(
         index_type="hnsw_sq", metric="cosine", num_partitions=1, m=policy.m,
         ef_construction=policy.ef_construction, dense_chunks_count=dense_count,
@@ -287,10 +372,37 @@ def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_r
         exact_term=_exact_term([type("R", (), row) for row in target.table_rows("sparse_chunks")]),
         vector_index_name=config.index_name,
     )
-    target.seal(target_dir / "lance_db")
+    target.seal(lance_dir)
+    manifest_path = None
+    if build_dir is not None and index_dir is not None and build_id is not None and generation is not None:
+        try:
+            pages = json.loads((frozen_dir / "pages.json").read_text(encoding="utf-8"))
+            if not isinstance(pages, list):
+                raise FrozenBaseError("frozen page manifest")
+            manifest = _candidate_manifest(
+                pages=pages, build_id=build_id, generation=generation,
+                candidate_query_policy=candidate_query_policy, vector_config=config,
+            )
+            manifest_path = build_dir / "manifest.json"
+            manifest_path.write_bytes(_canonical_json(manifest))
+            record_validated(
+                build_dir, build_id=build_id, generation=generation,
+                manifest_sha256=_sha256_file(manifest_path),
+            )
+            publish_pointer(index_dir, build_dir, build_id=build_id, generation=generation)
+        except Exception:
+            # Preserve the existing pre-/post-publication semantics: once the
+            # pointer is durable there can be no contradictory failed marker.
+            if not (index_dir / "ACTIVE_INDEX").exists() and build_dir is not None:
+                (build_dir / ".failed").write_text("frozen private clone failed before publication\n", encoding="utf-8")
+            raise
     if validate_frozen_base(frozen_dir, expected_wiki_root=expected_wiki_root) != source_digest:
         raise FrozenBaseError("frozen source mutated by private clone")
-    return {"source_tree_sha256": source_digest, "role_m": policy.m, "lance_dir": str(target_dir / "lance_db")}
+    return {
+        "source_tree_sha256": source_digest, "role_m": policy.m,
+        "lance_dir": str(lance_dir), "index_dir": str(index_dir) if index_dir is not None else None,
+        "manifest_path": str(manifest_path) if manifest_path is not None else None,
+    }
 
 
 def safe_extract_frozen_base(archive: Path, destination: Path) -> None:
@@ -320,7 +432,8 @@ def validate_frozen_role_provenance(records: list[dict[str, Any]], *, expected_h
     expected = {("baseline", 16), ("m20", 20), ("m32", 32)}
     common_fields = {
         "prepare_run_id", "prepare_run_attempt", "prepare_job_id", "prepare_artifact_id",
-        "archive_sha256", "tree_sha256", "retention_days", "head_sha", "runtime",
+        "prepare_archive_sha256", "prepare_descriptor_sha256", "prepare_tree_sha256",
+        "retention_days", "head_sha", "runtime",
         "corpus_sha256", "model_manifest_sha256",
     }
     seen = set()
@@ -340,6 +453,10 @@ def validate_frozen_role_provenance(records: list[dict[str, Any]], *, expected_h
         seen.add(identity)
         run_ids.add(identity[0]); job_ids.add(identity[1]); artifact_ids.add(identity[2])
         current = {field: record.get(field) for field in common_fields}
+        if not all(isinstance(current[name], str) and _HEX64.fullmatch(current[name])
+                   for name in ("prepare_archive_sha256", "prepare_descriptor_sha256", "prepare_tree_sha256",
+                                "corpus_sha256", "model_manifest_sha256")):
+            raise ValueError("frozen prepare identity")
         if common is None:
             common = current
         elif common != current:

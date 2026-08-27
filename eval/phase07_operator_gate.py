@@ -705,7 +705,8 @@ def _consume_hybrid_execution_capability(value: object) -> dict[str, Any]:
 
 
 def execute_hybrid_dispatch(*, bundle: dict[str, Any], locked_execution: dict[str, Any], allocation: dict[str, Any],
-                            work_dir: Path, runner: Any | None = None) -> dict[str, Any]:
+                            work_dir: Path, runner: Any | None = None,
+                            frozen_dir: Path | None = None) -> dict[str, Any]:
     """The single build boundary; validate all authority before invoking the runner."""
     head = _git("rev-parse", "HEAD")
     member = validate_hybrid_dispatch_bundle(bundle, expected_head=head)
@@ -722,7 +723,14 @@ def execute_hybrid_dispatch(*, bundle: dict[str, Any], locked_execution: dict[st
     if production_runner:
         from eval.run_eval import _run_phase07_hybrid_campaign_with_capability
         runner = _run_phase07_hybrid_campaign_with_capability
-    result = runner(capability=capability, work_dir=work_dir / "campaign" if production_runner else work_dir)
+    runner_kwargs = {"capability": capability, "work_dir": work_dir / "campaign" if production_runner else work_dir}
+    if frozen_dir is not None:
+        # Only the production runner accepts the trusted downloaded root.  A
+        # custom test runner must not gain an unvalidated filesystem authority.
+        if not production_runner:
+            raise ValueError("frozen source is only valid for the production hybrid runner")
+        runner_kwargs["frozen_dir"] = Path(frozen_dir)
+    result = runner(**runner_kwargs)
     if not isinstance(result, dict) or result.get("authorization") != "none":
         raise ValueError("hybrid runner produced authorizing evidence")
     if production_runner:
@@ -1718,6 +1726,7 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
     parser.add_argument("--locked-execution", type=Path)
     parser.add_argument("--allocation", type=Path)
     parser.add_argument("--downloads-file", type=Path)
+    parser.add_argument("--frozen-dir", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "hosted-preflight":
@@ -1769,7 +1778,7 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
             allocation = allocation_document.get("allocation") if set(allocation_document) >= {"allocation"} else allocation_document
             execute_hybrid_dispatch(
                 bundle=_read_object(args.dispatch_bundle), locked_execution=_read_object(args.locked_execution),
-                allocation=allocation, work_dir=args.output_dir,
+                allocation=allocation, work_dir=args.output_dir, frozen_dir=args.frozen_dir,
             )
             return 0
         if args.command == "hybrid-collection-request":
