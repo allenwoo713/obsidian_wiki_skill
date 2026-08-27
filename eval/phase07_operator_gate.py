@@ -104,6 +104,73 @@ HYBRID_DENSE_ORDINAL_IDENTITIES = (
      "build_ids": ["825c1a3f523e62affe8385443f628aa3d0638db7468f8c6871e76a9038ef44c0", "b6f66e475137e3e58c7554d503b0714586df6a0558b5ab9c22b2118cf28ea4e4", "95194274760a8b9f083c629250e4437d4199efe633241a0ae02bb161300b848f"]},
 )
 
+# The frozen prepare is intentionally a separate state machine from the
+# legacy three-role hybrid request.  A local measurement can authorize *only*
+# a prepare dispatch; an artifact identity does not exist until that run has
+# completed, so requiring one at this point would be a circular future-ID gate.
+FROZEN_ROLE_CONFIGS = (
+    ("baseline", {"index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100}),
+    ("m20", {"index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300}),
+    ("m32", {"index_type": "hnsw_sq", "m": 32, "ef_construction": 300, "query_ef": 300}),
+)
+
+
+def build_frozen_prepare_bundle(local_preflight: dict[str, Any], *, expected_head: str) -> dict[str, Any]:
+    """Mint the sole non-authorizing prepare bundle from measured local facts.
+
+    No remotely allocated ID is accepted here: the API identity is a result of
+    this prepare run and is deliberately required only by ``build_frozen_role_bundles``.
+    """
+    required = {
+        "schema_version", "head_sha", "target_size", "wall_time_seconds", "cap_minutes",
+        "uncompressed_bytes", "archive_bytes", "file_count", "largest_file", "descriptor_sha256",
+        "tree_sha256", "repository_capability", "human_authorized",
+    }
+    if not SHA.fullmatch(expected_head) or not isinstance(local_preflight, dict) or set(local_preflight) != required \
+            or local_preflight.get("schema_version") != 1 or local_preflight.get("head_sha") != expected_head \
+            or local_preflight.get("target_size") != 30000 or local_preflight.get("cap_minutes") != 120 \
+            or local_preflight.get("repository_capability") is not True or local_preflight.get("human_authorized") is not True \
+            or not all(isinstance(local_preflight.get(name), int) and not isinstance(local_preflight[name], bool) and local_preflight[name] > 0
+                       for name in ("wall_time_seconds", "uncompressed_bytes", "archive_bytes", "file_count", "largest_file")) \
+            or local_preflight["wall_time_seconds"] > 120 * 60 \
+            or not all(isinstance(local_preflight.get(name), str) and HEX64.fullmatch(local_preflight[name])
+                       for name in ("descriptor_sha256", "tree_sha256")):
+        raise ValueError("sealed frozen local preflight")
+    return _sealed({
+        "schema_version": 1, "campaign_stage": "hybrid-prepare", "head_sha": expected_head,
+        "local_preflight": dict(local_preflight), "authorization": "none", "retention_days": 90,
+    })
+
+
+def build_frozen_role_bundles(prepare_provenance: object, *, expected_head: str) -> list[dict[str, Any]]:
+    """Return exactly three role bundles only after one successful API-bound prepare.
+
+    Rejected, pending, retry, replacement, expired, or malformed prepare evidence
+    has one safe output: zero role bundles.
+    """
+    fields = {
+        "status", "head_sha", "run_id", "run_attempt", "job_id", "artifact_id", "archive_sha256",
+        "descriptor_sha256", "tree_sha256", "uploaded_bytes", "retention_days", "replacement_for_run_id",
+    }
+    if not isinstance(prepare_provenance, dict) or set(prepare_provenance) != fields \
+            or prepare_provenance.get("status") != "success" or prepare_provenance.get("head_sha") != expected_head \
+            or prepare_provenance.get("run_attempt") != 1 or prepare_provenance.get("retention_days") != 90 \
+            or prepare_provenance.get("replacement_for_run_id") is not None:
+        return []
+    if not all(isinstance(prepare_provenance.get(name), int) and not isinstance(prepare_provenance[name], bool) and prepare_provenance[name] > 0
+               for name in ("run_id", "job_id", "artifact_id", "uploaded_bytes")) \
+            or not all(isinstance(prepare_provenance.get(name), str) and HEX64.fullmatch(prepare_provenance[name])
+                       for name in ("archive_sha256", "descriptor_sha256", "tree_sha256")):
+        return []
+    base = {
+        "schema_version": 1, "campaign_stage": "hybrid", "head_sha": expected_head,
+        "prepare": dict(prepare_provenance), "authorization": "none", "retention_days": 90,
+    }
+    return [
+        _sealed({**base, "role": role, "config": dict(config), "dispatch_identity": f"phase07-hybrid/{role}"})
+        for role, config in FROZEN_ROLE_CONFIGS
+    ]
+
 
 def canonical_digest(payload: dict[str, Any]) -> str:
     """Digest a record without its recursive self-digest field."""

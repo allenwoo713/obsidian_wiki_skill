@@ -88,6 +88,28 @@ def test_frozen_role_provenance_requires_three_distinct_attempt_one_roles() -> N
         validate_frozen_role_provenance(duplicate, expected_head=HEAD)
 
 
+def test_frozen_prepare_has_no_future_id_gate_and_failed_prepare_emits_zero_roles() -> None:
+    preflight = {
+        "schema_version": 1, "head_sha": HEAD, "target_size": 30000, "wall_time_seconds": 7199,
+        "cap_minutes": 120, "uncompressed_bytes": 12, "archive_bytes": 8, "file_count": 4,
+        "largest_file": 6, "descriptor_sha256": hashlib.sha256(b"descriptor").hexdigest(),
+        "tree_sha256": hashlib.sha256(b"tree").hexdigest(), "repository_capability": True,
+        "human_authorized": True,
+    }
+    bundle = operator.build_frozen_prepare_bundle(preflight, expected_head=HEAD)
+    assert bundle["campaign_stage"] == "hybrid-prepare"
+    assert "artifact_id" not in bundle["local_preflight"]
+    assert operator.build_frozen_role_bundles({"status": "cancelled"}, expected_head=HEAD) == []
+    provenance = {
+        "status": "success", "head_sha": HEAD, "run_id": 10, "run_attempt": 1, "job_id": 11,
+        "artifact_id": 12, "archive_sha256": hashlib.sha256(b"archive").hexdigest(),
+        "descriptor_sha256": preflight["descriptor_sha256"], "tree_sha256": preflight["tree_sha256"],
+        "uploaded_bytes": 8, "retention_days": 90, "replacement_for_run_id": None,
+    }
+    roles = operator.build_frozen_role_bundles(provenance, expected_head=HEAD)
+    assert [(row["role"], row["config"]["m"]) for row in roles] == [("baseline", 16), ("m20", 20), ("m32", 32)]
+
+
 def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
     request = {
         "schema_version": 1, "stage": stage, "request_id": "request-1", "environment": {},
