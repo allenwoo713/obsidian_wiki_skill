@@ -82,14 +82,13 @@ def _embed384(seed: int = 0):
 
 
 def _phase07_test_corpus_identity(wiki: Path) -> dict[str, object]:
-    """The only small-corpus seam is an explicit pytest-only identity."""
-    from eval.run_eval import expected_phase07_expanded_corpus_identity
+    """Small storage fixtures opt in through this explicit function argument."""
+    from eval.ann_corpus_manifest import canonical_content_tree_sha256
 
-    return expected_phase07_expanded_corpus_identity(
-        fixture_root=wiki,
-        target_size=sum(1 for path in wiki.rglob("*.md") if path.is_file()),
-        test_only=True,
-    )
+    return {
+        "expanded_content_tree_sha256": canonical_content_tree_sha256(wiki),
+        "expanded_member_count": sum(1 for path in wiki.rglob("*.md") if path.is_file()),
+    }
 
 
 class _FacadeEmbedder:
@@ -1233,3 +1232,87 @@ def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_co
             validate_frozen_prepare_identity_shape(
                 invalid, expected_repository=identity["repository"], expected_head=head_sha, now=now,
             )
+
+
+def test_phase07_frozen_corpus_identity_is_exact_authority_not_a_30k_shaped_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A descriptor may not substitute an arbitrary 64-hex/count-30k identity."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    authority = {
+        "expanded_content_tree_sha256": "a" * 64,
+        "expanded_member_count": 30_000,
+    }
+    forged = {
+        "expanded_content_tree_sha256": "b" * 64,
+        "expanded_member_count": 30_000,
+    }
+    monkeypatch.setattr(frozen, "_default_expected_corpus_identity", lambda: authority)
+
+    assert frozen._expected_corpus_identity(None) == authority
+    with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
+        frozen._expected_corpus_identity(forged)
+
+
+@pytest.mark.parametrize("field", ("text", "content_hash", "title", "chunk_id"))
+def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    """Even a re-sealed dense table cannot drift from canonical Markdown chunks."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Plan source\n\nMARKDOWNPLANIDENTITYTERM\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen_dir = tmp_path / "frozen"
+    frozen.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen_dir, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+
+    repository = LanceDbIndexRepository(frozen_dir / "lance_db")
+    original = dict(repository.table_rows("dense_chunks")[0])
+    changed = dict(original)
+    if field == "chunk_id":
+        changed[field] = original[field] + "-tampered"
+        deleted = [str(original["chunk_id"])]
+    elif field == "content_hash":
+        changed[field] = "0" * 16
+        deleted = []
+    else:
+        changed[field] = str(original[field]) + " tampered"
+        deleted = []
+    repository.apply_delta("dense_chunks", added=(), updated=(changed,), deleted_ids=deleted)
+    repository.seal(frozen_dir / "lance_db")
+
+    # Model an attacker who also recomputes every descriptor/tree digest.  The
+    # remaining validator must derive the non-vector plan from Markdown.
+    descriptor = frozen._read_descriptor(frozen_dir)
+    sparse = repository.table_rows("sparse_chunks")
+    dense = repository.table_rows("dense_chunks")
+    descriptor["canonical_chunk_plan_sha256"] = frozen._canonical_chunk_plan_sha256(sparse, dense)
+    descriptor["dense_vectors_sha256"] = frozen._dense_vectors_sha256(dense)
+    descriptor["lance_tree_sha256"] = frozen._tree_inventory(frozen_dir / "lance_db")[1]
+    inventory, tree = frozen._tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))
+    descriptor["frozen_file_inventory"] = inventory
+    descriptor["frozen_tree_sha256"] = tree
+    descriptor["record_self_sha256"] = frozen._sha256_bytes(frozen._canonical_json({
+        key: value for key, value in descriptor.items() if key != "record_self_sha256"
+    }))
+    (frozen_dir / "frozen-base.json").write_bytes(frozen._canonical_json(descriptor))
+
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("tampered frozen source reached clone/HNSW"),
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="canonical Markdown chunk plan"):
+        frozen.finalize_private_role(
+            frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
+            candidate_query_policy=policy, expected_corpus_identity=identity,
+        )
