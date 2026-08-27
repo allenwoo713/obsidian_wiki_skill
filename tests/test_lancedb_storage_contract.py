@@ -105,6 +105,19 @@ class _FacadeEmbedder:
         return self._encode(texts)
 
 
+def _boundary_tokenizer(text: str, **_kwargs: object) -> dict[str, list[int]]:
+    """A deterministic tokenizer unlike the removed four-char estimator."""
+    import re
+
+    # Seven words are 21 tokens here but only 14 with the old char/4 estimate;
+    # the 112-token chunk boundary therefore falls on different paragraphs.
+    return {"input_ids": list(range(max(1, 3 * len(re.findall(r"[A-Za-z]+|[^\sA-Za-z]", text)))))}
+
+
+def _different_boundary_tokenizer(text: str, **_kwargs: object) -> dict[str, list[int]]:
+    return {"input_ids": list(range(max(1, len(text) // 4)))}
+
+
 def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> None:
     """The direct script wrapper crosses service/port/adapter into LanceDB."""
     long_term = "D01ExactTerm" + "abc123" * 29
@@ -822,7 +835,8 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     assert not (frozen / "ACTIVE_INDEX").exists()
     assert not list((frozen / "lance_db").rglob("*hnsw*"))
     source_digest = validate_frozen_base(
-        frozen, expected_wiki_root=frozen / "Wiki", expected_corpus_identity=identity,
+        frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
     )
     source = lancedb.connect(str(frozen / "lance_db"))
     assert set(source.table_names()) == {"sparse_chunks", "dense_chunks"}
@@ -837,6 +851,7 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
         target = tmp_path / f"role-m{m}"
         finalized = finalize_private_role(
             frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki", candidate_query_policy=policy,
+            tokenizer=_FacadeEmbedder().tokenizer,
             expected_corpus_identity=identity,
         )
         assert finalized["source_tree_sha256"] == source_digest
@@ -844,8 +859,77 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
         assert len(target_db.open_table("dense_chunks").list_indices()) == 1
         assert {index.name for index in target_db.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
         assert validate_frozen_base(
-            frozen, expected_wiki_root=frozen / "Wiki", expected_corpus_identity=identity,
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
         ) == source_digest
+
+
+def test_phase07_frozen_base_requires_the_preparation_tokenizer_at_the_112_token_boundary(tmp_path: Path) -> None:
+    """The canonical validation plan must not silently use char/4 token counts."""
+    from eval.phase07_frozen_base import FrozenBaseError, prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    # Each paragraph has seven 8-char words.  The two tokenizers split this
+    # long Markdown on different paragraph boundaries around 112 tokens.
+    body = "\n\n".join("alphabet betaabcd gammabcd deltaabcd epsilonx zetaabcd etaabcde" for _ in range(24))
+    _write_page(wiki, f"# Boundary\n\n{body}\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen = tmp_path / "frozen"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_boundary_tokenizer,
+        expected_corpus_identity=identity,
+    )
+    assert validate_frozen_base(
+        frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_boundary_tokenizer,
+        expected_corpus_identity=identity,
+    )
+    with pytest.raises(FrozenBaseError, match="canonical Markdown chunk plan"):
+        validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_different_boundary_tokenizer,
+            expected_corpus_identity=identity,
+        )
+
+
+def test_phase07_frozen_base_rejects_missing_tokenizer_before_target_mutation(tmp_path: Path) -> None:
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        FrozenBaseError,
+        finalize_private_role,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# No tokenizer\n\nTOKENIZERREQUIRED\n")
+    with pytest.raises(FrozenBaseError, match="tokenizer is required"):
+        prepare_frozen_base(wiki_dir=wiki, frozen_dir=tmp_path / "frozen", embed=_embed384(), tokenizer=None)
+    assert not (tmp_path / "frozen").exists()
+    # Production frozen APIs cannot regain the default tokenizer by omission.
+    for function in (prepare_frozen_base, validate_frozen_base, finalize_private_role):
+        assert inspect.signature(function).parameters["tokenizer"].default is inspect.Parameter.empty
+
+
+def test_phase07_frozen_base_uses_the_manifest_verified_local_model_tokenizer(tmp_path: Path) -> None:
+    """A model-backed gate, not a skip, exercises the production tokenizer identity."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        load_verified_frozen_embedder,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+
+    model_dir = Path(__file__).parent.parent / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
+    embedder = load_verified_frozen_embedder(model_dir)
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Model tokenizer\n\nMODEL_TOKENIZER_FROZEN_IDENTITY\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen = tmp_path / "frozen"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=lambda texts: embedder.embed(list(texts)),
+        tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
+    )
+    assert validate_frozen_base(
+        frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
+        expected_corpus_identity=identity,
+    )
 
 
 def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_path: Path) -> None:
@@ -868,7 +952,8 @@ def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_pat
     private_root = tmp_path / "private"
     published = finalize_private_role(
         frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-        candidate_query_policy=policy, publish_index_dir=private_root, expected_corpus_identity=identity,
+        candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+        publish_index_dir=private_root, expected_corpus_identity=identity,
     )
     index = WikiIndex(private_root)
     index.load()
@@ -886,7 +971,7 @@ def test_phase07_frozen_base_rejects_unsafe_archive_members(tmp_path: Path) -> N
     with tarfile.open(archive, "w") as handle:
         handle.add(payload, arcname="../escape.txt")
     with pytest.raises(FrozenBaseError, match="archive member"):
-        safe_extract_frozen_base(archive, tmp_path / "extract")
+        safe_extract_frozen_base(archive, tmp_path / "extract", tokenizer=_FacadeEmbedder().tokenizer)
 
 
 def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_relocated_clone(
@@ -910,7 +995,8 @@ def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_reloca
         expected_corpus_identity=identity,
     )
     assert validate_frozen_base(
-        root_a, expected_wiki_root=root_a / "Wiki", expected_corpus_identity=identity,
+        root_a, expected_wiki_root=root_a / "Wiki", tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
     )
 
     root_b = tmp_path / "relocated-frozen-corpus"
@@ -927,7 +1013,7 @@ def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_reloca
     with pytest.raises(FrozenBaseError, match="resolved root"):
         finalize_private_role(
             frozen_dir=root_b, target_dir=tmp_path / "should-not-exist",
-            expected_wiki_root=root_b / "Wiki", candidate_query_policy=policy,
+            expected_wiki_root=root_b / "Wiki", candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
             expected_corpus_identity=identity,
         )
     assert not (tmp_path / "should-not-exist").exists()
@@ -1008,7 +1094,7 @@ def test_phase07_frozen_archive_rejects_noncanonical_aliases_and_extracted_tree_
         handle.add(payload, arcname="x")
         handle.add(payload, arcname="./x")
     with pytest.raises(FrozenBaseError, match="archive member"):
-        safe_extract_frozen_base(archive, tmp_path / "extract")
+        safe_extract_frozen_base(archive, tmp_path / "extract", tokenizer=_FacadeEmbedder().tokenizer)
 
 
 def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
@@ -1040,7 +1126,8 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
     index_dir = tmp_path / "private"
     result = finalize_private_role(
         frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-        candidate_query_policy=policy, publish_index_dir=index_dir, expected_corpus_identity=identity,
+        candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+        publish_index_dir=index_dir, expected_corpus_identity=identity,
     )
     assert writes == [Path(result["manifest_path"])]
     assert (index_dir / "ACTIVE_INDEX").is_file()
@@ -1087,7 +1174,8 @@ def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nest
     with pytest.raises(FrozenBaseError):
         finalize_private_role(
             frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, expected_corpus_identity=identity,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
         )
     assert not (tmp_path / "clone").exists()
 
@@ -1117,7 +1205,8 @@ def test_phase07_private_finalizer_marks_every_pre_pointer_clone_failure_failed(
     with pytest.raises(RuntimeError, match="clone boom"):
         finalize_private_role(
             frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, publish_index_dir=private, expected_corpus_identity=identity,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            publish_index_dir=private, expected_corpus_identity=identity,
         )
     builds = list((private / "builds").glob("*"))
     assert len(builds) == 1
@@ -1168,7 +1257,8 @@ def test_phase07_private_finalizer_has_one_failed_outcome_for_every_pre_pointer_
     with pytest.raises(RuntimeError, match=f"forced {fault} failure"):
         frozen_module.finalize_private_role(
             frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, publish_index_dir=private, expected_corpus_identity=identity,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            publish_index_dir=private, expected_corpus_identity=identity,
         )
     builds = list((private / "builds").glob("*"))
     assert len(builds) == 1
@@ -1204,7 +1294,8 @@ def test_phase07_private_finalizer_does_not_lie_after_uncertain_pointer_commit(
     with pytest.raises(CommitUncertainError, match="pointer state uncertain"):
         frozen_module.finalize_private_role(
             frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, publish_index_dir=private, expected_corpus_identity=identity,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            publish_index_dir=private, expected_corpus_identity=identity,
         )
     builds = list((private / "builds").glob("*"))
     assert len(builds) == 1
@@ -1324,11 +1415,11 @@ def test_phase07_resealed_30k_descriptor_cannot_choose_its_own_authority(
     with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
         frozen.finalize_private_role(
             frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
-            candidate_query_policy=policy,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
         )
 
 
-@pytest.mark.parametrize("field", ("text", "content_hash", "title", "chunk_id"))
+@pytest.mark.parametrize("field", ("text", "token_count", "start_char", "chunk_id"))
 def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
 ) -> None:
@@ -1351,8 +1442,11 @@ def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
     if field == "chunk_id":
         changed[field] = original[field] + "-tampered"
         deleted = [str(original["chunk_id"])]
-    elif field == "content_hash":
-        changed[field] = "0" * 16
+    elif field == "token_count":
+        changed[field] = int(original[field]) + 1
+        deleted = []
+    elif field == "start_char":
+        changed[field] = int(original[field]) + 1
         deleted = []
     else:
         changed[field] = str(original[field]) + " tampered"
@@ -1387,7 +1481,8 @@ def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
     with pytest.raises(frozen.FrozenBaseError, match="canonical Markdown chunk plan"):
         frozen.finalize_private_role(
             frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
-            candidate_query_policy=policy, expected_corpus_identity=identity,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
         )
 
 
@@ -1429,5 +1524,6 @@ def test_phase07_frozen_validator_rejects_resealed_page_metadata_before_clone(
     with pytest.raises(frozen.FrozenBaseError, match="page metadata identity"):
         frozen.finalize_private_role(
             frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
-            candidate_query_policy=policy, expected_corpus_identity=identity,
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
         )

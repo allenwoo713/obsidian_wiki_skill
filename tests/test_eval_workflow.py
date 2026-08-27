@@ -1351,6 +1351,7 @@ def test_phase07_role_download_uses_the_exact_prepare_run_and_artifact_identity(
     assert "--dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json" in hybrid
     assert "--archive .review-tmp/phase07/frozen-prepare.zip" in hybrid
     assert "--frozen-dir .review-tmp/phase07/frozen-corpus" in hybrid
+    assert "--model-dir models/paraphrase-multilingual-MiniLM-L12-v2" in hybrid
     assert "name: phase07-frozen-base" not in hybrid
     assert "actions/download-artifact@v4" not in hybrid
     assert "artifact-ids:" not in hybrid
@@ -1408,7 +1409,7 @@ def _real_tiny_frozen_archive(root: Path) -> tuple[bytes, str, dict[str, object]
     )
     descriptor = prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=root, embed=embed,
-        tokenizer=lambda text, **_kwargs: {"input_ids": list(range(max(1, len(text) // 4)))},
+        tokenizer=_non_equivalent_frozen_tokenizer,
         expected_corpus_identity=expected_corpus_identity,
     )
     output = BytesIO()
@@ -1418,6 +1419,17 @@ def _real_tiny_frozen_archive(root: Path) -> tuple[bytes, str, dict[str, object]
                 archive.write(member, member.relative_to(root).as_posix())
     shutil.rmtree(root)
     return output.getvalue(), str(descriptor["frozen_tree_sha256"]), expected_corpus_identity
+
+
+def _non_equivalent_frozen_tokenizer(text: str, **_kwargs: object) -> dict[str, list[int]]:
+    """Deliberately unlike the removed ``len(text)//4`` fallback.
+
+    Its word/punctuation accounting moves the 112-token split boundary and
+    makes a validator using a different tokenizer observably reject the base.
+    """
+    import re
+
+    return {"input_ids": list(range(max(1, 3 * len(re.findall(r"[A-Za-z]+|[^\sA-Za-z]", text)))))}
 
 
 class _ExactFrozenArchiveClient:
@@ -1558,10 +1570,11 @@ def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
     client = _ExactFrozenArchiveClient(archive_bytes)
     validated: list[Path] = []
 
-    def validate(root: Path, *, expected_wiki_root: Path,
+    def validate(root: Path, *, expected_wiki_root: Path, tokenizer: object,
                  expected_corpus_identity: object | None = None) -> str:
         validated.append(root)
         assert expected_wiki_root == root / "Wiki"
+        assert tokenizer is _non_equivalent_frozen_tokenizer
         assert expected_corpus_identity is None
         return "c" * 64
 
@@ -1570,7 +1583,7 @@ def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
     if accepted:
         phase07_operator_gate.download_frozen_artifact(
             frozen_prepare=_frozen_prepare_download_identity(archive_bytes), token="fixture-token",
-            archive=archive, frozen_dir=root, client=client,
+            archive=archive, frozen_dir=root, client=client, tokenizer=_non_equivalent_frozen_tokenizer,
         )
         assert client.calls == ["/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"]
         assert archive.read_bytes() == archive_bytes
@@ -1580,7 +1593,7 @@ def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
         with pytest.raises(ValueError):
             phase07_operator_gate.download_frozen_artifact(
                 frozen_prepare=_frozen_prepare_download_identity(archive_bytes), token="fixture-token",
-                archive=archive, frozen_dir=root, client=client,
+                archive=archive, frozen_dir=root, client=client, tokenizer=_non_equivalent_frozen_tokenizer,
             )
         assert not root.exists()
 
@@ -1593,6 +1606,7 @@ def test_frozen_download_real_tiny_zip_extracts_and_validates_canonical_base(tmp
         frozen_prepare=_frozen_prepare_download_identity(payload, base_tree_sha256=tree_sha256),
         token="fixture-token", archive=tmp_path / "prepare.zip",
         frozen_dir=tmp_path / "frozen-corpus", client=client,
+        tokenizer=_non_equivalent_frozen_tokenizer,
         test_expected_corpus_identity=expected_corpus_identity,
     )
 
@@ -1601,6 +1615,7 @@ def test_frozen_download_real_tiny_zip_extracts_and_validates_canonical_base(tmp
     assert client.calls == ["/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"]
     assert validate_frozen_base(
         tmp_path / "frozen-corpus", expected_wiki_root=tmp_path / "frozen-corpus" / "Wiki",
+        tokenizer=_non_equivalent_frozen_tokenizer,
         expected_corpus_identity=expected_corpus_identity,
     ) == tree_sha256
 
@@ -1619,6 +1634,7 @@ def test_frozen_download_rejects_wrong_sealed_archive_digest_or_size(
         phase07_operator_gate.download_frozen_artifact(
             frozen_prepare=identity, token="fixture-token", archive=tmp_path / "prepare.zip",
             frozen_dir=tmp_path / "frozen-corpus", client=_ExactFrozenArchiveClient(payload),
+            tokenizer=_non_equivalent_frozen_tokenizer,
         )
     assert not (tmp_path / "prepare.zip").exists()
     assert not (tmp_path / "frozen-corpus").exists()
@@ -1639,6 +1655,7 @@ def test_frozen_download_rejects_casefold_alias_before_real_base_validation(tmp_
             frozen_prepare=_frozen_prepare_download_identity(archive, base_tree_sha256=tree_sha256),
             token="fixture-token", archive=tmp_path / "prepare.zip",
             frozen_dir=tmp_path / "frozen-corpus", client=_ExactFrozenArchiveClient(archive),
+            tokenizer=_non_equivalent_frozen_tokenizer,
         )
     assert not (tmp_path / "frozen-corpus").exists()
 
@@ -1651,7 +1668,7 @@ def test_frozen_download_rejects_a_different_artifact_id_before_any_extraction(t
         phase07_operator_gate.download_frozen_artifact(
             frozen_prepare=_frozen_prepare_download_identity(archive_bytes, artifact_id=74),
             token="fixture-token", archive=tmp_path / "prepare.zip",
-            frozen_dir=tmp_path / "frozen-corpus", client=client,
+            frozen_dir=tmp_path / "frozen-corpus", client=client, tokenizer=_non_equivalent_frozen_tokenizer,
         )
     assert not (tmp_path / "frozen-corpus").exists()
 
