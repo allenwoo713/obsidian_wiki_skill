@@ -972,6 +972,12 @@ def test_phase07_frozen_prepare_cli_accepts_an_external_verified_model_seam(
 
     monkeypatch.setattr(frozen, "validate_frozen_prepare_bundle", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(frozen, "load_verified_frozen_embedder", lambda _model_dir: VerifiedEmbedder())
+    # The CLI has no small-corpus production switch; inject the sealed test
+    # identity at its production-default boundary instead.
+    monkeypatch.setattr(
+        frozen, "_default_expected_corpus_identity",
+        lambda: _phase07_test_corpus_identity(target / "Wiki"),
+    )
     assert frozen.main([
         "prepare", "--wiki-dir", str(target / "Wiki"), "--frozen-dir", str(target),
         "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "external-model"),
@@ -1030,8 +1036,13 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
     assert (index_dir / "ACTIVE_INDEX").is_file()
 
 
+@pytest.mark.parametrize("sidecar", (
+    "Wiki/nested/candidate-policy.json",
+    ".index/nested/authorization.json",
+    "lance_db/candidate-verdict.json",
+))
 def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nested_sidecars_before_clone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: str,
 ) -> None:
     """#6: a descriptor may not bless a tiny/self-reported source or hidden policy file."""
     from eval.phase07_frozen_base import FrozenBaseError, finalize_private_role, prepare_frozen_base  # noqa: PLC0415
@@ -1055,8 +1066,9 @@ def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nest
         candidate="ivf-hnsw-sq", query_ef=100,
         build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
     )
-    (frozen / "Wiki" / "nested" / "candidate-policy.json").parent.mkdir(parents=True)
-    (frozen / "Wiki" / "nested" / "candidate-policy.json").write_text("{}", encoding="utf-8")
+    injected = frozen / sidecar
+    injected.parent.mkdir(parents=True, exist_ok=True)
+    injected.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         LanceDbIndexRepository, "clone_tables",
         lambda *_args, **_kwargs: pytest.fail("untrusted frozen tree reached clone"),
@@ -1099,6 +1111,90 @@ def test_phase07_private_finalizer_marks_every_pre_pointer_clone_failure_failed(
     assert len(builds) == 1
     assert (builds[0] / ".failed").is_file()
     assert not (private / "ACTIVE_INDEX").exists()
+
+
+@pytest.mark.parametrize("fault", ("hnsw", "reopen", "seal", "manifest", "validated", "pointer"))
+def test_phase07_private_finalizer_has_one_failed_outcome_for_every_pre_pointer_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    """Faults after BUILDING and before a durable pointer all leave clone-local .failed."""
+    from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Window fault\n\nWINDOWFAULTTERM\n")
+    frozen = tmp_path / "frozen"
+    frozen_module.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    error = RuntimeError(f"forced {fault} failure")
+    if fault == "hnsw":
+        monkeypatch.setattr(LanceDbIndexRepository, "create_eval_candidate_index", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    elif fault == "reopen":
+        real_validate = LanceDbIndexRepository.validate_reopened
+        def fail_clone_reopen(self, *args, **kwargs):
+            if Path(self._lance_dir) == frozen / "lance_db":
+                return real_validate(self, *args, **kwargs)
+            raise error
+        monkeypatch.setattr(LanceDbIndexRepository, "validate_reopened", fail_clone_reopen)
+    elif fault == "seal":
+        monkeypatch.setattr(LanceDbIndexRepository, "seal", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    elif fault == "manifest":
+        monkeypatch.setattr(FilesystemIndexManifest, "write", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    elif fault == "validated":
+        monkeypatch.setattr(frozen_module, "record_validated", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    else:
+        monkeypatch.setattr(frozen_module, "publish_pointer", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    private = tmp_path / "private"
+    with pytest.raises(RuntimeError, match=f"forced {fault} failure"):
+        frozen_module.finalize_private_role(
+            frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, publish_index_dir=private,
+        )
+    builds = list((private / "builds").glob("*"))
+    assert len(builds) == 1
+    assert (builds[0] / ".failed").is_file()
+    assert not (private / "ACTIVE_INDEX").exists()
+
+
+def test_phase07_private_finalizer_does_not_lie_after_uncertain_pointer_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CommitUncertainError is a possible pointer commit, never a failed clone."""
+    from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
+    from obsidian_wiki.application.durable_filesystem import CommitUncertainError  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Uncertain\n\nUNCERTAINPOINTERTERM\n")
+    frozen = tmp_path / "frozen"
+    frozen_module.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        frozen_module, "publish_pointer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CommitUncertainError("pointer state uncertain")),
+    )
+    private = tmp_path / "private"
+    with pytest.raises(CommitUncertainError, match="pointer state uncertain"):
+        frozen_module.finalize_private_role(
+            frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, publish_index_dir=private,
+        )
+    builds = list((private / "builds").glob("*"))
+    assert len(builds) == 1
+    assert not (builds[0] / ".failed").exists()
 
 
 def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_collector_data() -> None:
