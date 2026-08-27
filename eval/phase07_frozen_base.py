@@ -229,7 +229,14 @@ def _exact_term(chunks: list[object]) -> str:
     raise FrozenBaseError("frozen FTS term")
 
 
-def _canonical_markdown_plan(wiki_dir: Path, *, tokenizer: object | None) -> tuple[list[object], list[object], list[dict[str, object]]]:
+def _require_tokenizer(tokenizer: object) -> object:
+    """Reject the historical implicit chunking fallback at every frozen boundary."""
+    if tokenizer is None:
+        raise FrozenBaseError("frozen tokenizer is required")
+    return tokenizer
+
+
+def _canonical_markdown_plan(wiki_dir: Path, *, tokenizer: object) -> tuple[list[object], list[object], list[dict[str, object]]]:
     """Rebuild the source-derived chunk plan without reading either Lance table."""
     wiki_dir = Path(wiki_dir)
     project_root = wiki_dir.parent
@@ -237,7 +244,7 @@ def _canonical_markdown_plan(wiki_dir: Path, *, tokenizer: object | None) -> tup
     if not pages:
         raise FrozenBaseError("frozen corpus has no pages")
     lexicon = load_lexicon(project_root)
-    token_counter = EmbeddingTokenizer(tokenizer).count if tokenizer is not None else None
+    token_counter = EmbeddingTokenizer(_require_tokenizer(tokenizer)).count
     canonical = []
     page_rows = []
     for page in pages:
@@ -406,9 +413,10 @@ def _descriptor_identity(value: Mapping[str, object] | None, *,
 
 
 def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[list[str]], list[list[float]]],
-                        tokenizer: object = None, descriptor_identity: Mapping[str, object] | None = None,
+                        tokenizer: object, descriptor_identity: Mapping[str, object] | None = None,
                         expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
     """Persist reusable data once, deliberately stopping before HNSW/publication."""
+    _require_tokenizer(tokenizer)
     wiki_dir, frozen_dir = Path(wiki_dir).resolve(), Path(frozen_dir).resolve()
     identity = _descriptor_identity(
         descriptor_identity, expected_corpus_identity=expected_corpus_identity,
@@ -560,8 +568,10 @@ def _validate_frozen_semantic_layout(frozen_dir: Path) -> None:
 
 
 def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path,
+                         tokenizer: object,
                          expected_corpus_identity: Mapping[str, object] | None = None) -> str:
     """Validate data, FTS, graph/page identities and the fixed absolute-root contract."""
+    _require_tokenizer(tokenizer)
     frozen_dir = Path(frozen_dir)
     descriptor = _read_descriptor(frozen_dir, expected_corpus_identity=expected_corpus_identity)
     _validate_frozen_semantic_layout(frozen_dir)
@@ -596,7 +606,7 @@ def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path,
     dense = repository.table_rows("dense_chunks")
     _validate_table_rows(sparse, dense, page_ids=page_ids)
     expected_sparse, expected_dense_sources, expected_pages = _canonical_markdown_plan(
-        frozen_dir / "Wiki", tokenizer=None,
+        frozen_dir / "Wiki", tokenizer=tokenizer,
     )
     expected_dense = [_dense_from_canonical(chunk, ()) for chunk in expected_dense_sources]
     if pages != expected_pages or _canonical_non_vector_rows(sparse) != _canonical_non_vector_rows(expected_sparse) \
@@ -734,11 +744,13 @@ def _candidate_manifest(*, pages: list[dict[str, object]], build_id: str, genera
 
 def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_root: Path,
                           candidate_query_policy: CandidateQueryPolicy,
+                          tokenizer: object,
                           publish_index_dir: Path | None = None,
                           expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
     """Clone validated tables and build exactly one candidate HNSW in that clone."""
     source_digest = validate_frozen_base(
         frozen_dir, expected_wiki_root=expected_wiki_root,
+        tokenizer=tokenizer,
         expected_corpus_identity=expected_corpus_identity,
     )
     target_dir = Path(target_dir)
@@ -796,6 +808,7 @@ def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_r
         target.seal(lance_dir)
         if validate_frozen_base(
             frozen_dir, expected_wiki_root=expected_wiki_root,
+            tokenizer=tokenizer,
             expected_corpus_identity=expected_corpus_identity,
         ) != source_digest:
             raise FrozenBaseError("frozen source mutated by private clone")
@@ -839,8 +852,9 @@ def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_r
     }
 
 
-def safe_extract_frozen_base(archive: Path, destination: Path) -> None:
+def safe_extract_frozen_base(archive: Path, destination: Path, *, tokenizer: object) -> None:
     """Extract a tar archive only into a new empty root, rejecting links and traversal."""
+    _require_tokenizer(tokenizer)
     archive, destination = Path(archive), Path(destination)
     if destination.exists() and any(destination.iterdir()):
         raise FrozenBaseError("archive destination must be empty")
@@ -862,7 +876,7 @@ def safe_extract_frozen_base(archive: Path, destination: Path) -> None:
             handle.extract(member, destination, set_attrs=False, numeric_owner=False)
     # Treat an extracted artifact as hostile until its exact sealed inventory,
     # regular-file topology, and descriptor have all been revalidated.
-    validate_frozen_base(destination, expected_wiki_root=destination / "Wiki")
+    validate_frozen_base(destination, expected_wiki_root=destination / "Wiki", tokenizer=tokenizer)
 
 
 def validate_frozen_role_provenance(records: list[dict[str, Any]], *, expected_head: str) -> list[dict[str, Any]]:
@@ -924,7 +938,7 @@ def load_verified_frozen_embedder(model_dir: Path):
     embedder = SentenceTransformerEmbedder(model_dir)
     # Force local-only model load now, before any frozen-root mutation.  This
     # prevents a missing model from leaving a misleading partial artifact.
-    _ = embedder.tokenizer
+    _require_tokenizer(embedder.tokenizer)
     return embedder
 
 

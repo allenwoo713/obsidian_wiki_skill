@@ -678,6 +678,7 @@ jobs:
       - name: Prepare and seal only reusable source data
         run: >
           python -m eval.phase07_frozen_base prepare --wiki-dir .review-tmp/phase07/frozen-corpus/Wiki --frozen-dir .review-tmp/phase07/frozen-corpus --prepare-bundle .review-tmp/phase07/prepare-bundle.json
+          --model-dir models/paraphrase-multilingual-MiniLM-L12-v2
       - name: Upload sealed frozen base, never a candidate packet
         uses: actions/upload-artifact@v4
         with:
@@ -736,9 +737,10 @@ jobs:
           --dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json
           --archive .review-tmp/phase07/frozen-prepare.zip
           --frozen-dir .review-tmp/phase07/frozen-corpus
+          --model-dir models/paraphrase-multilingual-MiniLM-L12-v2
       - name: Validate the empty-root frozen extraction before private cloning
         run: >
-          python -c "from pathlib import Path; from eval.phase07_frozen_base import validate_frozen_base; root=Path('.review-tmp/phase07/frozen-corpus'); assert root.is_dir() and not root.is_symlink(); validate_frozen_base(root, expected_wiki_root=root/'Wiki')"
+          python -c "from pathlib import Path; from eval.phase07_frozen_base import load_verified_frozen_embedder,validate_frozen_base; root=Path('.review-tmp/phase07/frozen-corpus'); assert root.is_dir() and not root.is_symlink(); embedder=load_verified_frozen_embedder(Path('models/paraphrase-multilingual-MiniLM-L12-v2')); validate_frozen_base(root, expected_wiki_root=root/'Wiki', tokenizer=embedder.tokenizer)"
       - name: Bind this attempt to exactly one hybrid job before any index build
         # The operator queries the exact attempt-scoped /attempts/{run_attempt}/jobs API.
         env:

@@ -758,6 +758,7 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
                                                   query_limit: int | None = None,
                                                   progress_sink=None,
                                                   frozen_dir: Path | None = None,
+                                                  tokenizer: object | None = None,
                                                   _expected_frozen_corpus_identity: dict | None = None) -> dict:
     """Run one sealed hybrid *role* with an operator-minted capability.
 
@@ -783,11 +784,28 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         # Legacy non-frozen PR topology intentionally remains member-only.
         bundle = consumed
         frozen_prepare = None
-    if embed is not None and not os.environ.get("PYTEST_CURRENT_TEST"):
+    injected_embed = embed is not None
+    if injected_embed and not os.environ.get("PYTEST_CURRENT_TEST"):
         raise ValueError("injected hybrid encoder is pytest-only")
-    if query_limit is not None and (embed is None or not os.environ.get("PYTEST_CURRENT_TEST")
+    if tokenizer is not None and (not injected_embed or not os.environ.get("PYTEST_CURRENT_TEST")):
+        raise ValueError("injected hybrid tokenizer is pytest-only")
+    if query_limit is not None and (not injected_embed or not os.environ.get("PYTEST_CURRENT_TEST")
                                     or not isinstance(query_limit, int) or not 1 <= query_limit < 105):
         raise ValueError("hybrid query limit is pytest-only")
+    frozen_tokenizer = tokenizer
+    if frozen_dir is not None and injected_embed and frozen_tokenizer is None:
+        raise ValueError("injected frozen tokenizer is required")
+    if frozen_dir is not None and frozen_tokenizer is None:
+        # This is intentionally one load for the whole role: the original
+        # build, all source validations, and the private clone share it.
+        from eval.phase07_frozen_base import load_verified_frozen_embedder
+        from build_index import SKILL_EMBEDDER_DIR
+
+        frozen_embedder = load_verified_frozen_embedder(SKILL_EMBEDDER_DIR)
+        embed = lambda texts: frozen_embedder.embed(list(texts))
+        frozen_tokenizer = frozen_embedder.tokenizer
+    if frozen_dir is not None and frozen_tokenizer is None:
+        raise ValueError("frozen tokenizer is required")
     role, config = bundle["role"], bundle["config"]
     frozen_source_evidence: dict[str, object] = {}
     root = Path(work_dir) / f"hybrid-{role}-m{config['m']}"
@@ -797,7 +815,7 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
     shutil.copytree(FIXTURES_WIKI, original_wiki)
     # A local test exercises the production topology but not a 30k benchmark.
     source_count = sum(1 for page in FIXTURES_WIKI.rglob("*.md") if page.is_file())
-    target_size = source_count + 2 if embed is not None else bundle["scale"]
+    target_size = source_count + 2 if injected_embed else bundle["scale"]
     if frozen_dir is None:
         expanded_wiki = root / "expanded" / "Wiki"
         expanded_identity = _materialize_phase07_expanded_corpus(
@@ -813,6 +831,7 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         expanded_wiki = frozen_dir / "Wiki"
         base_tree_sha256 = validate_frozen_base(
             frozen_dir, expected_wiki_root=expanded_wiki,
+            tokenizer=frozen_tokenizer,
             expected_corpus_identity=_expected_frozen_corpus_identity,
         )
         if not isinstance(frozen_prepare, dict):
@@ -864,6 +883,7 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
                 target_dir=root / "expanded-private-clone",
                 expected_wiki_root=wiki,
                 candidate_query_policy=policy,
+                tokenizer=frozen_tokenizer,
                 publish_index_dir=index_dir,
                 expected_corpus_identity=_expected_frozen_corpus_identity,
             )
@@ -931,6 +951,7 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
         from eval.phase07_frozen_base import validate_frozen_base
         source_after_sha256 = validate_frozen_base(
             frozen_dir, expected_wiki_root=expanded_wiki,
+            tokenizer=frozen_tokenizer,
             expected_corpus_identity=_expected_frozen_corpus_identity,
         )
         if source_after_sha256 != base_tree_sha256:

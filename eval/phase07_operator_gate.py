@@ -150,6 +150,7 @@ def _safe_frozen_archive_member(name: object, *, seen: set[str], folded: set[str
 
 
 def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: str,
+                            tokenizer: object,
                             test_expected_corpus_identity: object | None = None) -> None:
     """Extract only regular ZIP members into a newly-created canonical root."""
     if archive.is_symlink() or not archive.is_file() or root.exists() or root.is_symlink():
@@ -182,6 +183,7 @@ def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: 
         from eval.phase07_frozen_base import validate_frozen_base
         actual_tree_sha256 = validate_frozen_base(
             root, expected_wiki_root=root / "Wiki",
+            tokenizer=tokenizer,
             expected_corpus_identity=test_expected_corpus_identity,
         )
         if actual_tree_sha256 != expected_tree_sha256:
@@ -195,6 +197,7 @@ def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: 
 
 def download_frozen_artifact(*, frozen_prepare: object, token: str, archive: Path,
                              frozen_dir: Path, client: Any | None = None,
+                             tokenizer: object,
                              test_expected_corpus_identity: object | None = None) -> None:
     """Fetch exactly one sealed artifact ID and securely unpack its verified ZIP.
 
@@ -204,7 +207,7 @@ def download_frozen_artifact(*, frozen_prepare: object, token: str, archive: Pat
     call and is not included in files or returned data.
     """
     from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
-    if not token or archive.exists() or archive.is_symlink():
+    if tokenizer is None or not token or archive.exists() or archive.is_symlink():
         raise ValueError("frozen artifact download destination/token")
     prepare = validate_frozen_prepare_identity_shape(
         frozen_prepare, expected_repository="allenwoo713/obsidian_wiki_skill",
@@ -227,6 +230,7 @@ def download_frozen_artifact(*, frozen_prepare: object, token: str, archive: Pat
         _extract_frozen_archive(
             archive=archive, root=frozen_dir,
             expected_tree_sha256=prepare["base_tree_sha256"],
+            tokenizer=tokenizer,
             test_expected_corpus_identity=test_expected_corpus_identity,
         )
     except Exception:
@@ -360,7 +364,7 @@ def _frozen_archive_sha256(path: Path) -> str:
 def collect_frozen_prepare_provenance(*, prepare_bundle: dict[str, Any], repository: str,
                                       run_id: int, run_attempt: int, archive: Path,
                                       frozen_dir: Path, locked_execution: dict[str, Any],
-                                      token: str, client: Any | None = None) -> dict[str, Any]:
+                                      token: str, tokenizer: object, client: Any | None = None) -> dict[str, Any]:
     """Return one API- and byte-bound frozen prepare identity.
 
     The API is queried by the caller-provided *exact* run and attempt.  A
@@ -368,7 +372,7 @@ def collect_frozen_prepare_provenance(*, prepare_bundle: dict[str, Any], reposit
     the one artifact returned for that exact run and the local downloaded bytes
     match GitHub's digest.  The result is the only value role planning accepts.
     """
-    if not repository or not SHA.fullmatch(prepare_bundle.get("head_sha", "")) \
+    if tokenizer is None or not repository or not SHA.fullmatch(prepare_bundle.get("head_sha", "")) \
             or not isinstance(run_id, int) or run_id <= 0 or run_attempt != 1 or not token:
         raise ValueError("frozen prepare collection identity")
     bundle = validate_frozen_prepare_bundle(prepare_bundle, expected_head=prepare_bundle["head_sha"])
@@ -380,7 +384,9 @@ def collect_frozen_prepare_provenance(*, prepare_bundle: dict[str, Any], reposit
         raise ValueError("frozen prepare extracted root")
     try:
         from eval.phase07_frozen_base import validate_frozen_base
-        base_tree_sha256 = validate_frozen_base(frozen_dir, expected_wiki_root=frozen_dir / "Wiki")
+        base_tree_sha256 = validate_frozen_base(
+            frozen_dir, expected_wiki_root=frozen_dir / "Wiki", tokenizer=tokenizer,
+        )
         descriptor = _read_object(frozen_dir / "frozen-base.json")
         descriptor_self_sha256 = descriptor.get("record_self_sha256")
         if not isinstance(descriptor_self_sha256, str) or not HEX64.fullmatch(descriptor_self_sha256):
@@ -484,7 +490,7 @@ def build_frozen_role_dispatch_bundles(*, hybrid_request: dict[str, Any],
 def run_frozen_role_plan(*, prepare_bundle: Path, hybrid_request: Path, workflow_inputs_dir: Path,
                          repository: str, run_id: int, run_attempt: int, archive: Path,
                          frozen_dir: Path, locked_execution: Path, token: str,
-                         client: Any | None = None) -> int:
+                         tokenizer: object, client: Any | None = None) -> int:
     """Collect live prepare evidence and immediately write the exact role set."""
     request = _read_object(hybrid_request)
     head = request.get("hybrid_implementation_head") if isinstance(request, dict) else ""
@@ -492,6 +498,7 @@ def run_frozen_role_plan(*, prepare_bundle: Path, hybrid_request: Path, workflow
         prepare_bundle=_read_object(prepare_bundle), repository=repository, run_id=run_id,
         run_attempt=run_attempt, archive=archive, frozen_dir=frozen_dir,
         locked_execution=_read_object(locked_execution), token=token, client=client,
+        tokenizer=tokenizer,
     )
     bundles = build_frozen_role_dispatch_bundles(
         hybrid_request=request, frozen_prepare=prepare, expected_head=head,
@@ -2178,6 +2185,7 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
     parser.add_argument("--prepare-bundle", type=Path)
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--hybrid-request", type=Path)
+    parser.add_argument("--model-dir", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.command == "frozen-size-preflight":
@@ -2192,13 +2200,15 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
                 expected_head=args.head_sha,
             )
         if args.command == "frozen-prepare-provenance":
-            if None in (args.prepare_bundle, args.ledger_file, args.archive, args.frozen_dir, args.locked_execution):
-                raise ValueError("frozen prepare provenance requires sealed input, archive, root, execution, and output")
+            if None in (args.prepare_bundle, args.ledger_file, args.archive, args.frozen_dir, args.locked_execution, args.model_dir):
+                raise ValueError("frozen prepare provenance requires sealed input, archive, root, model, execution, and output")
+            from eval.phase07_frozen_base import load_verified_frozen_embedder
+            embedder = load_verified_frozen_embedder(args.model_dir)
             identity = collect_frozen_prepare_provenance(
                 prepare_bundle=_read_object(args.prepare_bundle), repository=args.repository or "",
                 run_id=args.run_id or 0, run_attempt=args.run_attempt or 0, archive=args.archive,
                 frozen_dir=args.frozen_dir, locked_execution=_read_object(args.locked_execution),
-                token=os.environ.get("GITHUB_TOKEN", ""), client=github_client,
+                token=os.environ.get("GITHUB_TOKEN", ""), tokenizer=embedder.tokenizer, client=github_client,
             )
             # This is an audit copy of the collector's *exact* shared
             # identity shape.  Do not add a second self-digest/envelope: that
@@ -2211,28 +2221,36 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
             )
             return 0
         if args.command == "frozen-download":
-            if None in (args.dispatch_bundle, args.archive, args.frozen_dir):
-                raise ValueError("frozen download requires a sealed role bundle, archive, and canonical root")
+            if None in (args.dispatch_bundle, args.archive, args.frozen_dir, args.model_dir):
+                raise ValueError("frozen download requires a sealed role bundle, archive, canonical root, and model")
             bundle = _read_object(args.dispatch_bundle)
             prepare = bundle.get("frozen_prepare") if isinstance(bundle, dict) else None
             if not isinstance(prepare, dict):
                 raise ValueError("frozen download requires collector-bound prepare identity")
             validate_hybrid_dispatch_bundle(bundle, expected_head=prepare.get("head_sha", ""))
+            # Verify and instantiate the locked local model before a target
+            # root exists.  The only tokenizer that can validate this archive
+            # is the one exposed by that manifest-verified embedder.
+            from eval.phase07_frozen_base import load_verified_frozen_embedder
+            embedder = load_verified_frozen_embedder(args.model_dir)
             download_frozen_artifact(
                 frozen_prepare=prepare, token=os.environ.get("GITHUB_TOKEN", ""),
                 archive=args.archive, frozen_dir=args.frozen_dir, client=github_client,
+                tokenizer=embedder.tokenizer,
             )
             return 0
         if args.command == "role-plan":
             if None in (args.prepare_bundle, args.hybrid_request, args.workflow_inputs_dir,
-                        args.archive, args.frozen_dir, args.locked_execution):
-                raise ValueError("role-plan requires API-bound prepare, request, root, execution, and output")
+                        args.archive, args.frozen_dir, args.locked_execution, args.model_dir):
+                raise ValueError("role-plan requires API-bound prepare, request, root, model, execution, and output")
+            from eval.phase07_frozen_base import load_verified_frozen_embedder
+            embedder = load_verified_frozen_embedder(args.model_dir)
             return run_frozen_role_plan(
                 prepare_bundle=args.prepare_bundle, hybrid_request=args.hybrid_request,
                 workflow_inputs_dir=args.workflow_inputs_dir, repository=args.repository or "",
                 run_id=args.run_id or 0, run_attempt=args.run_attempt or 0, archive=args.archive,
                 frozen_dir=args.frozen_dir, locked_execution=args.locked_execution,
-                token=os.environ.get("GITHUB_TOKEN", ""), client=github_client,
+                token=os.environ.get("GITHUB_TOKEN", ""), tokenizer=embedder.tokenizer, client=github_client,
             )
         if args.command == "hosted-preflight":
             if args.ledger_file is None:
