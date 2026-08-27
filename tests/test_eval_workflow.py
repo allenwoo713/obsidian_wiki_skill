@@ -367,10 +367,11 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
     assert selected == {
         "phase07-entitlement-preflight-ubuntu",
         "phase07-entitlement-preflight-windows",
-        "phase07-screening",
-        "phase07-confirmation",
-        "phase07-hybrid",
-    }
+            "phase07-screening",
+            "phase07-confirmation",
+            "phase07-hybrid-prepare",
+            "phase07-hybrid",
+        }
 
 
 def test_phase07_d25_confirmation_workflow_has_no_retired_authority() -> None:
