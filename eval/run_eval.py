@@ -754,6 +754,14 @@ def run_phase07_representative_campaign(
     }
 
 
+def _load_phase07_frozen_runner_embedder():
+    """Load the verified frozen-source model behind the private runner boundary."""
+    from eval.phase07_frozen_base import load_verified_frozen_embedder
+    from build_index import SKILL_EMBEDDER_DIR
+
+    return load_verified_frozen_embedder(SKILL_EMBEDDER_DIR)
+
+
 def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir: Path, embed=None,
                                                   query_limit: int | None = None,
                                                   progress_sink=None,
@@ -793,17 +801,15 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
                                     or not isinstance(query_limit, int) or not 1 <= query_limit < 105):
         raise ValueError("hybrid query limit is pytest-only")
     frozen_tokenizer = tokenizer
+    frozen_query_embedder = None
     if frozen_dir is not None and injected_embed and frozen_tokenizer is None:
         raise ValueError("injected frozen tokenizer is required")
     if frozen_dir is not None and frozen_tokenizer is None:
-        # This is intentionally one load for the whole role: the original
-        # build, all source validations, and the private clone share it.
-        from eval.phase07_frozen_base import load_verified_frozen_embedder
-        from build_index import SKILL_EMBEDDER_DIR
-
-        frozen_embedder = load_verified_frozen_embedder(SKILL_EMBEDDER_DIR)
-        embed = lambda texts: frozen_embedder.embed(list(texts))
-        frozen_tokenizer = frozen_embedder.tokenizer
+        # The source validator and private clone share this one verified
+        # tokenizer.  Keep the public ``embed`` argument untouched: its None
+        # value is what makes the original side use ``WikiIndex.build``.
+        frozen_query_embedder = _load_phase07_frozen_runner_embedder()
+        frozen_tokenizer = frozen_query_embedder.tokenizer
     if frozen_dir is not None and frozen_tokenizer is None:
         raise ValueError("frozen tokenizer is required")
     role, config = bundle["role"], bundle["config"]
@@ -922,6 +928,16 @@ def _run_phase07_hybrid_campaign_with_capability(*, capability: object, work_dir
                 return embed(texts)
         for index in (original_index, expanded_index):
             index._embedder = _InjectedEncoder()
+    elif frozen_query_embedder is not None:
+        class _FrozenSourceEncoder:
+            def encode(self, texts, **_kwargs):
+                return frozen_query_embedder.embed(list(texts))
+
+        # The private clone has no model object of its own.  Its vectors were
+        # sealed with the verified frozen-source model above; query through the
+        # same dependency without converting this production run into an
+        # injected-embedder/test build.
+        expanded_index._embedder = _FrozenSourceEncoder()
     queries = load_queries(HERE / "queries.jsonl")
     if len(queries) != bundle["query_count"]:
         raise ValueError("sealed hybrid original query manifest")

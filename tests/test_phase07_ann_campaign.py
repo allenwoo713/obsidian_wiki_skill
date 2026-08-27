@@ -673,7 +673,6 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
     original_builds: list[Path] = []
     scan_calls: list[Path] = []
     chunk_calls: list[Path] = []
-    embed_calls: list[int] = []
     persist_calls: list[Path] = []
     graph_calls: list[tuple[Path, Path]] = []
     loads: list[Path] = []
@@ -740,7 +739,7 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
         return real_hybrid_search(*args, **kwargs)
 
     monkeypatch.setattr(run_eval, "hybrid_search", record_public_hybrid_search)
-    monkeypatch.setattr(frozen_base, "load_verified_frozen_embedder", lambda _path: frozen_embedder)
+    monkeypatch.setattr(run_eval, "_load_phase07_frozen_runner_embedder", lambda: frozen_embedder)
     real_get_embedder = run_eval.WikiIndex._get_embedder
 
     def inject_verified_embedder(self):
@@ -755,6 +754,10 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
     assert "_expected_frozen_corpus_identity" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
     assert "tokenizer" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
     assert "embed" not in inspect.signature(operator.execute_hybrid_dispatch).parameters
+    cli_source = inspect.getsource(operator.main)
+    assert 'add_argument("--tokenizer"' not in cli_source
+    assert 'add_argument("--embed"' not in cli_source
+    assert "_expected_frozen_corpus_identity" not in cli_source
     result = operator.execute_hybrid_dispatch(
         bundle=bundle, locked_execution=_locked_confirmation_environment(),
         allocation={"run_id": 7, "run_attempt": 1, "job_id": 8,
