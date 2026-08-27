@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import tarfile
 from pathlib import Path
 
 import lancedb
@@ -786,3 +787,54 @@ def test_require_current_layout_rejects_stale_layout_version(tmp_path: Path):
     }), encoding="utf-8")
     # Current version is accepted without raising.
     LanceDbIndexRepository.require_current_layout(manifest)
+
+
+def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_path: Path) -> None:
+    """The frozen path is a real Lance prepare/clone boundary, never a mock cache."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        finalize_private_role,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus" / "Wiki"
+    _write_pages(wiki, 3, body_prefix="FROZENBASE")
+    frozen = tmp_path / "prepared"
+    descriptor = prepare_frozen_base(wiki_dir=wiki, frozen_dir=frozen, embed=_embed384())
+
+    assert descriptor["schema_version"] == 1
+    assert not (frozen / "ACTIVE_INDEX").exists()
+    assert not list((frozen / "lance_db").rglob("*hnsw*"))
+    source_digest = validate_frozen_base(frozen, expected_wiki_root=wiki)
+    source = lancedb.connect(str(frozen / "lance_db"))
+    assert set(source.table_names()) == {"sparse_chunks", "dense_chunks"}
+    assert {index.name for index in source.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
+    assert not source.open_table("dense_chunks").list_indices()
+
+    for m, ef in ((16, 100), (20, 300), (32, 300)):
+        policy = CandidateQueryPolicy(
+            candidate="ivf-hnsw-sq", query_ef=ef,
+            build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=m, ef_construction=300),
+        )
+        target = tmp_path / f"role-m{m}"
+        finalized = finalize_private_role(
+            frozen_dir=frozen, target_dir=target, expected_wiki_root=wiki, candidate_query_policy=policy,
+        )
+        assert finalized["source_tree_sha256"] == source_digest
+        target_db = lancedb.connect(str(target / "lance_db"))
+        assert len(target_db.open_table("dense_chunks").list_indices()) == 1
+        assert {index.name for index in target_db.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
+        assert validate_frozen_base(frozen, expected_wiki_root=wiki) == source_digest
+
+
+def test_phase07_frozen_base_rejects_unsafe_archive_members(tmp_path: Path) -> None:
+    from eval.phase07_frozen_base import FrozenBaseError, safe_extract_frozen_base  # noqa: PLC0415
+
+    archive = tmp_path / "unsafe.tar"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("not allowed", encoding="utf-8")
+    with tarfile.open(archive, "w") as handle:
+        handle.add(payload, arcname="../escape.txt")
+    with pytest.raises(FrozenBaseError, match="archive member"):
+        safe_extract_frozen_base(archive, tmp_path / "extract")

@@ -65,6 +65,29 @@ def _locked_confirmation_environment() -> dict:
     }
 
 
+def test_frozen_role_provenance_requires_three_distinct_attempt_one_roles() -> None:
+    """Prepare evidence is non-authorizing until all independent role records bind it."""
+    from eval.phase07_frozen_base import validate_frozen_role_provenance  # noqa: PLC0415
+
+    base = {
+        "prepare_run_id": 101, "prepare_run_attempt": 1, "prepare_job_id": 201,
+        "prepare_artifact_id": 301, "archive_sha256": hashlib.sha256(b"archive").hexdigest(),
+        "tree_sha256": hashlib.sha256(b"tree").hexdigest(), "retention_days": 90,
+        "head_sha": HEAD, "runtime": _locked_confirmation_environment()["runtime"],
+        "corpus_sha256": CORPUS_MANIFEST_SHA256, "model_manifest_sha256": MODEL_MANIFEST_SHA256,
+    }
+    roles = [
+        {"role": "baseline", "m": 16, "run_id": 1, "run_attempt": 1, "job_id": 11, "artifact_id": 21, **base},
+        {"role": "m20", "m": 20, "run_id": 2, "run_attempt": 1, "job_id": 12, "artifact_id": 22, **base},
+        {"role": "m32", "m": 32, "run_id": 3, "run_attempt": 1, "job_id": 13, "artifact_id": 23, **base},
+    ]
+    assert validate_frozen_role_provenance(roles, expected_head=HEAD) == roles
+    duplicate = [dict(record) for record in roles]
+    duplicate[2]["run_id"] = 2
+    with pytest.raises(ValueError, match="distinct"):
+        validate_frozen_role_provenance(duplicate, expected_head=HEAD)
+
+
 def _request(stage: str = "screening", *, mode: str = "stage2_sq") -> dict:
     request = {
         "schema_version": 1, "stage": stage, "request_id": "request-1", "environment": {},
