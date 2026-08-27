@@ -812,15 +812,18 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus" / "Wiki"
     _write_page(wiki, "# Frozen base\n\nFROZENBASE exact retrieval content.")
     frozen = tmp_path / "prepared"
+    identity = _phase07_test_corpus_identity(wiki)
     descriptor = prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
 
     assert descriptor["schema_version"] == 1
     assert not (frozen / "ACTIVE_INDEX").exists()
     assert not list((frozen / "lance_db").rglob("*hnsw*"))
-    source_digest = validate_frozen_base(frozen, expected_wiki_root=frozen / "Wiki")
+    source_digest = validate_frozen_base(
+        frozen, expected_wiki_root=frozen / "Wiki", expected_corpus_identity=identity,
+    )
     source = lancedb.connect(str(frozen / "lance_db"))
     assert set(source.table_names()) == {"sparse_chunks", "dense_chunks"}
     assert {index.name for index in source.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
@@ -834,12 +837,15 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
         target = tmp_path / f"role-m{m}"
         finalized = finalize_private_role(
             frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki", candidate_query_policy=policy,
+            expected_corpus_identity=identity,
         )
         assert finalized["source_tree_sha256"] == source_digest
         target_db = lancedb.connect(str(target / "lance_db"))
         assert len(target_db.open_table("dense_chunks").list_indices()) == 1
         assert {index.name for index in target_db.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
-        assert validate_frozen_base(frozen, expected_wiki_root=frozen / "Wiki") == source_digest
+        assert validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", expected_corpus_identity=identity,
+        ) == source_digest
 
 
 def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_path: Path) -> None:
@@ -850,9 +856,10 @@ def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_pat
     wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus-source" / "Wiki"
     _write_page(wiki, "# Frozen lifecycle\n\nFROZENLIFECYCLE exact retrieval content.")
     frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
     prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=300,
@@ -861,7 +868,7 @@ def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_pat
     private_root = tmp_path / "private"
     published = finalize_private_role(
         frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-        candidate_query_policy=policy, publish_index_dir=private_root,
+        candidate_query_policy=policy, publish_index_dir=private_root, expected_corpus_identity=identity,
     )
     index = WikiIndex(private_root)
     index.load()
@@ -897,11 +904,14 @@ def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_reloca
     root_a = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
     wiki = root_a / "Wiki"
     _write_page(wiki, "# Canonical root\n\nCANONICALROOTTERM\n")
+    identity = _phase07_test_corpus_identity(wiki)
     prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=root_a, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
-    assert validate_frozen_base(root_a, expected_wiki_root=root_a / "Wiki")
+    assert validate_frozen_base(
+        root_a, expected_wiki_root=root_a / "Wiki", expected_corpus_identity=identity,
+    )
 
     root_b = tmp_path / "relocated-frozen-corpus"
     import shutil
@@ -918,6 +928,7 @@ def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_reloca
         finalize_private_role(
             frozen_dir=root_b, target_dir=tmp_path / "should-not-exist",
             expected_wiki_root=root_b / "Wiki", candidate_query_policy=policy,
+            expected_corpus_identity=identity,
         )
     assert not (tmp_path / "should-not-exist").exists()
 
@@ -951,10 +962,10 @@ def test_phase07_frozen_prepare_loads_and_validates_model_before_creating_target
     assert not list(tmp_path.rglob(".embedder-probe"))
 
 
-def test_phase07_frozen_prepare_cli_accepts_an_external_verified_model_seam(
+def test_phase07_frozen_prepare_cli_cannot_select_a_tiny_identity_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A successful CLI prepare still builds at the already-materialized canonical root."""
+    """CLI preparation has no test identity switch; only direct calls may inject one."""
     from eval import phase07_frozen_base as frozen  # noqa: PLC0415
 
     target = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
@@ -971,17 +982,16 @@ def test_phase07_frozen_prepare_cli_accepts_an_external_verified_model_seam(
 
     monkeypatch.setattr(frozen, "validate_frozen_prepare_bundle", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(frozen, "load_verified_frozen_embedder", lambda _model_dir: VerifiedEmbedder())
-    # The CLI has no small-corpus production switch; inject the sealed test
-    # identity at its production-default boundary instead.
     monkeypatch.setattr(
         frozen, "_default_expected_corpus_identity",
-        lambda: _phase07_test_corpus_identity(target / "Wiki"),
+        lambda: {"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 30_000},
     )
-    assert frozen.main([
-        "prepare", "--wiki-dir", str(target / "Wiki"), "--frozen-dir", str(target),
-        "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "external-model"),
-    ]) == 0
-    assert (target / "frozen-base.json").is_file()
+    with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
+        frozen.main([
+            "prepare", "--wiki-dir", str(target / "Wiki"), "--frozen-dir", str(target),
+            "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "external-model"),
+        ])
+    assert not (target / "frozen-base.json").exists()
     assert not list(target.rglob(".embedder-probe"))
 
 
@@ -1010,10 +1020,11 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
 
     frozen = tmp_path / "frozen"
     _write_page(frozen / "Wiki", "# Finalizer\n\nDURABLEMANIFESTTERM\n")
+    identity = _phase07_test_corpus_identity(frozen / "Wiki")
     prepare_frozen_base(
         wiki_dir=frozen / "Wiki", frozen_dir=frozen,
         embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(frozen / "Wiki"),
+        expected_corpus_identity=identity,
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=100,
@@ -1029,7 +1040,7 @@ def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
     index_dir = tmp_path / "private"
     result = finalize_private_role(
         frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-        candidate_query_policy=policy, publish_index_dir=index_dir,
+        candidate_query_policy=policy, publish_index_dir=index_dir, expected_corpus_identity=identity,
     )
     assert writes == [Path(result["manifest_path"])]
     assert (index_dir / "ACTIVE_INDEX").is_file()
@@ -1056,9 +1067,10 @@ def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nest
         )
 
     frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
     descriptor = prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
     assert descriptor["expected_corpus_identity"] == _phase07_test_corpus_identity(wiki)
     policy = CandidateQueryPolicy(
@@ -1075,7 +1087,7 @@ def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nest
     with pytest.raises(FrozenBaseError):
         finalize_private_role(
             frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy,
+            candidate_query_policy=policy, expected_corpus_identity=identity,
         )
     assert not (tmp_path / "clone").exists()
 
@@ -1090,9 +1102,10 @@ def test_phase07_private_finalizer_marks_every_pre_pointer_clone_failure_failed(
     wiki = tmp_path / "source" / "Wiki"
     _write_page(wiki, "# Clone fault\n\nCLONEFAULTTERM\n")
     frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
     prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=100,
@@ -1104,7 +1117,7 @@ def test_phase07_private_finalizer_marks_every_pre_pointer_clone_failure_failed(
     with pytest.raises(RuntimeError, match="clone boom"):
         finalize_private_role(
             frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, publish_index_dir=private,
+            candidate_query_policy=policy, publish_index_dir=private, expected_corpus_identity=identity,
         )
     builds = list((private / "builds").glob("*"))
     assert len(builds) == 1
@@ -1123,9 +1136,10 @@ def test_phase07_private_finalizer_has_one_failed_outcome_for_every_pre_pointer_
     wiki = tmp_path / "source" / "Wiki"
     _write_page(wiki, "# Window fault\n\nWINDOWFAULTTERM\n")
     frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
     frozen_module.prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=100,
@@ -1154,7 +1168,7 @@ def test_phase07_private_finalizer_has_one_failed_outcome_for_every_pre_pointer_
     with pytest.raises(RuntimeError, match=f"forced {fault} failure"):
         frozen_module.finalize_private_role(
             frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, publish_index_dir=private,
+            candidate_query_policy=policy, publish_index_dir=private, expected_corpus_identity=identity,
         )
     builds = list((private / "builds").glob("*"))
     assert len(builds) == 1
@@ -1173,9 +1187,10 @@ def test_phase07_private_finalizer_does_not_lie_after_uncertain_pointer_commit(
     wiki = tmp_path / "source" / "Wiki"
     _write_page(wiki, "# Uncertain\n\nUNCERTAINPOINTERTERM\n")
     frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
     frozen_module.prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=_phase07_test_corpus_identity(wiki),
+        expected_corpus_identity=identity,
     )
     policy = CandidateQueryPolicy(
         candidate="ivf-hnsw-sq", query_ef=100,
@@ -1189,7 +1204,7 @@ def test_phase07_private_finalizer_does_not_lie_after_uncertain_pointer_commit(
     with pytest.raises(CommitUncertainError, match="pointer state uncertain"):
         frozen_module.finalize_private_role(
             frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
-            candidate_query_policy=policy, publish_index_dir=private,
+            candidate_query_policy=policy, publish_index_dir=private, expected_corpus_identity=identity,
         )
     builds = list((private / "builds").glob("*"))
     assert len(builds) == 1
@@ -1234,8 +1249,12 @@ def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_co
             )
 
 
+@pytest.mark.parametrize("forged", (
+    {"expanded_content_tree_sha256": "b" * 64, "expanded_member_count": 30_000},
+    {"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 29_999},
+))
 def test_phase07_frozen_corpus_identity_is_exact_authority_not_a_30k_shaped_label(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, forged: dict[str, object],
 ) -> None:
     """A descriptor may not substitute an arbitrary 64-hex/count-30k identity."""
     from eval import phase07_frozen_base as frozen  # noqa: PLC0415
@@ -1244,15 +1263,69 @@ def test_phase07_frozen_corpus_identity_is_exact_authority_not_a_30k_shaped_labe
         "expanded_content_tree_sha256": "a" * 64,
         "expanded_member_count": 30_000,
     }
-    forged = {
-        "expanded_content_tree_sha256": "b" * 64,
-        "expanded_member_count": 30_000,
-    }
     monkeypatch.setattr(frozen, "_default_expected_corpus_identity", lambda: authority)
 
     assert frozen._expected_corpus_identity(None) == authority
     with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
         frozen._expected_corpus_identity(forged)
+
+
+def test_phase07_descriptor_recipe_fields_are_exact_authority_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-sealed descriptor cannot replace a committed recipe digest label."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    authority = {
+        "target_size": 30_000, "corpus_manifest_sha256": "a" * 64,
+        "generator_recipe_sha256": "b" * 64, "model_manifest_sha256": "c" * 64,
+        "runtime": {"python": "3.13"},
+    }
+    monkeypatch.setattr(frozen, "_default_descriptor_identity", lambda: dict(authority))
+    forged = dict(authority)
+    forged["generator_recipe_sha256"] = "d" * 64
+    with pytest.raises(frozen.FrozenBaseError, match="descriptor identity"):
+        frozen._descriptor_identity(forged)
+
+
+def test_phase07_resealed_30k_descriptor_cannot_choose_its_own_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production validation rejects a self-consistent but wrong 30k descriptor."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Re-sealed descriptor\n\nRESEALEDIDENTITYTERM\n")
+    fixture_identity = _phase07_test_corpus_identity(wiki)
+    frozen_dir = tmp_path / "frozen"
+    frozen.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen_dir, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=fixture_identity,
+    )
+    descriptor = frozen._read_descriptor(frozen_dir, expected_corpus_identity=fixture_identity)
+    authority = {"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 30_000}
+    descriptor["expected_corpus_identity"] = {
+        "expanded_content_tree_sha256": "b" * 64, "expanded_member_count": 30_000,
+    }
+    descriptor["record_self_sha256"] = frozen._sha256_bytes(frozen._canonical_json({
+        key: value for key, value in descriptor.items() if key != "record_self_sha256"
+    }))
+    (frozen_dir / "frozen-base.json").write_bytes(frozen._canonical_json(descriptor))
+    monkeypatch.setattr(frozen, "_default_expected_corpus_identity", lambda: authority)
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("re-sealed source reached clone/HNSW"),
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
+        frozen.finalize_private_role(
+            frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
+            candidate_query_policy=policy,
+        )
 
 
 @pytest.mark.parametrize("field", ("text", "content_hash", "title", "chunk_id"))
@@ -1289,7 +1362,7 @@ def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
 
     # Model an attacker who also recomputes every descriptor/tree digest.  The
     # remaining validator must derive the non-vector plan from Markdown.
-    descriptor = frozen._read_descriptor(frozen_dir)
+    descriptor = frozen._read_descriptor(frozen_dir, expected_corpus_identity=identity)
     sparse = repository.table_rows("sparse_chunks")
     dense = repository.table_rows("dense_chunks")
     descriptor["canonical_chunk_plan_sha256"] = frozen._canonical_chunk_plan_sha256(sparse, dense)
@@ -1312,6 +1385,48 @@ def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
         lambda *_args, **_kwargs: pytest.fail("tampered frozen source reached clone/HNSW"),
     )
     with pytest.raises(frozen.FrozenBaseError, match="canonical Markdown chunk plan"):
+        frozen.finalize_private_role(
+            frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
+            candidate_query_policy=policy, expected_corpus_identity=identity,
+        )
+
+
+def test_phase07_frozen_validator_rejects_resealed_page_metadata_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The source scan also binds page title metadata, not merely table rows."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Page metadata\n\nPAGEMETADATATERM\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen_dir = tmp_path / "frozen"
+    frozen.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen_dir, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    descriptor = frozen._read_descriptor(frozen_dir, expected_corpus_identity=identity)
+    pages = json.loads((frozen_dir / "pages.json").read_text(encoding="utf-8"))
+    pages[0]["title"] = "Re-sealed false title"
+    (frozen_dir / "pages.json").write_text(json.dumps(pages), encoding="utf-8")
+    descriptor["pages_sha256"] = frozen._sha256_file(frozen_dir / "pages.json")
+    inventory, tree = frozen._tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))
+    descriptor["frozen_file_inventory"] = inventory
+    descriptor["frozen_tree_sha256"] = tree
+    descriptor["record_self_sha256"] = frozen._sha256_bytes(frozen._canonical_json({
+        key: value for key, value in descriptor.items() if key != "record_self_sha256"
+    }))
+    (frozen_dir / "frozen-base.json").write_bytes(frozen._canonical_json(descriptor))
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("re-sealed pages reached clone/HNSW"),
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="page metadata identity"):
         frozen.finalize_private_role(
             frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
             candidate_query_policy=policy, expected_corpus_identity=identity,

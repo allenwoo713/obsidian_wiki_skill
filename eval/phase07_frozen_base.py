@@ -229,21 +229,22 @@ def _exact_term(chunks: list[object]) -> str:
     raise FrozenBaseError("frozen FTS term")
 
 
-def _make_chunks(wiki_dir: Path, embed: Callable[[list[str]], list[list[float]]], *, tokenizer: object) -> tuple[list[object], list[DenseChunk], list[dict[str, object]]]:
+def _canonical_markdown_plan(wiki_dir: Path, *, tokenizer: object | None) -> tuple[list[object], list[object], list[dict[str, object]]]:
+    """Rebuild the source-derived chunk plan without reading either Lance table."""
     wiki_dir = Path(wiki_dir)
     project_root = wiki_dir.parent
     pages = scan_wiki(wiki_dir, project_root)
     if not pages:
         raise FrozenBaseError("frozen corpus has no pages")
     lexicon = load_lexicon(project_root)
-    tokenizer = EmbeddingTokenizer(tokenizer)
+    token_counter = EmbeddingTokenizer(tokenizer).count if tokenizer is not None else None
     canonical = []
     page_rows = []
     for page in pages:
         page_id = page_id_of(page.path)
         records = list(chunk_page(
             page_id=page_id, path=page.path, title=page.title, page_type=page.page_type,
-            content=page.content, tokenizer=tokenizer.count,
+            content=page.content, tokenizer=token_counter,
         ))
         if page.content.strip() and {record.chunk_kind for record in records} != {"sparse", "dense"}:
             raise FrozenBaseError("canonical frozen chunk plan")
@@ -254,24 +255,31 @@ def _make_chunks(wiki_dir: Path, embed: Callable[[list[str]], list[list[float]]]
             "aliases": page.aliases, "sha256": page.sha256,
         })
     dense_sources = [chunk for chunk in canonical if chunk.chunk_kind == "dense"]
+    return [chunk for chunk in canonical if chunk.chunk_kind == "sparse"], dense_sources, page_rows
+
+
+def _dense_from_canonical(chunk: object, vector: tuple[float, ...]) -> DenseChunk:
+    return DenseChunk(
+        chunk_id=chunk.chunk_id, page_id=chunk.page_id, path=chunk.path, title=chunk.title,
+        text=chunk.text, vector=vector, page_type=chunk.page_type,
+        section_path=chunk.section_path, heading=chunk.heading, chunk_kind=chunk.chunk_kind,
+        chunk_index=chunk.chunk_index, parent_section_id=chunk.parent_section_id,
+        token_count=chunk.token_count, content_hash=chunk.content_hash,
+        forced_split=chunk.forced_split, continuation_index=chunk.continuation_index,
+        start_char=chunk.start_char, end_char=chunk.end_char,
+    )
+
+
+def _make_chunks(wiki_dir: Path, embed: Callable[[list[str]], list[list[float]]], *, tokenizer: object) -> tuple[list[object], list[DenseChunk], list[dict[str, object]]]:
+    sparse, dense_sources, page_rows = _canonical_markdown_plan(wiki_dir, tokenizer=tokenizer)
     vectors = embed([chunk.text for chunk in dense_sources])
     if len(vectors) != len(dense_sources):
         raise FrozenBaseError("frozen embedding count")
-    dense = [
-        DenseChunk(
-            chunk_id=chunk.chunk_id, page_id=chunk.page_id, path=chunk.path, title=chunk.title,
-            text=chunk.text, vector=tuple(float(value) for value in vector), page_type=chunk.page_type,
-            section_path=chunk.section_path, heading=chunk.heading, chunk_kind=chunk.chunk_kind,
-            chunk_index=chunk.chunk_index, parent_section_id=chunk.parent_section_id,
-            token_count=chunk.token_count, content_hash=chunk.content_hash,
-            forced_split=chunk.forced_split, continuation_index=chunk.continuation_index,
-            start_char=chunk.start_char, end_char=chunk.end_char,
-        )
-        for chunk, vector in zip(dense_sources, vectors)
-    ]
+    dense = [_dense_from_canonical(chunk, tuple(float(value) for value in vector))
+             for chunk, vector in zip(dense_sources, vectors)]
     if not dense:
         raise FrozenBaseError("frozen corpus has no dense chunks")
-    return [chunk for chunk in canonical if chunk.chunk_kind == "sparse"], dense, page_rows
+    return sparse, dense, page_rows
 
 
 def _default_expected_corpus_identity() -> dict[str, object]:
@@ -283,9 +291,10 @@ def _default_expected_corpus_identity() -> dict[str, object]:
     )
 
 
-def _expected_corpus_identity(value: Mapping[str, object] | None) -> dict[str, object]:
-    """Validate a fixed generator result; sub-30k values are pytest injection only."""
-    identity = _default_expected_corpus_identity() if value is None else dict(value)
+def _expected_corpus_identity(value: Mapping[str, object] | None, *, allow_explicit: bool = False) -> dict[str, object]:
+    """Bind a descriptor to the committed recipe, except an explicit test seam."""
+    authority = dict(_default_expected_corpus_identity())
+    identity = authority if value is None else dict(value)
     if set(identity) != _EXPECTED_CORPUS_IDENTITY_FIELDS \
             or not isinstance(identity.get("expanded_content_tree_sha256"), str) \
             or not _HEX64.fullmatch(str(identity["expanded_content_tree_sha256"])) \
@@ -293,7 +302,9 @@ def _expected_corpus_identity(value: Mapping[str, object] | None) -> dict[str, o
             or not isinstance(identity.get("expanded_member_count"), int) \
             or identity["expanded_member_count"] <= 0:
         raise FrozenBaseError("frozen corpus identity")
-    if identity["expanded_member_count"] != FROZEN_TARGET_SIZE and not os.environ.get("PYTEST_CURRENT_TEST"):
+    if authority["expanded_member_count"] != FROZEN_TARGET_SIZE:
+        raise FrozenBaseError("frozen corpus authority")
+    if identity != authority and not allow_explicit:
         raise FrozenBaseError("frozen corpus identity")
     return identity
 
@@ -309,17 +320,22 @@ def _actual_corpus_identity(wiki_dir: Path) -> dict[str, object]:
     }
 
 
+def _canonical_non_vector_rows(rows: list[object] | tuple[Mapping[str, object], ...]) -> list[dict[str, object]]:
+    """Normalize every persisted non-vector field for source-plan comparison."""
+    payload = []
+    for row in rows:
+        raw = dict(row) if isinstance(row, Mapping) else dict(vars(row))
+        raw.pop("vector", None)
+        payload.append(raw)
+    return sorted(payload, key=lambda row: str(row["chunk_id"]))
+
+
 def _canonical_chunk_plan_sha256(sparse: list[object] | tuple[Mapping[str, object], ...],
                                  dense: list[object] | tuple[Mapping[str, object], ...]) -> str:
     """Bind every canonical chunk field except the separately sealed float32 bytes."""
-    def row_payload(row: object) -> dict[str, object]:
-        raw = dict(row) if isinstance(row, Mapping) else dict(vars(row))
-        raw.pop("vector", None)
-        return raw
-
     payload = {
-        "sparse": sorted((row_payload(row) for row in sparse), key=lambda row: str(row["chunk_id"])),
-        "dense": sorted((row_payload(row) for row in dense), key=lambda row: str(row["chunk_id"])),
+        "sparse": _canonical_non_vector_rows(sparse),
+        "dense": _canonical_non_vector_rows(dense),
     }
     return _sha256_bytes(_canonical_json(payload))
 
@@ -367,7 +383,8 @@ def _default_descriptor_identity() -> dict[str, object]:
 
 def _descriptor_identity(value: Mapping[str, object] | None, *,
                          expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
-    identity = _default_descriptor_identity() if value is None else dict(value)
+    authority = _default_descriptor_identity()
+    identity = authority if value is None else dict(value)
     required = {"target_size", "corpus_manifest_sha256", "generator_recipe_sha256", "model_manifest_sha256", "runtime"}
     if set(identity) != required or identity.get("target_size") != FROZEN_TARGET_SIZE:
         raise FrozenBaseError("frozen descriptor identity")
@@ -380,7 +397,11 @@ def _descriptor_identity(value: Mapping[str, object] | None, *,
         _canonical_json(identity["runtime"])
     except (TypeError, ValueError) as exc:
         raise FrozenBaseError("frozen descriptor runtime") from exc
-    identity["expected_corpus_identity"] = _expected_corpus_identity(expected_corpus_identity)
+    if identity != authority:
+        raise FrozenBaseError("frozen descriptor identity")
+    identity["expected_corpus_identity"] = _expected_corpus_identity(
+        expected_corpus_identity, allow_explicit=expected_corpus_identity is not None,
+    )
     return identity
 
 
@@ -450,7 +471,7 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
     return descriptor
 
 
-def _read_descriptor(frozen_dir: Path) -> dict[str, object]:
+def _read_descriptor(frozen_dir: Path, *, expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
     try:
         descriptor = json.loads((Path(frozen_dir) / "frozen-base.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -461,9 +482,11 @@ def _read_descriptor(frozen_dir: Path) -> dict[str, object]:
     if descriptor.get("schema_version") != SCHEMA_VERSION or descriptor.get("kind") != "phase07-frozen-base" \
             or descriptor.get("authorization") != "none" or descriptor.get("record_self_sha256") != _sha256_bytes(_canonical_json(sealed)):
         raise FrozenBaseError("frozen descriptor identity")
-    _descriptor_identity({key: descriptor[key] for key in (
+    identity = _descriptor_identity({key: descriptor[key] for key in (
         "target_size", "corpus_manifest_sha256", "generator_recipe_sha256", "model_manifest_sha256", "runtime",
-    )}, expected_corpus_identity=descriptor.get("expected_corpus_identity"))
+    )}, expected_corpus_identity=expected_corpus_identity)
+    if descriptor.get("expected_corpus_identity") != identity["expected_corpus_identity"]:
+        raise FrozenBaseError("frozen corpus identity")
     for name in ("canonical_chunk_plan_sha256", "dense_vectors_sha256"):
         if not isinstance(descriptor.get(name), str) or not _HEX64.fullmatch(str(descriptor[name])):
             raise FrozenBaseError("frozen descriptor identity")
@@ -536,10 +559,11 @@ def _validate_frozen_semantic_layout(frozen_dir: Path) -> None:
             raise FrozenBaseError("frozen Lance sidecar")
 
 
-def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path) -> str:
+def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path,
+                         expected_corpus_identity: Mapping[str, object] | None = None) -> str:
     """Validate data, FTS, graph/page identities and the fixed absolute-root contract."""
     frozen_dir = Path(frozen_dir)
-    descriptor = _read_descriptor(frozen_dir)
+    descriptor = _read_descriptor(frozen_dir, expected_corpus_identity=expected_corpus_identity)
     _validate_frozen_semantic_layout(frozen_dir)
     expected = Path(expected_wiki_root).resolve()
     if expected != (frozen_dir / "Wiki").resolve() or descriptor["resolved_wiki_root"] != str(expected):
@@ -571,6 +595,13 @@ def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path) -> str:
     sparse = repository.table_rows("sparse_chunks")
     dense = repository.table_rows("dense_chunks")
     _validate_table_rows(sparse, dense, page_ids=page_ids)
+    expected_sparse, expected_dense_sources, expected_pages = _canonical_markdown_plan(
+        frozen_dir / "Wiki", tokenizer=None,
+    )
+    expected_dense = [_dense_from_canonical(chunk, ()) for chunk in expected_dense_sources]
+    if pages != expected_pages or _canonical_non_vector_rows(sparse) != _canonical_non_vector_rows(expected_sparse) \
+            or _canonical_non_vector_rows(dense) != _canonical_non_vector_rows(expected_dense):
+        raise FrozenBaseError("frozen canonical Markdown chunk plan")
     if _canonical_chunk_plan_sha256(sparse, dense) != descriptor["canonical_chunk_plan_sha256"] \
             or _dense_vectors_sha256(dense) != descriptor["dense_vectors_sha256"]:
         raise FrozenBaseError("frozen canonical table identity")
@@ -703,9 +734,13 @@ def _candidate_manifest(*, pages: list[dict[str, object]], build_id: str, genera
 
 def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_root: Path,
                           candidate_query_policy: CandidateQueryPolicy,
-                          publish_index_dir: Path | None = None) -> dict[str, object]:
+                          publish_index_dir: Path | None = None,
+                          expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
     """Clone validated tables and build exactly one candidate HNSW in that clone."""
-    source_digest = validate_frozen_base(frozen_dir, expected_wiki_root=expected_wiki_root)
+    source_digest = validate_frozen_base(
+        frozen_dir, expected_wiki_root=expected_wiki_root,
+        expected_corpus_identity=expected_corpus_identity,
+    )
     target_dir = Path(target_dir)
     if target_dir.exists():
         raise FrozenBaseError("private clone target must be new")
@@ -759,7 +794,10 @@ def finalize_private_role(*, frozen_dir: Path, target_dir: Path, expected_wiki_r
             vector_index_name=config.index_name,
         )
         target.seal(lance_dir)
-        if validate_frozen_base(frozen_dir, expected_wiki_root=expected_wiki_root) != source_digest:
+        if validate_frozen_base(
+            frozen_dir, expected_wiki_root=expected_wiki_root,
+            expected_corpus_identity=expected_corpus_identity,
+        ) != source_digest:
             raise FrozenBaseError("frozen source mutated by private clone")
         if build_dir is not None and index_dir is not None and build_id is not None and generation is not None:
             pages = json.loads((frozen_dir / "pages.json").read_text(encoding="utf-8"))
