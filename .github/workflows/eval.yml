@@ -726,17 +726,16 @@ jobs:
       - name: Require an empty canonical root before secure artifact extraction
         run: >
           python -c "from pathlib import Path; root=Path('.review-tmp/phase07/frozen-corpus'); assert not root.exists(), root"
-      - name: Download one explicit successful frozen prepare artifact
-        # Cross-run evidence may never be selected by latest name.  The sealed
-        # role bundle carries both IDs and the source is extracted into the one
-        # empty canonical root whose absolute page IDs were prepared.
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.run_id }}
-          artifact-ids: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.artifact_id }}
-          path: .review-tmp/phase07/frozen-corpus
+      - name: Download and securely extract the one sealed frozen prepare artifact
+        # The operator uses only the sealed numeric artifact ID at GitHub's
+        # archive endpoint; it never selects latest/name/matrix artifacts.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -m eval.phase07_operator_gate frozen-download
+          --dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json
+          --archive .review-tmp/phase07/frozen-prepare.zip
+          --frozen-dir .review-tmp/phase07/frozen-corpus
       - name: Validate the empty-root frozen extraction before private cloning
         run: >
           python -c "from pathlib import Path; from eval.phase07_frozen_base import validate_frozen_base; root=Path('.review-tmp/phase07/frozen-corpus'); assert root.is_dir() and not root.is_symlink(); validate_frozen_base(root, expected_wiki_root=root/'Wiki')"

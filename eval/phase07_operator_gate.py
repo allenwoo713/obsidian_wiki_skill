@@ -15,11 +15,16 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
+import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 
@@ -117,6 +122,102 @@ FROZEN_ROLE_CONFIGS = (
 # Generic PR evidence retains its historic candidate labels.  D-25 frozen
 # dispatches use the stricter immutable role names below.
 FROZEN_HYBRID_ROLE_CONFIGS = FROZEN_ROLE_CONFIGS
+_FROZEN_ARCHIVE_TOP_LEVEL = frozenset({"Wiki", "lance_db", ".index", "graph.json", "pages.json", "frozen-base.json"})
+
+
+def _safe_frozen_archive_member(name: object, *, seen: set[str], folded: set[str]) -> PurePosixPath:
+    """Reject aliases before writing one member below the fixed extraction root."""
+    if not isinstance(name, str) or not name or "\\" in name or name.startswith("/"):
+        raise ValueError("unsafe frozen archive member")
+    pure = PurePosixPath(name.rstrip("/"))
+    canonical = pure.as_posix()
+    if name.rstrip("/") != canonical or canonical in {"", "."} or ".." in pure.parts:
+        raise ValueError("unsafe frozen archive member")
+    normalized = unicodedata.normalize("NFC", canonical)
+    folded_name = normalized.casefold()
+    if normalized != canonical or canonical in seen or folded_name in folded:
+        raise ValueError("ambiguous frozen archive member")
+    if pure.parts[0] not in _FROZEN_ARCHIVE_TOP_LEVEL:
+        raise ValueError("frozen archive requires direct canonical root")
+    seen.add(canonical); folded.add(folded_name)
+    return pure
+
+
+def _extract_frozen_archive(*, archive: Path, root: Path, expected_tree_sha256: str) -> None:
+    """Extract only regular ZIP members into a newly-created canonical root."""
+    if archive.is_symlink() or not archive.is_file() or root.exists() or root.is_symlink():
+        raise ValueError("frozen archive extraction root")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    if root.parent.is_symlink():
+        raise ValueError("frozen archive extraction parent")
+    root.mkdir(mode=0o700)
+    seen: set[str] = set(); folded: set[str] = set()
+    try:
+        with zipfile.ZipFile(archive) as source:
+            for member in source.infolist():
+                relative = _safe_frozen_archive_member(member.filename, seen=seen, folded=folded)
+                mode = (member.external_attr >> 16) & 0o177777
+                is_directory = member.is_dir()
+                kind = stat.S_IFMT(mode)
+                if kind and not (stat.S_ISDIR(mode) if is_directory else stat.S_ISREG(mode)):
+                    raise ValueError("frozen archive special member")
+                destination = root.joinpath(*relative.parts)
+                if is_directory:
+                    destination.mkdir(parents=True, exist_ok=False)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists() or destination.is_symlink():
+                    raise ValueError("ambiguous frozen archive member")
+                with source.open(member, "r") as input_stream, destination.open("xb") as output_stream:
+                    shutil.copyfileobj(input_stream, output_stream, length=1024 * 1024)
+        from eval.phase07_frozen_base import validate_frozen_base
+        actual_tree_sha256 = validate_frozen_base(root, expected_wiki_root=root / "Wiki")
+        if actual_tree_sha256 != expected_tree_sha256:
+            raise ValueError("frozen archive tree digest")
+    except Exception:
+        # The root was created by this function and is never caller-selected
+        # after validation.  Do not leave a partial corpus for a later role.
+        shutil.rmtree(root)
+        raise
+
+
+def download_frozen_artifact(*, frozen_prepare: object, token: str, archive: Path,
+                             frozen_dir: Path, client: Any | None = None) -> None:
+    """Fetch exactly one sealed artifact ID and securely unpack its verified ZIP.
+
+    Artifact names, latest-run endpoints, and artifact-list selection are
+    deliberately absent: the one numeric ID carried by the frozen capability
+    is the sole REST selector.  The bearer token is supplied only to the client
+    call and is not included in files or returned data.
+    """
+    from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+    if not token or archive.exists() or archive.is_symlink():
+        raise ValueError("frozen artifact download destination/token")
+    prepare = validate_frozen_prepare_identity_shape(
+        frozen_prepare, expected_repository="allenwoo713/obsidian_wiki_skill",
+        expected_head=frozen_prepare.get("head_sha", "") if isinstance(frozen_prepare, dict) else "",
+    )
+    github = client or GitHubActionsClient()
+    endpoint = f"/repos/{prepare['repository']}/actions/artifacts/{prepare['artifact_id']}/zip"
+    try:
+        payload = github.download_artifact(endpoint, token)
+    except Exception as exc:
+        raise ValueError("exact frozen artifact download failed") from exc
+    if not isinstance(payload, bytes) or not payload or len(payload) != prepare["archive_size_bytes"] \
+            or hashlib.sha256(payload).hexdigest() != prepare["archive_sha256"]:
+        raise ValueError("exact frozen artifact archive digest/size")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    if archive.parent.is_symlink():
+        raise ValueError("frozen artifact archive parent")
+    archive.write_bytes(payload)
+    try:
+        _extract_frozen_archive(
+            archive=archive, root=frozen_dir,
+            expected_tree_sha256=prepare["base_tree_sha256"],
+        )
+    except Exception:
+        archive.unlink(missing_ok=True)
+        raise
 
 def validate_frozen_prepare_identity(identity: object, *, expected_head: str,
                                      locked_execution: object) -> dict[str, Any]:
@@ -1257,14 +1358,30 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
     if output.exists() or provenance_dir.is_symlink() or (provenance_dir.exists() and any(provenance_dir.iterdir())):
         raise ValueError("hybrid provenance output must be new and empty")
     github = client or GitHubActionsClient()
-    evidence: list[dict[str, str]] = []
+    evidence: list[dict[str, Any]] = []
     seen_ids: set[tuple[int, int, int, int]] = set()
+    frozen_identity: dict[str, Any] | None = None
+    frozen_roles: set[str] = set()
     for row in collection["downloads"]:
         run_id, run_attempt = row["run_id"], row["run_attempt"]
         if run_attempt != 1:
             raise ValueError("hybrid evidence requires three independent first-attempt runs")
         archive, extracted = Path(row["archive"]), Path(row["extracted_dir"])
         validated = validate_hybrid_artifact_tree(extracted)
+        packet_frozen_prepare = validated.get("frozen_prepare")
+        if packet_frozen_prepare is not None:
+            from eval.phase07_frozen_base import validate_frozen_prepare_identity_shape
+            packet_frozen_prepare = validate_frozen_prepare_identity_shape(
+                packet_frozen_prepare, expected_repository=collection["repository"],
+                expected_head=collection["head_sha"],
+            )
+            if frozen_identity is None:
+                frozen_identity = dict(packet_frozen_prepare)
+            elif frozen_identity != packet_frozen_prepare:
+                raise ValueError("mixed frozen prepare identity")
+            frozen_roles.add(row["role"])
+        elif frozen_identity is not None or row["role"] in {"m20", "m32"}:
+            raise ValueError("missing frozen prepare identity")
         allocation = validated["result"].get("allocation", {}).get("allocation")
         if not isinstance(allocation, dict):
             raise ValueError("hybrid artifact allocation")
@@ -1340,15 +1457,26 @@ def collect_hybrid_provenance(*, request_file: Path, output: Path, provenance_di
             "role": row["role"], "config": row["config"], "bundle_sha256": row["bundle_sha256"],
             "archive": str(archive.resolve()), "extracted_dir": str(extracted.resolve()),
         }
+        # Frozen roles carry the exact collector identity in every evidence
+        # representation.  Generic legacy packets intentionally retain their
+        # former schema, where this field is absent rather than nullable.
+        if frozen_identity is not None:
+            provenance["frozen_prepare"] = dict(frozen_identity)
         provenance_dir.mkdir(parents=True, exist_ok=True)
         provenance_path = provenance_dir / f"hybrid-{run_id}-{run_attempt}-provenance.json"
         _write_ledger(provenance_path, {"schema_version": 1, "evidence": [provenance]})
-        evidence.append({
+        evidence_row: dict[str, Any] = {
             "run_id": run_id, "run_attempt": run_attempt, "job_id": row["job_id"],
             "artifact_id": row["artifact_id"], "role": row["role"], "config": row["config"],
             "bundle_sha256": row["bundle_sha256"], "archive": str(archive.resolve()),
             "extracted_dir": str(extracted.resolve()), "provenance": str(provenance_path.resolve()),
-        })
+        }
+        if frozen_identity is not None:
+            evidence_row["frozen_prepare"] = dict(frozen_identity)
+        evidence.append(evidence_row)
+    if any(row["role"] in {"m20", "m32"} for row in collection["downloads"]) \
+            and frozen_roles != {"baseline", "m20", "m32"}:
+        raise ValueError("missing frozen prepare identity")
     _write_ledger(output, {"schema_version": 1, "evidence": evidence})
     return 0
 
@@ -1369,6 +1497,38 @@ class GitHubActionsClient:
         if not isinstance(value, dict):
             raise ValueError("attempt-scoped job API JSON")
         return value
+
+    def download_artifact(self, path: str, token: str) -> bytes:
+        """Read one archive endpoint, allowing only GitHub-owned HTTPS redirects."""
+        if not isinstance(path, str) or not path.startswith("/repos/") or not token:
+            raise ValueError("exact artifact download request")
+
+        class _GitHubOnlyRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, request, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+                parsed = urllib.parse.urlparse(newurl)
+                host = (parsed.hostname or "").lower()
+                if parsed.scheme != "https" or not (host == "github.com" or host.endswith(".github.com")
+                                                     or host == "githubusercontent.com" or host.endswith(".githubusercontent.com")):
+                    raise urllib.error.HTTPError(newurl, code, "non-GitHub artifact redirect", headers, fp)
+                # Redirect targets are signed URLs.  Deliberately do not forward
+                # Authorization outside api.github.com.
+                return urllib.request.Request(newurl, headers={"Accept": "application/octet-stream"})
+
+        request = urllib.request.Request(
+            f"https://api.github.com{path}",
+            headers={"Accept": "application/octet-stream", "Authorization": f"Bearer {token}"},
+        )
+        try:
+            opener = urllib.request.build_opener(_GitHubOnlyRedirect())
+            with opener.open(request, timeout=30) as response:
+                if getattr(response, "status", response.getcode()) != 200:
+                    raise ValueError("exact artifact download status")
+                payload = response.read()
+        except (OSError, ValueError) as exc:
+            raise ValueError("exact artifact download unavailable") from exc
+        if not isinstance(payload, bytes) or not payload:
+            raise ValueError("exact artifact download body")
+        return payload
 
 
 def seal_confirmation_allocation(*, workflow_inputs: dict[str, Any], output: Path, repository: str,
@@ -1936,7 +2096,7 @@ def run_hybrid_plan(*, dense_ledger: Path, request_file: Path, workflow_inputs_d
 
 def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-allocation", "hybrid-dispatch", "hybrid-collection-request", "hybrid-provenance", "frozen-size-preflight", "prepare-plan", "frozen-prepare-provenance", "role-plan"))
+    parser.add_argument("command", choices=("preflight", "campaign", "decision", "pr-gates", "hosted-preflight", "finalize", "reconcile-hosted", "confirmation-allocation", "confirmation-plan", "confirmation-provenance", "hybrid-plan", "hybrid-allocation", "hybrid-dispatch", "hybrid-collection-request", "hybrid-provenance", "frozen-size-preflight", "prepare-plan", "frozen-prepare-provenance", "frozen-download", "role-plan"))
     parser.add_argument("--request-file", type=Path)
     parser.add_argument("--ledger-file", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -1994,6 +2154,19 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
             args.ledger_file.write_text(
                 json.dumps(identity, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                 encoding="utf-8",
+            )
+            return 0
+        if args.command == "frozen-download":
+            if None in (args.dispatch_bundle, args.archive, args.frozen_dir):
+                raise ValueError("frozen download requires a sealed role bundle, archive, and canonical root")
+            bundle = _read_object(args.dispatch_bundle)
+            prepare = bundle.get("frozen_prepare") if isinstance(bundle, dict) else None
+            if not isinstance(prepare, dict):
+                raise ValueError("frozen download requires collector-bound prepare identity")
+            validate_hybrid_dispatch_bundle(bundle, expected_head=prepare.get("head_sha", ""))
+            download_frozen_artifact(
+                frozen_prepare=prepare, token=os.environ.get("GITHUB_TOKEN", ""),
+                archive=args.archive, frozen_dir=args.frozen_dir, client=github_client,
             )
             return 0
         if args.command == "role-plan":

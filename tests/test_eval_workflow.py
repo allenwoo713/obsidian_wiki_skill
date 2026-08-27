@@ -1646,12 +1646,20 @@ class _HybridGitHubFixtureClient:
         raise AssertionError(path)
 
 
-def _three_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, list[dict], object]:
+def _three_download_hybrid_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, frozen: bool = False,
+) -> tuple[dict, list[dict], object]:
     """Return baseline/m20/m32 role trees and their independent API records."""
     fixture = _phase07_hybrid_fixture_module()
     plan_root = tmp_path / "plan"
     plan_root.mkdir()
     plan, _ = fixture._build_test_hybrid_plan(plan_root, monkeypatch)
+    frozen_bundles = (
+        phase07_operator_gate.build_frozen_role_dispatch_bundles(
+            hybrid_request=plan["hybrid_request"], frozen_prepare=fixture._frozen_prepare_identity(),
+            expected_head=plan["hybrid_request"]["hybrid_implementation_head"],
+        ) if frozen else []
+    )
     records: list[dict] = []
     identities = {
         16: {
@@ -1673,7 +1681,10 @@ def _three_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             "api_job_id_mismatch": 1802, "api_artifact_id_mismatch": 1902,
         },
     }
-    for role, m in (("baseline", 16), ("candidate", 20), ("candidate", 32)):
+    role_pairs = (("baseline", 16), ("m20", 20), ("m32", 32)) if frozen else (
+        ("baseline", 16), ("candidate", 20), ("candidate", 32),
+    )
+    for role, m in role_pairs:
         identity = identities[m]
         run_id, attempt, job_id, artifact_id = (
             identity["run_id"], identity["run_attempt"], identity["job_id"], identity["artifact_id"],
@@ -1686,14 +1697,20 @@ def _three_download_hybrid_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         # This collection fixture continues to cover the ordinary PR packet
         # reader.  Frozen D-25 roles are covered by the strict role-plan path;
         # they must not make historic generic evidence unreadable.
-        input_record = next(
-            row for row in plan["workflow_inputs"]
-            if row["role"] == role and row["config"]["m"] == m
-        )
-        dispatch_bundle = phase07_operator_gate._sealed({
-            "schema_version": 1, "hybrid_request": plan["hybrid_request"],
-            "workflow_input": input_record, "replacement_for_run_id": None,
-        })
+        if frozen:
+            dispatch_bundle = next(
+                bundle for bundle in frozen_bundles
+                if bundle["workflow_input"]["role"] == role and bundle["workflow_input"]["config"]["m"] == m
+            )
+        else:
+            input_record = next(
+                row for row in plan["workflow_inputs"]
+                if row["role"] == role and row["config"]["m"] == m
+            )
+            dispatch_bundle = phase07_operator_gate._sealed({
+                "schema_version": 1, "hybrid_request": plan["hybrid_request"],
+                "workflow_input": input_record, "replacement_for_run_id": None,
+            })
         # Hosted workflow records `${ImageOS} ${ImageVersion}`.  Keep this
         # integration fixture production-shaped without changing the shared
         # raw-tree fixture used by unrelated campaign tests.
@@ -2341,6 +2358,58 @@ def test_hybrid_reconciler_has_no_generic_or_representative_authority() -> None:
     assert "validate_hybrid_artifact_tree" in source
     assert "exactly-three" in source.lower()
     assert "_pair_hybrid_role_observations" in source
+
+
+@pytest.mark.parametrize("mutation", ("success", "missing", "mutation", "mixed"))
+def test_frozen_three_role_collector_and_reconciler_share_one_prepare_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    """All frozen roles preserve one identity from raw packet through final ledger."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch, frozen=True)
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json", tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+    collected = json.loads(manifest.read_text(encoding="utf-8"))
+    identities = [row["frozen_prepare"] for row in collected["evidence"]]
+    assert len(identities) == 3 and identities[0] == identities[1] == identities[2]
+    for row in collected["evidence"]:
+        document = json.loads(Path(row["provenance"]).read_text(encoding="utf-8"))
+        assert document["evidence"][0]["frozen_prepare"] == row["frozen_prepare"]
+
+    if mutation == "missing":
+        collected["evidence"][0].pop("frozen_prepare")
+    elif mutation == "mutation":
+        collected["evidence"][0]["frozen_prepare"]["base_tree_sha256"] = "0" * 64
+    elif mutation == "mixed":
+        collected["evidence"][1]["frozen_prepare"]["artifact_id"] = 999
+    collected["record_self_sha256"] = gate.canonical_digest(collected)
+    manifest.write_text(json.dumps(collected, sort_keys=True), encoding="utf-8")
+    output = tmp_path / "hybrid-ledger.json"
+    code = reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(output), "--mode", "hybrid-postdownload",
+    ])
+    assert code == (0 if mutation == "success" else 1)
+    if mutation == "success":
+        ledger = json.loads(output.read_text(encoding="utf-8"))
+        assert ledger["frozen_prepare"] == identities[0]
+    else:
+        assert not output.exists()
 
 
 @pytest.mark.parametrize("init_baseline", [False, True])
