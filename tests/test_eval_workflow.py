@@ -1325,6 +1325,17 @@ def test_phase07_frozen_prepare_is_a_separate_120_minute_non_authorizing_job() -
     assert job["permissions"] == {"contents": "read", "actions": "read"}
     assert "inputs.campaign_stage == 'hybrid-prepare'" in job["if"]
     assert "eval.phase07_frozen_base prepare" in section
+    # Prepare uses the same pinned model/cache path as roles and materializes
+    # directly at the canonical root that later role extraction reuses.
+    for required in (
+        "actions/cache@v4",
+        "Hydrate exact immutable model only on cache miss",
+        "Validate immutable cached model tree",
+        ".review-tmp/phase07/frozen-corpus/Wiki",
+        "--frozen-dir .review-tmp/phase07/frozen-corpus",
+        "path: .review-tmp/phase07/frozen-corpus",
+    ):
+        assert required in section
     assert "include-hidden-files: true" in section
     assert "retention-days: 90" in section
     assert "phase07-hybrid" not in section
@@ -1334,10 +1345,49 @@ def test_phase07_role_download_uses_the_exact_prepare_run_and_artifact_identity(
     """A role cannot fall back to a latest artifact name or an inherited matrix file."""
     _job, hybrid = _phase07_hybrid_workflow_section()
     assert "actions/download-artifact@v4" in hybrid
-    assert "run-id: ${{ fromJSON(inputs.workflow_inputs).prepare.run_id }}" in hybrid
-    assert "artifact-ids: ${{ fromJSON(inputs.workflow_inputs).prepare.artifact_id }}" in hybrid
+    assert "github-token: ${{ github.token }}" in hybrid
+    assert "repository: ${{ github.repository }}" in hybrid
+    assert "Require an empty canonical root before secure artifact extraction" in hybrid
+    assert "assert not root.exists()" in hybrid
+    assert "run-id: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.run_id }}" in hybrid
+    assert "artifact-ids: ${{ fromJSON(inputs.workflow_inputs).frozen_prepare.artifact_id }}" in hybrid
     assert "--frozen-dir .review-tmp/phase07/frozen-corpus" in hybrid
     assert "name: phase07-frozen-base" not in hybrid
+
+
+def test_frozen_size_preflight_and_prepare_plan_are_reachable_real_operator_clis(tmp_path: Path) -> None:
+    """The two non-network stages are real module CLIs, not dead helpers."""
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True,
+    ).strip()
+    preflight = {
+        "schema_version": 1, "head_sha": head, "target_size": 30000,
+        "wall_time_seconds": 1, "cap_minutes": 120, "uncompressed_bytes": 100,
+        "archive_bytes": 50, "file_count": 1, "largest_file": 100,
+        "descriptor_sha256": hashlib.sha256(b"descriptor").hexdigest(),
+        "tree_sha256": hashlib.sha256(b"tree").hexdigest(),
+        "repository_capability": True, "human_authorized": True,
+    }
+    request, ledger, workflow_input = (
+        tmp_path / "size.json", tmp_path / "sealed-preflight.json", tmp_path / "prepare-input.json",
+    )
+    request.write_text(json.dumps(preflight), encoding="utf-8")
+    first = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "frozen-size-preflight",
+         "--request-file", str(request), "--ledger-file", str(ledger)],
+        cwd=SKILL_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    second = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "prepare-plan",
+         "--request-file", str(ledger), "--workflow-input-file", str(workflow_input),
+         "--head-sha", head],
+        cwd=SKILL_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    output = json.loads(workflow_input.read_text(encoding="utf-8"))
+    assert output == phase07_operator_gate.validate_frozen_prepare_bundle(output, expected_head=head)
+    assert "artifact_id" not in output["local_preflight"]
 
 
 def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
