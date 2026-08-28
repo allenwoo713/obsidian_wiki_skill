@@ -1723,6 +1723,100 @@ def test_frozen_size_preflight_and_prepare_plan_are_reachable_real_operator_clis
     assert "artifact_id" not in output["local_preflight"]
 
 
+def _tiny_measurement_materializer(destination: Path) -> dict[str, object]:
+    """Explicit in-process seam; the production CLI has no reduced-size mode."""
+    from eval.ann_corpus_manifest import canonical_content_tree_sha256
+
+    page = destination / "concepts" / "measurement.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\ntype: concept\ntitle: Measurement corpus\nsources: []\ntags: []\nrelated: []\n---\n\n"
+        "# Measurement corpus\n\nLOCALMEASUREMENT unique sealed content.\n",
+        encoding="utf-8",
+    )
+    return {"expanded_content_tree_sha256": canonical_content_tree_sha256(destination), "expanded_member_count": 1}
+
+
+class _TinyMeasurementEmbedder:
+    tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+    @staticmethod
+    def embed(texts: list[str]) -> list[list[float]]:
+        return [[1.0, *([0.0] * 383)] for _ in texts]
+
+
+def test_local_frozen_size_measurement_builds_actual_archive_and_cleans_its_scratch(tmp_path: Path,
+                                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """The small corpus is an explicit API seam, never a CLI flag or test env switch."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    expected_identity = {
+        "expanded_content_tree_sha256": hashlib.sha256(b"unused").hexdigest(), "expanded_member_count": 1,
+    }
+    # Materialize once into a disposable directory to obtain the exact source identity.
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    seen: dict[str, object] = {}
+    original_archive = phase07_operator_gate._write_canonical_frozen_archive
+
+    def capture_archive(*, frozen_dir: Path, archive: Path) -> list[dict[str, object]]:
+        inventory = original_archive(frozen_dir=frozen_dir, archive=archive)
+        seen["archive_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        seen["archive_bytes"] = archive.stat().st_size
+        seen["members"] = {str(item["path"]) for item in inventory}
+        return inventory
+
+    monkeypatch.setattr(phase07_operator_gate, "_write_canonical_frozen_archive", capture_archive)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement-ledger.json"
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "not-used-by-explicit-seam", ledger_file=ledger,
+        head_sha=head, materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    record = json.loads(ledger.read_text(encoding="utf-8"))
+    assert record == phase07_operator_gate.validate_frozen_size_measurement(record, expected_head=head)
+    assert record["archive_sha256"] == seen["archive_sha256"]
+    assert record["archive_bytes"] == seen["archive_bytes"]
+    assert record["file_count"] > 0 and record["uncompressed_bytes"] >= record["largest_file_bytes"] > 0
+    assert ".index/graph.json" in seen["members"]
+    assert record["authorization"] == "none"
+    assert record["repository_capability"] is False and record["human_authorized"] is False
+    assert not work_dir.exists()
+    # A measurement cannot stand in for the separately human/capability-sealed prepare envelope.
+    with pytest.raises(ValueError, match="sealed frozen prepare bundle"):
+        phase07_operator_gate.run_frozen_prepare_plan(
+            preflight_file=ledger, workflow_input_file=tmp_path / "prepare.json", expected_head=head,
+        )
+
+
+def test_local_frozen_size_measurement_cleans_failures_and_preserves_preexisting_paths(tmp_path: Path) -> None:
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    failure_work, failure_ledger = tmp_path / "failure-scratch", tmp_path / "failure-ledger.json"
+
+    def failing_materializer(_destination: Path) -> dict[str, object]:
+        raise ValueError("intentional materialization failure")
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=failure_work, model_dir=tmp_path / "unused", ledger_file=failure_ledger, head_sha=head,
+        materializer=failing_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert not failure_work.exists() and not failure_ledger.exists()
+
+    existing_work, existing_ledger = tmp_path / "existing-work", tmp_path / "existing-ledger.json"
+    existing_work.mkdir(); (existing_work / "keep").write_text("keep", encoding="utf-8")
+    existing_ledger.write_text("keep", encoding="utf-8")
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=existing_work, model_dir=tmp_path / "unused", ledger_file=existing_ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert (existing_work / "keep").read_text(encoding="utf-8") == "keep"
+    assert existing_ledger.read_text(encoding="utf-8") == "keep"
+
+
 def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
     """The distinct job is model-backed, finite, and never publishes secrets."""
     _job, hybrid = _phase07_hybrid_workflow_section()

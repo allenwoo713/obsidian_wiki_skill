@@ -18,6 +18,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -129,6 +131,14 @@ FROZEN_ROLE_CONFIGS = (
 # dispatches use the stricter immutable role names below.
 FROZEN_HYBRID_ROLE_CONFIGS = FROZEN_ROLE_CONFIGS
 _FROZEN_ARCHIVE_TOP_LEVEL = frozenset({"Wiki", "lance_db", ".index", "graph.json", "pages.json", "frozen-base.json"})
+_FROZEN_SIZE_MEASUREMENT_FIELDS = frozenset({
+    "schema_version", "kind", "head_sha", "head_sha256", "target_size", "cap_minutes",
+    "wall_time_seconds", "uncompressed_bytes", "archive_bytes", "file_count",
+    "largest_file_bytes", "descriptor_sha256", "tree_sha256", "archive_sha256",
+    "model_manifest_sha256", "corpus_manifest_sha256", "generator_recipe_sha256",
+    "runtime_sha256", "authorization", "repository_capability", "human_authorized",
+    "record_self_sha256",
+})
 
 
 def _safe_frozen_archive_member(name: object, *, seen: set[str], folded: set[str]) -> PurePosixPath:
@@ -336,6 +346,217 @@ def seal_frozen_size_preflight(*, request_file: Path, ledger_file: Path) -> int:
         return 0
     except (OSError, ValueError, json.JSONDecodeError):
         return 1
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _measurement_inventory(root: Path) -> list[dict[str, object]]:
+    """Return the regular-file archive inventory, including hidden members."""
+    root = Path(root)
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("frozen measurement tree")
+    inventory: list[dict[str, object]] = []
+    folded: set[str] = set()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink() or not relative or "\\" in relative or relative.startswith("/"):
+            raise ValueError("frozen measurement member")
+        folded_name = unicodedata.normalize("NFC", relative).casefold()
+        if unicodedata.normalize("NFC", relative) != relative or folded_name in folded:
+            raise ValueError("frozen measurement member")
+        folded.add(folded_name)
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode) or path.stat().st_nlink != 1:
+            raise ValueError("frozen measurement member")
+        inventory.append({"path": relative, "size": path.stat().st_size, "sha256": _sha256_file(path)})
+    if not inventory:
+        raise ValueError("frozen measurement tree")
+    return inventory
+
+
+def _write_canonical_frozen_archive(*, frozen_dir: Path, archive: Path) -> list[dict[str, object]]:
+    """Write the same rootless, hidden-file-inclusive shape Actions uploads."""
+    frozen_dir, archive = Path(frozen_dir), Path(archive)
+    if archive.exists() or archive.is_symlink():
+        raise ValueError("frozen measurement archive must be new")
+    inventory = _measurement_inventory(frozen_dir)
+    with zipfile.ZipFile(archive, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as output:
+        for entry in inventory:
+            source = frozen_dir / str(entry["path"])
+            info = zipfile.ZipInfo(str(entry["path"]), date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            output.writestr(info, source.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    with archive.open("rb") as stream:
+        os.fsync(stream.fileno())
+    return inventory
+
+
+def validate_frozen_size_measurement(value: object, *, expected_head: str) -> dict[str, Any]:
+    """Accept only a completed local measurement, never an authorization seal."""
+    if not isinstance(value, dict) or set(value) != _FROZEN_SIZE_MEASUREMENT_FIELDS \
+            or not SHA.fullmatch(expected_head) or value.get("record_self_sha256") != canonical_digest(value):
+        raise ValueError("frozen size measurement")
+    if value.get("schema_version") != 2 or value.get("kind") != "phase07-frozen-size-measurement" \
+            or value.get("head_sha") != expected_head \
+            or value.get("head_sha256") != hashlib.sha256(expected_head.encode("ascii")).hexdigest() \
+            or value.get("target_size") != 30000 or value.get("cap_minutes") != 120 \
+            or value.get("authorization") != "none" \
+            or value.get("repository_capability") is not False or value.get("human_authorized") is not False:
+        raise ValueError("frozen size measurement")
+    integer_fields = ("wall_time_seconds", "uncompressed_bytes", "archive_bytes", "file_count", "largest_file_bytes")
+    if not all(isinstance(value.get(name), int) and not isinstance(value[name], bool) and value[name] > 0
+               for name in integer_fields) or value["wall_time_seconds"] > 120 * 60:
+        raise ValueError("frozen size measurement")
+    digest_fields = (
+        "descriptor_sha256", "tree_sha256", "archive_sha256", "model_manifest_sha256",
+        "corpus_manifest_sha256", "generator_recipe_sha256", "runtime_sha256",
+    )
+    if not all(isinstance(value.get(name), str) and HEX64.fullmatch(value[name]) for name in digest_fields):
+        raise ValueError("frozen size measurement")
+    return value
+
+
+def _write_new_durable_ledger(path: Path, record: dict[str, Any]) -> None:
+    """Atomically publish one ledger and fsync both bytes and directory metadata."""
+    path = Path(path)
+    if path.exists() or path.is_symlink():
+        raise ValueError("frozen measurement ledger must be new")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise ValueError("frozen measurement ledger parent")
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="xb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.exists() or path.is_symlink():
+            raise ValueError("frozen measurement ledger must be new")
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger_file: Path,
+                                      head_sha: str, materializer: Any | None = None,
+                                      corpus_identity: dict[str, object] | None = None,
+                                      embedder: Any | None = None, tokenizer: object | None = None) -> int:
+    """Build and measure the real candidate-neutral base without minting authority.
+
+    The optional callable/object parameters are a deliberately explicit in-process
+    test seam.  The command-line path never exposes a small target, alternate
+    corpus, or model bypass.
+    """
+    work_dir, ledger_file = Path(work_dir), Path(ledger_file)
+    created_work_dir = False
+    wrote_ledger = False
+    completed = False
+    try:
+        if not SHA.fullmatch(head_sha) or work_dir.exists() or work_dir.is_symlink() \
+                or ledger_file.exists() or ledger_file.is_symlink():
+            raise ValueError("frozen measurement paths or head")
+        try:
+            current_head = _git("rev-parse", "HEAD")
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValueError("frozen measurement repository head") from exc
+        if current_head != head_sha:
+            raise ValueError("frozen measurement exact head")
+        started = time.monotonic()
+        if materializer is None:
+            from eval.run_eval import (
+                FIXTURES_WIKI, _materialize_phase07_expanded_corpus,
+                expected_phase07_expanded_corpus_identity,
+            )
+            corpus_identity = expected_phase07_expanded_corpus_identity(
+                fixture_root=FIXTURES_WIKI, target_size=30000,
+            )
+            materializer = lambda destination: _materialize_phase07_expanded_corpus(
+                fixture_root=FIXTURES_WIKI, output_root=destination, target_size=30000, test_only=False,
+            )
+        elif corpus_identity is None:
+            raise ValueError("test materializer needs explicit corpus identity")
+        if embedder is None:
+            if tokenizer is not None:
+                raise ValueError("test tokenizer needs explicit embedder")
+            from eval.phase07_frozen_base import load_verified_frozen_embedder
+            embedder = load_verified_frozen_embedder(model_dir)
+        if tokenizer is None:
+            tokenizer = getattr(embedder, "tokenizer", None)
+        if tokenizer is None or not callable(getattr(embedder, "embed", None)):
+            raise ValueError("frozen measurement embedder")
+        work_dir.mkdir(mode=0o700, parents=False)
+        created_work_dir = True
+        wiki_dir, frozen_dir, archive = work_dir / "Wiki", work_dir / "frozen-corpus", work_dir / "frozen-base.zip"
+        actual_identity = materializer(wiki_dir)
+        if actual_identity != corpus_identity or not wiki_dir.is_dir() or wiki_dir.is_symlink():
+            raise ValueError("frozen measurement corpus materialization")
+        from eval.phase07_frozen_base import prepare_frozen_base, validate_frozen_base
+        descriptor = prepare_frozen_base(
+            wiki_dir=wiki_dir, frozen_dir=frozen_dir,
+            embed=lambda texts: embedder.embed(list(texts)), tokenizer=tokenizer,
+            expected_corpus_identity=corpus_identity,
+        )
+        tree_sha256 = validate_frozen_base(
+            frozen_dir, expected_wiki_root=frozen_dir / "Wiki", tokenizer=tokenizer,
+            expected_corpus_identity=corpus_identity,
+        )
+        inventory = _write_canonical_frozen_archive(frozen_dir=frozen_dir, archive=archive)
+        elapsed = time.monotonic() - started
+        wall_time_seconds = max(1, math.ceil(elapsed))
+        if wall_time_seconds > 120 * 60:
+            raise ValueError("frozen measurement duration cap")
+        record = _sealed({
+            "schema_version": 2, "kind": "phase07-frozen-size-measurement", "head_sha": head_sha,
+            "head_sha256": hashlib.sha256(head_sha.encode("ascii")).hexdigest(),
+            "target_size": 30000, "cap_minutes": 120, "wall_time_seconds": wall_time_seconds,
+            "uncompressed_bytes": sum(int(item["size"]) for item in inventory),
+            "archive_bytes": archive.stat().st_size, "file_count": len(inventory),
+            "largest_file_bytes": max(int(item["size"]) for item in inventory),
+            "descriptor_sha256": _sha256_file(frozen_dir / "frozen-base.json"),
+            "tree_sha256": tree_sha256, "archive_sha256": _sha256_file(archive),
+            "model_manifest_sha256": descriptor["model_manifest_sha256"],
+            "corpus_manifest_sha256": descriptor["corpus_manifest_sha256"],
+            "generator_recipe_sha256": descriptor["generator_recipe_sha256"],
+            "runtime_sha256": hashlib.sha256(
+                json.dumps(descriptor["runtime"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "authorization": "none", "repository_capability": False, "human_authorized": False,
+        })
+        validate_frozen_size_measurement(record, expected_head=head_sha)
+        _write_new_durable_ledger(ledger_file, record)
+        wrote_ledger = True
+        validate_frozen_size_measurement(_read_object(ledger_file), expected_head=head_sha)
+        completed = True
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        return 1
+    finally:
+        cleanup_failed = False
+        if created_work_dir:
+            try:
+                shutil.rmtree(work_dir)
+            except OSError:
+                cleanup_failed = True
+        if wrote_ledger and (not completed or cleanup_failed):
+            ledger_file.unlink(missing_ok=True)
 
 
 def run_frozen_prepare_plan(*, preflight_file: Path, workflow_input_file: Path,
@@ -2186,11 +2407,20 @@ def main(argv: list[str] | None = None, *, github_client: Any | None = None) -> 
     parser.add_argument("--archive", type=Path)
     parser.add_argument("--hybrid-request", type=Path)
     parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--work-dir", type=Path,
+                        help="new empty local scratch directory for frozen-size measurement")
     args = parser.parse_args(argv)
     try:
         if args.command == "frozen-size-preflight":
+            if args.work_dir is not None or args.model_dir is not None or args.head_sha is not None:
+                if None in (args.work_dir, args.model_dir, args.ledger_file) or not args.head_sha:
+                    raise ValueError("frozen-size-preflight measurement requires --work-dir --model-dir --ledger-file --head-sha")
+                return run_local_frozen_size_measurement(
+                    work_dir=args.work_dir, model_dir=args.model_dir,
+                    ledger_file=args.ledger_file, head_sha=args.head_sha,
+                )
             if args.request_file is None or args.ledger_file is None:
-                raise ValueError("frozen-size-preflight requires local preflight and ledger")
+                raise ValueError("frozen-size-preflight requires either measurement paths or legacy local preflight and ledger")
             return seal_frozen_size_preflight(request_file=args.request_file, ledger_file=args.ledger_file)
         if args.command == "prepare-plan":
             if args.request_file is None or args.workflow_input_file is None or not args.head_sha:
