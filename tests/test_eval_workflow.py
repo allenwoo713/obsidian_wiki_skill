@@ -1812,6 +1812,7 @@ def test_local_frozen_size_measurement_reports_embedding_stages(tmp_path: Path) 
     assert embedder.progress_flags == [True]
     assert [stage for stage, _detail in events] == [
         "model_ready", "corpus_materialized", "plan_finished", "embedding_started", "embedding_finished",
+        "graph_started", "graph_finished", "lance_persist_started", "lance_persist_finished",
     ]
     assert all(detail["event"] == "phase07-frozen-size-progress" for _stage, detail in events)
     assert events[3][1]["wiki_root"].endswith("frozen-corpus/Wiki")
@@ -1917,7 +1918,8 @@ def test_local_frozen_size_measurement_reports_embedding_events_around_embed_cal
     ) == 0
     assert trace == [
         "model_ready", "corpus_materialized", "plan_finished", "embedding_started", "embed_called",
-        "embedding_finished",
+        "embedding_finished", "graph_started", "graph_finished", "lance_persist_started",
+        "lance_persist_finished",
     ]
 
 

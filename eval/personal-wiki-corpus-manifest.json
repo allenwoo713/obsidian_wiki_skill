@@ -1,5 +1,5 @@
 {
   "schema_version": 1,
-  "generator": {"version": "public-distractor-v1", "seed": "phase07-public-corpus", "source_fixture_sha256": "3df4b971354569af4f9a26c86189e6865926f0e81f7083a94ebdde8dd4e0e2f5", "rules_sha256": "149c142a2d5ed8ea0851b3bb74d294f9617f41a4006bc2bdb8b3dc0b3c6e3fee"},
-  "record_self_sha256": "89b3e740ccdd3b4406bdf25c8bf5624176394fee4e7bc2feb3ccc165d662abab"
+  "generator": {"version": "public-distractor-v2", "seed": "phase07-public-corpus", "source_fixture_sha256": "3df4b971354569af4f9a26c86189e6865926f0e81f7083a94ebdde8dd4e0e2f5", "rules_sha256": "2614e594c796c64e588a9824eb9993bf76415c97b0cec89c872ec5502cdb9811"},
+  "record_self_sha256": "0e4561cbcfd9a447da24a0adca9f77c68ef2f274606970e3815f111af1f675ab"
 }

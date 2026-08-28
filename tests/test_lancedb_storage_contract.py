@@ -826,9 +826,10 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     _write_page(wiki, "# Frozen base\n\nFROZENBASE exact retrieval content.")
     frozen = tmp_path / "prepared"
     identity = _phase07_test_corpus_identity(wiki)
+    progress: list[str] = []
     descriptor = prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
-        expected_corpus_identity=identity,
+        expected_corpus_identity=identity, progress=lambda stage, _detail: progress.append(stage),
     )
 
     assert descriptor["schema_version"] == 1
@@ -842,6 +843,8 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
     assert set(source.table_names()) == {"sparse_chunks", "dense_chunks"}
     assert {index.name for index in source.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
     assert not source.open_table("dense_chunks").list_indices()
+    assert progress.index("graph_started") < progress.index("graph_finished") \
+        < progress.index("lance_persist_started") < progress.index("lance_persist_finished")
 
     for m, ef in ((16, 100), (20, 300), (32, 300)):
         policy = CandidateQueryPolicy(

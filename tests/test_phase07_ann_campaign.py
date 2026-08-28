@@ -27,7 +27,8 @@ from eval import phase07_operator_gate as operator
 from eval.run_eval import (_representative_indexed_query_separation, run_phase07_representative_campaign,
                            expected_phase07_expanded_corpus_identity, aggregate_hybrid_serialized_metrics)
 from eval.ann_corpus_manifest import canonical_content_tree_sha256
-from eval.ann_corpus_manifest import PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256, validate_indexed_query_digest_separation
+from eval.ann_corpus_manifest import (PHASE07_CURRENT_BASELINE, phase07_current_baseline_sha256,
+                                      public_distractor_recipe, validate_indexed_query_digest_separation)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1753,13 +1754,44 @@ def _small_expanded_corpus(root: Path) -> Path:
     """Deterministic test-only analogue of the public distractor expansion."""
     shutil.copytree(ROOT / "tests" / "fixtures" / "wiki", root)
     pages = sorted(root.rglob("*.md"))
+    from eval.ann_corpus_manifest import public_distractor_bytes
     for ordinal in range(2):
         (root / "phase07_distractors").mkdir(exist_ok=True)
-        (root / "phase07_distractors" / f"hybrid-{ordinal:05d}.md").write_text(
-            pages[ordinal % len(pages)].read_text(encoding="utf-8") + f"\n\nphase07 hybrid distractor {ordinal}\n",
-            encoding="utf-8",
+        (root / "phase07_distractors" / f"hybrid-{ordinal:05d}.md").write_bytes(
+            public_distractor_bytes(pages[ordinal % len(pages)].read_bytes(), ordinal)
         )
     return root
+
+
+def test_phase07_v2_recipe_seals_30k_graph_scale_without_materializing_or_embedding() -> None:
+    """The 30k recipe has a computable sparse graph identity, not a quadratic build seam."""
+    from eval.ann_corpus_manifest import expected_phase07_graph_scale_identity
+
+    assert expected_phase07_graph_scale_identity(ROOT / "tests" / "fixtures" / "wiki") == {
+        "expected_nodes": 30_000,
+        "expected_edges": 3,
+        "source_overlap_edges": 3,
+    }
+
+
+def test_phase07_v2_distractors_keep_fixture_bytes_and_chunk_text_unchanged(tmp_path: Path) -> None:
+    """Only generated front-matter provenance changes; fixture/body retrieval bytes do not."""
+    import eval.run_eval as run_eval
+    from build_index import scan_wiki
+
+    fixture = ROOT / "tests" / "fixtures" / "wiki"
+    before = {path.relative_to(fixture): path.read_bytes() for path in fixture.rglob("*.md")}
+    expanded = tmp_path / "expanded"
+    run_eval._materialize_phase07_expanded_corpus(
+        fixture_root=fixture, output_root=expanded, target_size=len(before) + 1, test_only=True,
+    )
+    assert {path.relative_to(fixture): path.read_bytes() for path in fixture.rglob("*.md")} == before
+    source = sorted(fixture.rglob("*.md"))[0]
+    synthetic = expanded / "phase07_distractors" / "hybrid-00000.md"
+    source_page = scan_wiki(source.parent, source.parent)[0]
+    synthetic_page = next(page for page in scan_wiki(expanded, expanded.parent) if page.path == synthetic)
+    assert synthetic_page.content == source_page.content
+    assert synthetic_page.sources == ["phase07-distractor/0"]
 
 
 def test_raw_hybrid_artifact_binds_expanded_content_identity_and_member_count_after_reseal(
@@ -1905,11 +1937,7 @@ def _make_valid_test_hybrid_raw_tree(root: Path, *, dispatch_bundle: dict,
     query_file_sha256 = hashlib.sha256(query_file.read_bytes()).hexdigest()
     baselines_sha256 = hashlib.sha256((ROOT / "eval" / "baselines.json").read_bytes()).hexdigest()
     fixture_tree_sha256 = canonical_content_tree_sha256(ROOT / "tests" / "fixtures" / "wiki")
-    generator_recipe = {
-        "version": "public-distractor-v1", "seed": "phase07-public-corpus", "target_size": 30000,
-        "source_selection": "sorted-round-robin-markdown",
-        "content_suffix": "phase07 hybrid distractor {ordinal}", "query_injection": False,
-    }
+    generator_recipe = public_distractor_recipe()
     generator_recipe["record_self_sha256"] = canonical_digest(generator_recipe)
     corpus_identity = {
         "schema_version": 1, "target_size": 30000, "fixture_tree_sha256": fixture_tree_sha256,

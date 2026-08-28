@@ -59,7 +59,7 @@ from eval.ann_corpus_manifest import (  # noqa: E402
     canonical_corpus_file_bytes,
     canonical_content_tree_sha256,
     PHASE07_CURRENT_BASELINE,
-    public_distractor_recipe,
+    public_distractor_bytes,
     validate_indexed_query_digest_separation,
 )
 from query_planner import DefaultQueryPlanner  # noqa: E402
@@ -449,19 +449,26 @@ def expected_phase07_expanded_corpus_identity(*, fixture_root: Path, target_size
                      key=lambda path: path.relative_to(root).as_posix())
     if not sources or target_size < len(sources):
         raise ValueError("phase07 deterministic corpus source")
-    entries = {path.relative_to(root).as_posix(): canonical_corpus_file_bytes(path)
-               for path in root.rglob("*") if path.is_file()}
-    recipe = public_distractor_recipe()
-    for ordinal in range(target_size - len(sources)):
-        entries[f"phase07_distractors/hybrid-{ordinal:05d}.md"] = (
-            canonical_corpus_file_bytes(sources[ordinal % len(sources)])
-            + f"\n\n{recipe['content_suffix'].format(ordinal=ordinal)}\n".encode("utf-8")
-        )
+    source_members = sorted(
+        (path.relative_to(root).as_posix(), path)
+        for path in root.rglob("*") if path.is_file()
+    )
+    source_by_name = dict(source_members)
+    synthetic_names = [f"phase07_distractors/hybrid-{ordinal:05d}.md"
+                       for ordinal in range(target_size - len(sources))]
     digest = hashlib.sha256()
-    for name in sorted(entries):
+    for name in sorted([*source_by_name, *synthetic_names]):
+        if name in source_by_name:
+            contents = canonical_corpus_file_bytes(source_by_name[name])
+        else:
+            ordinal = int(name.rsplit("-", 1)[1].removesuffix(".md"))
+            contents = public_distractor_bytes(
+                canonical_corpus_file_bytes(sources[ordinal % len(sources)]), ordinal,
+            )
         digest.update(name.encode("utf-8")); digest.update(b"\0")
-        digest.update(entries[name]); digest.update(b"\0")
-    return {"expanded_content_tree_sha256": digest.hexdigest(), "expanded_member_count": len(entries)}
+        digest.update(contents); digest.update(b"\0")
+    return {"expanded_content_tree_sha256": digest.hexdigest(),
+            "expanded_member_count": len(source_by_name) + len(synthetic_names)}
 
 
 def _materialize_phase07_expanded_corpus(*, fixture_root: Path, output_root: Path, target_size: int,
@@ -474,8 +481,9 @@ def _materialize_phase07_expanded_corpus(*, fixture_root: Path, output_root: Pat
     for ordinal in range(target_size - len(sources)):
         target = output_root / "phase07_distractors" / f"hybrid-{ordinal:05d}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(canonical_corpus_file_bytes(sources[ordinal % len(sources)])
-                           + f"\n\nphase07 hybrid distractor {ordinal}\n".encode("utf-8"))
+        target.write_bytes(public_distractor_bytes(
+            canonical_corpus_file_bytes(sources[ordinal % len(sources)]), ordinal,
+        ))
     actual = {"expanded_content_tree_sha256": canonical_content_tree_sha256(output_root),
               "expanded_member_count": sum(1 for item in output_root.rglob("*") if item.is_file())}
     if actual != expected:
@@ -680,10 +688,11 @@ def run_phase07_representative_campaign(
     if not source_pages:
         raise ValueError("representative public fixture unavailable")
     for ordinal in range(max(0, size - len(source_pages))):
-        source = source_pages[ordinal % len(source_pages)].read_text(encoding="utf-8")
         target = expanded_wiki / "phase07_distractors" / f"public-{ordinal:05d}.md"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(source + f"\n\npublic distractor ordinal {ordinal}\n", encoding="utf-8")
+        target.write_bytes(public_distractor_bytes(
+            canonical_corpus_file_bytes(source_pages[ordinal % len(source_pages)]), ordinal,
+        ))
     baseline = baseline or dict(PHASE07_CURRENT_BASELINE)
     finalist = finalist or {"candidate": "ivf-hnsw-sq", "m": 16, "ef_construction": 300, "query_ef": 200, "refine_factor": None}
     def build_candidate(name, config, wiki):

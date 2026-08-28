@@ -35,7 +35,7 @@ def _three_strata() -> dict[str, object]:
             "indexed_query_overlap_count": 0,
         },
         "generator": {
-            "version": "public-distractor-v1", "seed": "phase07-public-corpus",
+            "version": "public-distractor-v2", "seed": "phase07-public-corpus",
             "source_fixture_sha256": "1" * 64, "rules_sha256": "2" * 64,
         },
     }
@@ -51,6 +51,10 @@ def test_d06_to_d09_three_truth_strata_are_versioned_and_never_merge() -> None:
         broken.pop(removed)
         with pytest.raises(ValueError):
             manifests.validate_truth_strata(broken)
+    stale_recipe = deepcopy(manifest)
+    stale_recipe["generator"]["version"] = "public-distractor-v1"
+    with pytest.raises(ValueError):
+        manifests.validate_truth_strata(stale_recipe)
 
 
 def test_d08_query_rows_cannot_leak_into_the_indexed_corpus() -> None:
@@ -92,6 +96,7 @@ def test_committed_personal_wiki_manifest_binds_actual_fixture_and_generator_rec
     manifest = manifests.validate_committed_personal_wiki_manifest(
         manifest_path, fixture_root=fixture_root,
     )
+    assert manifest["generator"]["version"] == "public-distractor-v2"
     assert manifest["generator"]["source_fixture_sha256"] == \
         "3df4b971354569af4f9a26c86189e6865926f0e81f7083a94ebdde8dd4e0e2f5"
     assert manifest["generator"]["source_fixture_sha256"] == manifests.canonical_content_tree_sha256(fixture_root)

@@ -7,6 +7,8 @@
 from __future__ import annotations
 import json
 import re
+from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, List
 
@@ -64,6 +66,44 @@ def _jaccard(a: set, b: set) -> float:
     return len(inter) / len(union) if union else 0.0
 
 
+def _merge_signal(G: nx.Graph, u: str, v: str, *, weight: float, signal: str) -> None:
+    """Apply one graph signal while preserving direct/inferred merge semantics."""
+    if G.has_edge(u, v):
+        G[u][v]["weight"] += weight
+        G[u][v]["signals"].add(signal)
+    else:
+        G.add_edge(u, v, weight=weight, signals={signal})
+
+
+def _source_overlap_candidates(src_sets: Dict[str, set]) -> list[tuple[str, str]]:
+    """Generate only page pairs sharing a source, in a stable order.
+
+    A full page-pair scan turns a 30k corpus into ~450M comparisons.  The
+    inverted source map leaves exact Jaccard scoring intact but makes unique
+    synthetic sources contribute no candidates at all.
+    """
+    inverted: dict[str, list[str]] = defaultdict(list)
+    for page_id in sorted(src_sets):
+        for source in sorted(src_sets[page_id]):
+            inverted[source].append(page_id)
+    candidates: set[tuple[str, str]] = set()
+    for members in inverted.values():
+        for u, v in combinations(members, 2):
+            candidates.add((u, v) if u < v else (v, u))
+    return sorted(candidates)
+
+
+def _adamic_adar_candidates(G: nx.Graph) -> list[tuple[str, str]]:
+    """Return two-hop non-edges only, avoiding NetworkX's global non-edge scan."""
+    candidates: set[tuple[str, str]] = set()
+    for pivot in sorted(G.nodes()):
+        neighbors = sorted(G.neighbors(pivot))
+        for u, v in combinations(neighbors, 2):
+            if not G.has_edge(u, v):
+                candidates.add((u, v) if u < v else (v, u))
+    return sorted(candidates)
+
+
 def build_graph(wiki_dir: Path) -> nx.Graph:
     pages = _load_pages(wiki_dir)
     G = nx.Graph()
@@ -86,17 +126,10 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
                 G.add_edge(p["page_id"], resolved, weight=1.0, signals={"direct_link"})
     # Signal 2: 源重叠
     src_sets = {p["page_id"]: set(p["sources"]) for p in pages}
-    pids = list(src_sets.keys())
-    for i in range(len(pids)):
-        for j in range(i + 1, len(pids)):
-            ov = _jaccard(src_sets[pids[i]], src_sets[pids[j]])
-            if ov > 0:
-                u, v = pids[i], pids[j]
-                if G.has_edge(u, v):
-                    G[u][v]["weight"] += 0.6 * ov
-                    G[u][v]["signals"].add("source_overlap")
-                else:
-                    G.add_edge(u, v, weight=0.6 * ov, signals={"source_overlap"})
+    for u, v in _source_overlap_candidates(src_sets):
+        ov = _jaccard(src_sets[u], src_sets[v])
+        if ov > 0:
+            _merge_signal(G, u, v, weight=0.6 * ov, signal="source_overlap")
     # Signal 3: Adamic-Adar
     compute_adamic_adar(G)
     # Signal 4: 类型亲和力
@@ -113,17 +146,17 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
 def compute_adamic_adar(G: nx.Graph, top_n_per_node: int = 5, min_score: float = 0.0):
     if G.number_of_edges() == 0 or G.number_of_nodes() < 2:
         return
-    preds = [(u, v, s) for u, v, s in nx.adamic_adar_index(G) if s > min_score]
-    preds.sort(key=lambda x: -x[2])
+    candidates = _adamic_adar_candidates(G)
+    if not candidates:
+        return
+    preds = [(u, v, score) for u, v, score in nx.adamic_adar_index(G, ebunch=candidates)
+             if score > min_score]
+    preds.sort(key=lambda item: (-item[2], item[0], item[1]))
     added_count: Dict[str, int] = {}
     for u, v, score in preds:
         if added_count.get(u, 0) >= top_n_per_node and added_count.get(v, 0) >= top_n_per_node:
             continue
-        if G.has_edge(u, v):
-            G[u][v]["weight"] += 0.4 * score
-            G[u][v]["signals"].add("adamic_adar")
-        else:
-            G.add_edge(u, v, weight=0.4 * score, signals={"adamic_adar"})
+        _merge_signal(G, u, v, weight=0.4 * score, signal="adamic_adar")
         added_count[u] = added_count.get(u, 0) + 1
         added_count[v] = added_count.get(v, 0) + 1
 

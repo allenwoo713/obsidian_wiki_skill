@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
@@ -16,13 +17,15 @@ PHASE07_CURRENT_BASELINE = {
     "query_ef": 100, "refine_factor": None,
 }
 _PUBLIC_DISTRACTOR_RECIPE = {
-    "version": "public-distractor-v1",
+    "version": "public-distractor-v2",
     "seed": "phase07-public-corpus",
     "target_size": 30_000,
     "source_selection": "sorted-round-robin-markdown",
-    "content_suffix": "phase07 hybrid distractor {ordinal}",
+    "synthetic_source_template": "phase07-distractor/{ordinal}",
+    "body_transform": "none",
     "query_injection": False,
 }
+_SOURCES_BLOCK = re.compile(br"(?m)^sources:\r?\n(?:^[ \t]+-[^\r\n]*(?:\r?\n|$))*")
 
 
 def phase07_current_baseline_sha256() -> str:
@@ -43,6 +46,86 @@ def public_distractor_recipe_sha256() -> str:
 def public_distractor_recipe() -> dict[str, object]:
     """Return a copy of the fixed recipe; callers may seal it into evidence."""
     return dict(_PUBLIC_DISTRACTOR_RECIPE)
+
+
+def public_distractor_source(ordinal: int) -> str:
+    """Return the unique, deterministic synthetic provenance for one distractor."""
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+        raise ValueError("public distractor ordinal")
+    return str(_PUBLIC_DISTRACTOR_RECIPE["synthetic_source_template"]).format(ordinal=ordinal)
+
+
+def public_distractor_bytes(source_bytes: bytes, ordinal: int) -> bytes:
+    """Replace only synthetic front-matter provenance; Markdown body is byte-stable.
+
+    The fixture source itself is never modified.  Keeping the body intact also
+    keeps canonical chunk text/content hashes stable while preventing cloned
+    pages from forming a 30k-wide source-overlap clique.
+    """
+    if not isinstance(source_bytes, bytes):
+        raise ValueError("public distractor source bytes")
+    match = _SOURCES_BLOCK.search(source_bytes)
+    if match is None:
+        raise ValueError("public distractor source front matter")
+    replacement = f"sources:\n  - {public_distractor_source(ordinal)}\n".encode("utf-8")
+    return source_bytes[:match.start()] + replacement + source_bytes[match.end():]
+
+
+def expected_phase07_graph_scale_identity(fixture_root: Path) -> dict[str, int]:
+    """Compute the sealed 30k graph cardinality without materializing 30k files.
+
+    V2 distractor sources are unique, so only fixture pages can contribute
+    source-overlap edges.  This is deliberately a metadata-only gate: it does
+    not construct an O(N²) graph, load a model, or persist Lance tables.
+    """
+    from collections import defaultdict
+    import yaml
+
+    root = Path(fixture_root)
+    sources_by_value: dict[str, set[str]] = defaultdict(set)
+    pages = sorted(path for path in root.rglob("*.md") if path.is_file())
+    if not pages:
+        raise ValueError("public distractor fixture")
+    for path in pages:
+        raw = canonical_corpus_file_bytes(path).decode("utf-8", errors="strict")
+        if not raw.startswith("---\n"):
+            raise ValueError("public distractor fixture front matter")
+        closing = raw.find("\n---\n", 4)
+        if closing < 0:
+            raise ValueError("public distractor fixture front matter")
+        if "[[" in raw[closing + 5:]:
+            raise ValueError("public distractor fixture direct links")
+        front_matter = yaml.safe_load(raw[4:closing]) or {}
+        values = front_matter.get("sources", [])
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            raise ValueError("public distractor fixture sources")
+        page = path.relative_to(root).as_posix()
+        for value in values:
+            sources_by_value[str(value)].add(page)
+    edge_pairs = {
+        tuple(sorted((left, right)))
+        for members in sources_by_value.values()
+        for index, left in enumerate(sorted(members))
+        for right in sorted(members)[index + 1:]
+    }
+    neighbors: dict[str, set[str]] = defaultdict(set)
+    for left, right in edge_pairs:
+        neighbors[left].add(right); neighbors[right].add(left)
+    if any(
+        tuple(sorted((left, right))) not in edge_pairs
+        for pivot in neighbors
+        for index, left in enumerate(sorted(neighbors[pivot]))
+        for right in sorted(neighbors[pivot])[index + 1:]
+    ):
+        raise ValueError("public distractor fixture adamic-adar candidates")
+    source_overlap_edges = len(edge_pairs)
+    return {
+        "expected_nodes": int(_PUBLIC_DISTRACTOR_RECIPE["target_size"]),
+        "expected_edges": source_overlap_edges,
+        "source_overlap_edges": source_overlap_edges,
+    }
 
 
 def _digest(name: str, value: object) -> str:
@@ -96,7 +179,7 @@ def validate_truth_strata(manifest: Mapping[str, object]) -> Mapping[str, object
         _digest(f"personal.{name}", personal.get(name))
     if personal.get("indexed_query_overlap_count") != 0:
         raise ValueError("natural ANN queries must never be indexed")
-    if not isinstance(generator, Mapping) or generator.get("version") != "public-distractor-v1":
+    if not isinstance(generator, Mapping) or generator.get("version") != "public-distractor-v2":
         raise ValueError("public distractor generator")
     if not isinstance(generator.get("seed"), str) or not generator["seed"]:
         raise ValueError("generator seed")
@@ -153,7 +236,7 @@ def validate_committed_personal_wiki_manifest(path: Path, *, fixture_root: Path)
         raise ValueError("personal wiki manifest schema")
     generator = manifest["generator"]
     expected = {
-        "version": "public-distractor-v1", "seed": "phase07-public-corpus",
+        "version": "public-distractor-v2", "seed": "phase07-public-corpus",
         "source_fixture_sha256": canonical_content_tree_sha256(fixture_root),
         "rules_sha256": public_distractor_recipe_sha256(),
     }

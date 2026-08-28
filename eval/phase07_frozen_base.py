@@ -453,13 +453,19 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
         raise FrozenBaseError("canonical frozen page metadata")
     pages_path = frozen_dir / "pages.json"
     pages_path.write_bytes(_canonical_json(pages))
+    if progress is not None:
+        progress("graph_started", {"pages": len(pages), "wiki_root": str(wiki_dir)})
     graph_bytes = _canonical_json(_graph_payload(wiki_dir))
+    if progress is not None:
+        progress("graph_finished", {"pages": len(pages)})
     (frozen_dir / "graph.json").write_bytes(graph_bytes)
     # Public hybrid search resolves graph state from ``Wiki/../.index``.  Copy
     # the already-built sealed graph there instead of rebuilding it per role.
     (frozen_dir / ".index").mkdir()
     (frozen_dir / ".index" / "graph.json").write_bytes(graph_bytes)
     repository = LanceDbIndexRepository(frozen_dir / "lance_db")
+    if progress is not None:
+        progress("lance_persist_started", {"sparse_chunks": len(sparse), "dense_chunks": len(dense)})
     repository.persist(frozen_dir / "lance_db", sparse, dense, FtsIndexConfig())
     repository.validate_reopened(
         dimension=len(dense[0].vector), exact_term=_exact_term(sparse), vector_index_name=None,
@@ -467,6 +473,8 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
     if repository._dense_table().list_indices():  # Lance enumeration is the primary no-HNSW assertion.
         raise FrozenBaseError("frozen dense vector index")
     repository.seal(frozen_dir / "lance_db")
+    if progress is not None:
+        progress("lance_persist_finished", {"sparse_chunks": len(sparse), "dense_chunks": len(dense)})
     source_tree = _tree_inventory(frozen_dir / "Wiki")[1]
     lance_tree = _tree_inventory(frozen_dir / "lance_db")[1]
     inventory, frozen_tree = _tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))

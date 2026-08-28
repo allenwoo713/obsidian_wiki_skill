@@ -5,7 +5,7 @@ import pytest
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from build_graph import build_graph, compute_4_signals, detect_communities, render_html
+from build_graph import build_graph, compute_4_signals, compute_adamic_adar, detect_communities, render_html
 
 
 def _write(wiki, name, title, sources, related, ptype="concept", subdir="concepts"):
@@ -36,6 +36,35 @@ def test_source_overlap_creates_edge(tmp_path):
     pid_a = str((wiki / "concepts" / "a.md").resolve())
     pid_b = str((wiki / "concepts" / "b.md").resolve())
     assert G.has_edge(pid_a, pid_b) or G.has_edge(pid_b, pid_a)
+
+
+def test_source_overlap_uses_only_shared_source_candidates_and_exact_jaccard(tmp_path):
+    """Source overlap must not scan unrelated page pairs at corpus scale."""
+    wiki = tmp_path / "Wiki"
+    _write(wiki, "a.md", "A", ["s1", "s2"], [], ptype="concept")
+    _write(wiki, "b.md", "B", ["s1", "s3"], [], ptype="procedure")
+    _write(wiki, "c.md", "C", ["s2"], [], ptype="reference")
+    _write(wiki, "d.md", "D", ["s4"], [], ptype="example")
+    G = build_graph(wiki)
+    ids = {name: str((wiki / "concepts" / f"{name}.md").resolve()) for name in "abcd"}
+    assert G[ids["a"]][ids["b"]]["weight"] == pytest.approx(0.6 / 3)
+    assert G[ids["a"]][ids["c"]]["weight"] == pytest.approx(0.3)
+    assert not G.has_edge(ids["a"], ids["d"])
+    assert "source_overlap" not in G[ids["b"]][ids["c"]]["signals"]
+
+
+def test_adamic_adar_never_enumerates_networkx_global_non_edges(monkeypatch):
+    """AA candidates are two-hop pairs only; 30k isolated nodes stay O(E), not O(N²)."""
+    G = __import__("networkx").Graph()
+    G.add_edges_from((("a", "b"), ("b", "c")))
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("global nx.non_edges enumeration is forbidden at Phase07 scale")
+
+    monkeypatch.setattr(__import__("networkx"), "non_edges", forbidden)
+    compute_adamic_adar(G)
+    assert G.has_edge("a", "c")
+    assert "adamic_adar" in G["a"]["c"]["signals"]
 
 
 def test_communities(tmp_path):
