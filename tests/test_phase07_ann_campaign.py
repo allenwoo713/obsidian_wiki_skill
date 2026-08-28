@@ -1815,6 +1815,8 @@ def test_phase07_v2_distractor_preserves_the_v1_body_suffix_after_front_matter(t
     b"# not front matter\nsources:\n  - body-only\n",
     b"---\ntitle: only body source\n---\n\nsources:\n  - body-only\n",
     b"---\nsources:\n  - one\nsources:\n  - two\n---\n\nbody\n",
+    b"---\nsources: [inline]\n---\n\nbody\n",
+    b"---\nsources: scalar\n---\n\nbody\n",
 ])
 def test_phase07_v2_distractor_rejects_missing_or_ambiguous_front_matter_sources(raw: bytes) -> None:
     """Only one YAML-front-matter sources block is eligible for provenance replacement."""
@@ -1830,6 +1832,23 @@ def test_phase07_v2_distractor_does_not_rewrite_a_body_sources_literal() -> None
     raw = b"---\ntitle: valid\nsources:\n  - fixture\n---\n\nbody\nsources:\n  - literal\n"
     actual = public_distractor_bytes(raw, 3)
     assert actual.endswith(b"body\nsources:\n  - literal\n\n\nphase07 hybrid distractor 3\n")
+
+
+def test_phase07_v2_materialized_30k_graph_is_real_and_bounded(tmp_path: Path) -> None:
+    """The production graph path must remain bounded after actual 30k materialization."""
+    import eval.run_eval as run_eval
+    from eval.phase07_frozen_base import _canonical_json, _graph_payload
+
+    wiki = tmp_path / "Wiki"
+    run_eval._materialize_phase07_expanded_corpus(
+        fixture_root=ROOT / "tests" / "fixtures" / "wiki", output_root=wiki,
+        target_size=30_000, test_only=True,
+    )
+    graph_bytes = _canonical_json(_graph_payload(wiki))
+    graph = json.loads(graph_bytes)
+    assert len(graph["nodes"]) == 30_000
+    assert len(graph["edges"]) == 3
+    assert len(graph_bytes) < 64 * 1024 * 1024
 
 
 def test_raw_hybrid_artifact_binds_expanded_content_identity_and_member_count_after_reseal(
@@ -2180,8 +2199,12 @@ def test_expanded_corpus_identity_normalizes_source_line_endings(tmp_path: Path)
 
     lf_root, crlf_root = tmp_path / "lf-source", tmp_path / "crlf-source"
     lf_root.mkdir(); crlf_root.mkdir()
-    (lf_root / "source.md").write_bytes(b"# Source\nbody\n")
-    (crlf_root / "source.md").write_bytes(b"# Source\r\nbody\r\n")
+    (lf_root / "source.md").write_bytes(
+        b"---\ntitle: Source\nsources:\n  - raw/source.docx\n---\n\n# Source\nbody\n"
+    )
+    (crlf_root / "source.md").write_bytes(
+        b"---\r\ntitle: Source\r\nsources:\r\n  - raw/source.docx\r\n---\r\n\r\n# Source\r\nbody\r\n"
+    )
 
     expected_lf = run_eval.expected_phase07_expanded_corpus_identity(
         fixture_root=lf_root, target_size=3, test_only=True,

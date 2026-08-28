@@ -867,6 +867,37 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
         ) == source_digest
 
 
+def test_phase07_frozen_base_rejects_oversize_graph_and_revalidates_complete_tree_size(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both creation and reload fail closed on graph/base byte ceilings."""
+    from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
+    from eval.phase07_frozen_base import FrozenBaseError, prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Frozen cap\n\nFROZENCAP exact retrieval content.")
+    identity = _phase07_test_corpus_identity(wiki)
+    embedder = _FacadeEmbedder()
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 1)
+    with pytest.raises(FrozenBaseError, match="frozen graph size"):
+        prepare_frozen_base(
+            wiki_dir=wiki, frozen_dir=tmp_path / "oversize-graph", embed=_embed384(),
+            tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
+        )
+
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 64 * 1024 * 1024)
+    frozen = tmp_path / "prepared"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=embedder.tokenizer,
+        expected_corpus_identity=identity,
+    )
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1)
+    with pytest.raises(FrozenBaseError, match="frozen base size"):
+        validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
+            expected_corpus_identity=identity,
+        )
+
+
 def test_phase07_frozen_base_requires_the_preparation_tokenizer_at_the_112_token_boundary(tmp_path: Path) -> None:
     """The canonical validation plan must not silently use char/4 token counts."""
     from eval.phase07_frozen_base import FrozenBaseError, prepare_frozen_base, validate_frozen_base  # noqa: PLC0415

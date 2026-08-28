@@ -29,7 +29,7 @@ _PUBLIC_DISTRACTOR_RECIPE = {
 _FRONT_MATTER = re.compile(
     br"\A---(?P<newline>\r?\n)(?P<contents>.*?)(?P=newline)---(?P=newline)", re.DOTALL,
 )
-_SOURCES_BLOCK = re.compile(br"(?m)^sources:[ \t]*(?:\r?\n[ \t]+-[^\r\n]*)*(?:\r?\n)?")
+_SOURCES_BLOCK = re.compile(br"(?m)^sources:[ \t]*\r?\n(?:[ \t]+-[^\r\n]*(?:\r?\n|$))+")
 
 
 def phase07_current_baseline_sha256() -> str:

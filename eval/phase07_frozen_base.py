@@ -47,6 +47,8 @@ from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemInd
 
 SCHEMA_VERSION = 1
 FROZEN_TARGET_SIZE = 30_000
+MAX_CANONICAL_GRAPH_BYTES = 64 * 1024 * 1024
+MAX_COMPLETE_FROZEN_BASE_BYTES = 1024 * 1024 * 1024
 _TOP_LEVEL = frozenset({"Wiki", "lance_db", ".index", "graph.json", "pages.json", "frozen-base.json"})
 _DESCRIPTOR_FIELDS = frozenset({
     "schema_version", "kind", "authorization", "resolved_wiki_root", "pages_sha256",
@@ -169,12 +171,14 @@ def _canonical_relative(raw: str) -> str:
     return canonical
 
 
-def _tree_inventory(root: Path, *, exclude: frozenset[str] = frozenset()) -> tuple[list[dict[str, object]], str]:
+def _tree_inventory(root: Path, *, exclude: frozenset[str] = frozenset(),
+                    max_total_bytes: int | None = None) -> tuple[list[dict[str, object]], str]:
     root = Path(root)
     if not root.is_dir() or root.is_symlink():
         raise FrozenBaseError("frozen tree root")
     inventory: list[dict[str, object]] = []
     folded: set[str] = set()
+    total_bytes = 0
     for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
         relative = _canonical_relative(path.relative_to(root).as_posix())
         if relative in exclude:
@@ -193,8 +197,22 @@ def _tree_inventory(root: Path, *, exclude: frozenset[str] = frozenset()) -> tup
             raise FrozenBaseError("frozen tree special member")
         if path.stat().st_nlink != 1:
             raise FrozenBaseError("frozen tree hardlink member")
-        inventory.append({"path": relative, "size": path.stat().st_size, "sha256": _sha256_file(path)})
+        size = path.stat().st_size
+        total_bytes += size
+        if max_total_bytes is not None and total_bytes >= max_total_bytes:
+            raise FrozenBaseError("frozen base size")
+        inventory.append({"path": relative, "size": size, "sha256": _sha256_file(path)})
     return inventory, _sha256_bytes(_canonical_json(inventory))
+
+
+def _require_graph_size(graph_bytes: bytes) -> None:
+    if len(graph_bytes) >= MAX_CANONICAL_GRAPH_BYTES:
+        raise FrozenBaseError("frozen graph size")
+
+
+def _require_complete_frozen_size(inventory: list[dict[str, object]], descriptor_bytes: bytes) -> None:
+    if sum(int(item["size"]) for item in inventory) + len(descriptor_bytes) >= MAX_COMPLETE_FROZEN_BASE_BYTES:
+        raise FrozenBaseError("frozen base size")
 
 
 def _graph_payload(wiki_dir: Path) -> dict[str, object]:
@@ -456,6 +474,7 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
     if progress is not None:
         progress("graph_started", {"pages": len(pages), "wiki_root": str(wiki_dir)})
     graph_bytes = _canonical_json(_graph_payload(wiki_dir))
+    _require_graph_size(graph_bytes)
     if progress is not None:
         progress("graph_finished", {"pages": len(pages)})
     (frozen_dir / "graph.json").write_bytes(graph_bytes)
@@ -477,7 +496,9 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
         progress("lance_persist_finished", {"sparse_chunks": len(sparse), "dense_chunks": len(dense)})
     source_tree = _tree_inventory(frozen_dir / "Wiki")[1]
     lance_tree = _tree_inventory(frozen_dir / "lance_db")[1]
-    inventory, frozen_tree = _tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))
+    inventory, frozen_tree = _tree_inventory(
+        frozen_dir, exclude=frozenset({"frozen-base.json"}), max_total_bytes=MAX_COMPLETE_FROZEN_BASE_BYTES,
+    )
     descriptor: dict[str, object] = {
         "schema_version": SCHEMA_VERSION, "kind": "phase07-frozen-base", "authorization": "none",
         "resolved_wiki_root": str(wiki_dir), "pages_sha256": _sha256_file(pages_path),
@@ -494,13 +515,19 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
         "frozen_file_inventory": inventory,
     }
     descriptor["record_self_sha256"] = _sha256_bytes(_canonical_json(descriptor))
-    (frozen_dir / "frozen-base.json").write_bytes(_canonical_json(descriptor))
+    descriptor_bytes = _canonical_json(descriptor)
+    _require_complete_frozen_size(inventory, descriptor_bytes)
+    (frozen_dir / "frozen-base.json").write_bytes(descriptor_bytes)
     return descriptor
 
 
 def _read_descriptor(frozen_dir: Path, *, expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
+    descriptor_path = Path(frozen_dir) / "frozen-base.json"
     try:
-        descriptor = json.loads((Path(frozen_dir) / "frozen-base.json").read_text(encoding="utf-8"))
+        mode = descriptor_path.lstat().st_mode
+        if not stat.S_ISREG(mode) or descriptor_path.stat().st_size >= MAX_COMPLETE_FROZEN_BASE_BYTES:
+            raise FrozenBaseError("frozen base size")
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise FrozenBaseError("frozen descriptor") from exc
     if not isinstance(descriptor, dict) or set(descriptor) != _DESCRIPTOR_FIELDS:
@@ -599,10 +626,20 @@ def validate_frozen_base(frozen_dir: Path, *, expected_wiki_root: Path,
         raise FrozenBaseError("frozen resolved root")
     if _actual_corpus_identity(frozen_dir / "Wiki") != descriptor["expected_corpus_identity"]:
         raise FrozenBaseError("frozen corpus identity")
+    graph_path = frozen_dir / "graph.json"
+    if graph_path.stat().st_size >= MAX_CANONICAL_GRAPH_BYTES:
+        raise FrozenBaseError("frozen graph size")
+    descriptor_bytes = (frozen_dir / "frozen-base.json").stat().st_size
+    if descriptor_bytes >= MAX_COMPLETE_FROZEN_BASE_BYTES:
+        raise FrozenBaseError("frozen base size")
+    inventory, frozen_tree = _tree_inventory(
+        frozen_dir, exclude=frozenset({"frozen-base.json"}),
+        max_total_bytes=MAX_COMPLETE_FROZEN_BASE_BYTES - descriptor_bytes,
+    )
+    _require_complete_frozen_size(inventory, (frozen_dir / "frozen-base.json").read_bytes())
     if _tree_inventory(frozen_dir / "Wiki")[1] != descriptor["source_tree_sha256"] \
             or _tree_inventory(frozen_dir / "lance_db")[1] != descriptor["lance_tree_sha256"]:
         raise FrozenBaseError("frozen tree digest")
-    inventory, frozen_tree = _tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))
     if inventory != descriptor["frozen_file_inventory"] or frozen_tree != descriptor["frozen_tree_sha256"]:
         raise FrozenBaseError("frozen tree digest")
     if _sha256_file(frozen_dir / "pages.json") != descriptor["pages_sha256"] \
