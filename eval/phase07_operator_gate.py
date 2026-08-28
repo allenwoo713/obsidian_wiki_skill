@@ -427,6 +427,12 @@ def validate_frozen_size_measurement(value: object, *, expected_head: str) -> di
 
 
 def _fsync_directory(path: Path) -> None:
+    # Directory handles are a POSIX durability primitive.  Windows rejects
+    # ``os.open(directory, O_RDONLY)`` with PermissionError; the project's
+    # production durable-filesystem collaborator uses the same platform
+    # boundary and relies on file fsync / write-through publication there.
+    if os.name != "posix":
+        return
     descriptor = os.open(Path(path), os.O_RDONLY)
     try:
         os.fsync(descriptor)

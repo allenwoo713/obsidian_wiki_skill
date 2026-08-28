@@ -2116,6 +2116,46 @@ def test_new_durable_ledger_never_replaces_a_racing_sentinel(tmp_path: Path,
     assert ledger.read_text(encoding="utf-8") == "sentinel"
 
 
+def test_frozen_measurement_directory_fsync_skips_unsupported_windows_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows must not attempt the POSIX-only open/fsync directory sequence."""
+    calls: list[object] = []
+    fake_os = SimpleNamespace(
+        name="nt",
+        O_RDONLY=0,
+        open=lambda *_args, **_kwargs: calls.append("open"),
+        fsync=lambda descriptor: calls.append(("fsync", descriptor)),
+        close=lambda descriptor: calls.append(("close", descriptor)),
+    )
+    monkeypatch.setattr(phase07_operator_gate, "os", fake_os)
+
+    phase07_operator_gate._fsync_directory(tmp_path)
+
+    assert calls == []
+
+
+def test_frozen_measurement_directory_fsync_preserves_posix_durability_sequence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Windows guard must not weaken the established POSIX fsync path."""
+    calls: list[object] = []
+    fake_os = SimpleNamespace(
+        name="posix",
+        O_RDONLY=7,
+        open=lambda path, flags: calls.append(("open", path, flags)) or 41,
+        fsync=lambda descriptor: calls.append(("fsync", descriptor)),
+        close=lambda descriptor: calls.append(("close", descriptor)),
+    )
+    monkeypatch.setattr(phase07_operator_gate, "os", fake_os)
+
+    phase07_operator_gate._fsync_directory(tmp_path)
+
+    assert calls == [
+        ("open", tmp_path, 7),
+        ("fsync", 41),
+        ("close", 41),
+    ]
+
+
 def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
     """The distinct job is model-backed, finite, and never publishes secrets."""
     _job, hybrid = _phase07_hybrid_workflow_section()
