@@ -82,6 +82,11 @@ jobs:
       - name: Bootstrap local embedding model
         run: |
           python scripts/download_embedding_model.py
+      - name: Run Phase 07 frozen-base real-model tokenizer gate
+        run: >
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/phase07-frozen-model
+          tests/test_phase07_frozen_model_contract.py -q
       # #22 must use the real storage/public facade after the existing local-model
       # bootstrap.  No baseline initialization or policy mutation is accepted.
       - name: Run #22 storage, recovery, telemetry, and public-route gates
@@ -124,8 +129,10 @@ jobs:
           tests/test_community_reports.py
           tests/test_eval_workflow.py -q
       - name: Unit tests
-        run: |
-          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider --basetemp=.review-tmp/pytest
+        run: >
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/pytest
+          --ignore=tests/test_phase07_frozen_model_contract.py
       - name: Protect evaluation baseline on pull requests
         if: github.event_name == 'pull_request'
         run: |

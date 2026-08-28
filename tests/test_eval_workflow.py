@@ -275,6 +275,85 @@ def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> 
         assert required in workflow
 
 
+def test_phase07_real_model_tokenizer_gate_runs_only_after_model_bootstrap() -> None:
+    """The real-model test must never leak into the model-free platform matrix."""
+    model_test = "tests/test_phase07_frozen_model_contract.py"
+    workflow = yaml.load(
+        (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+
+    def assert_exact_routing(document: dict) -> None:
+        jobs = document["jobs"]
+        steps = jobs["test-and-eval"]["steps"]
+        normalize = lambda command: " ".join(command.split())
+        bootstrap_steps = [step for step in steps if step.get("name") == "Bootstrap local embedding model"]
+        gate_steps = [
+            step for step in steps if step.get("name") == "Run Phase 07 frozen-base real-model tokenizer gate"
+        ]
+        unit_steps = [step for step in steps if step.get("name") == "Unit tests"]
+        assert len(bootstrap_steps) == len(gate_steps) == len(unit_steps) == 1
+        assert steps.index(bootstrap_steps[0]) < steps.index(gate_steps[0])
+        assert normalize(bootstrap_steps[0].get("run", "")) == "python scripts/download_embedding_model.py"
+        assert normalize(gate_steps[0].get("run", "")) == (
+            "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+            "--basetemp=.review-tmp/phase07-frozen-model "
+            "tests/test_phase07_frozen_model_contract.py -q"
+        )
+        assert normalize(unit_steps[0].get("run", "")) == (
+            "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+            "--basetemp=.review-tmp/pytest "
+            "--ignore=tests/test_phase07_frozen_model_contract.py"
+        )
+        for job_name, job in jobs.items():
+            if job_name == "test-and-eval":
+                continue
+            assert all(
+                step.get("name") != "Run Phase 07 frozen-base real-model tokenizer gate"
+                and model_test not in step.get("run", "")
+                for step in job.get("steps", [])
+            )
+
+    assert_exact_routing(workflow)
+
+    # Regression proof: moving the real-model gate to an adjacent job must not
+    # satisfy the guard merely because the text still exists elsewhere.
+    mutated = deepcopy(workflow)
+    test_steps = mutated["jobs"]["test-and-eval"]["steps"]
+    gate = next(step for step in test_steps if model_test in step.get("run", ""))
+    test_steps.remove(gate)
+    mutated["jobs"]["issue41-manual-calibration"]["steps"].append(gate)
+    with pytest.raises(AssertionError):
+        assert_exact_routing(mutated)
+
+    manifest_only = deepcopy(workflow)
+    next(
+        step for step in manifest_only["jobs"]["test-and-eval"]["steps"]
+        if step.get("name") == "Bootstrap local embedding model"
+    )["run"] = "python scripts/download_embedding_model.py --validate-manifest-only"
+    with pytest.raises(AssertionError):
+        assert_exact_routing(manifest_only)
+
+    echo_gate = deepcopy(workflow)
+    next(
+        step for step in echo_gate["jobs"]["test-and-eval"]["steps"]
+        if step.get("name") == "Run Phase 07 frozen-base real-model tokenizer gate"
+    )["run"] = f"echo {model_test}"
+    with pytest.raises(AssertionError):
+        assert_exact_routing(echo_gate)
+
+    duplicate_gate = deepcopy(workflow)
+    duplicate_steps = duplicate_gate["jobs"]["test-and-eval"]["steps"]
+    duplicate_steps.append(deepcopy(next(step for step in duplicate_steps if model_test in step.get("run", ""))))
+    with pytest.raises(AssertionError):
+        assert_exact_routing(duplicate_gate)
+
+    ci_workflow = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert model_test not in ci_workflow
+    storage_contract = (SKILL_ROOT / "tests" / "test_lancedb_storage_contract.py").read_text(encoding="utf-8")
+    assert "test_phase07_frozen_base_uses_the_manifest_verified_local_model_tokenizer" not in storage_contract
+
+
 def test_phase07_screening_is_seeded_numeric_only_and_model_jobs_stay_model_backed() -> None:
     """D-07/D-18: screening validates its lock but never hydrates a model."""
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")

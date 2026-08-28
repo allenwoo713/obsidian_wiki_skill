@@ -986,30 +986,6 @@ def test_phase07_frozen_base_rejects_missing_tokenizer_before_target_mutation(tm
         assert inspect.signature(function).parameters["tokenizer"].default is inspect.Parameter.empty
 
 
-def test_phase07_frozen_base_uses_the_manifest_verified_local_model_tokenizer(tmp_path: Path) -> None:
-    """A model-backed gate, not a skip, exercises the production tokenizer identity."""
-    from eval.phase07_frozen_base import (  # noqa: PLC0415
-        load_verified_frozen_embedder,
-        prepare_frozen_base,
-        validate_frozen_base,
-    )
-
-    model_dir = Path(__file__).parent.parent / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
-    embedder = load_verified_frozen_embedder(model_dir)
-    wiki = tmp_path / "source" / "Wiki"
-    _write_page(wiki, "# Model tokenizer\n\nMODEL_TOKENIZER_FROZEN_IDENTITY\n")
-    identity = _phase07_test_corpus_identity(wiki)
-    frozen = tmp_path / "frozen"
-    prepare_frozen_base(
-        wiki_dir=wiki, frozen_dir=frozen, embed=lambda texts: embedder.embed(list(texts)),
-        tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
-    )
-    assert validate_frozen_base(
-        frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
-        expected_corpus_identity=identity,
-    )
-
-
 def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_path: Path) -> None:
     """The role clone follows the same ACTIVE_INDEX commit lifecycle as production."""
     from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
