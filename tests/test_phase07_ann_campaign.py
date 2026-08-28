@@ -1774,8 +1774,8 @@ def test_phase07_v2_recipe_seals_30k_graph_scale_without_materializing_or_embedd
     }
 
 
-def test_phase07_v2_distractors_keep_fixture_bytes_and_chunk_text_unchanged(tmp_path: Path) -> None:
-    """Only generated front-matter provenance changes; fixture/body retrieval bytes do not."""
+def test_phase07_v2_distractors_keep_fixture_bytes_and_preserve_v1_retrieval_body(tmp_path: Path) -> None:
+    """Fixture stays untouched while V2 retains the formerly sealed V1 body transform."""
     import eval.run_eval as run_eval
     from build_index import scan_wiki
 
@@ -1790,8 +1790,46 @@ def test_phase07_v2_distractors_keep_fixture_bytes_and_chunk_text_unchanged(tmp_
     synthetic = expanded / "phase07_distractors" / "hybrid-00000.md"
     source_page = scan_wiki(source.parent, source.parent)[0]
     synthetic_page = next(page for page in scan_wiki(expanded, expanded.parent) if page.path == synthetic)
-    assert synthetic_page.content == source_page.content
+    assert source_page.content in synthetic_page.content
+    assert synthetic_page.content.endswith("phase07 hybrid distractor 0")
     assert synthetic_page.sources == ["phase07-distractor/0"]
+
+
+def test_phase07_v2_distractor_preserves_the_v1_body_suffix_after_front_matter(tmp_path: Path) -> None:
+    """V2 changes only provenance; it must not silently change the ANN corpus body."""
+    from eval.ann_corpus_manifest import public_distractor_bytes
+
+    source = sorted((ROOT / "tests" / "fixtures" / "wiki").rglob("*.md"))[0].read_bytes()
+    ordinal = 7
+    v1 = source + f"\n\nphase07 hybrid distractor {ordinal}\n".encode("utf-8")
+    v2 = public_distractor_bytes(source, ordinal)
+
+    def body(raw: bytes) -> bytes:
+        return raw.split(b"\n---\n", 1)[1]
+
+    assert body(v2) == body(v1)
+    assert b"sources:\n  - phase07-distractor/7\n" in v2
+
+
+@pytest.mark.parametrize("raw", [
+    b"# not front matter\nsources:\n  - body-only\n",
+    b"---\ntitle: only body source\n---\n\nsources:\n  - body-only\n",
+    b"---\nsources:\n  - one\nsources:\n  - two\n---\n\nbody\n",
+])
+def test_phase07_v2_distractor_rejects_missing_or_ambiguous_front_matter_sources(raw: bytes) -> None:
+    """Only one YAML-front-matter sources block is eligible for provenance replacement."""
+    from eval.ann_corpus_manifest import public_distractor_bytes
+
+    with pytest.raises(ValueError, match="front matter"):
+        public_distractor_bytes(raw, 0)
+
+
+def test_phase07_v2_distractor_does_not_rewrite_a_body_sources_literal() -> None:
+    from eval.ann_corpus_manifest import public_distractor_bytes
+
+    raw = b"---\ntitle: valid\nsources:\n  - fixture\n---\n\nbody\nsources:\n  - literal\n"
+    actual = public_distractor_bytes(raw, 3)
+    assert actual.endswith(b"body\nsources:\n  - literal\n\n\nphase07 hybrid distractor 3\n")
 
 
 def test_raw_hybrid_artifact_binds_expanded_content_identity_and_member_count_after_reseal(

@@ -3,8 +3,10 @@ import json
 from pathlib import Path
 import pytest
 import sys
+import networkx as nx
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+import build_graph as graph_module
 from build_graph import build_graph, compute_4_signals, compute_adamic_adar, detect_communities, render_html
 
 
@@ -65,6 +67,36 @@ def test_adamic_adar_never_enumerates_networkx_global_non_edges(monkeypatch):
     compute_adamic_adar(G)
     assert G.has_edge("a", "c")
     assert "adamic_adar" in G["a"]["c"]["signals"]
+
+
+def test_adamic_adar_skips_complete_components_before_wedge_enumeration(monkeypatch):
+    """A complete component has no non-edges, so it must not visit C(degree, 2) wedges."""
+    G = nx.complete_graph(64)
+    wedge_calls = 0
+    real_combinations = graph_module.combinations
+
+    def count_combinations(*args, **kwargs):
+        nonlocal wedge_calls
+        wedge_calls += 1
+        return real_combinations(*args, **kwargs)
+
+    def forbidden_index(*_args, **_kwargs):
+        pytest.fail("complete components must not call adamic_adar_index")
+
+    monkeypatch.setattr(graph_module, "combinations", count_combinations)
+    monkeypatch.setattr(graph_module.nx, "adamic_adar_index", forbidden_index)
+    compute_adamic_adar(G)
+    assert wedge_calls == 0
+    assert G.number_of_edges() == 64 * 63 // 2
+
+
+def test_adamic_adar_skips_complete_component_but_preserves_disconnected_path_semantics():
+    """Skipping a clique cannot suppress AA on a different non-complete component."""
+    G = nx.disjoint_union(nx.path_graph(3), nx.complete_graph(3))
+    compute_adamic_adar(G)
+    assert G.has_edge(0, 2)
+    assert "adamic_adar" in G[0][2]["signals"]
+    assert G.number_of_edges() == 3 + 3
 
 
 def test_communities(tmp_path):

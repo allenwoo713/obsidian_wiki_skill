@@ -94,13 +94,18 @@ def _source_overlap_candidates(src_sets: Dict[str, set]) -> list[tuple[str, str]
 
 
 def _adamic_adar_candidates(G: nx.Graph) -> list[tuple[str, str]]:
-    """Return two-hop non-edges only, avoiding NetworkX's global non-edge scan."""
+    """Return two-hop non-edges only, skipping complete components in O(V+E)."""
     candidates: set[tuple[str, str]] = set()
-    for pivot in sorted(G.nodes()):
-        neighbors = sorted(G.neighbors(pivot))
-        for u, v in combinations(neighbors, 2):
-            if not G.has_edge(u, v):
-                candidates.add((u, v) if u < v else (v, u))
+    for component in nx.connected_components(G):
+        nodes = tuple(sorted(component))
+        node_count = len(nodes)
+        if sum(G.degree(node) for node in nodes) // 2 == node_count * (node_count - 1) // 2:
+            continue
+        for pivot in nodes:
+            neighbors = sorted(G.neighbors(pivot))
+            for u, v in combinations(neighbors, 2):
+                if not G.has_edge(u, v):
+                    candidates.add((u, v) if u < v else (v, u))
     return sorted(candidates)
 
 

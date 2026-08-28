@@ -120,6 +120,16 @@ def test_corpus_tree_digest_normalizes_platform_text_line_endings(tmp_path: Path
         manifests.canonical_content_tree_sha256(crlf_root)
 
 
+def test_v2_distractor_provenance_rewrite_uses_the_same_lf_canonical_bytes_on_crlf() -> None:
+    """The v2 front-matter edit cannot make checkout line endings part of corpus identity."""
+    manifests = _manifests()
+    lf = b"---\ntitle: Note\nsources:\n  - original\n---\n\nbody\n"
+    crlf = lf.replace(b"\n", b"\r\n")
+    assert manifests.public_distractor_bytes(lf, 2) == manifests.public_distractor_bytes(
+        crlf.replace(b"\r\n", b"\n"), 2,
+    )
+
+
 def test_d10_d18_model_tree_lock_and_cache_poisoning_fail_closed(tmp_path: Path) -> None:
     """D-10/D-18: local validation is read-only and rejects mutable/poisoned trees."""
     manifests = _manifests()

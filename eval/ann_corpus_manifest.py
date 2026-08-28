@@ -22,10 +22,14 @@ _PUBLIC_DISTRACTOR_RECIPE = {
     "target_size": 30_000,
     "source_selection": "sorted-round-robin-markdown",
     "synthetic_source_template": "phase07-distractor/{ordinal}",
-    "body_transform": "none",
+    "content_suffix": "phase07 hybrid distractor {ordinal}",
+    "body_transform": "append-content-suffix-v1",
     "query_injection": False,
 }
-_SOURCES_BLOCK = re.compile(br"(?m)^sources:\r?\n(?:^[ \t]+-[^\r\n]*(?:\r?\n|$))*")
+_FRONT_MATTER = re.compile(
+    br"\A---(?P<newline>\r?\n)(?P<contents>.*?)(?P=newline)---(?P=newline)", re.DOTALL,
+)
+_SOURCES_BLOCK = re.compile(br"(?m)^sources:[ \t]*(?:\r?\n[ \t]+-[^\r\n]*)*(?:\r?\n)?")
 
 
 def phase07_current_baseline_sha256() -> str:
@@ -56,7 +60,7 @@ def public_distractor_source(ordinal: int) -> str:
 
 
 def public_distractor_bytes(source_bytes: bytes, ordinal: int) -> bytes:
-    """Replace only synthetic front-matter provenance; Markdown body is byte-stable.
+    """Replace one YAML-front-matter source block and retain the v1 body suffix.
 
     The fixture source itself is never modified.  Keeping the body intact also
     keeps canonical chunk text/content hashes stable while preventing cloned
@@ -64,11 +68,21 @@ def public_distractor_bytes(source_bytes: bytes, ordinal: int) -> bytes:
     """
     if not isinstance(source_bytes, bytes):
         raise ValueError("public distractor source bytes")
-    match = _SOURCES_BLOCK.search(source_bytes)
-    if match is None:
+    front_matter = _FRONT_MATTER.match(source_bytes)
+    if front_matter is None:
         raise ValueError("public distractor source front matter")
-    replacement = f"sources:\n  - {public_distractor_source(ordinal)}\n".encode("utf-8")
-    return source_bytes[:match.start()] + replacement + source_bytes[match.end():]
+    sources = list(_SOURCES_BLOCK.finditer(front_matter.group("contents")))
+    if len(sources) != 1:
+        raise ValueError("public distractor source front matter")
+    source = sources[0]
+    newline = front_matter.group("newline")
+    trailing_newline = b"" if source.end() == len(front_matter.group("contents")) else newline
+    replacement = (b"sources:" + newline + b"  - "
+                   + public_distractor_source(ordinal).encode("utf-8") + trailing_newline)
+    start = front_matter.start("contents") + source.start()
+    end = front_matter.start("contents") + source.end()
+    suffix = b"\n\n" + str(_PUBLIC_DISTRACTOR_RECIPE["content_suffix"]).format(ordinal=ordinal).encode("utf-8") + b"\n"
+    return source_bytes[:start] + replacement + source_bytes[end:] + suffix
 
 
 def expected_phase07_graph_scale_identity(fixture_root: Path) -> dict[str, int]:
