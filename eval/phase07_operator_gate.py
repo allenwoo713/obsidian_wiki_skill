@@ -425,8 +425,16 @@ def validate_frozen_size_measurement(value: object, *, expected_head: str) -> di
     return value
 
 
-def _write_new_durable_ledger(path: Path, record: dict[str, Any]) -> None:
-    """Atomically publish one ledger and fsync both bytes and directory metadata."""
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(Path(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_new_durable_ledger(path: Path, record: dict[str, Any]) -> tuple[int, int]:
+    """Claim a new ledger name atomically, without ever replacing a peer's file."""
     path = Path(path)
     if path.exists() or path.is_symlink():
         raise ValueError("frozen measurement ledger must be new")
@@ -441,18 +449,40 @@ def _write_new_durable_ledger(path: Path, record: dict[str, Any]) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        if path.exists() or path.is_symlink():
-            raise ValueError("frozen measurement ledger must be new")
-        os.replace(temporary, path)
-        temporary = None
-        directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise ValueError("frozen measurement ledger must be new") from exc
+        published = path.stat()
+        temporary.unlink()
+        temporary = None
+        _fsync_directory(path.parent)
+        return (published.st_dev, published.st_ino)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+            _fsync_directory(path.parent)
+
+
+def _remove_owned_measurement_ledger(path: Path, identity: tuple[int, int] | None) -> None:
+    """Remove only the file this invocation published; never erase a replacement."""
+    if identity is None:
+        return
+    try:
+        actual = Path(path).lstat()
+    except OSError:
+        return
+    if stat.S_ISREG(actual.st_mode) and (actual.st_dev, actual.st_ino) == identity:
+        Path(path).unlink()
+        _fsync_directory(Path(path).parent)
+
+
+def _resolved_measurement_paths(work_dir: Path, ledger_file: Path) -> tuple[Path, Path]:
+    """Resolve both targets before creating either; reject every containment overlap."""
+    work_dir, ledger_file = Path(work_dir).resolve(strict=False), Path(ledger_file).resolve(strict=False)
+    if work_dir == ledger_file or work_dir in ledger_file.parents or ledger_file in work_dir.parents:
+        raise ValueError("frozen measurement work and ledger paths overlap")
+    return work_dir, ledger_file
 
 
 def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger_file: Path,
@@ -469,7 +499,12 @@ def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger
     created_work_dir = False
     wrote_ledger = False
     completed = False
+    ledger_identity: tuple[int, int] | None = None
+    status = 1
     try:
+        if work_dir.is_symlink() or ledger_file.is_symlink():
+            raise ValueError("frozen measurement paths or head")
+        work_dir, ledger_file = _resolved_measurement_paths(work_dir, ledger_file)
         if not SHA.fullmatch(head_sha) or work_dir.exists() or work_dir.is_symlink() \
                 or ledger_file.exists() or ledger_file.is_symlink():
             raise ValueError("frozen measurement paths or head")
@@ -541,13 +576,12 @@ def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger
             "authorization": "none", "repository_capability": False, "human_authorized": False,
         })
         validate_frozen_size_measurement(record, expected_head=head_sha)
-        _write_new_durable_ledger(ledger_file, record)
+        ledger_identity = _write_new_durable_ledger(ledger_file, record)
         wrote_ledger = True
         validate_frozen_size_measurement(_read_object(ledger_file), expected_head=head_sha)
         completed = True
-        return 0
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
-        return 1
+        completed = False
     finally:
         cleanup_failed = False
         if created_work_dir:
@@ -555,8 +589,16 @@ def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger
                 shutil.rmtree(work_dir)
             except OSError:
                 cleanup_failed = True
-        if wrote_ledger and (not completed or cleanup_failed):
-            ledger_file.unlink(missing_ok=True)
+        if completed and not cleanup_failed and not work_dir.exists() and ledger_file.is_file() \
+                and not ledger_file.is_symlink():
+            try:
+                validate_frozen_size_measurement(_read_object(ledger_file), expected_head=head_sha)
+                status = 0
+            except (OSError, ValueError, json.JSONDecodeError):
+                status = 1
+        if status != 0 and wrote_ledger:
+            _remove_owned_measurement_ledger(ledger_file, ledger_identity)
+    return status
 
 
 def run_frozen_prepare_plan(*, preflight_file: Path, workflow_input_file: Path,
