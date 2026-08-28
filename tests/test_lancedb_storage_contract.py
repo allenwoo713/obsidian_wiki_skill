@@ -869,7 +869,7 @@ def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_pat
 
 def test_phase07_frozen_base_rejects_oversize_graph_and_revalidates_complete_tree_size(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both creation and reload fail closed on graph/base byte ceilings."""
+    """Size-only preflight rejects before descriptor JSON or artifact hashing."""
     from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
     from eval.phase07_frozen_base import FrozenBaseError, prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
 
@@ -877,25 +877,69 @@ def test_phase07_frozen_base_rejects_oversize_graph_and_revalidates_complete_tre
     _write_page(wiki, "# Frozen cap\n\nFROZENCAP exact retrieval content.")
     identity = _phase07_test_corpus_identity(wiki)
     embedder = _FacadeEmbedder()
+    hash_calls: list[Path] = []
+    real_sha256_file = frozen_module._sha256_file
+
+    def track_sha256(path: Path) -> str:
+        hash_calls.append(Path(path))
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(frozen_module, "_sha256_file", track_sha256)
     monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 1)
     with pytest.raises(FrozenBaseError, match="frozen graph size"):
         prepare_frozen_base(
             wiki_dir=wiki, frozen_dir=tmp_path / "oversize-graph", embed=_embed384(),
             tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
         )
+    # Descriptor authority hashes are resolved before construction; no frozen-tree
+    # artifact is hashed before the graph ceiling rejects it.
+    assert not [path for path in hash_calls if path.is_relative_to(tmp_path)]
 
     monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1)
+    with pytest.raises(FrozenBaseError, match="frozen base size"):
+        prepare_frozen_base(
+            wiki_dir=wiki, frozen_dir=tmp_path / "oversize-base", embed=_embed384(),
+            tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
+        )
+    assert not [path for path in hash_calls if path.is_relative_to(tmp_path)]
+
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1024 * 1024 * 1024)
     frozen = tmp_path / "prepared"
     prepare_frozen_base(
         wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=embedder.tokenizer,
         expected_corpus_identity=identity,
     )
-    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1)
+    inventory, total_bytes = frozen_module._tree_size_inventory(frozen)
+    sizes = {row["path"]: row["size"] for row in inventory}
+    assert {"graph.json", ".index/graph.json", "frozen-base.json"} <= set(sizes)
+    assert total_bytes == sum(sizes.values())
+    descriptor_size = int(sizes["frozen-base.json"])
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", total_bytes)
+    with pytest.raises(FrozenBaseError, match="frozen base size"):
+        frozen_module._require_complete_frozen_size(total_bytes - descriptor_size, descriptor_size)
+
+    # Validation must reject graph size before it parses the descriptor or hashes any artifact.
+    hash_calls.clear()
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 1)
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1024 * 1024 * 1024)
+    monkeypatch.setattr(frozen_module.json, "loads", lambda *_args, **_kwargs: pytest.fail("descriptor JSON parsed"))
+    with pytest.raises(FrozenBaseError, match="frozen graph size"):
+        validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
+            expected_corpus_identity=identity,
+        )
+    assert hash_calls == []
+
+    # Exact equality is also forbidden; the root total includes descriptor and both graph copies.
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", total_bytes)
     with pytest.raises(FrozenBaseError, match="frozen base size"):
         validate_frozen_base(
             frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
             expected_corpus_identity=identity,
         )
+    assert hash_calls == []
 
 
 def test_phase07_frozen_base_requires_the_preparation_tokenizer_at_the_112_token_boundary(tmp_path: Path) -> None:
