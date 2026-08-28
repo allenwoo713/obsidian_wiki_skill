@@ -1740,8 +1740,11 @@ def _tiny_measurement_materializer(destination: Path) -> dict[str, object]:
 class _TinyMeasurementEmbedder:
     tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
 
-    @staticmethod
-    def embed(texts: list[str]) -> list[list[float]]:
+    def __init__(self) -> None:
+        self.progress_flags: list[bool] = []
+
+    def embed(self, texts: list[str], *, show_progress_bar: bool = False) -> list[list[float]]:
+        self.progress_flags.append(show_progress_bar)
         return [[1.0, *([0.0] * 383)] for _ in texts]
 
 
@@ -1787,6 +1790,135 @@ def test_local_frozen_size_measurement_builds_actual_archive_and_cleans_its_scra
         phase07_operator_gate.run_frozen_prepare_plan(
             preflight_file=ledger, workflow_input_file=tmp_path / "prepare.json", expected_head=head,
         )
+
+
+def test_local_frozen_size_measurement_reports_embedding_stages(tmp_path: Path) -> None:
+    """The production measurement path reports its opaque embedding phase."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    events: list[tuple[str, dict[str, object]]] = []
+    embedder = _TinyMeasurementEmbedder()
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=embedder, tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 0
+
+    assert embedder.progress_flags == [True]
+    assert [stage for stage, _detail in events] == [
+        "model_ready", "corpus_materialized", "plan_finished", "embedding_started", "embedding_finished",
+    ]
+    assert all(detail["event"] == "phase07-frozen-size-progress" for _stage, detail in events)
+    assert events[3][1]["wiki_root"].endswith("frozen-corpus/Wiki")
+    assert events[4][1]["dense_chunks"] > 0 and events[4][1]["pages"] == 1
+    assert not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_accepts_legacy_injected_embedder(tmp_path: Path) -> None:
+    """Explicit test seams remain compatible with pre-progress embedder objects."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+
+    class LegacyEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str]) -> list[list[float]]:
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=LegacyEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert ledger.is_file() and not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_does_not_pass_progress_keyword_to_positional_varargs(
+        tmp_path: Path) -> None:
+    """A parameter named show_progress_bar in ``*args`` is not keyword-capable."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+
+    class PositionalVarargsEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str], *show_progress_bar: object) -> list[list[float]]:
+            assert show_progress_bar == ()
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=PositionalVarargsEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert ledger.is_file() and not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_passes_progress_keyword_to_keyword_varargs(tmp_path: Path) -> None:
+    """A ``**kwargs`` embedder remains eligible for operator batch progress."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    progress_calls: list[dict[str, object]] = []
+
+    class KeywordVarargsEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str], **kwargs: object) -> list[list[float]]:
+            progress_calls.append(kwargs)
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=KeywordVarargsEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert progress_calls == [{"show_progress_bar": True}]
+
+
+def test_local_frozen_size_measurement_reports_embedding_events_around_embed_call(tmp_path: Path) -> None:
+    """Embedding stage boundaries surround only the actual embed call."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    trace: list[str] = []
+
+    class OrderedEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str], *, show_progress_bar: bool = False) -> list[list[float]]:
+            assert show_progress_bar is True
+            trace.append("embed_called")
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=tmp_path / "scratch", model_dir=tmp_path / "unused", ledger_file=tmp_path / "measurement.json",
+        head_sha=head, materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=OrderedEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, _detail: trace.append(stage),
+    ) == 0
+    assert trace == [
+        "model_ready", "corpus_materialized", "plan_finished", "embedding_started", "embed_called",
+        "embedding_finished",
+    ]
 
 
 def test_local_frozen_size_measurement_cleans_failures_and_preserves_preexisting_paths(tmp_path: Path) -> None:
@@ -1852,6 +1984,39 @@ def test_local_frozen_size_measurement_reports_cleanup_failure_and_withholds_led
     assert work_dir.exists() and not ledger.exists()
     monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", original_rmtree)
     original_rmtree(work_dir)
+
+
+def test_local_frozen_size_measurement_surfaces_ledger_cleanup_failure_after_scratch_failure(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ledger cleanup failure after scratch cleanup failed must not be swallowed."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    original_rmtree = shutil.rmtree
+
+    def reject_scratch_cleanup(_path: Path) -> None:
+        raise OSError("intentional scratch cleanup failure")
+
+    def reject_ledger_cleanup(_path: Path, _identity: tuple[int, int] | None) -> None:
+        raise OSError("intentional ledger cleanup failure")
+
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", reject_scratch_cleanup)
+    monkeypatch.setattr(phase07_operator_gate, "_remove_owned_measurement_ledger", reject_ledger_cleanup)
+    try:
+        with pytest.raises(OSError, match="intentional ledger cleanup failure"):
+            phase07_operator_gate.run_local_frozen_size_measurement(
+                work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+                materializer=_tiny_measurement_materializer, corpus_identity=identity,
+                embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            )
+        assert work_dir.exists() and ledger.is_file()
+    finally:
+        if ledger.exists():
+            ledger.unlink()
+        if work_dir.exists():
+            original_rmtree(work_dir)
 
 
 def test_new_durable_ledger_never_replaces_a_racing_sentinel(tmp_path: Path,

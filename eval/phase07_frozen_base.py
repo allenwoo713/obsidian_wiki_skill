@@ -277,9 +277,19 @@ def _dense_from_canonical(chunk: object, vector: tuple[float, ...]) -> DenseChun
     )
 
 
-def _make_chunks(wiki_dir: Path, embed: Callable[[list[str]], list[list[float]]], *, tokenizer: object) -> tuple[list[object], list[DenseChunk], list[dict[str, object]]]:
+def _make_chunks(wiki_dir: Path, embed: Callable[[list[str]], list[list[float]]], *, tokenizer: object,
+                 progress: Callable[[str, dict[str, object]], None] | None = None) -> tuple[list[object], list[DenseChunk], list[dict[str, object]]]:
     sparse, dense_sources, page_rows = _canonical_markdown_plan(wiki_dir, tokenizer=tokenizer)
+    if progress is not None:
+        progress("plan_finished", {
+            "sparse_chunks": len(sparse), "dense_chunks": len(dense_sources), "pages": len(page_rows),
+        })
+        progress("embedding_started", {"wiki_root": str(wiki_dir)})
     vectors = embed([chunk.text for chunk in dense_sources])
+    if progress is not None:
+        progress("embedding_finished", {
+            "sparse_chunks": len(sparse), "dense_chunks": len(dense_sources), "pages": len(page_rows),
+        })
     if len(vectors) != len(dense_sources):
         raise FrozenBaseError("frozen embedding count")
     dense = [_dense_from_canonical(chunk, tuple(float(value) for value in vector))
@@ -414,7 +424,8 @@ def _descriptor_identity(value: Mapping[str, object] | None, *,
 
 def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[list[str]], list[list[float]]],
                         tokenizer: object, descriptor_identity: Mapping[str, object] | None = None,
-                        expected_corpus_identity: Mapping[str, object] | None = None) -> dict[str, object]:
+                        expected_corpus_identity: Mapping[str, object] | None = None,
+                        progress: Callable[[str, dict[str, object]], None] | None = None) -> dict[str, object]:
     """Persist reusable data once, deliberately stopping before HNSW/publication."""
     _require_tokenizer(tokenizer)
     wiki_dir, frozen_dir = Path(wiki_dir).resolve(), Path(frozen_dir).resolve()
@@ -437,7 +448,7 @@ def prepare_frozen_base(*, wiki_dir: Path, frozen_dir: Path, embed: Callable[[li
     _validate_wiki_semantics(wiki_dir)
     if _actual_corpus_identity(wiki_dir) != identity["expected_corpus_identity"]:
         raise FrozenBaseError("frozen corpus identity")
-    sparse, dense, pages = _make_chunks(wiki_dir, embed, tokenizer=tokenizer)
+    sparse, dense, pages = _make_chunks(wiki_dir, embed, tokenizer=tokenizer, progress=progress)
     if pages != _page_rows(wiki_dir):
         raise FrozenBaseError("canonical frozen page metadata")
     pages_path = frozen_dir / "pages.json"

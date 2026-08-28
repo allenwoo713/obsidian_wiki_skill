@@ -116,3 +116,25 @@ def test_sentence_transformer_embedder_loads_only_local_assets(monkeypatch, tmp_
 
     with pytest.raises(RuntimeError, match="(?i)local embedding model"):
         SentenceTransformerEmbedder(tmp_path / "missing").embed(["dense text"])
+
+
+def test_sentence_transformer_embedder_can_surface_batch_progress(monkeypatch, tmp_path):
+    """Long operator runs must be able to expose the encoder's batch counter."""
+    model_dir = tmp_path / "local-model"
+    model_dir.mkdir()
+    (model_dir / "model.safetensors").write_bytes(b"local")
+    calls = []
+
+    class FakeModel:
+        def encode(self, texts, **kwargs):
+            calls.append((list(texts), kwargs))
+            return [[1.0, 2.0] for _ in texts]
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", types.SimpleNamespace(
+        SentenceTransformer=lambda path, local_files_only: FakeModel()
+    ))
+
+    assert SentenceTransformerEmbedder(model_dir).embed(
+        ["dense text"], show_progress_bar=True,
+    ) == [(1.0, 2.0)]
+    assert calls == [(["dense text"], {"show_progress_bar": True, "normalize_embeddings": False})]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -27,7 +28,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 
 # ``-m`` executes this source as ``__main__`` while the production runner
@@ -485,10 +486,40 @@ def _resolved_measurement_paths(work_dir: Path, ledger_file: Path) -> tuple[Path
     return work_dir, ledger_file
 
 
+def _report_frozen_measurement_stage(reporter: Callable[[str, dict[str, object]], None] | None,
+                                     stage: str, **detail: object) -> None:
+    payload: dict[str, object] = {"event": "phase07-frozen-size-progress", "stage": stage, **detail}
+    if reporter is not None:
+        reporter(stage, payload)
+    else:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+def _embed_frozen_measurement_texts(embedder: Any, texts: list[str]) -> Any:
+    """Request progress from the concrete adapter without breaking legacy test seams."""
+    embed = embedder.embed
+    try:
+        parameters = inspect.signature(embed).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    supports_progress = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "show_progress_bar"
+            and parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
+        for parameter in parameters
+    )
+    if supports_progress:
+        return embed(texts, show_progress_bar=True)
+    return embed(texts)
+
+
 def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger_file: Path,
                                       head_sha: str, materializer: Any | None = None,
                                       corpus_identity: dict[str, object] | None = None,
-                                      embedder: Any | None = None, tokenizer: object | None = None) -> int:
+                                      embedder: Any | None = None, tokenizer: object | None = None,
+                                      stage_reporter: Callable[[str, dict[str, object]], None] | None = None) -> int:
     """Build and measure the real candidate-neutral base without minting authority.
 
     The optional callable/object parameters are a deliberately explicit in-process
@@ -532,22 +563,30 @@ def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger
             if tokenizer is not None:
                 raise ValueError("test tokenizer needs explicit embedder")
             from eval.phase07_frozen_base import load_verified_frozen_embedder
+            _report_frozen_measurement_stage(stage_reporter, "model_loading")
             embedder = load_verified_frozen_embedder(model_dir)
         if tokenizer is None:
             tokenizer = getattr(embedder, "tokenizer", None)
         if tokenizer is None or not callable(getattr(embedder, "embed", None)):
             raise ValueError("frozen measurement embedder")
+        _report_frozen_measurement_stage(stage_reporter, "model_ready")
         work_dir.mkdir(mode=0o700, parents=False)
         created_work_dir = True
         wiki_dir, frozen_dir, archive = work_dir / "Wiki", work_dir / "frozen-corpus", work_dir / "frozen-base.zip"
         actual_identity = materializer(wiki_dir)
         if actual_identity != corpus_identity or not wiki_dir.is_dir() or wiki_dir.is_symlink():
             raise ValueError("frozen measurement corpus materialization")
+        _report_frozen_measurement_stage(stage_reporter, "corpus_materialized", target_size=30000)
         from eval.phase07_frozen_base import prepare_frozen_base, validate_frozen_base
+
+        def report_prepare_stage(stage: str, detail: dict[str, object]) -> None:
+            _report_frozen_measurement_stage(stage_reporter, stage, **detail)
+
         descriptor = prepare_frozen_base(
             wiki_dir=wiki_dir, frozen_dir=frozen_dir,
-            embed=lambda texts: embedder.embed(list(texts)), tokenizer=tokenizer,
+            embed=lambda texts: _embed_frozen_measurement_texts(embedder, list(texts)), tokenizer=tokenizer,
             expected_corpus_identity=corpus_identity,
+            progress=report_prepare_stage,
         )
         tree_sha256 = validate_frozen_base(
             frozen_dir, expected_wiki_root=frozen_dir / "Wiki", tokenizer=tokenizer,

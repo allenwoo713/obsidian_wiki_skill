@@ -27,12 +27,12 @@ class SentenceTransformerEmbedder:
                     f"Unable to load local embedding model at {self._model_path}: {exc}"
                 ) from exc
 
-    def embed(self, texts: Sequence[str]) -> Sequence[Tuple[float, ...]]:
+    def embed(self, texts: Sequence[str], *, show_progress_bar: bool = False) -> Sequence[Tuple[float, ...]]:
         if any(not isinstance(text, str) for text in texts):
             raise TypeError("Dense embedding inputs must be text strings")
         self._ensure_model()
         vectors = self._model.encode(
-            list(texts), show_progress_bar=False, normalize_embeddings=False
+            list(texts), show_progress_bar=show_progress_bar, normalize_embeddings=False
         )
         return [tuple(float(value) for value in vector) for vector in vectors]
 
