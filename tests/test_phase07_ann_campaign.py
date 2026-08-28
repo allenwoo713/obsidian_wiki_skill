@@ -1155,41 +1155,75 @@ def _hybrid_gate_metrics(**overrides: object) -> dict:
     return metrics
 
 
+def _expanded_scale_diagnostics() -> dict:
+    return {
+        "stratum": "expanded_30k_scale",
+        "baseline": {"sample_count": 105, "duration_p50_ms": 1.0, "duration_p95_ms": 2.0},
+        "candidate": {"sample_count": 105, "duration_p50_ms": 1.0, "duration_p95_ms": 2.0},
+    }
+
+
 def test_hybrid_gates_are_recomputable_and_numeric_regressions_are_rejected_not_authorized() -> None:
-    """Absolute and paired evidence are separate, with a per-candidate reject verdict."""
+    """Original quality and expanded scale evidence remain separate."""
     baseline = _hybrid_gate_metrics()
     original = {"baseline": baseline, "candidate": {**baseline, "page_recall_at_5": 0.97}}
-    paired = {"baseline": baseline, "candidate": baseline}
     verdict = operator.recompute_hybrid_gate_verdicts(
-        original_absolute=original, expanded_paired=paired,
+        original_absolute=original, expanded_scale_diagnostics=_expanded_scale_diagnostics(),
         committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
     )
     assert verdict["candidate_verdict"] == "rejected-candidate"
     assert verdict["authorization"] == "none"
-    assert set(verdict) >= {"original_absolute_gate", "paired_30k_non_regression_gate", "write_graph_artifact"}
+    assert set(verdict) >= {"original_absolute_gate", "expanded_30k_scale_diagnostics", "write_graph_artifact"}
+    assert "paired_30k_non_regression_gate" not in verdict
 
 
-def test_hybrid_gate_rejection_table_covers_absolute_paired_and_zero_tolerance_contracts() -> None:
-    """Every quality axis is a candidate verdict, never an authorization switch."""
+def test_hybrid_original_functional_overlap_regression_rejects_candidate() -> None:
+    """The original 105-query functional overlap is a candidate quality gate."""
+    baseline = _hybrid_gate_metrics()
+    verdict = operator.recompute_hybrid_gate_verdicts(
+        original_absolute={
+            "baseline": baseline,
+            "candidate": {**baseline, "functional_final_retrieval_ann_overlap_at_10": 0.97},
+        },
+        expanded_scale_diagnostics=_expanded_scale_diagnostics(),
+        committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
+    )
+    assert verdict["candidate_verdict"] == "rejected-candidate"
+
+
+def test_duplicate_heavy_30k_quality_is_diagnostic_only_and_cannot_reject_a_candidate() -> None:
+    """Only the original 105-query production corpus can authorize hybrid quality."""
+    base = _hybrid_gate_metrics()
+    verdict = operator.recompute_hybrid_gate_verdicts(
+        original_absolute={"baseline": base, "candidate": base},
+        expanded_scale_diagnostics=_expanded_scale_diagnostics(),
+        committed_baseline=_committed_hybrid_floors(),
+        baselines_sha256=_committed_baselines_sha256(),
+    )
+    assert verdict["candidate_verdict"] == "numeric-success"
+    assert verdict["quality_authority"] == "original_105_query_only"
+    assert verdict["expanded_30k_scale_diagnostics"] == _expanded_scale_diagnostics()
+    assert "paired_30k_non_regression_gate" not in verdict
+
+
+def test_hybrid_gate_rejection_table_keeps_30k_quality_diagnostic_only() -> None:
+    """Original quality rejects candidates; 30k quality remains diagnostic."""
     base = {
         **_hybrid_gate_metrics(),
     }
     for stratum, regression in (
         ("original_absolute", {"page_recall_at_5": 0.97}),
-        ("paired_30k", {"evidence_recall_at_10": 0.97}),
         ("original_absolute", {"mrr_at_10": 0.97}),
-        ("paired_30k", {"functional_final_retrieval_ann_overlap_at_10": 0.97}),
         ("original_absolute", {"citation_violation_count": 1}),
-        ("paired_30k", {"context_overflow_count": 1}),
         ("original_absolute", {"budget_violation_count": 1}),
-        ("paired_30k", {"graph_unsupported_count": 1}),
     ):
         verdict = operator.recompute_hybrid_gate_verdicts(
             original_absolute={"baseline": base, "candidate": {**base, **regression} if stratum == "original_absolute" else base},
-            expanded_paired={"baseline": base, "candidate": {**base, **regression} if stratum == "paired_30k" else base},
+            expanded_scale_diagnostics=_expanded_scale_diagnostics(),
             committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
         )
         assert verdict["candidate_verdict"] == "rejected-candidate"
+        assert "paired_30k_non_regression_gate" not in verdict
         assert verdict["authorization"] == "none"
 
 
@@ -1250,7 +1284,7 @@ def test_hybrid_aggregates_real_result_metrics_and_rejects_fact_citation_budget_
     assert aggregate["candidate"]["budget_violation_count"] == 1
     assert aggregate["candidate"]["graph_unsupported_count"] == 1
     verdict = operator.recompute_hybrid_gate_verdicts(
-        original_absolute=aggregate, expanded_paired=aggregate,
+        original_absolute=aggregate, expanded_scale_diagnostics=_expanded_scale_diagnostics(),
         committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
     )
     assert verdict["candidate_verdict"] == "rejected-candidate"
@@ -1290,6 +1324,69 @@ def test_live_and_serialized_hybrid_metrics_agree_for_case_variant_page_identiti
     assert serialized == live_metrics
 
 
+def test_expanded_hybrid_observations_expose_latency_only_never_gold_quality() -> None:
+    """The duplicate-heavy 30k stratum is scale evidence, not a quality gate."""
+    import eval.run_eval as run_eval
+
+    payload = {
+        "query": "needle", "plan": {"intent": "lookup"}, "pages": ["wrong-gold-id"],
+        "items": [], "context_text": "", "context_sha256": hashlib.sha256(b"").hexdigest(),
+        "token_count": 0,
+        "budget": {"requested_base_budget_tokens": 10, "budget_multiplier": 1.0,
+                   "effective_budget_tokens": 10, "hard_max_tokens": 20,
+                   "budget_policy": "context_mode_multiplier_v1", "max_context_tokens": 10},
+    }
+    observations = [
+        {"baseline": {"result": payload, "duration_ms": baseline_ms},
+         "candidate": {"result": payload, "duration_ms": candidate_ms}}
+        for baseline_ms, candidate_ms in ((1.0, 10.0), (2.0, 20.0), (3.0, 30.0))
+    ]
+    diagnostics = run_eval.aggregate_hybrid_serialized_scale_diagnostics(observations=observations)
+    assert diagnostics == {
+        "stratum": "expanded_30k_scale",
+        "baseline": {"sample_count": 3, "duration_p50_ms": 2.0, "duration_p95_ms": 3.0},
+        "candidate": {"sample_count": 3, "duration_p50_ms": 20.0, "duration_p95_ms": 30.0},
+    }
+    forbidden = {"page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10",
+                 "functional_final_retrieval_ann_overlap_at_10", "candidate_verdict", "non_regression_gate"}
+    serialized_diagnostics = json.dumps(diagnostics, sort_keys=True)
+    assert all(name not in serialized_diagnostics for name in forbidden)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-key", "extra-key", "bool-sample-count", "zero-sample-count",
+        "negative-latency", "nonfinite-latency", "reversed-percentiles",
+    ),
+)
+def test_expanded_scale_diagnostics_fail_closed_on_invalid_schema_or_values(mutation: str) -> None:
+    """Scale diagnostics are non-authorizing but still must be complete and sound."""
+    diagnostics = _expanded_scale_diagnostics()
+    values = diagnostics["candidate"]
+    if mutation == "missing-key":
+        values.pop("duration_p95_ms")
+    elif mutation == "extra-key":
+        values["unexpected"] = 1.0
+    elif mutation == "bool-sample-count":
+        values["sample_count"] = True
+    elif mutation == "zero-sample-count":
+        values["sample_count"] = 0
+    elif mutation == "negative-latency":
+        values["duration_p50_ms"] = -1.0
+    elif mutation == "nonfinite-latency":
+        values["duration_p95_ms"] = float("nan")
+    else:
+        values["duration_p50_ms"] = 3.0
+        values["duration_p95_ms"] = 2.0
+    with pytest.raises(ValueError, match="expanded hybrid scale diagnostics|finite expanded hybrid scale diagnostics"):
+        operator.recompute_hybrid_gate_verdicts(
+            original_absolute={"baseline": _hybrid_gate_metrics(), "candidate": _hybrid_gate_metrics()},
+            expanded_scale_diagnostics=diagnostics,
+            committed_baseline=_committed_hybrid_floors(), baselines_sha256=_committed_baselines_sha256(),
+        )
+
+
 def _committed_baselines_sha256() -> str:
     return hashlib.sha256((ROOT / "eval" / "baselines.json").read_bytes()).hexdigest()
 
@@ -1318,14 +1415,14 @@ def test_hybrid_original_absolute_fails_when_observed_baseline_is_below_committe
             "exact_lookup_hit_at_3": floors["exact_lookup_hit_at_3"] - 0.03}
     verdict = operator.recompute_hybrid_gate_verdicts(
         original_absolute={"baseline": weak, "candidate": weak},
-        expanded_paired={"baseline": full, "candidate": full},
+        expanded_scale_diagnostics=_expanded_scale_diagnostics(),
         committed_baseline=floors, baselines_sha256=_committed_baselines_sha256(),
     )
     assert verdict["candidate_verdict"] == "rejected-candidate"
     with pytest.raises(ValueError):
         operator.recompute_hybrid_gate_verdicts(
             original_absolute={"baseline": full, "candidate": full},
-            expanded_paired={"baseline": full, "candidate": full},
+            expanded_scale_diagnostics=_expanded_scale_diagnostics(),
             committed_baseline={**floors, "mrr_at_10": 0.0}, baselines_sha256="0" * 64,
         )
 

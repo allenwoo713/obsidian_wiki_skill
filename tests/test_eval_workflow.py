@@ -2492,10 +2492,123 @@ def test_hybrid_three_download_collection_provenance_and_postdownload_reconstruc
     ]
     assert all(row["run_attempt"] == 1 for row in evidence["evidence"])
     ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
+    assert ledger["schema_version"] == reconcile_ann_gate.HYBRID_POSTDOWNLOAD_LEDGER_SCHEMA_VERSION == 2
     assert ledger["baseline_record"]["config"]["m"] == 16
     assert [record["candidate"]["m"] for record in ledger["candidate_records"]] == [20, 32]
     assert all(record["status"] in {"numeric-success", "rejected-candidate"}
                for record in ledger["candidate_records"])
+    forbidden_expanded_quality = {
+        "page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10",
+        "functional_final_retrieval_ann_overlap_at_10", "paired_30k_non_regression_gate",
+    }
+    for record in ledger["candidate_records"]:
+        assert set(record) == {
+            "candidate", "status", "original_absolute_gate", "expanded_30k_scale_diagnostics",
+            "aggregate_metrics", "packet_identity", "provenance",
+        }
+        assert set(record["aggregate_metrics"]) == {"original_absolute"}
+        assert set(record["expanded_30k_scale_diagnostics"]) == {"stratum", "baseline", "candidate"}
+        serialized_diagnostics = json.dumps(record["expanded_30k_scale_diagnostics"], sort_keys=True)
+        assert all(name not in serialized_diagnostics for name in forbidden_expanded_quality)
+    assert ledger["record_self_sha256"] == reconcile_ann_gate.canonical_digest(ledger)
+
+
+def test_hybrid_postdownload_rejects_original_functional_overlap_regression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconciliation derives the functional-overlap rejection from raw evidence."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    baseline, candidate = records[0], records[1]
+    queries = [
+        json.loads(line)
+        for line in (SKILL_ROOT / "eval" / "queries.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    target_ordinals = [
+        ordinal for ordinal, query in enumerate(queries)
+        if len(query.get("relevant_pages", [])) >= 2
+    ][:6]
+    assert len(target_ordinals) == 6
+
+    # Keep all non-functional metrics fixed while making the second gold page
+    # visible at rank 6 only for the baseline.  The production raw artifacts
+    # must be resealed as a pair; changing just the downloaded m20 tree would
+    # not exercise the baseline-vs-candidate comparison honestly.
+    mutated_pages: dict[str, dict[int, list[str]]] = {"baseline": {}, "candidate": {}}
+    for record, role in ((baseline, "baseline"), (candidate, "candidate")):
+        raw = Path(record["extracted_dir"])
+        result_path = raw / "hybrid-result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        for ordinal in target_ordinals:
+            first, second = queries[ordinal]["relevant_pages"][:2]
+            non_gold = [
+                f"phase07-non-gold-{ordinal:03d}-{index}.md"
+                for index in range(1, 5)
+            ]
+            pages = [first, *non_gold]
+            if role == "baseline":
+                pages.append(second)
+            assert pages[0] == first and len(pages) >= 5
+            if role == "baseline":
+                assert pages[5] == second
+            else:
+                assert second not in pages
+            assert all(
+                not any(gold.lower() in page.lower() for gold in queries[ordinal]["relevant_pages"])
+                for page in pages[1:5]
+            )
+            mutated_pages[role][ordinal] = pages
+            result["original_observations"][ordinal]["observation"]["result"]["pages"] = pages
+        result_path.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+        fixture._reseal_test_hybrid_raw_tree(raw)
+        record["archive_sha256"] = _zip_hybrid_artifact(raw, Path(record["archive"]))
+        assert record["archive_sha256"] == hashlib.sha256(Path(record["archive"]).read_bytes()).hexdigest()
+    assert all(
+        mutated_pages["baseline"][ordinal][:5] == mutated_pages["candidate"][ordinal][:5]
+        for ordinal in target_ordinals
+    )
+
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+        tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
+    rejected = next(record for record in ledger["candidate_records"] if record["candidate"]["m"] == 20)
+    metrics = rejected["original_absolute_gate"]
+    baseline_metrics = metrics["baseline_metrics"]
+    candidate_metrics = metrics["candidate_metrics"]
+    committed_floors = gate.committed_hybrid_baseline()[0]
+    for name in (
+        "page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10",
+    ):
+        assert candidate_metrics[name] == baseline_metrics[name]
+        assert baseline_metrics[name] >= committed_floors[name] - 0.02
+        assert candidate_metrics[name] >= committed_floors[name] - 0.02
+    for name in (
+        "citation_violation_count", "context_overflow_count", "budget_violation_count", "graph_unsupported_count",
+    ):
+        assert candidate_metrics[name] == baseline_metrics[name] == committed_floors[name] == 0
+    baseline_functional = baseline_metrics["functional_final_retrieval_ann_overlap_at_10"]
+    candidate_functional = candidate_metrics["functional_final_retrieval_ann_overlap_at_10"]
+    assert baseline_functional - candidate_functional > 0.02
+    assert candidate_functional < baseline_functional - 0.02
+    assert rejected["status"] == "rejected-candidate"
     assert ledger["record_self_sha256"] == reconcile_ann_gate.canonical_digest(ledger)
 
 
@@ -2568,7 +2681,10 @@ def test_hybrid_success_uses_raw_upload_envelope_and_roundtrips_through_producti
         "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
         "--output", str(ledger), "--mode", "hybrid-postdownload",
     ]) == 0
-    assert json.loads(ledger.read_text(encoding="utf-8"))["campaign_stage"] == "hybrid"
+    reconciled = json.loads(ledger.read_text(encoding="utf-8"))
+    assert reconciled["campaign_stage"] == "hybrid"
+    assert reconciled["schema_version"] == reconcile_ann_gate.HYBRID_POSTDOWNLOAD_LEDGER_SCHEMA_VERSION == 2
+    assert reconciled["record_self_sha256"] == reconcile_ann_gate.canonical_digest(reconciled)
 
 
 def test_hybrid_finalizer_failure_removes_partial_raw_and_seals_only_one_rejection(

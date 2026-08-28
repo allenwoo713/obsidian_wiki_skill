@@ -1430,14 +1430,14 @@ def committed_hybrid_baseline() -> tuple[dict[str, float | int], str]:
     return floors, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expanded_paired: dict[str, Any],
+def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expanded_scale_diagnostics: dict[str, Any],
                                    committed_baseline: dict[str, float | int] | None = None,
                                    baselines_sha256: str | None = None) -> dict[str, Any]:
-    """Recompute non-authorizing absolute and paired gates from complete metrics.
+    """Recompute original-corpus quality and retain 30k latency diagnostics.
 
     The original campaign is an absolute check against the committed quality
-    floors; the expanded campaign is a paired non-regression check.  Both
-    sides are validated so a broken observed baseline cannot bless a candidate.
+    floors.  The duplicate-heavy expanded campaign has no gold-quality
+    authority and contributes scale latency only.
     """
     expected_floors, expected_digest = committed_hybrid_baseline()
     if committed_baseline is None:
@@ -1451,7 +1451,7 @@ def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expande
     def valid_metric(value: object) -> bool:
         return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
 
-    def gate(name: str, aggregate: object, *, absolute: bool) -> dict[str, Any]:
+    def gate(name: str, aggregate: object) -> dict[str, Any]:
         if not isinstance(aggregate, dict) or set(aggregate) != {"baseline", "candidate"} \
                 or not isinstance(aggregate["baseline"], dict) or not isinstance(aggregate["candidate"], dict):
             raise ValueError("complete hybrid aggregate metrics")
@@ -1467,27 +1467,38 @@ def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expande
                or baseline[key] < 0 or candidate[key] < 0 for key in _HYBRID_GATE_ZERO_TOLERANCE):
             raise ValueError("hybrid zero-tolerance metrics")
         rejected = False
-        if absolute:
-            # Functional retrieval deliberately has no ANN-floor alias.  It is
-            # required to be real and finite above, but is not compared to the
-            # dense ANN benchmark.
-            for key in ("page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10"):
-                rejected |= baseline[key] < committed_baseline[key] - 0.02
-                rejected |= candidate[key] < committed_baseline[key] - 0.02
-                rejected |= candidate[key] < baseline[key] - 0.02
-            rejected |= any(baseline[key] != 0 or candidate[key] != 0 for key in _HYBRID_GATE_ZERO_TOLERANCE)
-        else:
-            rejected |= any(candidate[key] < baseline[key] - 0.02 for key in _HYBRID_GATE_QUALITY)
-            # A non-zero observed baseline is an instrumentation failure, not
-            # a tolerance that a candidate may inherit.
-            rejected |= any(baseline[key] != 0 or candidate[key] != 0 for key in _HYBRID_GATE_ZERO_TOLERANCE)
+        # Functional retrieval deliberately has no ANN-floor alias.  It is
+        # required to be real and finite above, and cannot regress relative
+        # to the original 105-query baseline.
+        rejected |= candidate["functional_final_retrieval_ann_overlap_at_10"] \
+            < baseline["functional_final_retrieval_ann_overlap_at_10"] - 0.02
+        for key in ("page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10"):
+            rejected |= baseline[key] < committed_baseline[key] - 0.02
+            rejected |= candidate[key] < committed_baseline[key] - 0.02
+            rejected |= candidate[key] < baseline[key] - 0.02
+        rejected |= any(baseline[key] != 0 or candidate[key] != 0 for key in _HYBRID_GATE_ZERO_TOLERANCE)
         return {"stratum": name, "baseline_metrics": baseline, "candidate_metrics": candidate,
                 "candidate_verdict": "rejected-candidate" if rejected else "numeric-success", "authorization": "none"}
-    original_gate = gate("original_absolute", original_absolute, absolute=True)
-    paired_gate = gate("paired_30k", expanded_paired, absolute=False)
-    candidate_verdict = "rejected-candidate" if "rejected-candidate" in {original_gate["candidate_verdict"], paired_gate["candidate_verdict"]} else "numeric-success"
-    return {"original_absolute_gate": original_gate, "paired_30k_non_regression_gate": paired_gate,
-            "candidate_verdict": candidate_verdict, "authorization": "none", "write_graph_artifact": True}
+    original_gate = {**gate("original_absolute", original_absolute),
+                     "authority": "hybrid-quality"}
+    expected_scale_fields = {"sample_count", "duration_p50_ms", "duration_p95_ms"}
+    if not isinstance(expanded_scale_diagnostics, dict) \
+            or set(expanded_scale_diagnostics) != {"stratum", "baseline", "candidate"} \
+            or expanded_scale_diagnostics.get("stratum") != "expanded_30k_scale":
+        raise ValueError("complete expanded hybrid scale diagnostics")
+    for role in ("baseline", "candidate"):
+        values = expanded_scale_diagnostics[role]
+        if not isinstance(values, dict) or set(values) != expected_scale_fields \
+                or isinstance(values["sample_count"], bool) or not isinstance(values["sample_count"], int) \
+                or values["sample_count"] <= 0 \
+                or any(not valid_metric(values[key]) or values[key] < 0
+                       for key in ("duration_p50_ms", "duration_p95_ms")) \
+                or values["duration_p50_ms"] > values["duration_p95_ms"]:
+            raise ValueError("finite expanded hybrid scale diagnostics")
+    candidate_verdict = original_gate["candidate_verdict"]
+    return {"original_absolute_gate": original_gate, "expanded_30k_scale_diagnostics": expanded_scale_diagnostics,
+            "candidate_verdict": candidate_verdict, "quality_authority": "original_105_query_only",
+            "authorization": "none", "write_graph_artifact": True}
 
 
 def reject_retired_hybrid_authority(value: object) -> None:

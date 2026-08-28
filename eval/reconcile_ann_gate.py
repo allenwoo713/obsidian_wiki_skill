@@ -76,6 +76,9 @@ _STAGE1_API_ARTIFACT_FIELDS = frozenset({
     "artifact_id", "job_id", "job_key", "run_id", "name", "created_at",
     "expires_at", "expired",
 })
+# This is deliberately scoped to the derived, final reconciliation ledger.
+# Raw hybrid artifacts and their provenance documents retain schema v1.
+HYBRID_POSTDOWNLOAD_LEDGER_SCHEMA_VERSION = 2
 
 
 def _reject_secrets(value, location="packet") -> None:
@@ -730,7 +733,7 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         _validate_hybrid_request, canonical_digest as operator_digest,
         recompute_hybrid_gate_verdicts,
     )
-    from eval.run_eval import aggregate_hybrid_serialized_metrics
+    from eval.run_eval import aggregate_hybrid_serialized_metrics, aggregate_hybrid_serialized_scale_diagnostics
 
     _reject_hybrid_secrets(request, "hybrid request")
     if not isinstance(request, dict) or request.get("record_self_sha256") != operator_digest(request):
@@ -826,27 +829,26 @@ def reconcile_hybrid_postdownload(request: dict, manifest: dict) -> dict:
         expanded_paired = _pair_hybrid_role_observations(
             baseline=baseline_record["expanded_observations"],
             candidate=candidate_record["expanded_observations"], label="expanded")
-        aggregate_metrics = {
-            "original_absolute": aggregate_hybrid_serialized_metrics(
-                specifications=queries, observations=original_paired),
-            "paired_30k": aggregate_hybrid_serialized_metrics(
-                specifications=queries, observations=expanded_paired),
-        }
+        aggregate_metrics = {"original_absolute": aggregate_hybrid_serialized_metrics(
+            specifications=queries, observations=original_paired)}
+        expanded_scale_diagnostics = aggregate_hybrid_serialized_scale_diagnostics(
+            observations=expanded_paired)
         gates = recompute_hybrid_gate_verdicts(
             original_absolute=aggregate_metrics["original_absolute"],
-            expanded_paired=aggregate_metrics["paired_30k"], committed_baseline=None,
+            expanded_scale_diagnostics=expanded_scale_diagnostics, committed_baseline=None,
             baselines_sha256=candidate_record["packet_identity"]["baselines_sha256"],
         )
         candidate_records.append({
             "candidate": candidate_record["config"], "status": gates["candidate_verdict"],
             "original_absolute_gate": gates["original_absolute_gate"],
-            "paired_30k_non_regression_gate": gates["paired_30k_non_regression_gate"],
+            "expanded_30k_scale_diagnostics": gates["expanded_30k_scale_diagnostics"],
             "aggregate_metrics": aggregate_metrics,
             "packet_identity": candidate_record["packet_identity"],
             "provenance": candidate_record["provenance"],
         })
     ledger = {
-        "schema_version": 1, "campaign_stage": "hybrid", "authorization": "none",
+        "schema_version": HYBRID_POSTDOWNLOAD_LEDGER_SCHEMA_VERSION,
+        "campaign_stage": "hybrid", "authorization": "none",
         "hybrid_request_sha256": request["record_self_sha256"],
         "dense_ledger_sha256": request["dense_ledger_sha256"], "dense_source_head": request["dense_source_head"],
         "hybrid_implementation_head": head, "baseline": request["baseline"],

@@ -435,6 +435,31 @@ def aggregate_hybrid_serialized_metrics(*, specifications: list[dict], observati
     return {"baseline": metrics("baseline"), "candidate": metrics("candidate")}
 
 
+def aggregate_hybrid_serialized_scale_diagnostics(*, observations: list[dict]) -> dict[str, object]:
+    """Reduce expanded hybrid evidence to latency diagnostics without gold labels."""
+    if not observations:
+        raise ValueError("complete serialized hybrid scale observations")
+
+    def diagnostics(role: str) -> dict[str, float | int]:
+        durations: list[float] = []
+        for row in observations:
+            observation = row.get(role) if isinstance(row, dict) else None
+            if not isinstance(observation, dict) or set(observation) != {"result", "duration_ms"} \
+                    or not isinstance(observation["result"], dict):
+                raise ValueError("complete serialized hybrid scale observation")
+            duration = observation["duration_ms"]
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)) \
+                    or not math.isfinite(float(duration)) or duration < 0:
+                raise ValueError("serialized hybrid scale duration")
+            durations.append(float(duration))
+        return {"sample_count": len(durations),
+                "duration_p50_ms": _percentile(durations, 50),
+                "duration_p95_ms": _percentile(durations, 95)}
+
+    return {"stratum": "expanded_30k_scale",
+            "baseline": diagnostics("baseline"), "candidate": diagnostics("candidate")}
+
+
 def expected_phase07_expanded_corpus_identity(*, fixture_root: Path, target_size: int,
                                               test_only: bool = False) -> dict[str, object]:
     """Compute deterministic public-corpus identity from fixed inputs, not a label.
