@@ -1817,6 +1817,59 @@ def test_local_frozen_size_measurement_cleans_failures_and_preserves_preexisting
     assert existing_ledger.read_text(encoding="utf-8") == "keep"
 
 
+def test_local_frozen_size_measurement_rejects_ledger_inside_its_scratch_before_mutation(tmp_path: Path) -> None:
+    """The output cannot be made disposable by placing it below the work root."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "scratch" / "measurement.json"
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_reports_cleanup_failure_and_withholds_ledger(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful build is not a successful command until its scratch is gone."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    original_rmtree = shutil.rmtree
+
+    def reject_cleanup(_path: Path) -> None:
+        raise OSError("intentional cleanup failure")
+
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", reject_cleanup)
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert work_dir.exists() and not ledger.exists()
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", original_rmtree)
+    original_rmtree(work_dir)
+
+
+def test_new_durable_ledger_never_replaces_a_racing_sentinel(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """The destination name is claimed atomically, not checked then replaced."""
+    ledger = tmp_path / "measurement.json"
+    original_link = phase07_operator_gate.os.link
+
+    def racing_link(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
+        Path(destination).write_text("sentinel", encoding="utf-8")
+        original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(phase07_operator_gate.os, "link", racing_link)
+    with pytest.raises(ValueError, match="ledger must be new"):
+        phase07_operator_gate._write_new_durable_ledger(ledger, {"schema_version": 2})
+    assert ledger.read_text(encoding="utf-8") == "sentinel"
+
+
 def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
     """The distinct job is model-backed, finite, and never publishes secrets."""
     _job, hybrid = _phase07_hybrid_workflow_section()
