@@ -46,8 +46,8 @@ _EVAL_CANDIDATE_TYPES = {
 class LanceDbIndexRepository:
     """The sole location where #17 domain values become LanceDB calls.
 
-    Phase 06（issue #49）：仓库实例绑定一种 ANN 策略——默认加载批准的
-    生产策略（IVF_HNSW_SQ / ef=100）；显式传入 ``eval_candidate_policy``
+    Phase 7（issue #50）：仓库实例绑定一种 ANN 策略——默认加载批准的
+    生产策略（IVF_HNSW_SQ / m=20 / ef_construction=300 / query ef=300）；显式传入 ``eval_candidate_policy``
     才进入 evaluation-comparator 模式（FLAT/SQ × 声明 ef）。生产端口上
     不存在运行时类型/ef/exact 选择。
     """
@@ -612,8 +612,8 @@ class LanceDbIndexRepository:
             if exact:
                 query = query.bypass_vector_index()
             else:
-                # Phase 06（issue #49）：普通查询固定使用绑定策略的 ef
-                # （生产=批准 ef=100；eval candidate=声明的 grid ef）。
+                # Phase 7（issue #50）：普通查询固定使用绑定策略的 ef
+                # （生产=批准 query ef=300；eval candidate=声明的 grid ef）。
                 query = query.ef(ef if ef is not None else self._bound_query_ef())
             if where is not None:
                 query = query.where(where)

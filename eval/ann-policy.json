@@ -5,9 +5,9 @@
   "metric": "cosine",
   "dimensions": 384,
   "num_partitions": 1,
-  "m": 16,
+  "m": 20,
   "ef_construction": 300,
-  "query_ef": 100,
+  "query_ef": 300,
   "recall_at_10_floor": 0.19,
   "recall_at_20_floor": 0.17,
   "comparator_sha256": "dd4bdfbb9414f1215dc506d4a5cb2feecb81dace7b7c07f63c7897bacafc99c9",
@@ -16,12 +16,28 @@
   "evidence_run_url": "https://github.com/allenwoo713/obsidian_wiki_skill/actions/runs/31992733594",
   "retention_days": 90,
   "decision": {
-    "corpus_rows": 77348,
-    "held_out_queries": 256,
-    "candidates": ["ivf-hnsw-flat", "ivf-hnsw-sq"],
-    "ef_grid": [30, 50, 75, 100, 150, 200],
-    "pr_head_sha": "2e1de3c8e30794bf67b160dbe37e7fca41889bea",
-    "approved_by": "root/user (Derek), recorded in issue #49 comment 5312709866",
-    "approved_at": "2026-08-17T06:40:12Z"
+    "phase6_inherited_provenance": {
+      "approval_scope": "Inherited Phase 6 recall-floor and hybrid-baseline provenance only; it does not approve the Phase 7 m=20 selection.",
+      "configuration": {"m": 16, "ef_construction": 300, "query_ef": 100},
+      "corpus_rows": 77348,
+      "held_out_queries": 256,
+      "candidates": ["ivf-hnsw-flat", "ivf-hnsw-sq"],
+      "ef_grid": [30, 50, 75, 100, 150, 200],
+      "pr_head_sha": "2e1de3c8e30794bf67b160dbe37e7fca41889bea",
+      "approved_by": "root/user (Derek), recorded in issue #49 comment 5312709866",
+      "approved_at": "2026-08-17T06:40:12Z",
+      "comparator_sha256": "dd4bdfbb9414f1215dc506d4a5cb2feecb81dace7b7c07f63c7897bacafc99c9",
+      "candidate_hybrid_sha256": "d4d7ba3c6fb3a9520f170be953ea7e1e15d9a66f2be0f33030dce97b146194a7",
+      "reconciliation_sha256": "b09e346ad6604718daad59f4a89a3861bcc1dc5b94909a20c92c55bb08cd5926",
+      "evidence_run_url": "https://github.com/allenwoo713/obsidian_wiki_skill/actions/runs/31992733594"
+    },
+    "phase7_selection": {
+      "configuration": {"m": 20, "ef_construction": 300, "query_ef": 300},
+      "approved_by": "repository owner/user, recorded in D-28 / Issue #50",
+      "approval_reference": "D-28 / Issue #50",
+      "approved_at": "2026-08-28",
+      "sealed_dense_ledger_sha256": "71335b6bfa03f24368414ae56a22fd8896d4479c6bfbe871c36a14b26e3b211b",
+      "dense_evidence_head_sha": "2f15d6a4fef54dda9b0f4a258e78898e2ef6ea57"
+    }
   }
 }

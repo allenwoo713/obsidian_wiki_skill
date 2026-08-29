@@ -148,7 +148,8 @@ def _runtime_identity() -> dict[str, str]:
 def _head_sha() -> str:
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True
+            ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True,
+            encoding="utf-8", errors="strict",
         ).strip()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("source head") from exc

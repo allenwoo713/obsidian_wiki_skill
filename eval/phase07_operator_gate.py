@@ -396,7 +396,7 @@ def _write_canonical_frozen_archive(*, frozen_dir: Path, archive: Path) -> list[
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = (stat.S_IFREG | 0o600) << 16
             output.writestr(info, source.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
-    with archive.open("rb") as stream:
+    with archive.open("r+b") as stream:
         os.fsync(stream.fileno())
     return inventory
 
@@ -471,17 +471,28 @@ def _write_new_durable_ledger(path: Path, record: dict[str, Any]) -> tuple[int, 
             _fsync_directory(path.parent)
 
 
-def _remove_owned_measurement_ledger(path: Path, identity: tuple[int, int] | None) -> None:
-    """Remove only the file this invocation published; never erase a replacement."""
+def _remove_owned_measurement_ledger(path: Path, identity: tuple[int, int] | None) -> bool:
+    """Remove only this invocation's ledger, reporting whether cleanup completed.
+
+    A replacement is deliberately left in place: it is not ours to remove.  A
+    missing original is likewise already clean.  Filesystem failures are made
+    visible to the caller so a failed measurement cannot be reported as clean.
+    """
     if identity is None:
-        return
+        return True
     try:
         actual = Path(path).lstat()
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return False
     if stat.S_ISREG(actual.st_mode) and (actual.st_dev, actual.st_ino) == identity:
-        Path(path).unlink()
-        _fsync_directory(Path(path).parent)
+        try:
+            Path(path).unlink()
+            _fsync_directory(Path(path).parent)
+        except OSError:
+            return False
+    return True
 
 
 def _resolved_measurement_paths(work_dir: Path, ledger_file: Path) -> tuple[Path, Path]:
@@ -499,6 +510,35 @@ def _report_frozen_measurement_stage(reporter: Callable[[str, dict[str, object]]
         reporter(stage, payload)
     else:
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+def _sanitized_frozen_measurement_error_kind(exc: BaseException) -> str:
+    """Return an allow-listed exception category without serializing exception data."""
+    if isinstance(exc, FileNotFoundError):
+        return "file_not_found"
+    if isinstance(exc, PermissionError):
+        return "permission_denied"
+    if isinstance(exc, OSError):
+        return "os_error"
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_json"
+    if isinstance(exc, subprocess.SubprocessError):
+        return "subprocess_error"
+    if isinstance(exc, ValueError):
+        return "invalid_value"
+    return "unexpected_error"
+
+
+def _report_frozen_measurement_rejection(
+        reporter: Callable[[str, dict[str, object]], None] | None, *, reason: str,
+        error_kind: str | None = None, cleanup_failures: tuple[str, ...] = ()) -> None:
+    """Emit the one terminal failure event using only fixed, non-sensitive fields."""
+    detail: dict[str, object] = {"reason": reason}
+    if error_kind is not None:
+        detail["error_kind"] = error_kind
+    if cleanup_failures:
+        detail["cleanup_failures"] = list(cleanup_failures)
+    _report_frozen_measurement_stage(reporter, "measurement_rejected", **detail)
 
 
 def _embed_frozen_measurement_texts(embedder: Any, texts: list[str]) -> Any:
@@ -538,6 +578,19 @@ def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger
     completed = False
     ledger_identity: tuple[int, int] | None = None
     status = 1
+    failure_reason: str | None = None
+    failure_error_kind: str | None = None
+    cleanup_failures: list[str] = []
+
+    def record_failure(reason: str, exc: BaseException | None = None) -> None:
+        """Keep the first failure as the terminal cause; later cleanup still fails closed."""
+        nonlocal failure_reason, failure_error_kind
+        if failure_reason is None:
+            failure_reason = reason
+            failure_error_kind = (
+                _sanitized_frozen_measurement_error_kind(exc) if exc is not None else None
+            )
+
     try:
         if work_dir.is_symlink() or ledger_file.is_symlink():
             raise ValueError("frozen measurement paths or head")
@@ -625,24 +678,68 @@ def run_local_frozen_size_measurement(*, work_dir: Path, model_dir: Path, ledger
         wrote_ledger = True
         validate_frozen_size_measurement(_read_object(ledger_file), expected_head=head_sha)
         completed = True
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        record_failure("work_failed", exc)
         completed = False
     finally:
+        # An unexpected programming error is still active while this ``finally``
+        # executes.  Cleanup remains best-effort, but it must neither be
+        # converted into an operator status code nor produce a false terminal
+        # rejection before the original error propagates.
+        propagating_programming_error = sys.exc_info()[0] is not None
+        unexpected_finalization_error: Exception | None = None
+        unexpected_finalization_traceback = None
         cleanup_failed = False
-        if created_work_dir:
-            try:
-                shutil.rmtree(work_dir)
-            except OSError:
-                cleanup_failed = True
-        if completed and not cleanup_failed and not work_dir.exists() and ledger_file.is_file() \
-                and not ledger_file.is_symlink():
-            try:
-                validate_frozen_size_measurement(_read_object(ledger_file), expected_head=head_sha)
-                status = 0
-            except (OSError, ValueError, json.JSONDecodeError):
-                status = 1
-        if status != 0 and wrote_ledger:
-            _remove_owned_measurement_ledger(ledger_file, ledger_identity)
+        try:
+            if created_work_dir:
+                try:
+                    shutil.rmtree(work_dir)
+                except OSError as exc:
+                    cleanup_failed = True
+                    cleanup_failures.append("scratch_cleanup_failed")
+                    record_failure("scratch_cleanup_failed", exc)
+            if completed and not cleanup_failed and not work_dir.exists() and ledger_file.is_file() \
+                    and not ledger_file.is_symlink():
+                try:
+                    validate_frozen_size_measurement(_read_object(ledger_file), expected_head=head_sha)
+                    status = 0
+                except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+                    status = 1
+                    record_failure("post_cleanup_validation_failed", exc)
+            elif completed:
+                record_failure(
+                    "scratch_cleanup_failed" if cleanup_failed or work_dir.exists()
+                    else "post_cleanup_validation_failed"
+                )
+        except Exception as exc:
+            # Any programming error after publication must still pass through
+            # the identity-safe ledger cleanup below.  Do not turn it into a
+            # normal operator rejection or replace an already-propagating bug.
+            unexpected_finalization_error = exc
+            unexpected_finalization_traceback = exc.__traceback__
+            status = 1
+        finally:
+            if status != 0 and wrote_ledger:
+                try:
+                    ledger_removed = _remove_owned_measurement_ledger(ledger_file, ledger_identity)
+                except OSError:
+                    ledger_removed = False
+                except Exception as exc:
+                    ledger_removed = False
+                    if unexpected_finalization_error is None:
+                        unexpected_finalization_error = exc
+                        unexpected_finalization_traceback = exc.__traceback__
+                if not ledger_removed:
+                    cleanup_failures.append("ledger_removal_failed")
+                    record_failure("ledger_removal_failed")
+            if status != 0 and not propagating_programming_error \
+                    and unexpected_finalization_error is None:
+                _report_frozen_measurement_rejection(
+                    stage_reporter, reason=failure_reason or "work_failed",
+                    error_kind=failure_error_kind, cleanup_failures=tuple(cleanup_failures),
+                )
+        if unexpected_finalization_error is not None and not propagating_programming_error:
+            raise unexpected_finalization_error.with_traceback(unexpected_finalization_traceback)
     return status
 
 
@@ -1430,14 +1527,15 @@ def committed_hybrid_baseline() -> tuple[dict[str, float | int], str]:
     return floors, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expanded_scale_diagnostics: dict[str, Any],
+def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expanded_scale_diagnostics: dict[str, Any] | None,
                                    committed_baseline: dict[str, float | int] | None = None,
                                    baselines_sha256: str | None = None) -> dict[str, Any]:
-    """Recompute original-corpus quality and retain 30k latency diagnostics.
+    """Recompute original-corpus quality, optionally reading legacy scale data.
 
     The original campaign is an absolute check against the committed quality
-    floors.  The duplicate-heavy expanded campaign has no gold-quality
-    authority and contributes scale latency only.
+    floors.  New Phase 07 authority stops here.  The optional duplicate-heavy
+    expanded payload remains readable only for historical artifacts and never
+    contributes quality authority.
     """
     expected_floors, expected_digest = committed_hybrid_baseline()
     if committed_baseline is None:
@@ -1481,6 +1579,14 @@ def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expande
                 "candidate_verdict": "rejected-candidate" if rejected else "numeric-success", "authorization": "none"}
     original_gate = {**gate("original_absolute", original_absolute),
                      "authority": "hybrid-quality"}
+    candidate_verdict = original_gate["candidate_verdict"]
+    verdict = {"original_absolute_gate": original_gate,
+               "candidate_verdict": candidate_verdict,
+               "quality_authority": "original_105_query_only",
+               "authorization": "none", "write_graph_artifact": True}
+    if expanded_scale_diagnostics is None:
+        return verdict
+
     expected_scale_fields = {"sample_count", "duration_p50_ms", "duration_p95_ms"}
     if not isinstance(expanded_scale_diagnostics, dict) \
             or set(expanded_scale_diagnostics) != {"stratum", "baseline", "candidate"} \
@@ -1495,10 +1601,7 @@ def recompute_hybrid_gate_verdicts(*, original_absolute: dict[str, Any], expande
                        for key in ("duration_p50_ms", "duration_p95_ms")) \
                 or values["duration_p50_ms"] > values["duration_p95_ms"]:
             raise ValueError("finite expanded hybrid scale diagnostics")
-    candidate_verdict = original_gate["candidate_verdict"]
-    return {"original_absolute_gate": original_gate, "expanded_30k_scale_diagnostics": expanded_scale_diagnostics,
-            "candidate_verdict": candidate_verdict, "quality_authority": "original_105_query_only",
-            "authorization": "none", "write_graph_artifact": True}
+    return {**verdict, "expanded_30k_scale_diagnostics": expanded_scale_diagnostics}
 
 
 def reject_retired_hybrid_authority(value: object) -> None:
@@ -1978,7 +2081,10 @@ def validate_stage1_screening_runtime(environment: object) -> dict[str, Any]:
 
 
 def _git(*args: str) -> str:
-    return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    return subprocess.check_output(
+        ["git", *args], text=True, encoding="utf-8", errors="strict",
+        stderr=subprocess.DEVNULL,
+    ).strip()
 
 
 def _configured_live_upstream_head(branch: str) -> str:

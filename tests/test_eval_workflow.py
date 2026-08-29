@@ -208,8 +208,15 @@ def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> N
     """D-01/D-02/D-06/D-07: agent and user docs must not relabel cache reuse."""
     readme_contract = _build_mode_contract(SKILL_ROOT / "README.md")
     skill_contract = _build_mode_contract(SKILL_ROOT / "SKILL.md")
+    policy = json.loads((SKILL_ROOT / "eval" / "ann-policy.json").read_text(encoding="utf-8"))
+    selection = policy["decision"]["phase7_selection"]
 
     assert readme_contract == skill_contract
+    assert selection["configuration"] == {
+        "m": policy["m"], "ef_construction": policy["ef_construction"],
+        "query_ef": policy["query_ef"],
+    }
+    assert selection["approval_reference"] == "D-28 / Issue #50"
     for required in (
         "`--build-mode snapshot|incremental|auto`",
         "`snapshot`",
@@ -232,15 +239,19 @@ def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> N
         "ACTIVE_INDEX",
         "only sparse+dense commit boundary",
         "IVF_HNSW_SQ",
-        "ef=100",
-        "Recall@10 ≥ 0.19",
-        "Recall@20 ≥ 0.17",
+        f"m={policy['m']}",
+        f"ef_construction={policy['ef_construction']}",
+        f"query `ef={policy['query_ef']}`",
+        f"Recall@10 ≥ {policy['recall_at_10_floor']}",
+        f"Recall@20 ≥ {policy['recall_at_20_floor']}",
+        "Phase 7 selected these values",
         "citation/context/graph",
         "manifest",
         "no exact fallback",
         "do not invent thresholds",
     ):
         assert required in readme_contract
+    assert "ef=100" not in readme_contract
 
 
 def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_closed() -> None:
@@ -399,7 +410,6 @@ def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -
         "preflight": {"phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"},
         "screening": {"phase07-screening"},
         "confirmation": {"phase07-confirmation"},
-        "hybrid": {"phase07-hybrid"},
     }
     for stage, allowed in expected.items():
         selected = {
@@ -433,7 +443,7 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
 
     assert set(dispatch) == {"campaign_stage", "workflow_inputs"}
     assert dispatch["campaign_stage"]["options"] == [
-        "preflight", "screening", "confirmation", "hybrid-prepare", "hybrid",
+        "preflight", "screening", "confirmation",
     ]
     assert dispatch["workflow_inputs"]["description"] == (
         "Sealed generated Phase 07 campaign dispatch bundle"
@@ -449,9 +459,9 @@ def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> 
         "phase07-entitlement-preflight-windows",
             "phase07-screening",
             "phase07-confirmation",
-            "phase07-hybrid-prepare",
-            "phase07-hybrid",
         }
+    assert workflow["jobs"]["phase07-hybrid-prepare"]["if"] == "${{ false }}"
+    assert workflow["jobs"]["phase07-hybrid"]["if"] == "${{ false }}"
 
 
 def test_phase07_d25_confirmation_workflow_has_no_retired_authority() -> None:
@@ -1101,14 +1111,15 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
 
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
     assert "model-backed-ann-decision" in workflow
-    assert "--decision-evidence" in workflow
     assert "--init-baseline" not in workflow.split("model-backed-ann-decision:", 1)[1]
     model_job = workflow.split("model-backed-ann-decision:", 1)[1].split("reconcile-ann-decision:", 1)[0]
-    assert "candidate-hybrid-ann-decision.json" in model_job
-    assert "--validate-candidate-hybrid-evidence" in model_job
+    assert "phase07-final-hybrid.json" in model_job
+    assert "--phase07-final-output" in model_job
+    assert "--validate-phase07-final-evidence" in model_job
     assert "GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in model_job
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in model_job
     assert "if: success()" in model_job
-    assert "candidate-hybrid-ann-decision-error" in model_job
+    assert "phase07-final-hybrid-error" in model_job
 
 
 @pytest.mark.parametrize(
@@ -1232,6 +1243,213 @@ def test_candidate_hybrid_driver_builds_every_binding_and_calls_production_entry
     assert len(packet["records"]) == 12
 
 
+def _set_phase07_final_ci_env(
+    monkeypatch: pytest.MonkeyPatch, *, job: str = "model-backed-ann-decision",
+) -> None:
+    head = run_eval._head_sha()
+    values = {
+        "GITHUB_REPOSITORY": "allenwoo713/obsidian_wiki_skill",
+        "GITHUB_WORKFLOW": "eval",
+        "GITHUB_WORKFLOW_REF": (
+            "allenwoo713/obsidian_wiki_skill/.github/workflows/eval.yml@refs/pull/53/merge"
+        ),
+        "GITHUB_JOB": job, "GITHUB_RUN_ID": "32999999999", "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_PR_HEAD_SHA": head,
+        "PHASE07_FINAL_ARTIFACT_NAME": "phase07-final-hybrid-32999999999-1",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_phase07_final_gate_builds_only_m16_and_m20_and_calls_public_hybrid_for_original_105(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The final PR authority has two fixed roles and no m32/30k execution."""
+    queries = run_eval.load_queries(SKILL_ROOT / "eval" / "queries.jsonl")
+    by_query = {row["query"]: row for row in queries}
+    builds: list[dict] = []
+    calls: list[tuple[str, dict]] = []
+
+    def fake_build(root, wiki, full_rebuild, *, candidate_query_policy=None):
+        assert wiki == run_eval.FIXTURES_WIKI and full_rebuild is True
+        builds.append(candidate_query_policy.to_json())
+        return SimpleNamespace(role=root.name), run_eval.FIXTURES_WIKI, 0.01
+
+    class _Plan:
+        @staticmethod
+        def to_json():
+            return {"intent": "auto"}
+
+    class _Budget:
+        context_text = ""
+        token_count = 0
+        items: list = []
+
+        @staticmethod
+        def budget_to_json():
+            return {
+                "requested_base_budget_tokens": 4096, "budget_multiplier": 1.0,
+                "effective_budget_tokens": 4096, "hard_max_tokens": None,
+                "budget_policy": "test", "max_context_tokens": 4096,
+            }
+
+    def fake_hybrid(index, query, _planner, **kwargs):
+        specification = by_query[query]
+        pages = specification.get("relevant_pages") or ["Wiki/page.md"]
+        budget = _Budget()
+        budget.context_text = "\n".join(specification.get("required_facts") or [])
+        calls.append((index.role, dict(kwargs)))
+        return SimpleNamespace(
+            query=query, plan=_Plan(),
+            candidates=[SimpleNamespace(page_id=page) for page in pages], bundle=budget,
+        )
+
+    monkeypatch.setattr(run_eval, "_build", fake_build)
+    monkeypatch.setattr(run_eval, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(run_eval, "_decision_environment", lambda: {
+        "python": "3.13.0", "platform": "test", "lancedb": "0.34.0",
+        "numpy": "2.2.6", "pyarrow": "25.0.0",
+    })
+    _set_phase07_final_ci_env(monkeypatch)
+    packet = run_eval.run_phase07_final_hybrid_evaluation(
+        run_eval.FIXTURES_WIKI, queries, tmp_path / "phase07-final", 4096,
+    )
+
+    assert [(row["build_policy"]["m"], row["build_policy"]["ef_construction"], row["query_ef"])
+            for row in builds] == [(16, 300, 100), (20, 300, 300)]
+    assert len(calls) == 210
+    assert {role for role, _kwargs in calls} == {"baseline", "candidate"}
+    assert all(not {"candidate", "candidate_config", "candidate_aware"} & set(kwargs)
+               for _role, kwargs in calls)
+    assert packet["candidate"] == run_eval.PHASE07_FINAL_CANDIDATE
+    assert packet["quality_authority"] == "original_105_query_only"
+    assert packet["authorization"] == "user-approved-d28"
+    assert packet["gates"]["authorization"] == "user-approved-d28"
+    assert packet["provenance"] == {
+        "repository": "allenwoo713/obsidian_wiki_skill", "workflow_name": "eval",
+        "workflow_path": ".github/workflows/eval.yml", "run_id": 32999999999,
+        "run_attempt": 1, "producer_job_id": "model-backed-ann-decision",
+        "producer_job_name": "Phase 07 model-backed m20 original-105 hybrid gate",
+        "artifact_name": "phase07-final-hybrid-32999999999-1", "retention_days": 90,
+        "pr_head_sha": run_eval._head_sha(), "checkout_head_sha": run_eval._head_sha(),
+    }
+    assert packet["content_sha256"] == run_eval._phase07_final_content_digest(packet)
+    assert packet["record_self_sha256"] == run_eval._phase07_final_digest(packet)
+    assert packet["gates"]["candidate_verdict"] == "numeric-success"
+    serialized = json.dumps(packet, sort_keys=True)
+    assert '"m": 32' not in serialized and "expanded_30k" not in serialized
+    _set_phase07_final_ci_env(monkeypatch, job="reconcile-ann-decision")
+    assert run_eval.validate_phase07_final_hybrid_evidence(packet) == packet
+
+
+def test_phase07_final_packet_fails_closed_on_candidate_or_observation_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validator recomputes identity before accepting final evidence."""
+    _set_phase07_final_ci_env(monkeypatch)
+    provenance = run_eval._phase07_current_workflow_provenance(require_producer=True)
+    packet = {
+        "schema_version": run_eval.PHASE07_FINAL_HYBRID_SCHEMA_VERSION,
+        "packet_kind": "phase07-final-original-105-hybrid/v1",
+        "head_sha": run_eval._head_sha(), "pr_head_sha": run_eval._head_sha(),
+        "checkout_head_sha": run_eval._head_sha(),
+        "environment": {"python": "3.13.0", "platform": "test", "lancedb": "0.34.0",
+                        "numpy": "2.2.6", "pyarrow": "25.0.0"},
+        "baseline": dict(run_eval.PHASE07_FINAL_BASELINE),
+        "candidate": dict(run_eval.PHASE07_FINAL_CANDIDATE),
+        "query_count": 105,
+        "queries_sha256": hashlib.sha256((SKILL_ROOT / "eval" / "queries.jsonl").read_bytes()).hexdigest(),
+        "baselines_sha256": hashlib.sha256((SKILL_ROOT / "eval" / "baselines.json").read_bytes()).hexdigest(),
+        "fixture_sha256": run_eval._fixture_digest(run_eval.FIXTURES_WIKI),
+        "observations": [], "metrics": {}, "gates": {},
+        "hybrid_invocation": {"entrypoint": "query.hybrid_search",
+                              "candidate_aware_public_arguments": False,
+                              "baseline_calls": 105, "candidate_calls": 105},
+        "quality_authority": "original_105_query_only",
+        "authorization": run_eval.PHASE07_FINAL_AUTHORIZATION,
+        "provenance": provenance,
+    }
+    packet["content_sha256"] = run_eval._phase07_final_content_digest(packet)
+    packet["record_self_sha256"] = run_eval._phase07_final_digest(packet)
+    monkeypatch.setattr(run_eval, "_decision_environment", lambda: packet["environment"])
+    bad_self_digest = deepcopy(packet)
+    bad_self_digest["record_self_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="sealed Phase 07"):
+        run_eval.validate_phase07_final_hybrid_evidence(bad_self_digest)
+    missing_provenance = deepcopy(packet)
+    missing_provenance.pop("provenance")
+    missing_provenance["record_self_sha256"] = run_eval._phase07_final_digest(missing_provenance)
+    with pytest.raises(ValueError, match="sealed Phase 07"):
+        run_eval.validate_phase07_final_hybrid_evidence(missing_provenance)
+    substituted_provenance = deepcopy(packet)
+    substituted_provenance["provenance"]["artifact_name"] = "phase07-final-hybrid-other-run"
+    substituted_provenance["record_self_sha256"] = run_eval._phase07_final_digest(substituted_provenance)
+    with pytest.raises(ValueError, match="exact-head binding"):
+        run_eval.validate_phase07_final_hybrid_evidence(substituted_provenance)
+    tampered = deepcopy(packet)
+    tampered["candidate"]["m"] = 32
+    tampered["record_self_sha256"] = run_eval._phase07_final_digest(tampered)
+    with pytest.raises(ValueError, match="sealed Phase 07"):
+        run_eval.validate_phase07_final_hybrid_evidence(tampered)
+    with pytest.raises(ValueError, match="complete observations"):
+        run_eval.validate_phase07_final_hybrid_evidence(packet)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"test-and-eval": "failure"},
+        {"issue41-scale-benchmark": "skipped"},
+        {"model-backed-ann-decision": ""},
+    ],
+)
+def test_phase07_reconciliation_requires_every_dependency_success(
+    mutation: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = {
+        "test-and-eval": "success", "issue41-scale-benchmark": "success",
+        "model-backed-ann-decision": "success",
+    }
+    assert run_eval.validate_phase07_required_needs(results) == results
+    env_names = {
+        "test-and-eval": "PHASE07_NEED_TEST_AND_EVAL",
+        "issue41-scale-benchmark": "PHASE07_NEED_ISSUE41_SCALE",
+        "model-backed-ann-decision": "PHASE07_NEED_MODEL_BACKED",
+    }
+    for dependency, env_name in env_names.items():
+        monkeypatch.setenv(env_name, results[dependency])
+    monkeypatch.setattr(sys, "argv", ["run_eval", "--validate-phase07-required-needs"])
+    assert run_eval.main() == 0
+    rejected = {**results, **mutation}
+    for dependency, env_name in env_names.items():
+        monkeypatch.setenv(env_name, rejected[dependency])
+    with pytest.raises(ValueError, match="required job did not succeed"):
+        run_eval.main()
+
+
+def test_phase07_final_gate_excludes_30k_but_keeps_original_contract_failures() -> None:
+    """Dropping copied-corpus evidence cannot weaken original citation/context/graph gates."""
+    floors, digest = phase07_operator_gate.committed_hybrid_baseline()
+    baseline = {
+        run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC: 1.0,
+        "page_recall_at_5": floors["page_recall_at_5"],
+        "evidence_recall_at_10": floors["evidence_recall_at_10"],
+        "exact_lookup_hit_at_3": floors["exact_lookup_hit_at_3"],
+        "mrr_at_10": floors["mrr_at_10"],
+        "citation_violation_count": 0, "context_overflow_count": 0,
+        "budget_violation_count": 0, "graph_unsupported_count": 0,
+    }
+    candidate = {**baseline, "graph_unsupported_count": 1}
+    verdict = phase07_operator_gate.recompute_hybrid_gate_verdicts(
+        original_absolute={"baseline": baseline, "candidate": candidate},
+        expanded_scale_diagnostics=None, committed_baseline=floors,
+        baselines_sha256=digest,
+    )
+    assert verdict["candidate_verdict"] == "rejected-candidate"
+    assert verdict["quality_authority"] == "original_105_query_only"
+    assert "expanded_30k_scale_diagnostics" not in verdict
+
+
 def test_hybrid_search_interface_remains_candidate_unaware() -> None:
     parameters = inspect.signature(run_eval.hybrid_search).parameters
     assert "candidate" not in parameters
@@ -1272,9 +1490,9 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "index-benchmark-error.json" in scale
 
     model_job = workflow.split("model-backed-ann-decision:", 1)[1].split("reconcile-ann-decision:", 1)[0]
-    validation = "python -m eval.benchmark_ann_build --validate-evidence .review-tmp/held-out-evidence/index-benchmark.json"
-    assert validation in model_job
-    assert model_job.index(validation) < model_job.index("python scripts/download_embedding_model.py")
+    assert "--phase07-final-output eval/phase07-final-hybrid.json" in model_job
+    assert "--validate-phase07-final-evidence eval/phase07-final-hybrid.json" in model_job
+    assert "--decision-evidence" not in model_job
     assert "issue41-index-benchmark-error" in scale
     assert "Upload rejected issue #41 comparator error evidence" in scale
 
@@ -1283,11 +1501,38 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "test-and-eval" in reconciliation
     assert "issue41-scale-benchmark" in reconciliation
     assert "model-backed-ann-decision" in reconciliation
-    assert "python -m eval.reconcile_ann_gate" in reconciliation
-    assert '--expected-head "${{ github.sha }}"' in reconciliation
-    assert '--expected-pr-head "${{ github.event.pull_request.head.sha }}"' in reconciliation
+    assert "--validate-phase07-final-evidence" in reconciliation
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in reconciliation
     assert "Architecture (ubuntu-latest, Python 3.10)" in reconciliation
     assert "Architecture (windows-latest, Python 3.13)" in reconciliation
+
+
+def test_phase07_final_artifact_is_unique_to_current_run_and_reconciliation_is_bounded() -> None:
+    """The final packet uses same-run artifact identity and exact dependency status gates."""
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    producer = workflow["jobs"]["model-backed-ann-decision"]
+    reconciler = workflow["jobs"]["reconcile-ann-decision"]
+    assert producer["timeout-minutes"] == "45"
+    assert reconciler["timeout-minutes"] == "10"
+    unique_name = "phase07-final-hybrid-${{ github.run_id }}-${{ github.run_attempt }}"
+    assert producer["env"]["PHASE07_FINAL_ARTIFACT_NAME"] == unique_name
+    assert reconciler["env"]["PHASE07_FINAL_ARTIFACT_NAME"] == unique_name
+    section = source.split("  reconcile-ann-decision:", 1)[1].split(
+        "  phase07-entitlement-preflight-ubuntu:", 1,
+    )[0]
+    download = section.split("Download Phase 07 final hybrid evidence", 1)[1].split(
+        "Recompute exact-head Phase 07 final evidence", 1,
+    )[0]
+    assert "name: ${{ env.PHASE07_FINAL_ARTIFACT_NAME }}" in download
+    assert "run-id:" not in download and "repository:" not in download
+    assert "current workflow run" in download and "cross-run name lookup is not used" in download
+    assert "--validate-phase07-required-needs" in section
+    for dependency in (
+        "needs.test-and-eval.result", "needs.issue41-scale-benchmark.result",
+        "needs.model-backed-ann-decision.result",
+    ):
+        assert dependency in section
 
 
 def test_reconciliation_cli_is_fail_closed_for_missing_jobs_and_artifacts() -> None:
@@ -1357,8 +1602,8 @@ def _phase07_hybrid_workflow_section() -> tuple[dict, str]:
     )[1].split("  phase07-pr-acceptance-gate:", 1)[0]
 
 
-def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> None:
-    """Only a sealed baseline/m20/m32 role bundle can select this one job."""
+def test_phase07_manual_hybrid_dispatch_is_retired_from_hosted_topology() -> None:
+    """No workflow input can mint a new m32/copied-30k hybrid campaign."""
     source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(
         encoding="utf-8"
     )
@@ -1366,7 +1611,7 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
     dispatch = workflow["on"]["workflow_dispatch"]["inputs"]
 
     assert dispatch["campaign_stage"]["options"] == [
-        "preflight", "screening", "confirmation", "hybrid-prepare", "hybrid",
+        "preflight", "screening", "confirmation",
     ]
     assert dispatch["workflow_inputs"]["description"] == (
         "Sealed generated Phase 07 campaign dispatch bundle"
@@ -1377,33 +1622,25 @@ def test_phase07_hybrid_dispatch_has_one_distinct_locked_hosted_topology() -> No
         for name, spec in workflow["jobs"].items()
         if "inputs.campaign_stage == 'hybrid'" in spec.get("if", "")
     }
-    assert selected == {"phase07-hybrid"}
+    assert selected == set()
     job, hybrid = _phase07_hybrid_workflow_section()
-    assert job["runs-on"] == "ubuntu-latest"
-    assert job["permissions"] == {"contents": "read", "actions": "read"}
-    assert job["timeout-minutes"] == "90"
-    assert "workflow_dispatch" in job["if"]
-    assert "inputs.workflow_inputs" in hybrid
-    assert "phase07-hybrid" in hybrid
-    assert "hybrid-allocation" in hybrid
-    assert "python -m eval.phase07_operator_gate hybrid-dispatch" in hybrid
-    assert "python -m eval.phase07_ann_campaign export-hybrid-packet" in hybrid
-    assert "PYTHONUNBUFFERED" not in hybrid
-    assert "sealed-role hybrid campaign with live progress" in hybrid
-    assert "finalize --output-dir .review-tmp/phase07/hybrid-artifact --stage hybrid" in hybrid
-    assert "if: ${{ always() }}" in hybrid
-    assert "representative" not in hybrid.lower()
-    assert "generic campaign" not in hybrid.lower()
+    assert job["if"] == "${{ false }}"
+    assert "Retired:" in hybrid
+    model = source.split("  model-backed-ann-decision:", 1)[1].split(
+        "  reconcile-ann-decision:", 1,
+    )[0]
+    assert "--phase07-final-output" in model
+    assert "m16-vs-m20 original-105" in model
 
 
-def test_phase07_frozen_prepare_is_a_separate_120_minute_non_authorizing_job() -> None:
+def test_phase07_frozen_prepare_is_retained_only_as_disabled_history() -> None:
     source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
     workflow = yaml.load(source, Loader=yaml.BaseLoader)
     job = workflow["jobs"]["phase07-hybrid-prepare"]
     section = source.split("  phase07-hybrid-prepare:", 1)[1].split("  phase07-hybrid:", 1)[0]
     assert job["timeout-minutes"] == "120"
     assert job["permissions"] == {"contents": "read", "actions": "read"}
-    assert "inputs.campaign_stage == 'hybrid-prepare'" in job["if"]
+    assert job["if"] == "${{ false }}"
     assert "eval.phase07_frozen_base prepare" in section
     # Prepare uses the same pinned model/cache path as roles and materializes
     # directly at the canonical root that later role extraction reuses.
@@ -2002,6 +2239,148 @@ def test_local_frozen_size_measurement_reports_embedding_events_around_embed_cal
     ]
 
 
+def test_local_frozen_size_measurement_fsyncs_archive_through_write_capable_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production path must satisfy Windows ``_commit`` access semantics."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    original_open = Path.open
+    original_fsync = phase07_operator_gate.os.fsync
+    archive_streams_by_descriptor: dict[int, tuple[str, object]] = {}
+    archive_open_modes: list[str] = []
+
+    def track_archive_mode(path: Path, mode: str = "r", buffering: int = -1,
+                           encoding: str | None = None, errors: str | None = None,
+                           newline: str | None = None):
+        stream = original_open(path, mode, buffering, encoding, errors, newline)
+        if path.name == "frozen-base.zip":
+            archive_open_modes.append(mode)
+            archive_streams_by_descriptor[stream.fileno()] = (mode, stream)
+        return stream
+
+    def require_windows_fsync_access(descriptor: int) -> None:
+        tracked = archive_streams_by_descriptor.get(descriptor)
+        mode = tracked[0] if tracked is not None and not getattr(tracked[1], "closed", True) else None
+        if mode is not None and not any(marker in mode for marker in ("+", "w", "a", "x")):
+            raise OSError(9, "simulated Windows _commit rejected read-only archive")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(Path, "open", track_archive_mode)
+    monkeypatch.setattr(phase07_operator_gate.os, "fsync", require_windows_fsync_access)
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert archive_open_modes[0] == "r+b"
+    assert ledger.is_file() and not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_reports_sanitized_original_archive_failure_and_cleans_scratch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Terminal rejection retains a fixed error category, never exception text."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def reject_archive(*, frozen_dir: Path, archive: Path) -> list[dict[str, object]]:
+        raise OSError("simulated Windows archive fsync failure")
+
+    monkeypatch.setattr(phase07_operator_gate, "_write_canonical_frozen_archive", reject_archive)
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 1
+    assert events[-1] == (
+        "measurement_rejected",
+        {
+            "event": "phase07-frozen-size-progress",
+            "stage": "measurement_rejected",
+            "reason": "work_failed",
+            "error_kind": "os_error",
+        },
+    )
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_sanitizes_secret_file_not_found_failure(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A path-bearing exception is safe through both callback and stderr reporting."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    secret_path = "/private/ghp_rejection-token/authorization-secret.json"
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def missing_materializer(_destination: Path) -> dict[str, object]:
+        raise FileNotFoundError(secret_path)
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=tmp_path / "scratch", model_dir=tmp_path / "unused",
+        ledger_file=tmp_path / "measurement.json", head_sha=head,
+        materializer=missing_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 1
+
+    rejected = [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert rejected == [{
+        "event": "phase07-frozen-size-progress",
+        "stage": "measurement_rejected",
+        "reason": "work_failed",
+        "error_kind": "file_not_found",
+    }]
+    assert secret_path not in json.dumps(rejected)
+    assert not (tmp_path / "scratch").exists() and not (tmp_path / "measurement.json").exists()
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=tmp_path / "stderr-scratch", model_dir=tmp_path / "unused",
+        ledger_file=tmp_path / "stderr-measurement.json", head_sha=head,
+        materializer=missing_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    stderr = capsys.readouterr().err
+    stderr_events = [json.loads(line) for line in stderr.splitlines() if line]
+    stderr_rejections = [event for event in stderr_events if event["stage"] == "measurement_rejected"]
+    assert stderr_rejections == rejected
+    assert secret_path not in stderr
+    assert "/private/" not in stderr
+    assert not (tmp_path / "stderr-scratch").exists()
+    assert not (tmp_path / "stderr-measurement.json").exists()
+
+
+def test_local_frozen_size_measurement_propagates_unexpected_programming_error(
+        tmp_path: Path) -> None:
+    """Programming errors remain visible and cannot be reclassified as an operator rejection."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def broken_materializer(_destination: Path) -> dict[str, object]:
+        raise TypeError("programming regression")
+
+    with pytest.raises(TypeError, match="programming regression"):
+        phase07_operator_gate.run_local_frozen_size_measurement(
+            work_dir=tmp_path / "scratch", model_dir=tmp_path / "unused",
+            ledger_file=tmp_path / "measurement.json", head_sha=head,
+            materializer=broken_materializer,
+            corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+            embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            stage_reporter=lambda stage, detail: events.append((stage, detail)),
+        )
+    assert not [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert not (tmp_path / "scratch").exists() and not (tmp_path / "measurement.json").exists()
+
+
 def test_local_frozen_size_measurement_cleans_failures_and_preserves_preexisting_paths(tmp_path: Path) -> None:
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
     failure_work, failure_ledger = tmp_path / "failure-scratch", tmp_path / "failure-ledger.json"
@@ -2067,9 +2446,9 @@ def test_local_frozen_size_measurement_reports_cleanup_failure_and_withholds_led
     original_rmtree(work_dir)
 
 
-def test_local_frozen_size_measurement_surfaces_ledger_cleanup_failure_after_scratch_failure(
+def test_local_frozen_size_measurement_reports_cleanup_and_ledger_failures_once(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A ledger cleanup failure after scratch cleanup failed must not be swallowed."""
+    """Cleanup failures are fail-closed but never displace or duplicate the terminal event."""
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
     identity_root = tmp_path / "identity"
     identity = _tiny_measurement_materializer(identity_root)
@@ -2085,17 +2464,134 @@ def test_local_frozen_size_measurement_surfaces_ledger_cleanup_failure_after_scr
 
     monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", reject_scratch_cleanup)
     monkeypatch.setattr(phase07_operator_gate, "_remove_owned_measurement_ledger", reject_ledger_cleanup)
+    events: list[tuple[str, dict[str, object]]] = []
     try:
-        with pytest.raises(OSError, match="intentional ledger cleanup failure"):
+        assert phase07_operator_gate.run_local_frozen_size_measurement(
+            work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+            materializer=_tiny_measurement_materializer, corpus_identity=identity,
+            embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            stage_reporter=lambda stage, detail: events.append((stage, detail)),
+        ) == 1
+        assert work_dir.exists() and ledger.is_file()
+        rejected = [detail for stage, detail in events if stage == "measurement_rejected"]
+        assert rejected == [{
+            "event": "phase07-frozen-size-progress",
+            "stage": "measurement_rejected",
+            "reason": "scratch_cleanup_failed",
+            "error_kind": "os_error",
+            "cleanup_failures": ["scratch_cleanup_failed", "ledger_removal_failed"],
+        }]
+    finally:
+        if ledger.exists():
+            ledger.unlink()
+        if work_dir.exists():
+            original_rmtree(work_dir)
+
+
+def test_local_frozen_size_measurement_reports_post_cleanup_validation_failure_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A published ledger is accepted only after its post-cleanup validation succeeds."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+    original_validate = phase07_operator_gate.validate_frozen_size_measurement
+    calls = 0
+
+    def fail_only_post_cleanup(value: object, *, expected_head: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise ValueError("post-cleanup validation must fail closed")
+        return original_validate(value, expected_head=expected_head)
+
+    monkeypatch.setattr(phase07_operator_gate, "validate_frozen_size_measurement", fail_only_post_cleanup)
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 1
+    rejected = [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert rejected == [{
+        "event": "phase07-frozen-size-progress",
+        "stage": "measurement_rejected",
+        "reason": "post_cleanup_validation_failed",
+        "error_kind": "invalid_value",
+    }]
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_removes_published_ledger_before_propagating_post_cleanup_type_error(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unexpected final validation error cannot leave a usable measurement behind."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+    original_validate = phase07_operator_gate.validate_frozen_size_measurement
+    calls = 0
+
+    def fail_only_third_validation(value: object, *, expected_head: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise TypeError("unexpected post-cleanup validation regression")
+        return original_validate(value, expected_head=expected_head)
+
+    monkeypatch.setattr(phase07_operator_gate, "validate_frozen_size_measurement", fail_only_third_validation)
+    with pytest.raises(TypeError, match="unexpected post-cleanup validation regression"):
+        phase07_operator_gate.run_local_frozen_size_measurement(
+            work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+            materializer=_tiny_measurement_materializer, corpus_identity=identity,
+            embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            stage_reporter=lambda stage, detail: events.append((stage, detail)),
+        )
+    assert calls == 3
+    assert not [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_removes_published_ledger_before_propagating_scratch_cleanup_type_error(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unexpected scratch cleanup errors propagate only after owned-ledger cleanup."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+    cleanup_order: list[str] = []
+    original_rmtree = shutil.rmtree
+    original_remove = phase07_operator_gate._remove_owned_measurement_ledger
+
+    def unexpected_scratch_cleanup(path: Path) -> None:
+        assert path == work_dir and ledger.is_file()
+        cleanup_order.append("scratch_cleanup")
+        raise TypeError("unexpected scratch cleanup regression")
+
+    def record_owned_ledger_removal(path: Path, identity: tuple[int, int] | None) -> bool:
+        cleanup_order.append("ledger_removal")
+        return original_remove(path, identity)
+
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", unexpected_scratch_cleanup)
+    monkeypatch.setattr(phase07_operator_gate, "_remove_owned_measurement_ledger", record_owned_ledger_removal)
+    try:
+        with pytest.raises(TypeError, match="unexpected scratch cleanup regression"):
             phase07_operator_gate.run_local_frozen_size_measurement(
                 work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
                 materializer=_tiny_measurement_materializer, corpus_identity=identity,
                 embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+                stage_reporter=lambda stage, detail: events.append((stage, detail)),
             )
-        assert work_dir.exists() and ledger.is_file()
+        assert cleanup_order == ["scratch_cleanup", "ledger_removal"]
+        assert not [detail for stage, detail in events if stage == "measurement_rejected"]
+        assert work_dir.exists() and not ledger.exists()
     finally:
-        if ledger.exists():
-            ledger.unlink()
         if work_dir.exists():
             original_rmtree(work_dir)
 

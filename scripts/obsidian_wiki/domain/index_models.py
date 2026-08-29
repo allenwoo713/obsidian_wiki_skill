@@ -81,7 +81,7 @@ class VectorIndexConfig(_JsonRecord):
 
 @dataclass(frozen=True)
 class ProductionAnnPolicy(_JsonRecord):
-    """Phase 06 批准的唯一生产 ANN 契约（issue #49 / Plan 06-02 决策）。
+    """Phase 7 选择的唯一生产 ANN 契约（issue #49 / Plan 06-02 决策）。
 
     值来自源码控制的 ``eval/ann-policy.json``；运行时不可选择类型/ef/exact。
     """
@@ -92,9 +92,9 @@ class ProductionAnnPolicy(_JsonRecord):
     metric: str                       # "cosine"
     dimensions: int                   # 384
     num_partitions: int               # 1
-    m: int                            # 16
+    m: int                            # 20
     ef_construction: int              # 300
-    query_ef: int                     # 100
+    query_ef: int                     # 300
     recall_at_10_floor: float         # 0.19
     recall_at_20_floor: float         # 0.17
     comparator_sha256: str            # Plan 02 决策证据 digest

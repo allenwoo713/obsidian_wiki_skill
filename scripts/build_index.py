@@ -451,8 +451,8 @@ class WikiIndex:
         #34：最外层 facade 生成一次不可变 BuildContext，贯穿两层锁 metadata、build
         目录、manifest、ACTIVE_INDEX pointer 与返回 artifact；内层不再独立生成 ID。
 
-        Phase 06（issue #49）：``vector_index_mode`` 已移除——生产构建固定使用
-        批准策略（IVF_HNSW_SQ / ef=100）；``candidate_query_policy`` 仅用于显式
+        Phase 7（issue #50）：``vector_index_mode`` 已移除——生产构建固定使用
+        批准策略（IVF_HNSW_SQ / m=20 / ef_construction=300 / query ef=300）；``candidate_query_policy`` 仅用于显式
         eval comparator 构建。
         """
         from obsidian_wiki.application.build_lock import BuildLock, new_build_context
@@ -1015,7 +1015,7 @@ def main():
     import argparse
     p = argparse.ArgumentParser(
         prog="build_index.py",
-        description="构建 分层分块 + LanceDB FTS + 固定向量索引（批准策略 IVF_HNSW_SQ/ef=100）",
+        description="构建 分层分块 + LanceDB FTS + 固定向量索引（批准策略 IVF_HNSW_SQ/m=20/ef_construction=300/query ef=300）",
     )
     p.add_argument("project_root", help="知识库项目根目录（含 Wiki/）")
     p.add_argument("--full-rebuild", action="store_true",
@@ -1028,7 +1028,7 @@ def main():
                    help="auto 模式的项目内 JSON policy 相对路径；无效策略安全回退到 snapshot。")
     p.add_argument("--vector-index", default=None,
                    choices=["auto", "exact", "ivf-hnsw-flat", "ivf-hnsw-sq"],
-                   help="（已废弃）Phase 06 起生产向量索引固定为批准策略 IVF_HNSW_SQ/ef=100；"
+                   help="（已废弃）Phase 7 起生产向量索引固定为批准策略 IVF_HNSW_SQ/m=20/ef_construction=300/query ef=300；"
                         "传入任何值都会在构建前被拒绝。旧索引需全量重建。")
     p.add_argument("--allow-partial-index", action="store_true",
                    help="实验用：容忍缺页/0-chunk（降级为 warning）。默认关闭 fail-fast，禁止用于生产发布")
@@ -1058,11 +1058,11 @@ def main():
         return
 
     if args.vector_index is not None:
-        # Phase 06（issue #49）：一次性兼容 shim——任何显式 mode 在 embedding/
+        # Phase 7（issue #50）：一次性兼容 shim——任何显式 mode 在 embedding/
         # storage mutation 之前拒绝；运行时类型选择已从生产路径移除。
         print(
             f"--vector-index={args.vector_index} 已废弃：生产向量索引固定为批准策略 "
-            "(IVF_HNSW_SQ, ef=100)。请去掉该参数重新构建；旧 mode-ambiguous 索引需全量重建。",
+            "(IVF_HNSW_SQ, m=20, ef_construction=300, query ef=300)。请去掉该参数重新构建；旧 mode-ambiguous 索引需全量重建。",
             file=sys.stderr,
         )
         sys.exit(2)

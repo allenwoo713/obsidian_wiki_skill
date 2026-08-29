@@ -17,7 +17,7 @@ on:
         required: false
         default: preflight
         type: choice
-        options: [preflight, screening, confirmation, hybrid-prepare, hybrid]
+        options: [preflight, screening, confirmation]
       workflow_inputs:
         description: "Sealed generated Phase 07 campaign dispatch bundle"
         required: false
@@ -356,14 +356,18 @@ jobs:
           retention-days: 90
 
   model-backed-ann-decision:
-    name: "Model-backed candidate-specific hybrid decision records"
+    name: "Phase 07 model-backed m20 original-105 hybrid gate"
     if: github.event_name == 'pull_request'
-    needs: issue41-scale-benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PHASE07_FINAL_ARTIFACT_NAME: phase07-final-hybrid-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -371,13 +375,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
-      - name: Download complete held-out comparator evidence
-        uses: actions/download-artifact@v4
-        with:
-          name: issue41-index-benchmark
-          path: .review-tmp/held-out-evidence
-      - name: Validate comparator evidence before model bootstrap
-        run: python -m eval.benchmark_ann_build --validate-evidence .review-tmp/held-out-evidence/index-benchmark.json
       - name: Cache embedding model
         uses: actions/cache@v4
         with:
@@ -385,35 +382,30 @@ jobs:
           key: embed-model-${{ hashFiles('scripts/download_embedding_model.py') }}
       - name: Bootstrap local embedding model
         run: python scripts/download_embedding_model.py
-      - name: Run model-backed candidate decision records without baseline refresh
+      - name: Run locked m16-vs-m20 original-105 production hybrid gate
         run: >
           python -m eval.run_eval
-          --work-dir .review-tmp/model-backed-ann
-          --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
-          --decision-output eval/candidate-hybrid-ann-decision.json
-      - name: Validate all twelve candidate-specific production hybrid records
+          --work-dir .review-tmp/phase07-final
+          --phase07-final-output eval/phase07-final-hybrid.json
+      - name: Recompute and validate the exact-head Phase 07 packet
         run: >
           python -m eval.run_eval
-          --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
-          --validate-candidate-hybrid-evidence eval/candidate-hybrid-ann-decision.json
-      - name: Upload model-backed candidate decision records
+          --validate-phase07-final-evidence eval/phase07-final-hybrid.json
+      - name: Upload Phase 07 final hybrid evidence
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-hybrid-ann-decision
+          name: ${{ env.PHASE07_FINAL_ARTIFACT_NAME }}
           path: |
-            eval/candidate-hybrid-ann-decision.json
-            eval/results.json
-            eval/detail.jsonl
+            eval/phase07-final-hybrid.json
           retention-days: 90
-      - name: Upload rejected candidate-hybrid diagnostics
+      - name: Upload rejected Phase 07 diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-hybrid-ann-decision-error
+          name: phase07-final-hybrid-error
           path: |
-            eval/results.json
-            eval/detail.jsonl
+            eval/phase07-final-hybrid.json
           if-no-files-found: ignore
           retention-days: 90
 
@@ -422,8 +414,15 @@ jobs:
     if: ${{ github.event_name == 'pull_request' && always() }}
     needs: [test-and-eval, issue41-scale-benchmark, model-backed-ann-decision]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PHASE07_FINAL_ARTIFACT_NAME: phase07-final-hybrid-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -433,36 +432,32 @@ jobs:
       - name: Install locked reconciliation dependencies
         if: ${{ always() }}
         run: python -m pip install -r requirements.txt pytest
-      - name: Download scale evidence for validation
+      - name: Require every independent PR dependency to succeed
         if: ${{ always() }}
+        env:
+          PHASE07_NEED_TEST_AND_EVAL: ${{ needs.test-and-eval.result }}
+          PHASE07_NEED_ISSUE41_SCALE: ${{ needs.issue41-scale-benchmark.result }}
+          PHASE07_NEED_MODEL_BACKED: ${{ needs.model-backed-ann-decision.result }}
+        run: python -m eval.run_eval --validate-phase07-required-needs
+      - name: Download Phase 07 final hybrid evidence
+        if: ${{ always() }}
+        # Without run-id/repository, v4 resolves this fixed unique name only
+        # inside the current workflow run; cross-run name lookup is not used.
         uses: actions/download-artifact@v4
         with:
-          name: issue41-index-benchmark
-          path: .review-tmp/reconcile/scale
-      - name: Download model-backed records for validation
-        if: ${{ always() }}
-        uses: actions/download-artifact@v4
-        with:
-          name: candidate-hybrid-ann-decision
+          name: ${{ env.PHASE07_FINAL_ARTIFACT_NAME }}
           path: .review-tmp/reconcile/model
-      - name: Reconcile numeric same-head Eval evidence
+      - name: Recompute exact-head Phase 07 final evidence
         if: ${{ always() }}
         run: >
-          python -m eval.reconcile_ann_gate
-          --scale-evidence .review-tmp/reconcile/scale/index-benchmark.json
-          --model-records .review-tmp/reconcile/model/candidate-hybrid-ann-decision.json
-          --test-and-eval "${{ needs.test-and-eval.result }}"
-          --scale "${{ needs.issue41-scale-benchmark.result }}"
-          --model-backed "${{ needs.model-backed-ann-decision.result }}"
-          --expected-head "${{ github.sha }}"
-          --expected-pr-head "${{ github.event.pull_request.head.sha }}"
-          --output .review-tmp/reconcile/ann-reconciliation.json
+          python -m eval.run_eval
+          --validate-phase07-final-evidence .review-tmp/reconcile/model/phase07-final-hybrid.json
       - name: Upload reconciliation diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: ann-decision-reconciliation
-          path: .review-tmp/reconcile/ann-reconciliation.json
+          path: .review-tmp/reconcile/model/phase07-final-hybrid.json
           if-no-files-found: warn
           retention-days: 90
       - name: Required cross-workflow PR checks
@@ -653,7 +648,9 @@ jobs:
 
   phase07-hybrid-prepare:
     name: "Phase 07 candidate-neutral frozen corpus prepare"
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'hybrid-prepare' }}
+    # Retained only so historical artifacts remain understandable.  Phase 07
+    # final authority no longer permits a copied 30k corpus campaign.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions: {contents: read, actions: read}
@@ -697,7 +694,9 @@ jobs:
 
   phase07-hybrid:
     name: "Phase 07 independent hybrid campaign"
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'hybrid' }}
+    # Retired: the pull-request job above runs only m16 vs m20 on the original
+    # 105-query corpus, so no manual m32/30k dispatch can mint new evidence.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions: {contents: read, actions: read}

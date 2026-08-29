@@ -174,8 +174,8 @@ python eval/run_eval.py
 
 生产 dense 检索只有**一条**批准策略，记录在源码控制的 `eval/ann-policy.json`（决策证据：issue #49）：
 
-- **索引类型**：`IVF_HNSW_SQ`（cosine，`num_partitions=1`，`m=16`，`ef_construction=300`）
-- **查询 ef**：`100`（查询期探索参数；不可运行时选择）
+- **索引类型**：`IVF_HNSW_SQ`（cosine，`num_partitions=1`，`m=20`，`ef_construction=300`）
+- **查询 ef**：`300`（查询期探索参数；不可运行时选择）
 - **held-out floors**：Recall@10 ≥ `0.19`、Recall@20 ≥ `0.17`（针对锁定的 77,348 x 384 / 256 held-out 压力测量；生产构建的发布门禁见下）
 - **证据保留**：GitHub Actions artifacts 保留 90 天
 - **exact 检索**：仅为诊断/基准 API（`search_dense_exact*`），生产路径不可达，**不存在 exact 回退**
@@ -183,6 +183,8 @@ python eval/run_eval.py
 - **旧索引兼容**：format-5 及更早的 mode-ambiguous manifest（`--vector-index`/exact 回退时代）加载时直接 `RebuildRequiredError`，需全量重建，不做原地迁移；`--vector-index` CLI 参数保留一个版本仅作前置拒绝 shim（exit 2）
 
 `BENCHMARK_MAX_PROBES` 只影响验证采样规模，不能改变类型/ef/任何策略值。`python eval/run_eval.py --validate-ann-policy` 可校验策略记录完整性。
+
+Phase 7 由用户选择此 `m=20` / `ef_construction=300` / 查询 `ef=300` 策略；最终 exact-head 的远程门禁负责验证该选择，本文不新增或替换既有决策证据的 digest 与 URL。
 
 > **tests/** 与 **eval/** 目录已公开（issue #9），含可复现的脱敏评测集与单元测试，无需外部私有文档即可运行。
 
@@ -345,7 +347,7 @@ Every published manifest records `mode_requested`, `mode_selected`, `selection_r
 
 The staged candidate keeps source/clone lineage until journal recovery is complete. Its durable journal records recovery state; commit uncertainty is never silently treated as success. `ACTIVE_INDEX` is the only sparse+dense commit boundary: no candidate becomes query-visible until journal recovery, catch-up, validation, and the zero-unindexed publication gate all succeed. Failed or uncertain work preserves the previously active index.
 
-The fixed production ANN contract remains `IVF_HNSW_SQ`, `ef=100`, Recall@10 ≥ 0.19, and Recall@20 ≥ 0.17. It preserves citation/context/graph behavior and the sealed manifest contract; there is no runtime ANN selection and no exact fallback. Do not reset evaluation baselines, change model/dependency policy, or treat model downloads as normal build-mode acceptance.
+The fixed production ANN contract remains `IVF_HNSW_SQ`, `m=20`, `ef_construction=300`, and query `ef=300`, with Recall@10 ≥ 0.19 and Recall@20 ≥ 0.17. It preserves citation/context/graph behavior and the sealed manifest contract; there is no runtime ANN selection and no exact fallback. Phase 7 selected these values; final exact-head remote gates validate them without replacing the recorded provenance. Do not reset evaluation baselines, change model/dependency policy, or treat model downloads as normal build-mode acceptance.
 <!-- build-mode-contract:end -->
 
 ### 增量更新
@@ -419,6 +421,9 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/check_tags.py <proje
 `.obsidian/` 目录由 Obsidian 独占管理，含 vault 级配置，任何脚本强制绕过。
 
 ## 已知约束
+
+跨平台开发、测试与合并的强制规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。其中明确规定文件
+durability、进程监督、subprocess 编码、fail-closed 可观察性，以及 Windows/Linux 数值门禁。
 
 - **Windows + WorkBuddy 沙箱**：`.pyc` / `.pytest_cache` / junction 路径需特殊处理；pytest 加 `-p no:cacheprovider`，Python 运行设 `PYTHONDONTWRITEBYTECODE=1`
 - **stdout 大输出段错误**：沙箱对 managed-python 的 stdout 拦截层在 >~20KB 时非确定性触发 access-violation。`--read-full` 必须用 `--out` 落盘，禁用 `| head` 等管道

@@ -78,6 +78,21 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the CLI entry poi
 
 FUNCTIONAL_FINAL_RETRIEVAL_METRIC = "functional_final_retrieval_ann_overlap_at_10"
 FINAL_RETRIEVAL_DECISION_SCHEMA_VERSION = 2
+PHASE07_FINAL_HYBRID_SCHEMA_VERSION = 1
+PHASE07_FINAL_AUTHORIZATION = "user-approved-d28"
+PHASE07_FINAL_REPOSITORY = "allenwoo713/obsidian_wiki_skill"
+PHASE07_FINAL_WORKFLOW_NAME = "eval"
+PHASE07_FINAL_WORKFLOW_PATH = ".github/workflows/eval.yml"
+PHASE07_FINAL_PRODUCER_JOB = "model-backed-ann-decision"
+PHASE07_FINAL_PRODUCER_JOB_NAME = "Phase 07 model-backed m20 original-105 hybrid gate"
+PHASE07_FINAL_RECONCILER_JOB = "reconcile-ann-decision"
+PHASE07_FINAL_RETENTION_DAYS = 90
+PHASE07_FINAL_BASELINE = {
+    "index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 100,
+}
+PHASE07_FINAL_CANDIDATE = {
+    "index_type": "hnsw_sq", "m": 20, "ef_construction": 300, "query_ef": 300,
+}
 _CANDIDATE_OBSERVATION_FIELDS = {
     "retrieval", "page", "evidence", "mrr", "latency", "context",
     "citation", "graph", "non_regression",
@@ -87,7 +102,8 @@ _CANDIDATE_OBSERVATION_FIELDS = {
 def _head_sha() -> str:
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True
+            ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True,
+            encoding="utf-8", errors="strict",
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
@@ -685,6 +701,247 @@ def run_candidate_hybrid_evaluation(
         "records": records,
     }
     return validate_candidate_decision_records(packet, comparator_evidence)
+
+
+def _phase07_policy(config: dict[str, int | str]) -> CandidateQueryPolicy:
+    """Translate one locked Phase 07 role into the normal production policy objects."""
+    return CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=int(config["query_ef"]),
+        build_policy=CandidateBuildPolicy(
+            candidate="ivf-hnsw-sq", m=int(config["m"]),
+            ef_construction=int(config["ef_construction"]),
+        ),
+    )
+
+
+def _phase07_final_digest(value: dict) -> str:
+    detached = dict(value)
+    detached.pop("record_self_sha256", None)
+    return _stable_json_digest(detached)
+
+
+def _phase07_final_content_digest(value: dict) -> str:
+    fields = (
+        "baseline", "candidate", "query_count", "queries_sha256", "baselines_sha256",
+        "fixture_sha256", "observations", "metrics", "gates", "hybrid_invocation",
+        "quality_authority", "authorization",
+    )
+    return _stable_json_digest({name: value[name] for name in fields})
+
+
+def _required_phase07_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Phase 07 final workflow provenance missing {name}")
+    return value
+
+
+def _phase07_current_workflow_provenance(*, require_producer: bool) -> dict[str, object]:
+    """Return only the current GitHub workflow-run identity, never a name lookup."""
+    repository = _required_phase07_env("GITHUB_REPOSITORY")
+    workflow_name = _required_phase07_env("GITHUB_WORKFLOW")
+    workflow_ref = _required_phase07_env("GITHUB_WORKFLOW_REF")
+    current_job = _required_phase07_env("GITHUB_JOB")
+    pr_head = _required_phase07_env("GITHUB_PR_HEAD_SHA")
+    artifact_name = _required_phase07_env("PHASE07_FINAL_ARTIFACT_NAME")
+    try:
+        run_id = int(_required_phase07_env("GITHUB_RUN_ID"))
+        run_attempt = int(_required_phase07_env("GITHUB_RUN_ATTEMPT"))
+    except ValueError as exc:
+        raise ValueError("Phase 07 final numeric workflow identity") from exc
+    prefix = f"{repository}/"
+    workflow_path = workflow_ref.removeprefix(prefix).rsplit("@", 1)[0]
+    checkout = _head_sha()
+    expected_artifact = f"phase07-final-hybrid-{run_id}-{run_attempt}"
+    if repository != PHASE07_FINAL_REPOSITORY \
+            or workflow_name != PHASE07_FINAL_WORKFLOW_NAME \
+            or not workflow_ref.startswith(prefix) \
+            or workflow_path != PHASE07_FINAL_WORKFLOW_PATH \
+            or run_id <= 0 or run_attempt <= 0 \
+            or artifact_name != expected_artifact \
+            or pr_head != checkout \
+            or (require_producer and current_job != PHASE07_FINAL_PRODUCER_JOB) \
+            or (not require_producer and current_job not in {
+                PHASE07_FINAL_PRODUCER_JOB, PHASE07_FINAL_RECONCILER_JOB,
+            }):
+        raise ValueError("Phase 07 final exact workflow-run provenance")
+    return {
+        "repository": repository, "workflow_name": workflow_name,
+        "workflow_path": workflow_path, "run_id": run_id,
+        "run_attempt": run_attempt, "producer_job_id": PHASE07_FINAL_PRODUCER_JOB,
+        "producer_job_name": PHASE07_FINAL_PRODUCER_JOB_NAME,
+        "artifact_name": artifact_name, "retention_days": PHASE07_FINAL_RETENTION_DAYS,
+        "pr_head_sha": pr_head, "checkout_head_sha": checkout,
+    }
+
+
+def validate_phase07_required_needs(results: dict[str, str]) -> dict[str, str]:
+    """Require every independent PR dependency to finish with numeric success."""
+    expected = {"test-and-eval", "issue41-scale-benchmark", "model-backed-ann-decision"}
+    if not isinstance(results, dict) or set(results) != expected \
+            or any(results[name] != "success" for name in expected):
+        raise ValueError("Phase 07 final required job did not succeed")
+    return results
+
+
+def run_phase07_final_hybrid_evaluation(
+    wiki_src: Path, queries: list[dict], work_dir: Path, max_tokens: int,
+    *, hard_max_tokens: int | None = None,
+) -> dict:
+    """Run the sole Phase 07 PR-quality comparison on the original corpus.
+
+    The configuration is intentionally not a caller input.  Each role builds
+    its own normal production index, and every committed query reaches the
+    public ``hybrid_search`` entry point once per role.  The copied 30k corpus
+    and the retired m32 candidate are outside this authority path.
+    """
+    provenance = _phase07_current_workflow_provenance(require_producer=True)
+    if wiki_src.resolve() != FIXTURES_WIKI.resolve() or len(queries) != 105:
+        raise ValueError("Phase 07 final gate requires the committed corpus and 105 queries")
+    expected_queries = load_queries(HERE / "queries.jsonl")
+    if queries != expected_queries:
+        raise ValueError("Phase 07 final gate requires the committed query manifest")
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True)
+
+    indexes: dict[str, tuple[object, Path]] = {}
+    for role, config in (
+        ("baseline", PHASE07_FINAL_BASELINE), ("candidate", PHASE07_FINAL_CANDIDATE),
+    ):
+        root = work_dir / role
+        index, wiki, _build_seconds = _build(
+            root, wiki_src, True, candidate_query_policy=_phase07_policy(config),
+        )
+        indexes[role] = (index, wiki)
+
+    planner = DefaultQueryPlanner(project_root=work_dir)
+    observations: list[dict] = []
+    for ordinal, specification in enumerate(queries):
+        query = specification["query"]
+        row: dict[str, object] = {
+            "ordinal": ordinal,
+            "query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        }
+        for role in ("baseline", "candidate"):
+            index, wiki = indexes[role]
+            started = time.perf_counter()
+            result = hybrid_search(
+                index, query, planner, k=10, max_tokens=max_tokens,
+                hard_max_tokens=hard_max_tokens, wiki_dir=wiki,
+                intent_override="auto", allow_local_fallback=True,
+            )
+            row[role] = {
+                "result": _candidate_result_payload(result),
+                "duration_ms": round((time.perf_counter() - started) * 1000, 6),
+            }
+        observations.append(row)
+        if (ordinal + 1) % 15 == 0 or ordinal + 1 == len(queries):
+            print(f"[phase07-final] original_queries={ordinal + 1}/{len(queries)} complete", flush=True)
+
+    metrics = aggregate_hybrid_serialized_metrics(
+        specifications=queries, observations=observations,
+    )
+    from eval.phase07_operator_gate import recompute_hybrid_gate_verdicts
+    gates = recompute_hybrid_gate_verdicts(
+        original_absolute=metrics, expanded_scale_diagnostics=None,
+        committed_baseline=None,
+        baselines_sha256=hashlib.sha256((HERE / "baselines.json").read_bytes()).hexdigest(),
+    )
+    gates = {**gates, "authorization": PHASE07_FINAL_AUTHORIZATION}
+    checkout = _head_sha()
+    pr_head = str(provenance["pr_head_sha"])
+    packet = {
+        "schema_version": PHASE07_FINAL_HYBRID_SCHEMA_VERSION,
+        "packet_kind": "phase07-final-original-105-hybrid/v1",
+        "head_sha": _head_sha(), "pr_head_sha": pr_head,
+        "checkout_head_sha": checkout,
+        "environment": _decision_environment(),
+        "baseline": dict(PHASE07_FINAL_BASELINE),
+        "candidate": dict(PHASE07_FINAL_CANDIDATE),
+        "query_count": 105,
+        "queries_sha256": hashlib.sha256((HERE / "queries.jsonl").read_bytes()).hexdigest(),
+        "baselines_sha256": hashlib.sha256((HERE / "baselines.json").read_bytes()).hexdigest(),
+        "fixture_sha256": _fixture_digest(wiki_src),
+        "observations": observations,
+        "metrics": metrics, "gates": gates,
+        "hybrid_invocation": {
+            "entrypoint": "query.hybrid_search",
+            "candidate_aware_public_arguments": False,
+            "baseline_calls": 105, "candidate_calls": 105,
+        },
+        "quality_authority": "original_105_query_only",
+        "authorization": PHASE07_FINAL_AUTHORIZATION,
+        "provenance": provenance,
+    }
+    packet["content_sha256"] = _phase07_final_content_digest(packet)
+    packet["record_self_sha256"] = _phase07_final_digest(packet)
+    return validate_phase07_final_hybrid_evidence(packet)
+
+
+def validate_phase07_final_hybrid_evidence(packet: dict) -> dict:
+    """Fail closed over the exact-head m16-vs-m20 original-query packet."""
+    fields = {
+        "schema_version", "packet_kind", "head_sha", "pr_head_sha",
+        "checkout_head_sha", "environment", "baseline", "candidate",
+        "query_count", "queries_sha256", "baselines_sha256", "fixture_sha256",
+        "observations", "metrics", "gates", "hybrid_invocation",
+        "quality_authority", "authorization", "provenance", "content_sha256",
+        "record_self_sha256",
+    }
+    if not isinstance(packet, dict) or set(packet) != fields \
+            or packet.get("schema_version") != PHASE07_FINAL_HYBRID_SCHEMA_VERSION \
+            or packet.get("packet_kind") != "phase07-final-original-105-hybrid/v1" \
+            or packet.get("record_self_sha256") != _phase07_final_digest(packet) \
+            or packet.get("baseline") != PHASE07_FINAL_BASELINE \
+            or packet.get("candidate") != PHASE07_FINAL_CANDIDATE \
+            or packet.get("query_count") != 105 \
+            or packet.get("quality_authority") != "original_105_query_only" \
+            or packet.get("authorization") != PHASE07_FINAL_AUTHORIZATION \
+            or packet.get("content_sha256") != _phase07_final_content_digest(packet):
+        raise ValueError("sealed Phase 07 final hybrid evidence")
+    provenance = _phase07_current_workflow_provenance(require_producer=False)
+    checkout = _head_sha()
+    if packet.get("head_sha") != checkout \
+            or packet.get("pr_head_sha") != checkout \
+            or packet.get("checkout_head_sha") != checkout \
+            or packet.get("provenance") != provenance:
+        raise ValueError("Phase 07 final exact-head binding")
+    expected_environment = _decision_environment()
+    if packet.get("environment") != expected_environment \
+            or expected_environment.get("numpy") != "2.2.6" \
+            or expected_environment.get("lancedb") != "0.34.0" \
+            or expected_environment.get("pyarrow") != "25.0.0":
+        raise ValueError("Phase 07 final locked environment")
+    if packet.get("queries_sha256") != hashlib.sha256((HERE / "queries.jsonl").read_bytes()).hexdigest() \
+            or packet.get("baselines_sha256") != hashlib.sha256((HERE / "baselines.json").read_bytes()).hexdigest() \
+            or packet.get("fixture_sha256") != _fixture_digest(FIXTURES_WIKI):
+        raise ValueError("Phase 07 final committed input binding")
+    invocation = packet.get("hybrid_invocation")
+    if invocation != {
+        "entrypoint": "query.hybrid_search", "candidate_aware_public_arguments": False,
+        "baseline_calls": 105, "candidate_calls": 105,
+    }:
+        raise ValueError("Phase 07 final production invocation")
+    queries = load_queries(HERE / "queries.jsonl")
+    observations = packet.get("observations")
+    if not isinstance(observations, list) or len(observations) != 105:
+        raise ValueError("Phase 07 final complete observations")
+    for ordinal, (row, specification) in enumerate(zip(observations, queries, strict=True)):
+        if not isinstance(row, dict) or set(row) != {"ordinal", "query_sha256", "baseline", "candidate"} \
+                or row.get("ordinal") != ordinal \
+                or row.get("query_sha256") != hashlib.sha256(specification["query"].encode("utf-8")).hexdigest():
+            raise ValueError("Phase 07 final observation identity")
+    metrics = aggregate_hybrid_serialized_metrics(specifications=queries, observations=observations)
+    from eval.phase07_operator_gate import recompute_hybrid_gate_verdicts
+    gates = recompute_hybrid_gate_verdicts(
+        original_absolute=metrics, expanded_scale_diagnostics=None,
+        committed_baseline=None, baselines_sha256=packet["baselines_sha256"],
+    )
+    gates = {**gates, "authorization": PHASE07_FINAL_AUTHORIZATION}
+    if packet.get("metrics") != metrics or packet.get("gates") != gates:
+        raise ValueError("Phase 07 final recomputed metrics")
+    return packet
 
 
 def run_phase07_representative_campaign(
@@ -1672,6 +1929,12 @@ def main():
                     help="Machine-readable model-backed decision records (never a production policy)")
     ap.add_argument("--validate-candidate-hybrid-evidence", type=Path,
                     help="Validate an existing candidate-specific hybrid packet and exit")
+    ap.add_argument("--phase07-final-output", type=Path,
+                    help="Run the locked m16-vs-m20 original-105 Phase 07 gate and exit")
+    ap.add_argument("--validate-phase07-final-evidence", type=Path,
+                    help="Validate a locked Phase 07 final hybrid packet and exit")
+    ap.add_argument("--validate-phase07-required-needs", action="store_true",
+                    help="Fail unless every required Phase 07 PR dependency succeeded")
     ap.add_argument("--validate-ann-policy", action="store_true",
                     help="Validate the tracked eval/ann-policy.json against the approved "
                          "Phase 06 contract (type/ef/floors/digests) and exit")
@@ -1711,6 +1974,42 @@ def main():
         validate_candidate_decision_records(packet, comparator_evidence)
         print(json.dumps({"valid": True, "records": len(packet["records"])}, sort_keys=True))
         return 0
+
+    if args.validate_phase07_final_evidence is not None:
+        packet = json.loads(args.validate_phase07_final_evidence.read_text(encoding="utf-8"))
+        validate_phase07_final_hybrid_evidence(packet)
+        print(json.dumps({"valid": True, "candidate": PHASE07_FINAL_CANDIDATE,
+                          "query_count": 105}, sort_keys=True))
+        return 0
+
+    if args.validate_phase07_required_needs:
+        results = {
+            "test-and-eval": os.environ.get("PHASE07_NEED_TEST_AND_EVAL", ""),
+            "issue41-scale-benchmark": os.environ.get("PHASE07_NEED_ISSUE41_SCALE", ""),
+            "model-backed-ann-decision": os.environ.get("PHASE07_NEED_MODEL_BACKED", ""),
+        }
+        validate_phase07_required_needs(results)
+        print(json.dumps({"valid": True, "required_needs": results}, sort_keys=True))
+        return 0
+
+    if args.phase07_final_output is not None:
+        if args.wiki.resolve() != FIXTURES_WIKI.resolve() \
+                or args.queries.resolve() != (HERE / "queries.jsonl").resolve():
+            print("[ERROR] Phase 07 final gate accepts only committed inputs", file=sys.stderr)
+            return 2
+        queries = load_queries(args.queries)
+        work_dir = args.work_dir or Path(tempfile.mkdtemp(prefix="obs_wiki_phase07_final_"))
+        packet = run_phase07_final_hybrid_evaluation(
+            args.wiki, queries, work_dir, args.max_tokens,
+            hard_max_tokens=args.hard_max_tokens,
+        )
+        args.phase07_final_output.parent.mkdir(parents=True, exist_ok=True)
+        args.phase07_final_output.write_text(
+            json.dumps(packet, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        print(json.dumps({"candidate": packet["candidate"],
+                          "verdict": packet["gates"]["candidate_verdict"]}, sort_keys=True))
+        return 0 if packet["gates"]["candidate_verdict"] == "numeric-success" else 1
 
     if not args.wiki.exists():
         print(f"[ERROR] fixture wiki 不存在: {args.wiki}", file=sys.stderr)

@@ -28,6 +28,7 @@ from obsidian_wiki.domain.index_models import (  # noqa: E402
 )
 from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
 from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir  # noqa: E402
+from obsidian_wiki.application.incremental_index_service import IncrementalIndexService  # noqa: E402
 from obsidian_wiki.infrastructure import lancedb_index_repository as repository_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
     LanceDbIndexRepository,
@@ -36,6 +37,7 @@ from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemInd
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import (  # noqa: E402
     FilesystemPostCommitJournal,
 )
+from obsidian_wiki.ports.incremental_index import IncrementalFallbackEligible  # noqa: E402
 
 
 def _write_page(wiki: Path, body: str) -> None:
@@ -145,7 +147,9 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     # Phase 06：manifest 绑定批准策略（不再有 requested_vector_index_mode）。
     assert manifest["format_version"] == 6
     assert manifest["ann_policy"]["selected_index_type"] == "ivf-hnsw-sq"
-    assert manifest["ann_policy"]["query_ef"] == 100
+    assert manifest["vector_config"]["m"] == 20
+    assert manifest["vector_config"]["ef_construction"] == 300
+    assert manifest["ann_policy"]["query_ef"] == 300
     assert "requested_vector_index_mode" not in manifest
     assert manifest["fts_config"] == {
         "column": "fts_text",
@@ -157,6 +161,16 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
         "max_token_length": 256,
     }
     assert LanceDbIndexRepository(artifact.artifact.lance_dir).search_sparse(long_term)
+
+    # A persisted m=16/query-ef=100 binding predates the Phase 7 policy.  It
+    # is not incrementally compatible: the caller must fall back to a snapshot
+    # rebuild rather than reuse the old ANN structure.
+    retired = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
+    retired["vector_config"]["m"] = 16
+    retired["ann_policy"]["query_ef"] = 100
+    artifact.artifact.manifest_path.write_text(json.dumps(retired), encoding="utf-8")
+    with pytest.raises(IncrementalFallbackEligible, match="incompatible_active_contract"):
+        IncrementalIndexService._assert_current_manifest(artifact.artifact.lance_dir)
 
 
 def test_runtime_mode_selection_is_removed_from_public_surfaces() -> None:
@@ -515,7 +529,7 @@ def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
 
     approved = VectorIndexConfig(
         index_type="hnsw_sq", metric="cosine", num_partitions=2,
-        m=16, ef_construction=300, dense_chunks_count=20,
+        m=20, ef_construction=300, dense_chunks_count=20,
     )
     repository.create_vector_index(approved)
 
@@ -527,7 +541,7 @@ def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
     assert type(hnsw).__name__ == "HnswSq"
     assert hnsw.distance_type == "cosine"
     assert hnsw.num_partitions == 2
-    assert hnsw.m == 16
+    assert hnsw.m == 20
     assert hnsw.ef_construction == 300
     assert ann == exact == [{"chunk_id": "dense:1"}]
     assert table.queries[0].exact_bypass is False
@@ -535,8 +549,8 @@ def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
     assert table.queries[0].metric == table.queries[1].metric == "cosine"
     assert table.queries[0].predicate == table.queries[1].predicate == "page_id = 'safe'"
     assert table.queries[0].result_limit == table.queries[1].result_limit == 20
-    # 固定批准 ef=100（与 limit 无关；不再有 max(100, 1.5*limit) 启发式）。
-    assert table.queries[0].ef_value == 100
+    # 固定批准 ef=300（与 limit 无关；不再有 max(100, 1.5*limit) 启发式）。
+    assert table.queries[0].ef_value == 300
     assert table.queries[1].ef_value is None  # exact path bypasses ef
 
 
@@ -673,7 +687,7 @@ def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path)
     evidence = manifest["candidate_publication_evidence"]
     assert evidence["actual_dense_rows"] == 1
     assert evidence["validation_query_count"] == min(256, 1)
-    assert evidence["query_ef"] == 100
+    assert evidence["query_ef"] == 300
     assert evidence["corpus_query_overlap"] == 0
 
 

@@ -330,9 +330,14 @@ class IndexBuildService:
                 candidate_build = None
             vector_config = VectorIndexConfig(
                 index_type=candidate_index_type,
-                metric="cosine", num_partitions=1,
-                m=candidate_build.m if candidate_build is not None else 16,
-                ef_construction=candidate_build.ef_construction if candidate_build is not None else 300,
+                metric=self._ann_policy.metric,
+                num_partitions=self._ann_policy.num_partitions,
+                m=candidate_build.m if candidate_build is not None else self._ann_policy.m,
+                ef_construction=(
+                    candidate_build.ef_construction
+                    if candidate_build is not None
+                    else self._ann_policy.ef_construction
+                ),
                 dense_chunks_count=len(dense_chunks),
             )
             index_started = time.perf_counter()

@@ -129,6 +129,12 @@ jobs:
       # and public CLI dispatch on both operating systems.  The model-backed
       # public retrieval-equivalence artifact belongs in eval.yml after its cache.
       # All named suites are model-free and must pass on Windows + Linux.
+      - name: Enforce cross-platform process and filesystem contracts
+        run: >
+          python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/portability-contract
+          tests/test_portability_contract.py -q
+
       - name: Run storage, publication, chunking, and ANN benchmark acceptance gates
         run: >
           python -m pytest -p no:cacheprovider

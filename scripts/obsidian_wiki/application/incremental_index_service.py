@@ -429,9 +429,14 @@ class IncrementalIndexService:
                 if sparse_result.physically_written != len(sparse_delta.physically_written_ids) or dense_result.physically_written != len(dense_delta.physically_written_ids):
                     raise RuntimeError("adapter mutation accounting does not reconcile with delta")
                 serialization_write_ms = (time.perf_counter() - write_started) * 1000
+                approved_ann = self._publication_service.ann_policy
                 vector_config = VectorIndexConfig(
-                    index_type="hnsw_sq", metric="cosine", num_partitions=1, m=16,
-                    ef_construction=300, dense_chunks_count=len(dense),
+                    index_type=approved_ann.lancedb_index_type,
+                    metric=approved_ann.metric,
+                    num_partitions=approved_ann.num_partitions,
+                    m=approved_ann.m,
+                    ef_construction=approved_ann.ef_construction,
+                    dense_chunks_count=len(dense),
                 )
                 if record.state is IncrementalJournalState.MUTATED:
                     fts_started = time.perf_counter()

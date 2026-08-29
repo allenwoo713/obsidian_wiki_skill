@@ -167,7 +167,9 @@ def test_service_records_publication_evidence_and_fixed_ann_policy(tmp_path: Pat
     assert evidence["corpus_query_overlap"] == 0
     assert manifest["vector_config"]["index_type"] == "hnsw_sq"
     assert manifest["vector_config"]["num_partitions"] == 1
-    assert manifest["ann_policy"]["query_ef"] == 100
+    assert manifest["vector_config"]["m"] == 20
+    assert manifest["vector_config"]["ef_construction"] == 300
+    assert manifest["ann_policy"]["query_ef"] == 300
     assert manifest["policy"]["selected_mode"] == "ann"
 
 
@@ -210,7 +212,9 @@ def test_service_probe_cap_changes_only_validation_query_count(tmp_path: Path) -
         assert evidence["benchmark_max_probes"] == probes
         assert evidence["validation_query_count"] == min(probes, 8)
     assert results[256]["vector_config"]["index_type"] == results[37]["vector_config"]["index_type"] == "hnsw_sq"
-    assert results[256]["ann_policy"]["query_ef"] == results[37]["ann_policy"]["query_ef"] == 100
+    assert results[256]["vector_config"]["m"] == results[37]["vector_config"]["m"] == 20
+    assert results[256]["vector_config"]["ef_construction"] == results[37]["vector_config"]["ef_construction"] == 300
+    assert results[256]["ann_policy"]["query_ef"] == results[37]["ann_policy"]["query_ef"] == 300
 
 
 # ---- Phase 06（issue #49）：固定生产 ANN 契约 ---------------------------------
@@ -319,6 +323,7 @@ def _publication_evidence(
 
 
 def test_tracked_policy_record_loads_and_binds_the_approved_decision() -> None:
+    record = json.loads((_REPO_ROOT / "eval" / "ann-policy.json").read_text(encoding="utf-8"))
     policy = _approved_policy()
 
     assert policy.policy_schema_version == 2
@@ -327,7 +332,9 @@ def test_tracked_policy_record_loads_and_binds_the_approved_decision() -> None:
     assert policy.metric == "cosine"
     assert policy.dimensions == 384
     assert policy.num_partitions == 1
-    assert policy.query_ef == 100
+    assert policy.m == 20
+    assert policy.ef_construction == 300
+    assert policy.query_ef == 300
     assert policy.recall_at_10_floor == 0.19
     assert policy.recall_at_20_floor == 0.17
     assert policy.retention_days == 90
@@ -337,9 +344,52 @@ def test_tracked_policy_record_loads_and_binds_the_approved_decision() -> None:
     ):
         assert len(digest) == 64
 
+    # Informational metadata must distinguish the inherited Phase 6 m=16
+    # baseline provenance from the user-approved Phase 7 m=20 selection.
+    phase6 = record["decision"]["phase6_inherited_provenance"]
+    phase7 = record["decision"]["phase7_selection"]
+    assert phase6["configuration"] == {"m": 16, "ef_construction": 300, "query_ef": 100}
+    assert phase7["configuration"] == {"m": 20, "ef_construction": 300, "query_ef": 300}
+    assert phase6["configuration"] != phase7["configuration"]
+    assert phase6["comparator_sha256"] == policy.comparator_sha256
+    assert phase6["candidate_hybrid_sha256"] == policy.candidate_hybrid_sha256
+    assert phase6["reconciliation_sha256"] == policy.reconciliation_sha256
+    assert phase6["evidence_run_url"] == policy.evidence_run_url
+    assert phase7["approval_reference"] == "D-28 / Issue #50"
+    assert phase7["approved_at"] == "2026-08-28"
+    assert phase7["sealed_dense_ledger_sha256"] == (
+        "71335b6bfa03f24368414ae56a22fd8896d4479c6bfbe871c36a14b26e3b211b"
+    )
+    assert phase7["dense_evidence_head_sha"] == "2f15d6a4fef54dda9b0f4a258e78898e2ef6ea57"
+
     authorized = validate_ann_decision_evidence(_decision_evidence(policy), policy)
     assert authorized is policy
     assert authorized.to_json() == policy.to_json()  # stable JSON
+
+
+def test_policy_record_fails_closed_for_phase6_phase7_metadata_drift() -> None:
+    record = json.loads((_REPO_ROOT / "eval" / "ann-policy.json").read_text(encoding="utf-8"))
+
+    def mutated(update) -> dict:
+        payload = json.loads(json.dumps(record))
+        update(payload)
+        return payload
+
+    cases = (
+        mutated(lambda value: value.__setitem__("unexpected", "field")),
+        mutated(lambda value: value["decision"].__setitem__("unexpected", "field")),
+        mutated(lambda value: value["decision"].pop("phase7_selection")),
+        mutated(lambda value: value["decision"]["phase6_inherited_provenance"]["configuration"].__setitem__("m", 20)),
+        mutated(lambda value: value["decision"]["phase6_inherited_provenance"].__setitem__("comparator_sha256", "0" * 64)),
+        mutated(lambda value: value["decision"]["phase7_selection"]["configuration"].__setitem__("m", 16)),
+        mutated(lambda value: value["decision"]["phase7_selection"].__setitem__("approval_reference", "Issue #49")),
+        mutated(lambda value: value["decision"]["phase7_selection"].__setitem__("sealed_dense_ledger_sha256", None)),
+        mutated(lambda value: value["decision"]["phase7_selection"].__setitem__("dense_evidence_head_sha", "0" * 40)),
+        mutated(lambda value: value.__setitem__("m", 16)),
+    )
+    for payload in cases:
+        with pytest.raises(PolicyError):
+            load_ann_policy_record(payload)
 
 
 def test_decision_evidence_rejects_unlocked_scale_or_binding_mismatch() -> None:
@@ -379,7 +429,7 @@ def test_publication_evidence_accepts_non_decision_corpus_and_probe_caps() -> No
         # 返回的是固定批准策略——probe cap 不能选择或修改生产值。
         assert authorized is policy
         assert authorized.selected_index_type == "ivf-hnsw-sq"
-        assert authorized.query_ef == 100
+        assert authorized.query_ef == 300
 
 
 def test_publication_evidence_rejects_every_named_mutation() -> None:
