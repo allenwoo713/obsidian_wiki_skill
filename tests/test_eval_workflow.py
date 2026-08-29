@@ -2150,7 +2150,8 @@ def test_local_frozen_size_measurement_reports_embedding_stages(tmp_path: Path) 
         "graph_started", "graph_finished", "lance_persist_started", "lance_persist_finished",
     ]
     assert all(detail["event"] == "phase07-frozen-size-progress" for _stage, detail in events)
-    assert events[3][1]["wiki_root"].endswith("frozen-corpus/Wiki")
+    wiki_root = Path(str(events[3][1]["wiki_root"]))
+    assert wiki_root.parts[-2:] == ("frozen-corpus", "Wiki")
     assert events[4][1]["dense_chunks"] > 0 and events[4][1]["pages"] == 1
     assert not work_dir.exists()
 
