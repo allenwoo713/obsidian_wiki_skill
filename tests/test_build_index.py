@@ -7,6 +7,7 @@ import types
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import WikiIndex
+from obsidian_wiki.domain.index_policy import load_ann_policy_file
 from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
 
 
@@ -31,11 +32,15 @@ def test_wikiindex_build_has_no_runtime_mode_selection(monkeypatch, tmp_path):
     def fake_build(*_args, **kwargs):
         assert "vector_index_mode" not in kwargs, "runtime mode selection must be removed"
         requested.append(sorted(kwargs))
+        approved_ann = load_ann_policy_file()
         manifest = tmp_path / "manifest.json"
         manifest.write_text(
             json.dumps({
                 "policy": {"selected_mode": "ann"},
-                "ann_policy": {"selected_index_type": "ivf-hnsw-sq", "query_ef": 100},
+                "ann_policy": {
+                    "selected_index_type": approved_ann.selected_index_type,
+                    "query_ef": approved_ann.query_ef,
+                },
             }),
             encoding="utf-8",
         )

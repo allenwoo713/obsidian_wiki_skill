@@ -22,6 +22,29 @@ from compare_build_modes import (  # noqa: E402
     validate_comparison_artifact,
 )
 from obsidian_wiki.application.incremental_policy import load_build_mode_policy  # noqa: E402
+from obsidian_wiki.domain.index_policy import load_ann_policy_file  # noqa: E402
+
+
+def test_build_mode_gate_uses_selected_production_ann_policy() -> None:
+    """The incremental acceptance gate must migrate with the production policy."""
+    policy = load_ann_policy_file()
+    expected = {
+        name: getattr(policy, name)
+        for name in (
+            "selected_index_type", "lancedb_index_type", "metric", "query_ef",
+            "recall_at_10_floor", "recall_at_20_floor",
+        )
+    }
+    assert compare_build_modes._APPROVED_ANN == expected
+    assert compare_build_modes._APPROVED_VECTOR == {
+        "index_type": policy.lancedb_index_type,
+        "metric": policy.metric,
+        "num_partitions": policy.num_partitions,
+        "m": policy.m,
+        "ef_construction": policy.ef_construction,
+        "index_name": "dense_hnsw",
+    }
+    assert (policy.m, policy.ef_construction, policy.query_ef) == (20, 300, 300)
 
 
 def _run(tmp_path: Path) -> dict:

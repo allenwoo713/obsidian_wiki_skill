@@ -1535,6 +1535,25 @@ def test_phase07_final_artifact_is_unique_to_current_run_and_reconciliation_is_b
         assert dependency in section
 
 
+def test_phase07_policy_migration_gate_requires_current_exact_head_results() -> None:
+    """A selected-policy change is accepted only after both current-run gates pass."""
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    gate = workflow["jobs"]["phase07-pr-acceptance-gate"]
+    assert gate["needs"] == ["model-backed-ann-decision", "reconcile-ann-decision"]
+    assert gate["timeout-minutes"] == "5"
+    assert "always()" in gate["if"]
+    checkout = gate["steps"][0]
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    command = gate["steps"][1]["run"]
+    assert "PHASE07_MODEL_GATE" in command
+    assert "PHASE07_RECONCILIATION_GATE" in command
+    assert "(20,300,300)" in command
+    assert "D-28 / Issue #50" in command
+    assert "Plan 09 same-head baseline/finalist" not in command
+    assert "exit 1" not in command
+
+
 def test_reconciliation_cli_is_fail_closed_for_missing_jobs_and_artifacts() -> None:
     reconciliation = SKILL_ROOT / "eval" / "reconcile_ann_gate.py"
     source = reconciliation.read_text(encoding="utf-8")

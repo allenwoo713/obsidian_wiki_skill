@@ -1937,7 +1937,8 @@ def main():
                     help="Fail unless every required Phase 07 PR dependency succeeded")
     ap.add_argument("--validate-ann-policy", action="store_true",
                     help="Validate the tracked eval/ann-policy.json against the approved "
-                         "Phase 06 contract (type/ef/floors/digests) and exit")
+                         "Phase 6 inherited provenance and selected Phase 7 production "
+                         "policy (type/m/ef/floors/digests) and exit")
     args = ap.parse_args()
 
     if args.validate_ann_policy:

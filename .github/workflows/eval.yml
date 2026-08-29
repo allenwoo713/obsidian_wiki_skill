@@ -64,7 +64,7 @@ jobs:
           python -c "import importlib.metadata as metadata;
           print(', '.join(f'{package}={metadata.version(package)}' for package in
           ('lancedb', 'pyarrow', 'sentence-transformers')))"
-      - name: Validate approved production ANN policy record (Phase 06)
+      - name: Validate inherited Phase 6 provenance and selected Phase 7 ANN policy
         run: python -m eval.run_eval --validate-ann-policy
       # #17 API coverage: adapter call shapes, persisted real artifacts, exact-bypass
       # and ANN policy, SDK-free import boundaries, and installed-version reporting.
@@ -315,7 +315,7 @@ jobs:
           assert value['omp_threads'] == 2, 'approved OMP setting must remain 2';
           env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
           [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
-      - name: Validate approved production ANN policy record (Phase 06)
+      - name: Validate inherited Phase 6 provenance and selected Phase 7 ANN policy
         run: python -m eval.run_eval --validate-ann-policy
       - name: Run static-cap held-out FLAT/SQ ANN acceptance comparator
         env:
@@ -788,17 +788,21 @@ jobs:
 
   phase07-pr-acceptance-gate:
     name: "Phase 07 same-head policy migration gate"
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name == 'pull_request' && always() }}
+    needs: [model-backed-ann-decision, reconcile-ann-decision]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions: {contents: read, actions: read}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - name: Deterministically skip non-policy PRs and fail closed for policy migration
+      - name: Require the exact-head production policy and final gates
+        env:
+          PHASE07_MODEL_GATE: ${{ needs.model-backed-ann-decision.result }}
+          PHASE07_RECONCILIATION_GATE: ${{ needs.reconcile-ann-decision.result }}
         run: |
-          changed="$(git diff --name-only '${{ github.event.pull_request.base.sha }}' '${{ github.event.pull_request.head.sha }}')"
-          if ! printf '%s\n' "$changed" | grep -Eq '^(eval/ann-policy\.json|scripts/obsidian_wiki/domain/index_policy\.py)$'; then exit 0; fi
-          echo 'Policy migration requires Plan 09 same-head baseline/finalist artifact bindings.' >&2
-          exit 1
+          test "$PHASE07_MODEL_GATE" = success
+          test "$PHASE07_RECONCILIATION_GATE" = success
+          python -c "import json,pathlib; p=json.loads(pathlib.Path('eval/ann-policy.json').read_text(encoding='utf-8')); assert (p['m'],p['ef_construction'],p['query_ef'])==(20,300,300); assert p['decision']['phase7_selection']['approval_reference']=='D-28 / Issue #50'"
