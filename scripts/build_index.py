@@ -256,7 +256,7 @@ except Exception:
 # ISSUE-15：向量检索 metric contract —— 固定配置，索引侧与查询侧一致
 VECTOR_METRIC = "cosine"
 NORMALIZE_EMBEDDINGS = False
-VECTOR_ENCODE_BATCH = 64   # 每次 encode 的切片数，控制内存峰值
+CACHE_MISS_ENCODE_BATCH = 1024  # 每次 cache-miss encode 的外层切片数，控制内存峰值
 
 # #8 自适应向量索引阈值（按数据量自动选择索引类型）
 
@@ -644,10 +644,13 @@ class WikiIndex:
             misses.append((cache_file, positions))
         if misses:
             miss_positions = [position for _file, positions in misses for position in positions]
-            encoded = embedder.encode(
-                [dense_chunks[position].text for position in miss_positions],
-                show_progress_bar=False, normalize_embeddings=NORMALIZE_EMBEDDINGS,
-            )
+            encoded = []
+            for start in range(0, len(miss_positions), CACHE_MISS_ENCODE_BATCH):
+                batch_positions = miss_positions[start:start + CACHE_MISS_ENCODE_BATCH]
+                encoded.extend(embedder.encode(
+                    [dense_chunks[position].text for position in batch_positions],
+                    show_progress_bar=False, normalize_embeddings=NORMALIZE_EMBEDDINGS,
+                ))
             for position, vector in zip(miss_positions, encoded):
                 result[position] = list(vector)
             cursor = 0

@@ -4,11 +4,86 @@ from pathlib import Path
 import pytest
 import sys
 import types
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from build_index import WikiIndex
 from obsidian_wiki.domain.index_policy import load_ann_policy_file
 from obsidian_wiki.infrastructure.sentence_transformer_embedder import SentenceTransformerEmbedder
+
+
+class _RecordingDenseEmbedder:
+    """Production-seam fake that records each outer encode request."""
+
+    def __init__(self):
+        self.calls = []
+
+    def get_embedding_dimension(self):
+        return 2
+
+    def encode(self, texts, **kwargs):
+        self.calls.append((list(texts), kwargs))
+        return [[float(text.rsplit("-", 1)[1]), float(len(text))] for text in texts]
+
+
+def _dense_chunk(page_id, position):
+    return types.SimpleNamespace(
+        page_id=page_id,
+        content_hash=f"hash-{page_id}-{position}",
+        text=f"dense-{position}",
+    )
+
+
+def test_cached_dense_vectors_empty_input_never_encodes(tmp_path):
+    index = WikiIndex(tmp_path / ".index")
+    embedder = _RecordingDenseEmbedder()
+    index._embedder = embedder
+
+    assert index._cached_dense_vectors([], embedder, full_rebuild=False) == []
+    assert embedder.calls == []
+
+
+def test_cached_dense_vectors_at_most_outer_bound_preserves_arguments_and_order(tmp_path):
+    index = WikiIndex(tmp_path / ".index")
+    embedder = _RecordingDenseEmbedder()
+    index._embedder = embedder
+    chunks = [_dense_chunk("page-a", position) for position in range(3)]
+
+    vectors = index._cached_dense_vectors(chunks, embedder, full_rebuild=False)
+
+    assert embedder.calls == [(
+        ["dense-0", "dense-1", "dense-2"],
+        {"show_progress_bar": False, "normalize_embeddings": False},
+    )]
+    assert vectors == [[0.0, 7.0], [1.0, 7.0], [2.0, 7.0]]
+
+
+def test_cached_dense_vectors_batches_1025_misses_and_preserves_page_cache_order(tmp_path):
+    index = WikiIndex(tmp_path / ".index")
+    embedder = _RecordingDenseEmbedder()
+    index._embedder = embedder
+    chunks = (
+        [_dense_chunk("page-a", position) for position in range(1023)]
+        + [_dense_chunk("page-b", position) for position in range(1023, 1025)]
+    )
+
+    vectors = index._cached_dense_vectors(chunks, embedder, full_rebuild=False)
+
+    assert [len(texts) for texts, _kwargs in embedder.calls] == [1024, 1]
+    assert embedder.calls[0][0] == [f"dense-{position}" for position in range(1024)]
+    assert embedder.calls[1][0] == ["dense-1024"]
+    assert all(kwargs == {
+        "show_progress_bar": False,
+        "normalize_embeddings": False,
+    } for _texts, kwargs in embedder.calls)
+    assert vectors == [[float(position), float(len(f"dense-{position}"))]
+                       for position in range(1025)]
+
+    cache_arrays = [np.load(path).tolist() for path in (tmp_path / ".index").glob("vec_cache/**/*.npy")]
+    assert sorted(cache_arrays, key=len) == [
+        [[1023.0, 10.0], [1024.0, 10.0]],
+        [[float(position), float(len(f"dense-{position}"))] for position in range(1023)],
+    ]
 
 
 def test_wikiindex_build_has_no_runtime_mode_selection(monkeypatch, tmp_path):
