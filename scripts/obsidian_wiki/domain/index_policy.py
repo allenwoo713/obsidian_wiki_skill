@@ -45,6 +45,110 @@ _POLICY_DIGEST_FIELDS = (
     "retention_days",
 )
 
+_PHASE6_DECISION_FIELDS = frozenset({
+    "approval_scope", "configuration", "corpus_rows", "held_out_queries",
+    "candidates", "ef_grid", "pr_head_sha", "approved_by", "approved_at",
+    "comparator_sha256", "candidate_hybrid_sha256", "reconciliation_sha256",
+    "evidence_run_url",
+})
+_PHASE7_DECISION_FIELDS = frozenset({
+    "configuration", "approved_by", "approval_reference", "approved_at",
+    "sealed_dense_ledger_sha256", "dense_evidence_head_sha",
+})
+_PHASE6_CONFIGURATION = {"m": 16, "ef_construction": 300, "query_ef": 100}
+_PHASE7_CONFIGURATION = {"m": 20, "ef_construction": 300, "query_ef": 300}
+_PHASE6_APPROVAL_SCOPE = (
+    "Inherited Phase 6 recall-floor and hybrid-baseline provenance only; it does not "
+    "approve the Phase 7 m=20 selection."
+)
+_PHASE6_PR_HEAD_SHA = "2e1de3c8e30794bf67b160dbe37e7fca41889bea"
+_PHASE6_APPROVED_BY = "root/user (Derek), recorded in issue #49 comment 5312709866"
+_PHASE6_APPROVED_AT = "2026-08-17T06:40:12Z"
+_PHASE7_APPROVED_BY = "repository owner/user, recorded in D-28 / Issue #50"
+_PHASE7_APPROVAL_REFERENCE = "D-28 / Issue #50"
+_PHASE7_APPROVED_AT = "2026-08-28"
+_SEALED_DENSE_LEDGER_SHA256 = (
+    "71335b6bfa03f24368414ae56a22fd8896d4479c6bfbe871c36a14b26e3b211b"
+)
+_DENSE_EVIDENCE_HEAD_SHA = "2f15d6a4fef54dda9b0f4a258e78898e2ef6ea57"
+
+
+def _require_exact_mapping(
+    name: str, value: object, expected_fields: frozenset[str],
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise PolicyError(f"ann decision {name} has an incompatible shape")
+    return value
+
+
+def _require_exact_configuration(
+    name: str, value: object, expected: Mapping[str, int],
+) -> None:
+    configuration = _require_exact_mapping(name, value, frozenset(expected))
+    for field_name, expected_value in expected.items():
+        if type(configuration[field_name]) is not int or configuration[field_name] != expected_value:
+            raise PolicyError(f"ann decision {name}.{field_name} does not match the fixed policy")
+
+
+def _require_exact_value(name: str, value: object, expected: object) -> None:
+    if value != expected or type(value) is not type(expected):
+        raise PolicyError(f"ann decision {name} does not match the recorded provenance")
+
+
+def _validate_informational_decision(
+    decision: object, policy: ProductionAnnPolicy,
+) -> None:
+    """Fail closed on the tracked, human-readable Phase 6/7 policy provenance."""
+    record = _require_exact_mapping(
+        "record", decision,
+        frozenset({"phase6_inherited_provenance", "phase7_selection"}),
+    )
+    phase6 = _require_exact_mapping(
+        "phase6_inherited_provenance", record["phase6_inherited_provenance"],
+        _PHASE6_DECISION_FIELDS,
+    )
+    phase7 = _require_exact_mapping(
+        "phase7_selection", record["phase7_selection"], _PHASE7_DECISION_FIELDS,
+    )
+    _require_exact_configuration(
+        "phase6_inherited_provenance.configuration", phase6["configuration"],
+        _PHASE6_CONFIGURATION,
+    )
+    _require_exact_configuration(
+        "phase7_selection.configuration", phase7["configuration"],
+        _PHASE7_CONFIGURATION,
+    )
+    if (
+        policy.m, policy.ef_construction, policy.query_ef
+    ) != (
+        _PHASE7_CONFIGURATION["m"], _PHASE7_CONFIGURATION["ef_construction"],
+        _PHASE7_CONFIGURATION["query_ef"],
+    ):
+        raise PolicyError("top-level ann policy does not match the fixed Phase 7 selection")
+    for field_name, expected in (
+        ("approval_scope", _PHASE6_APPROVAL_SCOPE),
+        ("corpus_rows", _DECISION_CORPUS_ROWS),
+        ("held_out_queries", _DECISION_HELD_OUT_QUERIES),
+        ("candidates", list(_DECISION_CANDIDATES)),
+        ("ef_grid", list(_DECISION_EF_GRID)),
+        ("pr_head_sha", _PHASE6_PR_HEAD_SHA),
+        ("approved_by", _PHASE6_APPROVED_BY),
+        ("approved_at", _PHASE6_APPROVED_AT),
+        ("comparator_sha256", policy.comparator_sha256),
+        ("candidate_hybrid_sha256", policy.candidate_hybrid_sha256),
+        ("reconciliation_sha256", policy.reconciliation_sha256),
+        ("evidence_run_url", policy.evidence_run_url),
+    ):
+        _require_exact_value(f"phase6_inherited_provenance.{field_name}", phase6[field_name], expected)
+    for field_name, expected in (
+        ("approved_by", _PHASE7_APPROVED_BY),
+        ("approval_reference", _PHASE7_APPROVAL_REFERENCE),
+        ("approved_at", _PHASE7_APPROVED_AT),
+        ("sealed_dense_ledger_sha256", _SEALED_DENSE_LEDGER_SHA256),
+        ("dense_evidence_head_sha", _DENSE_EVIDENCE_HEAD_SHA),
+    ):
+        _require_exact_value(f"phase7_selection.{field_name}", phase7[field_name], expected)
+
 
 def production_policy_sha256(policy: ProductionAnnPolicy) -> str:
     """策略记录的稳定 digest——发布证据据此绑定它实际验证的策略。"""
@@ -56,12 +160,18 @@ def production_policy_sha256(policy: ProductionAnnPolicy) -> str:
 
 def load_ann_policy_record(data: Mapping) -> ProductionAnnPolicy:
     """从 ``eval/ann-policy.json`` 的映射构造并校验批准策略（fail-closed）。"""
-    required = (set(_POLICY_DIGEST_FIELDS) - {"policy_schema_version"}) | {"schema_version"}
+    if not isinstance(data, Mapping):
+        raise PolicyError("ann policy record must be a mapping")
+    required = (set(_POLICY_DIGEST_FIELDS) - {"policy_schema_version"}) | {
+        "schema_version", "decision",
+    }
     missing = required - set(data)
     if missing:
         raise PolicyError(f"ann policy record missing fields: {sorted(missing)}")
+    if set(data) != required:
+        raise PolicyError("ann policy record contains unknown fields")
     try:
-        return ProductionAnnPolicy(
+        policy = ProductionAnnPolicy(
             policy_schema_version=data["schema_version"],
             selected_index_type=data["selected_index_type"],
             lancedb_index_type=data["lancedb_index_type"],
@@ -81,6 +191,8 @@ def load_ann_policy_record(data: Mapping) -> ProductionAnnPolicy:
         )
     except (TypeError, ValueError) as exc:
         raise PolicyError(f"ann policy record is invalid: {exc}") from exc
+    _validate_informational_decision(data["decision"], policy)
+    return policy
 
 
 def default_ann_policy_path() -> Path:

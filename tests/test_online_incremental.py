@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from build_index import build_storage_contract  # noqa: E402
 from obsidian_wiki.domain.index_models import SparseChunk  # noqa: E402
+from obsidian_wiki.domain.index_policy import load_ann_policy_file  # noqa: E402
 
 
 def _active_rows(index_dir: Path) -> tuple[dict[str, object], ...]:
@@ -105,7 +106,10 @@ def test_single_page_edit_uses_staged_shallow_clone_and_atomic_pointer(tmp_path,
     manifest = json.loads(outcome.artifact.manifest_path.read_text(encoding="utf-8"))
     assert manifest["layout"] == "sparse_chunks+dense_chunks"
     assert manifest["ann_policy"]["selected_index_type"] == "ivf-hnsw-sq"
-    assert manifest["ann_policy"]["query_ef"] == 100
+    approved_ann = load_ann_policy_file()
+    assert manifest["vector_config"]["m"] == approved_ann.m
+    assert manifest["vector_config"]["ef_construction"] == approved_ann.ef_construction
+    assert manifest["ann_policy"]["query_ef"] == approved_ann.query_ef
 
 
 def test_unchanged_population_has_no_mutation_rows(tmp_path):

@@ -92,7 +92,10 @@ class MineruLocalPdfParser(DocumentParser):
             env["MINERU_DEVICE_MODE"] = "cpu"
             env["CUDA_VISIBLE_DEVICES"] = ""
 
-            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd, env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="strict",
+            )
             if result.returncode != 0:
                 raise RuntimeError(
                     f"MinerU local parser failed with code {result.returncode}: {result.stderr}"

@@ -41,7 +41,8 @@ def _uv_command() -> list[str]:
     uv = shutil.which("uv")
     if uv:
         version = subprocess.run(
-            [uv, "--version"], check=True, capture_output=True, text=True
+            [uv, "--version"], check=True, capture_output=True, text=True,
+            encoding="utf-8", errors="strict",
         ).stdout.split()[1]
         if version == UV_VERSION:
             return [uv]

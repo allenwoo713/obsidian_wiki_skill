@@ -14,8 +14,9 @@ def test_manual_calibration_isolated_from_pull_request_acceptance() -> None:
     assert "github.event_name == 'workflow_dispatch'" in workflow
     assert "github.event_name == 'pull_request'" in workflow
     acceptance = workflow.split("issue41-scale-benchmark:", 1)[1].split("model-backed-ann-decision:", 1)[0]
-    assert "--approved-static-cap" in acceptance
-    assert "--approved-calibration-sha256" in acceptance
+    assert "Require committed root/user-approved static calibration reference" in acceptance
+    assert "value['static_cap_seconds'] == 180" in acceptance
+    assert "value['omp_threads'] == 2" in acceptance
     assert "--calibrate" not in acceptance
 
 
@@ -41,4 +42,7 @@ def test_manual_calibration_has_ten_run_timeout_without_relaxing_pr_acceptance()
 
     assert "timeout-minutes: 30" in calibration
     assert "timeout-minutes: 15" in acceptance
-    assert "--max-seconds 60" in acceptance
+    assert "--per-build-cap-seconds 180" in acceptance
+    assert "--max-seconds 60" not in acceptance
+    assert "value['static_cap_seconds'] == 180" in acceptance
+    assert "value['omp_threads'] == 2" in acceptance

@@ -11,9 +11,27 @@ on:
       - 'requirements.txt'
       - 'scripts/compile_requirements.py'
   workflow_dispatch:
+    inputs:
+      campaign_stage:
+        description: "Typed, non-authorizing Phase 07 campaign stage"
+        required: false
+        default: preflight
+        type: choice
+        options: [preflight, screening, confirmation]
+      workflow_inputs:
+        description: "Sealed generated Phase 07 campaign dispatch bundle"
+        required: false
+        type: string
+
+# Hosted jobs need only their checkout and immutable artifact reads.  No job
+# receives write, package, deployment, or id-token authority.
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   test-and-eval:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,8 +64,8 @@ jobs:
           python -c "import importlib.metadata as metadata;
           print(', '.join(f'{package}={metadata.version(package)}' for package in
           ('lancedb', 'pyarrow', 'sentence-transformers')))"
-      - name: Validate approved production ANN policy record (Phase 06)
-        run: python eval/run_eval.py --validate-ann-policy
+      - name: Validate inherited Phase 6 provenance and selected Phase 7 ANN policy
+        run: python -m eval.run_eval --validate-ann-policy
       # #17 API coverage: adapter call shapes, persisted real artifacts, exact-bypass
       # and ANN policy, SDK-free import boundaries, and installed-version reporting.
       # D-03 timing and resource values are recorded observations, never timing gates.
@@ -64,6 +82,11 @@ jobs:
       - name: Bootstrap local embedding model
         run: |
           python scripts/download_embedding_model.py
+      - name: Run Phase 07 frozen-base real-model tokenizer gate
+        run: >
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/phase07-frozen-model
+          tests/test_phase07_frozen_model_contract.py -q
       # #22 must use the real storage/public facade after the existing local-model
       # bootstrap.  No baseline initialization or policy mutation is accepted.
       - name: Run #22 storage, recovery, telemetry, and public-route gates
@@ -77,7 +100,7 @@ jobs:
       - name: Run #22 public build-mode equivalence gate
         run: |
           set -euo pipefail
-          python eval/compare_build_modes.py \
+          python -m eval.compare_build_modes \
             --work-dir .review-tmp/phase04-modes \
             --output .review-tmp/phase04-modes/equivalence.json
           test -s .review-tmp/phase04-modes/equivalence.json
@@ -106,8 +129,10 @@ jobs:
           tests/test_community_reports.py
           tests/test_eval_workflow.py -q
       - name: Unit tests
-        run: |
-          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider --basetemp=.review-tmp/pytest
+        run: >
+          PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/pytest
+          --ignore=tests/test_phase07_frozen_model_contract.py
       - name: Protect evaluation baseline on pull requests
         if: github.event_name == 'pull_request'
         run: |
@@ -136,7 +161,7 @@ jobs:
           fi
       - name: Retrieval eval (regression check)
         run: |
-          python eval/run_eval.py --work-dir .review-tmp/eval
+          python -m eval.run_eval --work-dir .review-tmp/eval
       - name: Bind #22 evidence to the accepted workflow inputs
         run: >
           python -c "import json, pathlib; root=pathlib.Path('.review-tmp/phase04-modes');
@@ -155,6 +180,7 @@ jobs:
             .review-tmp/phase04-modes/equivalence.json
             .review-tmp/phase04-modes/acceptance.json
           if-no-files-found: error
+          retention-days: 90
       - name: Upload eval results
         if: always()
         uses: actions/upload-artifact@v4
@@ -163,10 +189,12 @@ jobs:
           path: |
             eval/results.json
             eval/detail.jsonl
+          retention-days: 90
 
   issue41-manual-calibration:
     name: "Issue #41 manual ANN calibration (non-authorizing)"
-    if: github.event_name == 'workflow_dispatch'
+    # Kept as a legacy Issue #41 diagnostic; it is not a Phase 07 campaign.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'legacy-issue41-calibration' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -202,7 +230,7 @@ jobs:
           assert actual == expected, f'expected LanceDB 0.34.0 / NumPy 2.2.6 / PyArrow 25.0.0, got {actual}'"
       - name: Run manual non-authorizing OMP calibration and batch observation
         run: >
-          python eval/benchmark_ann_build.py
+          python -m eval.benchmark_ann_build
           --rows 77348
           --dimensions 384
           --max-probes 256
@@ -211,7 +239,6 @@ jobs:
           --row-batch-size 8192
           --query-batch-size 32
           --max-exact-seconds 10
-          --max-seconds 60
           --max-evidence-bytes 10485760
           --work-dir .review-tmp/issue41-scale
           --output .review-tmp/issue41-scale/calibration-never-accepting.json
@@ -226,6 +253,7 @@ jobs:
           name: issue41-ann-calibration
           path: .review-tmp/issue41-scale/ann-calibration.json
           if-no-files-found: ignore
+          retention-days: 90
       - name: Upload observational ANN calibration batch spike
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -233,6 +261,7 @@ jobs:
           name: issue41-ann-calibration-batch-spike
           path: .review-tmp/issue41-scale/ann-calibration-batch-spike.json
           if-no-files-found: ignore
+          retention-days: 90
       - name: Upload rejected issue #41 comparator error evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -240,6 +269,7 @@ jobs:
           name: issue41-index-benchmark-error
           path: .review-tmp/issue41-scale/index-benchmark-error.json
           if-no-files-found: ignore
+          retention-days: 90
 
   issue41-scale-benchmark:
     name: "Issue #41 held-out ANN acceptance comparator (77,348 x 384)"
@@ -281,10 +311,12 @@ jobs:
           value=json.loads(path.read_text()); required=('static_cap_seconds','calibration_sha256','calibration_rule_version','omp_threads');
           assert all(value.get(key) is not None for key in required), 'incomplete committed calibration reference';
           assert len(value['calibration_sha256']) == 64, 'invalid committed calibration digest';
+          assert value['static_cap_seconds'] == 180, 'approved per-build cap must remain 180 seconds';
+          assert value['omp_threads'] == 2, 'approved OMP setting must remain 2';
           env=open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8');
           [print(f'ANN_APPROVED_{key.upper()}={value[key]}', file=env) for key in required]; env.close()"
-      - name: Validate approved production ANN policy record (Phase 06)
-        run: python eval/run_eval.py --validate-ann-policy
+      - name: Validate inherited Phase 6 provenance and selected Phase 7 ANN policy
+        run: python -m eval.run_eval --validate-ann-policy
       - name: Run static-cap held-out FLAT/SQ ANN acceptance comparator
         env:
           # Bind native thread pools to the approved calibration setting so the
@@ -293,7 +325,7 @@ jobs:
           OPENBLAS_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
           MKL_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}
         run: >
-          python eval/benchmark_ann_build.py
+          python -m eval.benchmark_ann_build
           --rows 77348
           --dimensions 384
           --max-probes 256
@@ -302,21 +334,18 @@ jobs:
           --row-batch-size 8192
           --query-batch-size 32
           --max-exact-seconds 10
-          --max-seconds 60
+          --per-build-cap-seconds 180
           --max-evidence-bytes 10485760
           --work-dir .review-tmp/issue41-scale
           --output eval/index-benchmark.json
           --error-output .review-tmp/issue41-scale/index-benchmark-error.json
-          --approved-static-cap "${{ env.ANN_APPROVED_STATIC_CAP_SECONDS }}"
-          --approved-calibration-sha256 "${{ env.ANN_APPROVED_CALIBRATION_SHA256 }}"
-          --approved-calibration-rule-version "${{ env.ANN_APPROVED_CALIBRATION_RULE_VERSION }}"
-          --approved-omp-threads "${{ env.ANN_APPROVED_OMP_THREADS }}"
       - name: Upload issue #41 held-out scale evidence
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: issue41-index-benchmark
           path: eval/index-benchmark.json
+          retention-days: 90
       - name: Upload rejected issue #41 comparator error evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -324,16 +353,21 @@ jobs:
           name: issue41-index-benchmark-error
           path: .review-tmp/issue41-scale/index-benchmark-error.json
           if-no-files-found: ignore
+          retention-days: 90
 
   model-backed-ann-decision:
-    name: "Model-backed candidate-specific hybrid decision records"
+    name: "Phase 07 model-backed m20 original-105 hybrid gate"
     if: github.event_name == 'pull_request'
-    needs: issue41-scale-benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PHASE07_FINAL_ARTIFACT_NAME: phase07-final-hybrid-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -348,48 +382,47 @@ jobs:
           key: embed-model-${{ hashFiles('scripts/download_embedding_model.py') }}
       - name: Bootstrap local embedding model
         run: python scripts/download_embedding_model.py
-      - name: Download complete held-out comparator evidence
-        uses: actions/download-artifact@v4
-        with:
-          name: issue41-index-benchmark
-          path: .review-tmp/held-out-evidence
-      - name: Run model-backed candidate decision records without baseline refresh
+      - name: Run locked m16-vs-m20 original-105 production hybrid gate
         run: >
-          python eval/run_eval.py
-          --work-dir .review-tmp/model-backed-ann
-          --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
-          --decision-output eval/candidate-hybrid-ann-decision.json
-      - name: Validate all twelve candidate-specific production hybrid records
+          python -m eval.run_eval
+          --work-dir .review-tmp/phase07-final
+          --phase07-final-output eval/phase07-final-hybrid.json
+      - name: Recompute and validate the exact-head Phase 07 packet
         run: >
-          python eval/run_eval.py
-          --decision-evidence .review-tmp/held-out-evidence/index-benchmark.json
-          --validate-candidate-hybrid-evidence eval/candidate-hybrid-ann-decision.json
-      - name: Upload model-backed candidate decision records
+          python -m eval.run_eval
+          --validate-phase07-final-evidence eval/phase07-final-hybrid.json
+      - name: Upload Phase 07 final hybrid evidence
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-hybrid-ann-decision
+          name: ${{ env.PHASE07_FINAL_ARTIFACT_NAME }}
           path: |
-            eval/candidate-hybrid-ann-decision.json
-            eval/results.json
-            eval/detail.jsonl
-      - name: Upload rejected candidate-hybrid diagnostics
+            eval/phase07-final-hybrid.json
+          retention-days: 90
+      - name: Upload rejected Phase 07 diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: candidate-hybrid-ann-decision-error
+          name: phase07-final-hybrid-error
           path: |
-            eval/results.json
-            eval/detail.jsonl
+            eval/phase07-final-hybrid.json
           if-no-files-found: ignore
+          retention-days: 90
 
   reconcile-ann-decision:
     name: "Eval ANN decision reconciliation"
     if: ${{ github.event_name == 'pull_request' && always() }}
     needs: [test-and-eval, issue41-scale-benchmark, model-backed-ann-decision]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PHASE07_FINAL_ARTIFACT_NAME: phase07-final-hybrid-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -399,37 +432,34 @@ jobs:
       - name: Install locked reconciliation dependencies
         if: ${{ always() }}
         run: python -m pip install -r requirements.txt pytest
-      - name: Download scale evidence for validation
+      - name: Require every independent PR dependency to succeed
         if: ${{ always() }}
+        env:
+          PHASE07_NEED_TEST_AND_EVAL: ${{ needs.test-and-eval.result }}
+          PHASE07_NEED_ISSUE41_SCALE: ${{ needs.issue41-scale-benchmark.result }}
+          PHASE07_NEED_MODEL_BACKED: ${{ needs.model-backed-ann-decision.result }}
+        run: python -m eval.run_eval --validate-phase07-required-needs
+      - name: Download Phase 07 final hybrid evidence
+        if: ${{ always() }}
+        # Without run-id/repository, v4 resolves this fixed unique name only
+        # inside the current workflow run; cross-run name lookup is not used.
         uses: actions/download-artifact@v4
         with:
-          name: issue41-index-benchmark
-          path: .review-tmp/reconcile/scale
-      - name: Download model-backed records for validation
-        if: ${{ always() }}
-        uses: actions/download-artifact@v4
-        with:
-          name: candidate-hybrid-ann-decision
+          name: ${{ env.PHASE07_FINAL_ARTIFACT_NAME }}
           path: .review-tmp/reconcile/model
-      - name: Reconcile numeric same-head Eval evidence
+      - name: Recompute exact-head Phase 07 final evidence
         if: ${{ always() }}
         run: >
-          python eval/reconcile_ann_gate.py
-          --scale-evidence .review-tmp/reconcile/scale/index-benchmark.json
-          --model-records .review-tmp/reconcile/model/candidate-hybrid-ann-decision.json
-          --test-and-eval "${{ needs.test-and-eval.result }}"
-          --scale "${{ needs.issue41-scale-benchmark.result }}"
-          --model-backed "${{ needs.model-backed-ann-decision.result }}"
-          --expected-head "${{ github.sha }}"
-          --expected-pr-head "${{ github.event.pull_request.head.sha }}"
-          --output .review-tmp/reconcile/ann-reconciliation.json
+          python -m eval.run_eval
+          --validate-phase07-final-evidence .review-tmp/reconcile/model/phase07-final-hybrid.json
       - name: Upload reconciliation diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: ann-decision-reconciliation
-          path: .review-tmp/reconcile/ann-reconciliation.json
+          path: .review-tmp/reconcile/model/phase07-final-hybrid.json
           if-no-files-found: warn
+          retention-days: 90
       - name: Required cross-workflow PR checks
         if: ${{ always() }}
         run: |
@@ -438,3 +468,341 @@ jobs:
           echo "Architecture (ubuntu-latest, Python 3.13)"
           echo "Architecture (windows-latest, Python 3.10)"
           echo "Architecture (windows-latest, Python 3.13)"
+
+  # Preflight never installs/imports the numeric stack, hydrates a model, or runs a campaign.
+  # Both legs are required evidence; either rejection blocks all later manual stages.
+  phase07-entitlement-preflight-ubuntu:
+    name: "Phase 07 hosted entitlement preflight (non-authorizing)"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'preflight' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions: {contents: read, actions: read}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Seal stdlib-only preflight success or rejection without dependency import
+        env:
+          PHASE07_STAGE: ${{ inputs.campaign_stage }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.sha }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: >
+          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$PHASE07_STAGE" --repository "$REPOSITORY" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --head-sha "$HEAD_SHA" --job-key phase07-entitlement-preflight-ubuntu --runner-os "$RUNNER_OS" --runner-architecture "$RUNNER_ARCH"
+      - name: Upload preflight evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-preflight-ubuntu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07-preflight/success-or-rejection.json
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-entitlement-preflight-windows:
+    name: "Phase 07 hosted entitlement preflight (Windows, non-authorizing)"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'preflight' }}
+    runs-on: windows-latest
+    timeout-minutes: 8
+    permissions: {contents: read, actions: read}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Seal stdlib-only Windows preflight success or rejection
+        shell: pwsh
+        env:
+          PHASE07_STAGE: ${{ inputs.campaign_stage }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD_SHA: ${{ github.sha }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: >
+          python -m eval.phase07_operator_gate hosted-preflight --ledger-file .review-tmp/phase07-preflight/success-or-rejection.json --stage "$env:PHASE07_STAGE" --repository "$env:REPOSITORY" --run-id "$env:RUN_ID" --run-attempt "$env:RUN_ATTEMPT" --head-sha "$env:HEAD_SHA" --job-key phase07-entitlement-preflight-windows --runner-os "$env:RUNNER_OS" --runner-architecture "$env:RUNNER_ARCH"
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: phase07-preflight-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07-preflight/success-or-rejection.json
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-screening:
+    name: "Phase 07 bounded SQ screening campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'screening' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '2', MKL_NUM_THREADS: '2'}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Validate immutable model manifest for seeded numeric screening
+        run: python scripts/download_embedding_model.py --validate-manifest-only
+      - name: Assert actual locked Stage 1 runtime and OMP settings
+        run: >
+          python -c "import importlib.metadata as metadata, os, sys;
+          expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'python':f'{sys.version_info.major}.{sys.version_info.minor}', 'lancedb':metadata.version('lancedb'), 'numpy':metadata.version('numpy'), 'pyarrow':metadata.version('pyarrow')};
+          threads={key:os.environ.get(key) for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')};
+          print({'runtime':actual, 'threads':threads});
+          assert actual == expected and threads == {'OMP_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'2', 'MKL_NUM_THREADS':'2'}, (actual, threads)"
+      - name: Construct finite screening request in this job
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          JOB_KEY: ${{ github.job }}
+          HEAD: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: >
+          python -c "import hashlib,json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); k=os.environ['JOB_KEY']; r={'schema_version':1,'stage':'screening','request_id':'screening-'+os.environ['RUN_ID'],'environment':{'branch':os.environ['BRANCH'],'workflow_path':'.github/workflows/eval.yml','head_sha':os.environ['HEAD'],'run_id':int(os.environ['RUN_ID']),'run_attempt':int(os.environ['RUN_ATTEMPT']),'job_key':k,'job_allocation_nonce':os.environ['RUN_ID']+'-'+os.environ['RUN_ATTEMPT']+'-'+k,'runtime':{'python':'3.13','lancedb':'0.34.0','numpy':'2.2.6','pyarrow':'25.0.0','omp_num_threads':2}},'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json'),'lock_identity':h('requirements.txt')}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+      - name: Invoke the real campaign CLI
+        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+      - name: Seal missing numeric output as a pipeline rejection
+        if: ${{ always() }}
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/output --stage screening --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-screening --job-status "${{ job.status }}"
+      - name: Upload sealed screening evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-screening-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/output
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-confirmation:
+    name: "Phase 07 independent confirmation campaign"
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.campaign_stage == 'confirmation' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: '2', OPENBLAS_NUM_THREADS: '2', MKL_NUM_THREADS: '2'}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - id: phase07-model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Hydrate exact immutable model only on cache miss
+        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
+        run: python scripts/download_embedding_model.py
+      - name: Validate immutable cached model tree before campaign import
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Assert actual locked confirmation runtime and thread settings
+        run: >
+          python -c "import importlib.metadata as metadata, os, sys;
+          expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'python':f'{sys.version_info.major}.{sys.version_info.minor}', 'lancedb':metadata.version('lancedb'), 'numpy':metadata.version('numpy'), 'pyarrow':metadata.version('pyarrow')};
+          threads={key:os.environ.get(key) for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')};
+          print({'runtime':actual, 'threads':threads});
+          assert actual == expected and threads == {'OMP_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'2', 'MKL_NUM_THREADS':'2'}, (actual, threads)"
+      - name: Materialize only the sealed generated confirmation input
+        env:
+          WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
+        run: >
+          python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); value=json.loads(os.environ['WORKFLOW_INPUTS']); (d/'workflow-inputs.json').write_text(json.dumps(value,sort_keys=True))"
+      - name: Bind this attempt to exactly one numeric job before any index build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -m eval.phase07_operator_gate confirmation-allocation --request-file .review-tmp/phase07/workflow-inputs.json --ledger-file .review-tmp/phase07/allocation.json --repository "${{ github.repository }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --head-sha "${{ github.sha }}" --job-key phase07-confirmation
+      - name: Construct the campaign request from sealed input and allocated job only
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          HEAD: ${{ github.sha }}
+        run: >
+          python -c "import hashlib,importlib.metadata as metadata,json,os,pathlib,sys; d=pathlib.Path('.review-tmp/phase07'); i=json.loads((d/'workflow-inputs.json').read_text())['workflow_input']; a=json.loads((d/'allocation.json').read_text())['allocation']; h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); cpu=next((line.split(':',1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown-cpu'); runtime={'python':f'{sys.version_info.major}.{sys.version_info.minor}','lancedb':metadata.version('lancedb'),'numpy':metadata.version('numpy'),'pyarrow':metadata.version('pyarrow'),'omp_num_threads':int(os.environ['OMP_NUM_THREADS']),'openblas_num_threads':int(os.environ['OPENBLAS_NUM_THREADS']),'mkl_num_threads':int(os.environ['MKL_NUM_THREADS'])}; source_digests={'requirements_sha256':h('requirements.txt'),'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; host={'os':'Linux','architecture':'X64','image':os.environ.get('ImageOS','ubuntu')+' '+os.environ.get('ImageVersion','unknown'),'hostname':os.uname().nodename,'cpu_count':os.cpu_count() or 1,'cpu_model':cpu}; r={'schema_version':1,'stage':'confirmation','request_id':'confirmation-'+os.environ['RUN_ID'],'environment':{'head_sha':os.environ['HEAD'],'runtime':runtime,'source_digests':source_digests,'host':host},'model_manifest_sha256':source_digests['model_manifest_sha256'],'corpus_manifest_sha256':source_digests['corpus_manifest_sha256'],'workflow_inputs':i,'run_identity':{k:a[k] for k in ('run_id','run_attempt','job_id','job_allocation_nonce')}}; (d/'request.json').write_text(json.dumps(r,sort_keys=True))"
+      - name: Invoke the real independent confirmation CLI
+        run: python -m eval.phase07_ann_campaign --request-file .review-tmp/phase07/request.json --output-dir .review-tmp/phase07/output
+      - name: Export the sealed confirmation artifact packet from production output
+        if: ${{ success() }}
+        run: >
+          python -m eval.phase07_ann_campaign export-confirmation-packet --campaign-output-dir .review-tmp/phase07/output --dispatch-bundle .review-tmp/phase07/workflow-inputs.json --allocation-ledger .review-tmp/phase07/allocation.json --artifact-dir .review-tmp/phase07/confirmation-artifact
+      - name: Seal missing numeric output as a pipeline rejection
+        if: ${{ always() }}
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-confirmation --job-status "${{ job.status }}"
+      - name: Upload sealed confirmation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-confirmation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/confirmation-artifact
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-hybrid-prepare:
+    name: "Phase 07 candidate-neutral frozen corpus prepare"
+    # Retained only so historical artifacts remain understandable.  Phase 07
+    # final authority no longer permits a copied 30k corpus campaign.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - id: phase07-model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
+      - name: Install exact numeric dependencies and validate the pinned local model
+        run: python -m pip install -r requirements.txt pytest
+      - name: Hydrate exact immutable model only on cache miss
+        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
+        run: python scripts/download_embedding_model.py
+      - name: Validate immutable cached model tree
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Materialize only the sealed prepare bundle
+        env:
+          WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
+        run: >
+          python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); (d/'prepare-bundle.json').write_text(json.dumps(json.loads(os.environ['WORKFLOW_INPUTS']),sort_keys=True))"
+      - name: Materialize the fixed candidate-neutral 30k corpus
+        run: >
+          python -c "from pathlib import Path; from eval.run_eval import FIXTURES_WIKI,_materialize_phase07_expanded_corpus; _materialize_phase07_expanded_corpus(fixture_root=FIXTURES_WIKI,output_root=Path('.review-tmp/phase07/frozen-corpus/Wiki'),target_size=30000)"
+      - name: Prepare and seal only reusable source data
+        run: >
+          python -m eval.phase07_frozen_base prepare --wiki-dir .review-tmp/phase07/frozen-corpus/Wiki --frozen-dir .review-tmp/phase07/frozen-corpus --prepare-bundle .review-tmp/phase07/prepare-bundle.json
+          --model-dir models/paraphrase-multilingual-MiniLM-L12-v2
+      - name: Upload sealed frozen base, never a candidate packet
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-frozen-base-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/frozen-corpus
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-hybrid:
+    name: "Phase 07 independent hybrid campaign"
+    # Retired: the pull-request job above runs only m16 vs m20 on the original
+    # 105-query corpus, so no manual m32/30k dispatch can mint new evidence.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions: {contents: read, actions: read}
+    env: {OMP_NUM_THREADS: "2", OPENBLAS_NUM_THREADS: "2", MKL_NUM_THREADS: "2"}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - id: phase07-model-cache
+        uses: actions/cache@v4
+        with:
+          path: models/paraphrase-multilingual-MiniLM-L12-v2
+          key: phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}
+      - name: Install exact numeric dependencies and validate model cache before import
+        run: python -m pip install -r requirements.txt pytest
+      - name: Hydrate exact immutable model only on cache miss
+        if: steps.phase07-model-cache.outputs.cache-hit != 'true'
+        run: python scripts/download_embedding_model.py
+      - name: Validate immutable cached model tree
+        run: python -c "from pathlib import Path; from eval.ann_corpus_manifest import load_manifest,validate_model_tree; validate_model_tree(Path('models/paraphrase-multilingual-MiniLM-L12-v2'),load_manifest(Path('eval/model-manifest.json')))"
+      - name: Assert locked hybrid runtime and thread settings
+        run: >
+          python -c "import importlib.metadata as metadata, os, sys;
+          expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'};
+          actual={'python':f'{sys.version_info.major}.{sys.version_info.minor}', 'lancedb':metadata.version('lancedb'), 'numpy':metadata.version('numpy'), 'pyarrow':metadata.version('pyarrow')};
+          threads={key:os.environ.get(key) for key in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')};
+          assert actual == expected and threads == {'OMP_NUM_THREADS':'2', 'OPENBLAS_NUM_THREADS':'2', 'MKL_NUM_THREADS':'2'}, (actual, threads)"
+      - name: Materialize only the sealed generated hybrid dispatch bundle
+        env:
+          WORKFLOW_INPUTS: ${{ inputs.workflow_inputs }}
+        run: >
+          python -c "import json,os,pathlib; d=pathlib.Path('.review-tmp/phase07'); d.mkdir(parents=True,exist_ok=True); v=json.loads(os.environ['WORKFLOW_INPUTS']); (d/'hybrid-dispatch.json').write_text(json.dumps(v,sort_keys=True))"
+      - name: Require an empty canonical root before secure artifact extraction
+        run: >
+          python -c "from pathlib import Path; root=Path('.review-tmp/phase07/frozen-corpus'); assert not root.exists(), root"
+      - name: Download and securely extract the one sealed frozen prepare artifact
+        # The operator uses only the sealed numeric artifact ID at GitHub's
+        # archive endpoint; it never selects latest/name/matrix artifacts.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -m eval.phase07_operator_gate frozen-download
+          --dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json
+          --archive .review-tmp/phase07/frozen-prepare.zip
+          --frozen-dir .review-tmp/phase07/frozen-corpus
+          --model-dir models/paraphrase-multilingual-MiniLM-L12-v2
+      - name: Validate the empty-root frozen extraction before private cloning
+        run: >
+          python -c "from pathlib import Path; from eval.phase07_frozen_base import load_verified_frozen_embedder,validate_frozen_base; root=Path('.review-tmp/phase07/frozen-corpus'); assert root.is_dir() and not root.is_symlink(); embedder=load_verified_frozen_embedder(Path('models/paraphrase-multilingual-MiniLM-L12-v2')); validate_frozen_base(root, expected_wiki_root=root/'Wiki', tokenizer=embedder.tokenizer)"
+      - name: Bind this attempt to exactly one hybrid job before any index build
+        # The operator queries the exact attempt-scoped /attempts/{run_attempt}/jobs API.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -m eval.phase07_operator_gate hybrid-allocation --request-file .review-tmp/phase07/hybrid-dispatch.json --ledger-file .review-tmp/phase07/hybrid-allocation.json --repository "${{ github.repository }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --head-sha "${{ github.sha }}" --job-key phase07-hybrid
+      - name: Construct locked hybrid execution binding
+        env:
+          HEAD: ${{ github.sha }}
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: >
+          python -c "import hashlib,importlib.metadata as metadata,json,os,pathlib,sys; d=pathlib.Path('.review-tmp/phase07'); h=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest(); assert os.environ['RUNNER_OS']=='Linux' and os.environ['RUNNER_ARCH']=='X64'; assert os.environ['ImageOS'] and os.environ['ImageVersion']; cpu=next((line.split(':',1)[1].strip() for line in pathlib.Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'unknown-cpu'); runtime={'python':f'{sys.version_info.major}.{sys.version_info.minor}','lancedb':metadata.version('lancedb'),'numpy':metadata.version('numpy'),'pyarrow':metadata.version('pyarrow'),'omp_num_threads':2,'openblas_num_threads':2,'mkl_num_threads':2}; source={'requirements_sha256':h('requirements.txt'),'model_manifest_sha256':h('eval/model-manifest.json'),'corpus_manifest_sha256':h('eval/personal-wiki-corpus-manifest.json')}; host={'os':os.environ['RUNNER_OS'],'architecture':os.environ['RUNNER_ARCH'],'image':os.environ['ImageOS']+' '+os.environ['ImageVersion'],'hostname':os.uname().nodename,'cpu_count':os.cpu_count() or 1,'cpu_model':cpu}; (d/'hybrid-execution.json').write_text(json.dumps({'head_sha':os.environ['HEAD'],'runtime':runtime,'source_digests':source,'host':host},sort_keys=True))"
+      - name: Invoke the real sealed-role hybrid campaign with live progress
+        run: >
+          python -m eval.phase07_operator_gate hybrid-dispatch
+          --dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json
+          --locked-execution .review-tmp/phase07/hybrid-execution.json
+          --allocation .review-tmp/phase07/hybrid-allocation.json
+          --output-dir .review-tmp/phase07/hybrid-artifact
+          --frozen-dir .review-tmp/phase07/frozen-corpus
+      - name: Export the sealed hybrid packet from raw production output
+        if: ${{ success() }}
+        run: >
+          python -m eval.phase07_ann_campaign export-hybrid-packet
+          --artifact-dir .review-tmp/phase07/hybrid-artifact/raw
+          --output .review-tmp/phase07/hybrid-artifact/exported-hybrid-packet.json
+      - name: Seal missing numeric output as a pipeline rejection
+        if: ${{ always() }}
+        run: python -m eval.phase07_operator_gate finalize --output-dir .review-tmp/phase07/hybrid-artifact --stage hybrid --head-sha "${{ github.sha }}" --run-id "${{ github.run_id }}" --run-attempt "${{ github.run_attempt }}" --job-key phase07-hybrid --job-status "${{ job.status }}"
+      - name: Upload sealed hybrid evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase07-hybrid-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .review-tmp/phase07/hybrid-artifact/raw
+          if-no-files-found: error
+          retention-days: 90
+
+  phase07-pr-acceptance-gate:
+    name: "Phase 07 same-head policy migration gate"
+    if: ${{ github.event_name == 'pull_request' && always() }}
+    needs: [model-backed-ann-decision, reconcile-ann-decision]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {contents: read, actions: read}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Require the exact-head production policy and final gates
+        env:
+          PHASE07_MODEL_GATE: ${{ needs.model-backed-ann-decision.result }}
+          PHASE07_RECONCILIATION_GATE: ${{ needs.reconcile-ann-decision.result }}
+        run: |
+          test "$PHASE07_MODEL_GATE" = success
+          test "$PHASE07_RECONCILIATION_GATE" = success
+          python -c "import json,pathlib; p=json.loads(pathlib.Path('eval/ann-policy.json').read_text(encoding='utf-8')); assert (p['m'],p['ef_construction'],p['query_ef'])==(20,300,300); assert p['decision']['phase7_selection']['approval_reference']=='D-28 / Issue #50'"

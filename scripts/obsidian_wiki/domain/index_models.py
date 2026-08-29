@@ -81,7 +81,7 @@ class VectorIndexConfig(_JsonRecord):
 
 @dataclass(frozen=True)
 class ProductionAnnPolicy(_JsonRecord):
-    """Phase 06 批准的唯一生产 ANN 契约（issue #49 / Plan 06-02 决策）。
+    """Phase 7 选择的唯一生产 ANN 契约（issue #49 / Plan 06-02 决策）。
 
     值来自源码控制的 ``eval/ann-policy.json``；运行时不可选择类型/ef/exact。
     """
@@ -92,9 +92,9 @@ class ProductionAnnPolicy(_JsonRecord):
     metric: str                       # "cosine"
     dimensions: int                   # 384
     num_partitions: int               # 1
-    m: int                            # 16
+    m: int                            # 20
     ef_construction: int              # 300
-    query_ef: int                     # 100
+    query_ef: int                     # 300
     recall_at_10_floor: float         # 0.19
     recall_at_20_floor: float         # 0.17
     comparator_sha256: str            # Plan 02 决策证据 digest
@@ -192,6 +192,21 @@ class CandidatePublicationEvidence(_JsonRecord):
 
 
 @dataclass(frozen=True)
+class CandidateBuildPolicy(_JsonRecord):
+    """Explicit eval-only immutable index-build binding."""
+    candidate: str
+    m: int
+    ef_construction: int
+
+    def __post_init__(self) -> None:
+        if self.candidate not in {"ivf-hnsw-flat", "ivf-hnsw-sq"} or self.m not in {16, 20, 32} or self.ef_construction not in {300, 500}:
+            raise ValueError("invalid evaluation build policy")
+
+    def to_json(self) -> dict[str, object]:
+        return {"candidate": self.candidate, "m": self.m, "ef_construction": self.ef_construction}
+
+
+@dataclass(frozen=True)
 class CandidateQueryPolicy(_JsonRecord):
     """Evaluation-only ANN binding applied below hybrid orchestration.
 
@@ -203,6 +218,7 @@ class CandidateQueryPolicy(_JsonRecord):
 
     candidate: str
     query_ef: int
+    build_policy: CandidateBuildPolicy | None = None
 
     def __post_init__(self) -> None:
         if self.candidate not in {"ivf-hnsw-flat", "ivf-hnsw-sq"}:
@@ -213,9 +229,16 @@ class CandidateQueryPolicy(_JsonRecord):
             or self.query_ef <= 0
         ):
             raise ValueError("query_ef must be a positive integer")
+        if isinstance(self.build_policy, dict):
+            object.__setattr__(self, "build_policy", CandidateBuildPolicy(**self.build_policy))
+        if self.build_policy is not None and self.build_policy.candidate != self.candidate:
+            raise ValueError("evaluation build/query candidate mismatch")
 
     def to_json(self) -> dict[str, object]:
-        return {"candidate": self.candidate, "query_ef": self.query_ef}
+        value = {"candidate": self.candidate, "query_ef": self.query_ef}
+        if self.build_policy is not None:
+            value["build_policy"] = self.build_policy.to_json()
+        return value
 
 
 @dataclass(frozen=True)

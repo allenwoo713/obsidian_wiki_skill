@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "generator": {"version": "public-distractor-v2", "seed": "phase07-public-corpus", "source_fixture_sha256": "3df4b971354569af4f9a26c86189e6865926f0e81f7083a94ebdde8dd4e0e2f5", "rules_sha256": "675a5f69df2b006b5f2a96fa8edf999a64f4883263b9814e5b5b30200983abff"},
+  "record_self_sha256": "bd5dc527ee3e050cef5eb894efff9e0c8015f05a6c79a731ad983f2a6e5d78e1"
+}

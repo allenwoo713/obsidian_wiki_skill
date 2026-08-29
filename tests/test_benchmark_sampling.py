@@ -6,10 +6,14 @@ and pass without weakening the existing recall thresholds.
 """
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import inspect
 import json
 import math
+import os
+import sys
+import time
 from argparse import Namespace
 from copy import deepcopy
 from pathlib import Path
@@ -85,15 +89,36 @@ def test_issue41_scale_gate_separates_exact_slo_from_coarse_wall_ceiling() -> No
     assert benchmark_ann_build.DEFAULT_MAX_EXACT_SECONDS == 10.0
     assert benchmark_ann_build.DEFAULT_MAX_WALL_SECONDS == 60.0
     assert benchmark_ann_build.MAX_APPROVED_STATIC_CAP_SECONDS == 180.0
-    assert benchmark_ann_build._valid_approved_static_cap(129.0)
-    assert not benchmark_ann_build._valid_approved_static_cap(180.1)
+    assert not benchmark_ann_build._valid_approved_static_cap(179.0)
+    assert benchmark_ann_build._valid_approved_static_cap(180.0)
+    assert not benchmark_ann_build._valid_approved_static_cap(181.0)
 
     workflow = (Path(__file__).parents[1] / ".github/workflows/eval.yml").read_text(
         encoding="utf-8"
     )
     scale_job = workflow.split("issue41-scale-benchmark:", 1)[1]
     assert "--max-exact-seconds 10" in scale_job
-    assert "--max-seconds 60" in scale_job
+    assert "--per-build-cap-seconds 180" in scale_job
+    assert "--max-seconds 60" not in scale_job
+
+
+@pytest.mark.parametrize("cap, expected_exit", ((179.0, 2), (180.0, 0), (181.0, 2)))
+def test_per_build_cli_requires_exactly_180_seconds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cap: float, expected_exit: int,
+) -> None:
+    monkeypatch.setattr(
+        sys, "argv", [
+            "benchmark_ann_build", "--per-build-cap-seconds", str(cap),
+            "--work-dir", str(tmp_path / "work"), "--output", str(tmp_path / "out.json"),
+        ],
+    )
+    monkeypatch.setattr(benchmark_ann_build, "run", lambda _args: {})
+    if expected_exit:
+        with pytest.raises(SystemExit) as exc:
+            benchmark_ann_build.main()
+        assert exc.value.code == expected_exit
+    else:
+        assert benchmark_ann_build.main() == expected_exit
 
 
 def _stats(total: int) -> IndexStats:
@@ -563,6 +588,542 @@ def test_complete_matrix_timer_and_candidate_run_references_fail_closed(
     boundary["matrix_timing"]["end_monotonic"] += 0.000001
     with pytest.raises(ValueError, match="wall-time cap"):
         benchmark_ann_build.validate_evidence(boundary)
+
+
+def test_schema_v5_per_build_static_acceptance_rejects_any_over_cap_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    args = _reduced_comparator_args(tmp_path)
+    args.per_build_cap_seconds = 180.0
+    monkeypatch.setattr(
+        benchmark_ann_build,
+        "_runtime_identity",
+        lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+    )
+    monkeypatch.setattr(benchmark_ann_build, "ProcessPoolExecutor", _InlineTwoWorkerSchedule)
+
+    payload = benchmark_ann_build.run(args)
+    assert payload["evidence_schema_version"] == benchmark_ann_build.EVIDENCE_SCHEMA_VERSION
+    assert payload["acceptance"] == {
+        "mode": "per_build_static_acceptance",
+        "aggregate_cap_seconds": None,
+        "per_build_cap_seconds": 180.0,
+    }
+    benchmark_ann_build.validate_evidence(payload)
+
+    over_cap = deepcopy(payload)
+    over_cap["candidate_runs"][0]["index_build_ms"] = 180_000.001
+    with pytest.raises(ValueError, match="per-build watchdog cap"):
+        benchmark_ann_build.validate_evidence(over_cap)
+
+    for invalid_cap in (179.0, 181.0):
+        invalid = deepcopy(payload)
+        invalid["acceptance"]["per_build_cap_seconds"] = invalid_cap
+        with pytest.raises(ValueError, match="per-build watchdog cap"):
+            benchmark_ann_build.validate_evidence(invalid)
+
+
+def test_reduced_real_per_build_comparator_uses_public_spawn_supervisor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    args = _reduced_comparator_args(tmp_path)
+    args.per_build_cap_seconds = 180.0
+    monkeypatch.setattr(
+        benchmark_ann_build, "_runtime_identity",
+        lambda: {"lancedb": "0.34.0", "numpy": "2.2.6", "pyarrow": "25.0.0"},
+    )
+
+    payload = benchmark_ann_build.run(args, _watchdog_deadline_seconds=30.0)
+
+    assert payload["evidence_schema_version"] == 5
+    assert len(payload["candidate_runs"]) == 2
+    assert len(payload["records"]) == 12
+    assert sum(run["normal_ann_request_count"] for run in payload["candidate_runs"]) == 2 * 6 * 256
+    assert payload["acceptance"]["per_build_cap_seconds"] == 180.0
+    assert payload["environment"]["worker_schedule"]["start_method"] == "spawn"
+
+
+def _delayed_outside_build_phase_candidate_worker(
+    candidate, pre_build_delay, build_delay, post_build_delay, *, _build_watchdog=None,
+):
+    time.sleep(pre_build_delay)
+    if _build_watchdog is None:
+        time.sleep(build_delay)
+    else:
+        with _build_watchdog:
+            time.sleep(build_delay)
+    time.sleep(post_build_delay)
+    return ({"candidate": candidate}, [])
+
+
+def test_per_build_deadline_excludes_preparation_and_query_work() -> None:
+    completed = benchmark_ann_build._run_spawned_candidates_with_deadline(
+        candidates=benchmark_ann_build.CANDIDATES,
+        deadline_seconds=0.1,
+        worker=_delayed_outside_build_phase_candidate_worker,
+        worker_args_for=lambda candidate: (candidate, 0.15, 0.01, 0.15),
+    )
+
+    assert [run[0]["candidate"] for run in completed] == list(
+        benchmark_ann_build.CANDIDATES
+    )
+
+
+def _install_public_spawn_supervisor_race(
+    monkeypatch: pytest.MonkeyPatch, *, trigger: str,
+):
+    candidate = benchmark_ann_build.CANDIDATES[0]
+    expected_result = ({"candidate": candidate}, [])
+    state = {
+        "messages": [("build_ready", candidate)],
+        "process": None,
+        "published": False,
+        "released": False,
+    }
+
+    def publish_terminal_messages() -> None:
+        if state["published"]:
+            return
+        state["messages"].extend(
+            [
+                ("build_finished", candidate),
+                ("candidate_result", candidate, True, expected_result),
+            ]
+        )
+        state["published"] = True
+
+    class Connection:
+        def __init__(self, *, parent: bool):
+            self.parent = parent
+            self.closed = False
+
+        def poll(self):
+            assert self.parent and not self.closed
+            return bool(state["messages"])
+
+        def recv(self):
+            message = state["messages"].pop(0)
+            if message[0] == "candidate_result":
+                state["process"]._exitcode = 0
+            return message
+
+        def send(self, message):
+            assert message == ("start_build", candidate)
+            state["released"] = True
+
+        def close(self):
+            self.closed = True
+
+    class ChildConnection:
+        def close(self):
+            pass
+
+    class Process:
+        def __init__(self, **_kwargs):
+            self._exitcode = None
+            state["process"] = self
+
+        @property
+        def exitcode(self):
+            if trigger == "exitcode" and state["released"]:
+                publish_terminal_messages()
+                self._exitcode = 0
+            return self._exitcode
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return self._exitcode is None
+
+        def terminate(self):
+            self._exitcode = -15
+
+        def join(self):
+            pass
+
+    class Context:
+        def Pipe(self, *, duplex):
+            assert duplex is True
+            return Connection(parent=True), ChildConnection()
+
+        def Process(self, **kwargs):
+            return Process(**kwargs)
+
+    monkeypatch.setattr(
+        benchmark_ann_build.multiprocessing, "get_context", lambda method: Context()
+    )
+
+    if trigger == "deadline":
+        class RaceClock:
+            calls = 0
+
+            def monotonic(self):
+                self.calls += 1
+                if self.calls == 2:
+                    publish_terminal_messages()
+                return 0.0 if self.calls == 1 else 1.0
+
+            def sleep(self, _seconds):
+                pass
+
+        monkeypatch.setattr(benchmark_ann_build, "time", RaceClock())
+
+    return candidate, expected_result
+
+
+def test_buffered_build_finished_wins_over_stale_deadline_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, expected_result = _install_public_spawn_supervisor_race(
+        monkeypatch, trigger="deadline"
+    )
+
+    completed = benchmark_ann_build._run_spawned_candidates_with_deadline(
+        candidates=(candidate,), deadline_seconds=1.0,
+        worker=lambda: None, worker_args_for=lambda _candidate: (),
+    )
+
+    assert completed == [expected_result]
+
+
+def test_buffered_candidate_result_wins_over_stale_exitcode_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, expected_result = _install_public_spawn_supervisor_race(
+        monkeypatch, trigger="exitcode"
+    )
+
+    completed = benchmark_ann_build._run_spawned_candidates_with_deadline(
+        candidates=(candidate,), deadline_seconds=1.0,
+        worker=lambda: None, worker_args_for=lambda _candidate: (),
+    )
+
+    assert completed == [expected_result]
+
+
+def _install_poll_failure_context(
+    monkeypatch: pytest.MonkeyPatch, *, messages: list[tuple], poll_error: OSError,
+) -> str:
+    candidate = benchmark_ann_build.CANDIDATES[0]
+
+    class Connection:
+        def poll(self):
+            if messages:
+                return True
+            raise poll_error
+
+        def recv(self):
+            return messages.pop(0)
+
+        def send(self, message):
+            assert message == ("start_build", candidate)
+
+        def close(self):
+            pass
+
+    class ChildConnection:
+        def close(self):
+            pass
+
+    class Process:
+        exitcode = 0
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def terminate(self):
+            pytest.fail("a cleanly exited child must not be terminated")
+
+        def join(self):
+            pass
+
+    class Context:
+        def Pipe(self, *, duplex):
+            assert duplex is True
+            return Connection(), ChildConnection()
+
+        def Process(self, **_kwargs):
+            return Process()
+
+    monkeypatch.setattr(
+        benchmark_ann_build.multiprocessing, "get_context", lambda _method: Context()
+    )
+    return candidate
+
+
+@pytest.mark.parametrize("exit_phase", ("pre_build", "post_build"))
+def test_closed_pipe_poll_after_clean_child_exit_is_phase_aware(
+    monkeypatch: pytest.MonkeyPatch, exit_phase: str,
+) -> None:
+    """Win32 closed-pipe polling must retain the supervisor phase contract."""
+    candidate = benchmark_ann_build.CANDIDATES[0]
+    messages = [] if exit_phase == "pre_build" else [
+        ("build_ready", candidate),
+        ("build_finished", candidate),
+    ]
+    candidate = _install_poll_failure_context(
+        monkeypatch,
+        messages=messages,
+        poll_error=BrokenPipeError(109, "The pipe has been ended"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"endpoint.*phase={exit_phase}",
+    ):
+        benchmark_ann_build._run_spawned_candidates_with_deadline(
+            candidates=(candidate,), deadline_seconds=1.0,
+            worker=lambda: None, worker_args_for=lambda _candidate: (),
+        )
+
+
+def test_unrelated_poll_oserror_is_not_reclassified_as_endpoint_closure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _install_poll_failure_context(
+        monkeypatch, messages=[], poll_error=PermissionError(13, "permission denied")
+    )
+
+    with pytest.raises(PermissionError, match="permission denied"):
+        benchmark_ann_build._run_spawned_candidates_with_deadline(
+            candidates=(candidate,), deadline_seconds=1.0,
+            worker=lambda: None, worker_args_for=lambda _candidate: (),
+        )
+
+
+def _never_returning_candidate_worker(*args, _build_watchdog=None):
+    candidate = args[0]
+    pid_path = Path(args[-1]) / f"{candidate}.pid"
+    pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    if candidate == "ivf-hnsw-sq":
+        while True:
+            time.sleep(1)
+    with _build_watchdog:
+        while True:
+            time.sleep(1)
+
+
+def _process_is_active(pid: int, *, _windows_api=None) -> bool:
+    """Query process status without assuming POSIX signal-0 semantics."""
+    if sys.platform == "win32":
+        from ctypes import wintypes
+
+        if _windows_api is None:
+            _windows_api = ctypes.WinDLL("kernel32", use_last_error=True)
+            _windows_api.OpenProcess.argtypes = [
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+            ]
+            _windows_api.OpenProcess.restype = wintypes.HANDLE
+            _windows_api.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+            ]
+            _windows_api.GetExitCodeProcess.restype = wintypes.BOOL
+            _windows_api.CloseHandle.argtypes = [wintypes.HANDLE]
+            _windows_api.CloseHandle.restype = wintypes.BOOL
+        handle = _windows_api.OpenProcess(0x1000, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            if error == 87:
+                return False
+            raise ctypes.WinError(error)
+        try:
+            exit_code = wintypes.DWORD()
+            if not _windows_api.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            return exit_code.value == 259
+        finally:
+            _windows_api.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _clean_exit_candidate_worker(candidate, exit_phase, *, _build_watchdog=None):
+    if exit_phase == "pre_build":
+        os._exit(0)
+    with _build_watchdog:
+        pass
+    os._exit(0)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "expected_active"), ((0, False), (259, True)),
+    ids=("exited", "still-active"),
+)
+def test_process_liveness_probe_uses_win32_exit_status(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int, expected_active: bool,
+) -> None:
+    from ctypes import wintypes
+
+    calls = []
+
+    class Kernel32:
+        def OpenProcess(self, access, inherit_handle, pid):
+            calls.append(("open", access, inherit_handle, pid))
+            return 17
+
+        def GetExitCodeProcess(self, handle, output):
+            calls.append(("status", handle))
+            assert isinstance(output._obj, wintypes.DWORD)
+            output._obj.value = exit_code
+            return 1
+
+        def CloseHandle(self, handle):
+            calls.append(("close", handle))
+            return 1
+
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert _process_is_active(4321, _windows_api=Kernel32()) is expected_active
+    assert calls == [
+        ("open", 0x1000, False, 4321),
+        ("status", 17),
+        ("close", 17),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("last_error", "inactive"), ((87, True), (5, False)),
+    ids=("missing-process", "access-denied"),
+)
+def test_process_liveness_probe_handles_win32_open_failure(
+    monkeypatch: pytest.MonkeyPatch, last_error: int, inactive: bool,
+) -> None:
+    class Kernel32:
+        def OpenProcess(self, _access, _inherit_handle, _pid):
+            return 0
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
+    monkeypatch.setattr(
+        ctypes, "WinError", lambda error: OSError(error, f"winerror {error}"),
+        raising=False,
+    )
+
+    if inactive:
+        assert not _process_is_active(4321, _windows_api=Kernel32())
+    else:
+        with pytest.raises(OSError, match="winerror 5"):
+            _process_is_active(4321, _windows_api=Kernel32())
+
+
+@pytest.mark.parametrize("exit_phase, expected_phase", (("pre_build", "pre_build"), ("post_build", "post_build")))
+def test_clean_child_exit_before_candidate_result_rejects_promptly(
+    exit_phase: str, expected_phase: str,
+) -> None:
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match=rf"phase={expected_phase}.*exit=0|endpoint.*phase={expected_phase}"):
+        benchmark_ann_build._run_spawned_candidates_with_deadline(
+            candidates=benchmark_ann_build.CANDIDATES,
+            deadline_seconds=2.0,
+            worker=_clean_exit_candidate_worker,
+            worker_args_for=lambda candidate: (candidate, exit_phase),
+        )
+    # This wall clock includes two fresh spawn interpreters importing the
+    # benchmark dependency graph; hosted-runner scheduling is not supervisor
+    # detection latency.  Keep a bounded smoke ceiling without coupling the
+    # gate to a 2-second machine-speed assumption.
+    assert time.monotonic() - started < 10.0
+
+
+def test_spawn_start_failure_cleans_local_resources_and_live_sibling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    endpoints = []
+    processes = []
+
+    class Endpoint:
+        close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    class Process:
+        def __init__(self, **_kwargs):
+            self.alive = False
+            self.exitcode = None
+            self.terminate_count = 0
+            self.join_count = 0
+            processes.append(self)
+
+        def start(self):
+            self.alive = True
+            if len(processes) == 2:
+                raise RuntimeError("simulated public spawn start failure")
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminate_count += 1
+            self.alive = False
+            self.exitcode = -15
+
+        def join(self):
+            self.join_count += 1
+
+    class Context:
+        def Pipe(self, *, duplex):
+            assert duplex is True
+            pair = (Endpoint(), Endpoint())
+            endpoints.extend(pair)
+            return pair
+
+        def Process(self, **kwargs):
+            return Process(**kwargs)
+
+    monkeypatch.setattr(benchmark_ann_build.multiprocessing, "get_context", lambda method: Context())
+    args = _reduced_comparator_args(tmp_path)
+    args.per_build_cap_seconds = 180.0
+    with pytest.raises(RuntimeError, match="simulated public spawn start failure"):
+        benchmark_ann_build.run(args, _watchdog_deadline_seconds=1.0)
+
+    assert [endpoint.close_count for endpoint in endpoints] == [1, 1, 1, 1]
+    assert all(not process.is_alive() for process in processes)
+    assert [process.terminate_count for process in processes] == [1, 1]
+    assert [process.join_count for process in processes] == [1, 1]
+    error = json.loads(args.error_output.read_text(encoding="utf-8"))
+    assert error["status"] == "reject-evidence"
+    assert error["error"]["class"] == "RuntimeError"
+    assert error["error"]["message"] == "simulated public spawn start failure"
+
+
+def test_per_build_deadline_terminates_never_returning_spawn_child_and_rejects_only(
+    tmp_path: Path,
+) -> None:
+    args = _reduced_comparator_args(tmp_path)
+    args.per_build_cap_seconds = 180.0
+    pid_dir = tmp_path / "hung-children"
+    pid_dir.mkdir()
+    args.output.write_text("stale accepted evidence", encoding="utf-8")
+
+    with pytest.raises(TimeoutError, match="per-build watchdog"):
+        benchmark_ann_build.run(
+            args,
+            _watchdog_deadline_seconds=0.75,
+            _candidate_worker_override=_never_returning_candidate_worker,
+            _candidate_worker_extra_args=(str(pid_dir),),
+        )
+
+    pid_paths = sorted(pid_dir.glob("*.pid"))
+    assert {path.stem for path in pid_paths} == set(benchmark_ann_build.CANDIDATES)
+    for pid_path in pid_paths:
+        pid = int(pid_path.read_text(encoding="utf-8"))
+        assert not _process_is_active(pid)
+    assert not args.output.exists()
+    error = json.loads(args.error_output.read_text(encoding="utf-8"))
+    assert error["status"] == "reject-evidence"
+    assert error["failure_phase"] == "candidate_execution"
+    assert error["error"]["class"] == "TimeoutError"
+    assert "per-build watchdog" in error["error"]["message"]
 
 
 def test_spawn_worker_failure_writes_rejected_error_evidence_only(

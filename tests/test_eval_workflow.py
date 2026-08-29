@@ -1,11 +1,20 @@
 """Static safety assertions for the fail-closed PR baseline workflow guard."""
 import hashlib
 import inspect
+import importlib.util
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
+import zipfile
+from copy import deepcopy
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+import yaml
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 APPROVED_CALIBRATION = SKILL_ROOT / "eval" / "approved_ann_calibration.json"
@@ -13,7 +22,177 @@ sys.path.insert(0, str(SKILL_ROOT / "eval"))
 
 from models import ChunkHit, ContextBundle, ContextItem  # noqa: E402
 import run_eval  # noqa: E402
+import phase07_operator_gate  # noqa: E402
 from run_eval import _citation_violations  # noqa: E402
+
+
+_DIRECT_EVAL_CLI = re.compile(
+    r"(?im)(?<![\w.-])python(?:3(?:\.\d+)?)?(?:\.exe)?\s+"
+    r"""["']?(?:\.[/\\])?eval[/\\]+[A-Za-z_][A-Za-z0-9_]*\.py\b"""
+)
+_EVAL_CLI_MODULES = (
+    "eval.run_eval",
+    "eval.compare_build_modes",
+    "eval.benchmark_ann_build",
+    "eval.reconcile_ann_gate",
+    "eval.phase07_operator_gate",
+    "eval.phase07_ann_campaign",
+)
+
+
+def _isolated_eval_cli_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _eval_cli_help_failures(commands: list[list[str]]) -> list[str]:
+    results = [
+        subprocess.run(
+            command,
+            cwd=SKILL_ROOT,
+            env=_isolated_eval_cli_env(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            check=False,
+        )
+        for command in commands
+    ]
+    failures = []
+    for command, result in zip(commands, results):
+        output = result.stdout + result.stderr
+        if result.returncode != 0 or "usage" not in output.lower():
+            failures.append(
+                f"{' '.join(command[1:])}: exit={result.returncode}; "
+                f"usage={'usage' in output.lower()}; stderr={result.stderr!r}"
+            )
+    return failures
+
+
+def test_direct_eval_cli_regex_covers_supported_python_launcher_spellings() -> None:
+    """The workflow static gate must reject every supported direct-script spelling."""
+    direct_launchers = (
+        "python eval/run_eval.py",
+        "python3 ./eval/run_eval.py",
+        'python3.13 ".\\eval\\run_eval.py"',
+        'python.exe "eval/run_eval.py"',
+        "python3.exe .\\eval\\run_eval.py",
+        "python eval//run_eval.py",
+        "python .\\eval\\\\run_eval.py",
+        "python .\\eval//run_eval.py",
+    )
+    assert all(_DIRECT_EVAL_CLI.search(command) for command in direct_launchers)
+    assert not _DIRECT_EVAL_CLI.search("python -m eval.run_eval")
+
+
+def test_eval_workflows_have_no_direct_eval_cli_launchers() -> None:
+    """CI must use package module entrypoints, never direct eval script paths."""
+    violations = [
+        f"{workflow.relative_to(SKILL_ROOT)}:{match.group(0)}"
+        for workflow in sorted((SKILL_ROOT / ".github" / "workflows").glob("*.y*ml"))
+        for match in _DIRECT_EVAL_CLI.finditer(workflow.read_text(encoding="utf-8"))
+    ]
+    assert not violations, (
+        f"found {len(violations)} direct eval CLI launchers: {violations}"
+    )
+
+
+def test_eval_module_cli_entrypoints_provide_help_without_pythonpath() -> None:
+    """All CI module entrypoints must be import-safe from the repository root."""
+    commands = [
+        [sys.executable, "-m", module, "--help"] for module in _EVAL_CLI_MODULES
+    ]
+    failures = _eval_cli_help_failures(commands)
+    assert not failures, f"{len(failures)} module eval CLI help failures: {failures}"
+
+
+def test_legacy_eval_script_entrypoints_provide_help_without_pythonpath() -> None:
+    """README-compatible run_eval and comparison scripts remain directly usable."""
+    commands = [
+        [sys.executable, "eval/run_eval.py", "--help"],
+        [sys.executable, "eval/compare_build_modes.py", "--help"],
+    ]
+    failures = _eval_cli_help_failures(commands)
+    assert not failures, f"{len(failures)} legacy eval CLI help failures: {failures}"
+
+
+@pytest.mark.parametrize(
+    "commands",
+    (
+        [[sys.executable, "-m", "eval.run_eval", "--help"]],
+        [[sys.executable, "eval/run_eval.py", "--help"]],
+    ),
+    ids=("module-help-gate", "legacy-help-gate"),
+)
+def test_eval_cli_help_parent_decodes_strict_utf8(
+    monkeypatch: pytest.MonkeyPatch, commands: list[list[str]],
+) -> None:
+    """The parent capture boundary must not inherit Windows CP1252."""
+    def run(command, **kwargs):
+        if kwargs.get("encoding") != "utf-8" or kwargs.get("errors") != "strict":
+            raise UnicodeDecodeError(
+                "cp1252", b"\x81", 0, 1, "simulated Windows parent decoder failure"
+            )
+        return subprocess.CompletedProcess(
+            command, 0, stdout="usage: 构建临时目录", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert _eval_cli_help_failures(commands) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        [sys.executable, "-m", "eval.run_eval", "--help"],
+        [sys.executable, "eval/run_eval.py", "--help"],
+    ),
+    ids=("module", "legacy-script"),
+)
+def test_run_eval_help_remains_utf8_under_windows_legacy_console_encoding(
+    command: list[str],
+) -> None:
+    """Both real run_eval entrypoints must not inherit a cp1252 stdout codec."""
+    env = _isolated_eval_cli_env()
+    env["PYTHONIOENCODING"] = "cp1252"
+    completed = subprocess.run(
+        command,
+        cwd=SKILL_ROOT,
+        env=env,
+        capture_output=True,
+        text=False,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(
+        "utf-8", errors="replace"
+    )
+    stdout = completed.stdout.decode("utf-8")
+    assert "usage:" in stdout.lower()
+    assert "构建临时目录" in stdout
+
+
+def test_import_run_eval_under_forced_cp1252_does_not_reconfigure_streams() -> None:
+    script = """
+import sys
+before = (sys.stdout, sys.stderr, sys.stdout.encoding, sys.stderr.encoding, sys.stdout.errors, sys.stderr.errors)
+import eval.run_eval
+after = (sys.stdout, sys.stderr, sys.stdout.encoding, sys.stderr.encoding, sys.stdout.errors, sys.stderr.errors)
+assert after == before, (before, after)
+print('IMPORT_STREAMS_UNCHANGED')
+"""
+    env = _isolated_eval_cli_env()
+    env["PYTHONIOENCODING"] = "cp1252:strict"
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=SKILL_ROOT, env=env,
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "IMPORT_STREAMS_UNCHANGED"
 
 
 def _build_mode_contract(document: Path) -> str:
@@ -29,8 +208,15 @@ def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> N
     """D-01/D-02/D-06/D-07: agent and user docs must not relabel cache reuse."""
     readme_contract = _build_mode_contract(SKILL_ROOT / "README.md")
     skill_contract = _build_mode_contract(SKILL_ROOT / "SKILL.md")
+    policy = json.loads((SKILL_ROOT / "eval" / "ann-policy.json").read_text(encoding="utf-8"))
+    selection = policy["decision"]["phase7_selection"]
 
     assert readme_contract == skill_contract
+    assert selection["configuration"] == {
+        "m": policy["m"], "ef_construction": policy["ef_construction"],
+        "query_ef": policy["query_ef"],
+    }
+    assert selection["approval_reference"] == "D-28 / Issue #50"
     for required in (
         "`--build-mode snapshot|incremental|auto`",
         "`snapshot`",
@@ -53,15 +239,599 @@ def test_incremental_documentation_has_one_truthful_storage_mode_contract() -> N
         "ACTIVE_INDEX",
         "only sparse+dense commit boundary",
         "IVF_HNSW_SQ",
-        "ef=100",
-        "Recall@10 ≥ 0.19",
-        "Recall@20 ≥ 0.17",
+        f"m={policy['m']}",
+        f"ef_construction={policy['ef_construction']}",
+        f"query `ef={policy['query_ef']}`",
+        f"Recall@10 ≥ {policy['recall_at_10_floor']}",
+        f"Recall@20 ≥ {policy['recall_at_20_floor']}",
+        "Phase 7 selected these values",
         "citation/context/graph",
         "manifest",
         "no exact fallback",
         "do not invent thresholds",
     ):
         assert required in readme_contract
+    assert "ef=100" not in readme_contract
+
+
+def test_phase07_d12_to_d17_workflow_and_reconciliation_are_sealed_and_fail_closed() -> None:
+    """D-12/D-14/D-15/D-17 require typed, immutable hosted evidence bindings."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    for required in (
+        "retention-days: 90",
+        "phase07-entitlement-preflight",
+        "per-build-cap-seconds",
+        "run_attempt",
+            "hosted-preflight",
+            "python -m eval.phase07_operator_gate finalize",
+        "workflow_dispatch",
+    ):
+        assert required in workflow
+
+    import reconcile_ann_gate
+
+    assert hasattr(reconcile_ann_gate, "validate_phase07_evidence_packet")
+    assert hasattr(reconcile_ann_gate, "validate_feature_worktree_preflight")
+
+
+def test_phase07_d06_to_d10_d18_workflow_pins_public_inputs_and_model_tree() -> None:
+    """D-06..D-10/D-18: workflow must validate, never hydrate around, identities."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    for required in (
+        "personal-wiki-corpus-manifest",
+        "model-manifest.json",
+        "corpus_manifest_sha256",
+        "model_manifest_sha256",
+    ):
+        assert required in workflow
+
+
+def test_phase07_real_model_tokenizer_gate_runs_only_after_model_bootstrap() -> None:
+    """The real-model test must never leak into the model-free platform matrix."""
+    model_test = "tests/test_phase07_frozen_model_contract.py"
+    workflow = yaml.load(
+        (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+
+    def assert_exact_routing(document: dict) -> None:
+        jobs = document["jobs"]
+        steps = jobs["test-and-eval"]["steps"]
+        normalize = lambda command: " ".join(command.split())
+        bootstrap_steps = [step for step in steps if step.get("name") == "Bootstrap local embedding model"]
+        gate_steps = [
+            step for step in steps if step.get("name") == "Run Phase 07 frozen-base real-model tokenizer gate"
+        ]
+        unit_steps = [step for step in steps if step.get("name") == "Unit tests"]
+        assert len(bootstrap_steps) == len(gate_steps) == len(unit_steps) == 1
+        assert steps.index(bootstrap_steps[0]) < steps.index(gate_steps[0])
+        assert normalize(bootstrap_steps[0].get("run", "")) == "python scripts/download_embedding_model.py"
+        assert normalize(gate_steps[0].get("run", "")) == (
+            "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+            "--basetemp=.review-tmp/phase07-frozen-model "
+            "tests/test_phase07_frozen_model_contract.py -q"
+        )
+        assert normalize(unit_steps[0].get("run", "")) == (
+            "PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider "
+            "--basetemp=.review-tmp/pytest "
+            "--ignore=tests/test_phase07_frozen_model_contract.py"
+        )
+        for job_name, job in jobs.items():
+            if job_name == "test-and-eval":
+                continue
+            assert all(
+                step.get("name") != "Run Phase 07 frozen-base real-model tokenizer gate"
+                and model_test not in step.get("run", "")
+                for step in job.get("steps", [])
+            )
+
+    assert_exact_routing(workflow)
+
+    # Regression proof: moving the real-model gate to an adjacent job must not
+    # satisfy the guard merely because the text still exists elsewhere.
+    mutated = deepcopy(workflow)
+    test_steps = mutated["jobs"]["test-and-eval"]["steps"]
+    gate = next(step for step in test_steps if model_test in step.get("run", ""))
+    test_steps.remove(gate)
+    mutated["jobs"]["issue41-manual-calibration"]["steps"].append(gate)
+    with pytest.raises(AssertionError):
+        assert_exact_routing(mutated)
+
+    manifest_only = deepcopy(workflow)
+    next(
+        step for step in manifest_only["jobs"]["test-and-eval"]["steps"]
+        if step.get("name") == "Bootstrap local embedding model"
+    )["run"] = "python scripts/download_embedding_model.py --validate-manifest-only"
+    with pytest.raises(AssertionError):
+        assert_exact_routing(manifest_only)
+
+    echo_gate = deepcopy(workflow)
+    next(
+        step for step in echo_gate["jobs"]["test-and-eval"]["steps"]
+        if step.get("name") == "Run Phase 07 frozen-base real-model tokenizer gate"
+    )["run"] = f"echo {model_test}"
+    with pytest.raises(AssertionError):
+        assert_exact_routing(echo_gate)
+
+    duplicate_gate = deepcopy(workflow)
+    duplicate_steps = duplicate_gate["jobs"]["test-and-eval"]["steps"]
+    duplicate_steps.append(deepcopy(next(step for step in duplicate_steps if model_test in step.get("run", ""))))
+    with pytest.raises(AssertionError):
+        assert_exact_routing(duplicate_gate)
+
+    ci_workflow = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert model_test not in ci_workflow
+    storage_contract = (SKILL_ROOT / "tests" / "test_lancedb_storage_contract.py").read_text(encoding="utf-8")
+    assert "test_phase07_frozen_base_uses_the_manifest_verified_local_model_tokenizer" not in storage_contract
+
+
+def test_phase07_screening_is_seeded_numeric_only_and_model_jobs_stay_model_backed() -> None:
+    """D-07/D-18: screening validates its lock but never hydrates a model."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    screening = workflow.split("  phase07-screening:", 1)[1].split(
+        "  phase07-confirmation:", 1
+    )[0]
+    for required in (
+        "python scripts/download_embedding_model.py --validate-manifest-only",
+        "'model_manifest_sha256':h('eval/model-manifest.json')",
+        "'lock_identity':h('requirements.txt')",
+        "Assert actual locked Stage 1 runtime and OMP settings",
+        "OMP_NUM_THREADS: '2'",
+    ):
+        assert required in screening
+    for forbidden in (
+        "actions/cache@v4",
+        "phase07-model-cache",
+        "Hydrate exact immutable model",
+        "Validate immutable cached model tree",
+        "models/paraphrase-multilingual-MiniLM-L12-v2",
+    ):
+        assert forbidden not in screening
+
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split(
+        "  phase07-pr-acceptance-gate:", 1
+    )[0]
+    for required in (
+        "actions/cache@v4",
+        "python scripts/download_embedding_model.py",
+        "Validate immutable cached model tree",
+    ):
+        assert required in confirmation
+
+
+def test_phase07_dispatch_stages_select_only_their_typed_finite_job_topology() -> None:
+    """A dispatch must never accidentally start legacy or full-evaluation jobs."""
+    workflow = yaml.load(
+        (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    jobs = workflow["jobs"]
+    expected = {
+        "preflight": {"phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"},
+        "screening": {"phase07-screening"},
+        "confirmation": {"phase07-confirmation"},
+    }
+    for stage, allowed in expected.items():
+        selected = {
+            name for name, spec in jobs.items()
+            if f"inputs.campaign_stage == '{stage}'" in spec.get("if", "")
+        }
+        assert selected == allowed
+    for job in ("test-and-eval", "issue41-scale-benchmark", "model-backed-ann-decision", "reconcile-ann-decision"):
+        assert "github.event_name == 'pull_request'" in jobs[job].get("if", "")
+    assert "legacy-issue41-calibration" in jobs["issue41-manual-calibration"].get("if", "")
+    assert all(
+        "inputs.campaign_stage == 'unknown'" not in spec.get("if", "")
+        for spec in jobs.values()
+    )
+    for name in expected["preflight"]:
+        serialized = json.dumps(jobs[name], sort_keys=True)
+        assert "python -m pip install" not in serialized
+        assert "download_embedding_model.py" not in serialized
+        assert "phase07_ann_campaign.py" not in serialized
+        assert '"retention-days": "90"' in serialized
+        assert '"actions": "read"' in serialized
+
+
+def test_phase07_d25_dispatch_exposes_only_three_ordinal_confirmation_runs() -> None:
+    """D-25 removes every continuation surface; confirmation is ordinal-owned."""
+    workflow = yaml.load(
+        (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    dispatch = workflow["on"]["workflow_dispatch"]["inputs"]
+
+    assert set(dispatch) == {"campaign_stage", "workflow_inputs"}
+    assert dispatch["campaign_stage"]["options"] == [
+        "preflight", "screening", "confirmation",
+    ]
+    assert dispatch["workflow_inputs"]["description"] == (
+        "Sealed generated Phase 07 campaign dispatch bundle"
+    )
+
+    selected = {
+        name
+        for name, spec in workflow["jobs"].items()
+        if name.startswith("phase07") and "inputs.campaign_stage" in spec.get("if", "")
+    }
+    assert selected == {
+        "phase07-entitlement-preflight-ubuntu",
+        "phase07-entitlement-preflight-windows",
+            "phase07-screening",
+            "phase07-confirmation",
+        }
+    assert workflow["jobs"]["phase07-hybrid-prepare"]["if"] == "${{ false }}"
+    assert workflow["jobs"]["phase07-hybrid"]["if"] == "${{ false }}"
+
+
+def test_phase07_d25_confirmation_workflow_has_no_retired_authority() -> None:
+    """Retired D-25 modes must be unreachable before central allocation validation."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    phase07_dispatch = workflow.split("  phase07-entitlement-preflight-ubuntu:", 1)[1].split(
+        "  phase07-pr-acceptance-gate:", 1
+    )[0].lower()
+
+    for retired in (
+        "continuation",
+        "stage2",
+        "ef=500",
+        "ef_construction=500",
+        "hnsw-flat",
+        "refine_factor",
+        "representative",
+        "1k",
+        "10k",
+    ):
+        assert retired not in phase07_dispatch
+
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split(
+        "  phase07-pr-acceptance-gate:", 1
+    )[0]
+    assert "runs-on: ubuntu-latest" in confirmation
+    assert "permissions: {contents: read, actions: read}" in confirmation
+    assert "confirmation-allocation" in confirmation
+    assert "retention-days: 90" in confirmation
+
+
+def test_phase07_operator_and_reconciler_reject_untrusted_packets() -> None:
+    """ASVS L1 boundary checks must reject secrets, replay, and retry laundering."""
+    import phase07_operator_gate
+    import reconcile_ann_gate
+
+    packet = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "run_id": 12,
+        "run_attempt": 1, "job_id": 34, "job_allocation_nonce": "0123456789abcdef",
+        "artifact_id": 56, "artifact_name": "phase07-proof", "archive_sha256": "a" * 64,
+        "content_sha256": "c" * 64, "record_self_sha256": "",
+        "retention_days_requested": 90, "retention_days_accepted": 90, "head_sha": "b" * 40,
+        "runner": {"os": "Linux", "image": "ubuntu-latest", "architecture": "X64"},
+        "lock_identity": "locked", "build_id": "d" * 64, "retry_lineage": {
+            "failure_class": "github_infrastructure", "original_run_id": 11,
+            "replacement_run_id": 12,
+        },
+    }
+    packet["record_self_sha256"] = phase07_operator_gate.canonical_digest(packet)
+    assert phase07_operator_gate.validate_phase07_evidence_packet(packet) == packet
+    assert reconcile_ann_gate.validate_phase07_evidence_packet(packet) == packet
+
+    packet["retention_days_accepted"] = 7
+    with pytest.raises(ValueError):
+        phase07_operator_gate.validate_phase07_evidence_packet(packet)
+    packet["retention_days_accepted"] = 90
+    packet["retry_lineage"]["failure_class"] = "numeric_failure"
+    with pytest.raises(ValueError):
+        phase07_operator_gate.validate_phase07_evidence_packet(packet)
+    with pytest.raises(ValueError):
+        phase07_operator_gate._reject_secrets({"token": "never"})
+
+
+def test_phase07_workflow_commands_are_real_and_do_not_consume_review_tmp_requests() -> None:
+    """Regression gate for the rejected Plan 03 placeholder workflow topology."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    for job in ("phase07-screening:", "phase07-confirmation:"):
+        section = workflow.split(job, 1)[1].split("\n  phase07-", 1)[0]
+        assert "Construct" in section
+        assert (
+            "python -m eval.phase07_ann_campaign "
+            "--request-file .review-tmp/phase07/request.json"
+        ) in section
+        assert "screening-request.json" not in section
+        assert "confirmation-request.json" not in section
+        assert "continuation-request.json" not in section
+        assert "retention-days: 90" in section
+        assert "permissions: {contents: read, actions: read}" in section
+    assert "hosted-preflight" in workflow
+    assert "retention_days_accepted" not in workflow
+
+
+def test_phase07_windows_gate_is_reduced_real_production_path_in_ci() -> None:
+    ci = (SKILL_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    section = ci.split("phase07-windows-reduced-real-lancedb:", 1)[1]
+    assert "runs-on: windows-latest" in section
+    assert "python-version: '3.13'" in section
+    assert "test_lancedb_storage_contract.py" in section
+    assert "test_benchmark_sampling.py" in section
+    assert "77348" not in section
+    assert "phase07_ann_campaign.py" not in section
+
+
+def test_phase07_cross_run_reconciliation_rejects_reused_allocation_and_build() -> None:
+    import phase07_operator_gate
+    packet = {
+        "repository": "allenwoo713/obsidian_wiki_skill", "run_id": 12, "run_attempt": 1,
+        "job_id": 34, "job_allocation_nonce": "0123456789abcdef", "artifact_id": 56,
+        "artifact_name": "proof", "archive_sha256": "a" * 64, "content_sha256": "c" * 64,
+        "record_self_sha256": "", "retention_days_requested": 90, "retention_days_accepted": 90,
+        "head_sha": "b" * 40, "runner": {"os": "Linux", "image": "ubuntu-latest", "architecture": "X64"},
+        "lock_identity": "locked", "build_id": "d" * 64,
+        "retry_lineage": {"failure_class": "github_infrastructure", "original_run_id": 11, "replacement_run_id": 12},
+    }
+    packet["record_self_sha256"] = phase07_operator_gate.canonical_digest(packet)
+    duplicate = {**packet, "record_self_sha256": ""}
+    duplicate["record_self_sha256"] = phase07_operator_gate.canonical_digest(duplicate)
+    with pytest.raises(ValueError, match="reused"):
+        phase07_operator_gate.validate_phase07_evidence_set([packet, duplicate], expected_repository=packet["repository"], expected_head=packet["head_sha"])
+
+
+def test_hosted_preflight_always_seals_success_or_rejection(tmp_path: Path) -> None:
+    import phase07_operator_gate
+    from eval.ann_corpus_manifest import canonical_sha256
+    root = tmp_path
+    (root / "eval").mkdir()
+    (root / "requirements.txt").write_text("lancedb==0.34.0\nnumpy==2.2.6\npyarrow==25.0.0\n")
+    manifest = {"schema_version": 2, "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "provider": {"name":"huggingface", "repository":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "revision":"e8f8c211226b894fcb81acc59f3b34ba3efd5f42"}, "runtime": {"python":"3.13","scipy":"1.15.3","lancedb":"0.34.0"}, "provider_files": [{"path": "x", "sha256": "a" * 64}], "local_compatible_metadata": {"path":"configuration.json", "sha256":"b" * 64, "provenance":{"provider":"modelscope", "model_id":"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "kind":"legacy-local-bootstrap"}}}
+    manifest["record_self_sha256"] = canonical_sha256(manifest)
+    (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    out = root / "proof.json"
+    assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 0
+    assert json.loads(out.read_text())["status"] == "success"
+    manifest["provider"]["revision"] = "0" * 40
+    (root / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    assert phase07_operator_gate.seal_hosted_preflight(output=out, stage="preflight", continuation="", repository="owner/repo", run_id=1, run_attempt=1, head_sha="a" * 40, job_key="ubuntu", runner_os="Linux", runner_architecture="X64", root=root) == 1
+    rejection = json.loads(out.read_text())
+    assert rejection["status"] == "reject-evidence" and "retention_days_accepted" not in rejection
+
+
+def test_hosted_preflight_module_entrypoint_seals_rejection(tmp_path: Path) -> None:
+    """Both hosted OSes execute the package entry point without an import traceback."""
+    def run(root: Path, output: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable, "-m", "eval.phase07_operator_gate", "hosted-preflight",
+                "--ledger-file", str(output), "--stage", "preflight",
+                "--repository", "owner/repo", "--run-id", "1", "--run-attempt", "1",
+                "--head-sha", "a" * 40, "--job-key", "hosted-preflight",
+                "--runner-os", "Linux", "--runner-architecture", "X64",
+            ],
+            cwd=root, capture_output=True, text=True, check=False,
+        )
+
+    # The production checkout is the Ubuntu contract; the minimal copied root
+    # exercises the same package entry point used by Windows runners.
+    ubuntu_output = tmp_path / "ubuntu-proof.json"
+    ubuntu = run(SKILL_ROOT, ubuntu_output)
+    assert ubuntu.returncode == 0, ubuntu.stderr
+    assert json.loads(ubuntu_output.read_text())["status"] == "success"
+
+    windows_root = tmp_path / "windows-repo"
+    (windows_root / "eval").mkdir(parents=True)
+    for name in ("phase07_operator_gate.py", "ann_corpus_manifest.py"):
+        (windows_root / "eval" / name).write_text((SKILL_ROOT / "eval" / name).read_text())
+    (windows_root / "requirements.txt").write_text((SKILL_ROOT / "requirements.txt").read_text())
+    manifest = json.loads((SKILL_ROOT / "eval/model-manifest.json").read_text())
+    manifest["provider"]["revision"] = "0" * 40
+    (windows_root / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    windows_output = tmp_path / "windows-proof.json"
+    windows = run(windows_root, windows_output)
+    assert windows.returncode == 1
+    assert "ModuleNotFoundError" not in windows.stderr
+    rejection = json.loads(windows_output.read_text())
+    assert rejection["status"] == "reject-evidence"
+    assert "model revision" in rejection["reason"]
+
+
+def test_phase07_parsed_numeric_jobs_pin_threads_and_confirmation_uses_job_key() -> None:
+    workflow = yaml.load((SKILL_ROOT / ".github/workflows/eval.yml").read_text(), Loader=yaml.BaseLoader)
+    for name in ("phase07-screening", "phase07-confirmation", "phase07-hybrid"):
+        assert workflow["jobs"][name]["env"] == {"OMP_NUM_THREADS":"2", "OPENBLAS_NUM_THREADS":"2", "MKL_NUM_THREADS":"2"}
+    confirmation = json.dumps(workflow["jobs"]["phase07-confirmation"], sort_keys=True)
+    source = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
+    assert "workflow_inputs" in confirmation and "confirmation-allocation" in source
+    assert "/attempts/{run_attempt}/jobs" in (SKILL_ROOT / "eval/phase07_operator_gate.py").read_text()
+
+
+def test_confirmation_workflow_calls_real_exporter_and_uploads_only_packet_artifact_dir() -> None:
+    workflow = (SKILL_ROOT / ".github/workflows/eval.yml").read_text()
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-pr-acceptance-gate:", 1)[0]
+    assert "python -m eval.phase07_ann_campaign export-confirmation-packet" in confirmation
+    assert "--artifact-dir .review-tmp/phase07/confirmation-artifact" in confirmation
+    assert "workflow-inputs.json" in confirmation
+    assert "D-25 confirmation replacements are not authorized" in (SKILL_ROOT / "eval/phase07_ann_campaign.py").read_text()
+    assert "finalize --output-dir .review-tmp/phase07/confirmation-artifact --stage confirmation" in confirmation
+    assert "path: .review-tmp/phase07/confirmation-artifact" in confirmation
+    assert "confirmation_packet_from_result" not in confirmation
+    assert "raw=hashlib.sha256" not in confirmation
+
+
+def test_reconcile_hosted_seals_success_and_rejection(tmp_path: Path) -> None:
+    import phase07_operator_gate as gate
+    packet = {"repository":"owner/repo","run_id":1,"run_attempt":1,"job_id":2,"job_allocation_nonce":"0123456789abcdef","artifact_id":3,"artifact_name":"x","archive_sha256":"a"*64,"content_sha256":"b"*64,"record_self_sha256":"","retention_days_requested":90,"retention_days_accepted":90,"head_sha":"c"*40,"runner":{"os":"Linux","image":"ubuntu","architecture":"X64"},"lock_identity":"locked","build_id":"d"*64,"retry_lineage":{"failure_class":"github_infrastructure","original_run_id":None,"replacement_run_id":None}}
+    packet["record_self_sha256"] = gate.canonical_digest(packet)
+    binding = tmp_path / "binding.json"; output = tmp_path / "out"; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]}))
+    assert gate.reconcile_hosted(binding, output) == 0
+    assert gate.finalize_pipeline_artifact(output_dir=output, stage="reconciliation", head_sha="c"*40, run_id=1, run_attempt=1, job_key="reconcile", job_status="success") == 0
+    assert (output / "reconciliation-result.json").is_file() and not list(output.glob("*-rejection.json"))
+    packet["retention_days_accepted"] = 7; binding.write_text(json.dumps({"repository":"owner/repo","head_sha":"c"*40,"packets":[packet]})); invalid = tmp_path / "invalid"
+    assert gate.reconcile_hosted(binding, invalid) == 1 and (invalid / "reconciliation-rejection.json").is_file() and not list(invalid.glob("*-result.json"))
+
+
+def test_phase07_finalizer_creates_rejection_when_campaign_output_is_missing(tmp_path: Path) -> None:
+    import phase07_operator_gate
+    assert phase07_operator_gate.finalize_pipeline_artifact(output_dir=tmp_path, stage="screening", head_sha="a" * 40, run_id=1, run_attempt=1, job_key="screening", job_status="failure") == 0
+    assert json.loads((tmp_path / "screening-pipeline-rejection.json").read_text())["status"] == "reject-evidence"
+
+
+def _load_hydrator(monkeypatch, tmp_path: Path):
+    spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
+    module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
+    contents = {"nested/config.json": b"provider"}
+    digest = hashlib.sha256(contents["nested/config.json"]).hexdigest()
+    manifest = {
+        "schema_version": 2, "model_id": module.MODEL_ID,
+        "provider": {"name": "huggingface", "repository": module.MODEL_ID, "revision": "a" * 40},
+        "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
+        "provider_files": [{"path": "nested/config.json", "sha256": digest}],
+        "local_compatible_metadata": {"path": "configuration.json", "sha256": "b" * 64, "provenance": {"provider": "modelscope", "model_id": module.MODEL_ID, "kind": "legacy-local-bootstrap"}},
+    }
+    import eval.ann_corpus_manifest as manifests
+    manifest["record_self_sha256"] = manifests.canonical_sha256(manifest)
+    (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    return module, contents, manifest
+
+
+def test_exact_hf_hydration_uses_private_local_dir_and_accepts_only_its_provider_files(monkeypatch, tmp_path: Path) -> None:
+    """The provider writes into an absolute private root, not a cache-style link tree."""
+    module, contents, manifest = _load_hydrator(monkeypatch, tmp_path)
+    calls = {}
+
+    def fake_download(**kwargs):
+        calls.update(kwargs)
+        root = Path(kwargs["local_dir"])
+        assert root.is_absolute() and root.is_dir()
+        for relative, data in contents.items():
+            path = root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        return str(root)
+
+    module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert Path(calls["local_dir"]).is_absolute()
+    assert Path(calls["local_dir"]) != module.CACHE_DIR
+    assert calls["revision"] == manifest["provider"]["revision"]
+    assert calls["allow_patterns"] == [item["path"] for item in manifest["provider_files"]]
+    assert (module.MODEL_DIR / "nested/config.json").read_bytes() == contents["nested/config.json"]
+    assert not (module.MODEL_DIR / "configuration.json").exists()
+
+
+@pytest.mark.parametrize("attack", ("returned-root", "cache-leaf", "download-root", "ancestor"))
+def test_exact_hf_hydration_rejects_unbound_or_linked_provider_snapshots(monkeypatch, tmp_path: Path, attack: str) -> None:
+    """Provider cache links and all linked path components are fail-closed."""
+    module, contents, _ = _load_hydrator(monkeypatch, tmp_path)
+    old_target = module.MODEL_DIR; old_target.mkdir(parents=True); (old_target / "old.bin").write_bytes(b"old")
+    outside = tmp_path / "outside"; (outside / "nested").mkdir(parents=True); (outside / "nested/config.json").write_bytes(contents["nested/config.json"])
+
+    def fake_download(**kwargs):
+        root = Path(kwargs["local_dir"])
+        if attack == "returned-root":
+            return str(outside)
+        if attack == "download-root":
+            root.rmdir(); root.symlink_to(outside, target_is_directory=True)
+        elif attack == "ancestor":
+            (root / "nested").symlink_to(outside / "nested", target_is_directory=True)
+        else:
+            (root / "nested").mkdir(parents=True); (root / "nested/config.json").symlink_to(outside / "nested/config.json")
+        return str(root)
+
+    with pytest.raises(RuntimeError, match="(returned unexpected root|unsafe provider snapshot)"):
+        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert (old_target / "old.bin").read_bytes() == b"old"
+    assert not list(module.MODEL_DIR.parent.glob(".model.staging-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.previous-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.provider-*"))
+
+
+def test_exact_hf_hydration_restores_old_target_after_publish_replace_failure(monkeypatch, tmp_path: Path) -> None:
+    """A failed second replace restores the old target and cleans every temporary root."""
+    module, contents, _ = _load_hydrator(monkeypatch, tmp_path)
+    old_target = module.MODEL_DIR; old_target.mkdir(parents=True); (old_target / "old.bin").write_bytes(b"old")
+
+    def fake_download(**kwargs):
+        root = Path(kwargs["local_dir"])
+        for relative, data in contents.items():
+            path = root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        return str(root)
+
+    real_replace = module.os.replace
+    def fail_publish(source, target):
+        if Path(source).name.startswith(".model.staging-") and Path(target) == module.MODEL_DIR:
+            raise OSError("simulated publish failure")
+        return real_replace(source, target)
+    monkeypatch.setattr(module.os, "replace", fail_publish)
+
+    with pytest.raises(OSError, match="simulated publish failure"):
+        module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert (old_target / "old.bin").read_bytes() == b"old"
+    assert not list(module.MODEL_DIR.parent.glob(".model.staging-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.previous-*"))
+    assert not list(module.MODEL_DIR.parent.glob(".model.provider-*"))
+
+
+def test_exact_hf_hydration_succeeds_from_provider_only_snapshot(monkeypatch, tmp_path: Path) -> None:
+    """Hosted cache misses call the real hydrator, then validate a provider-only tree."""
+    spec = importlib.util.spec_from_file_location("download_embedding_model", SKILL_ROOT / "scripts/download_embedding_model.py")
+    module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)
+    contents = {"config.json": b"provider"}
+    digest = hashlib.sha256(contents["config.json"]).hexdigest()
+    manifest = {
+        "schema_version": 2, "model_id": module.MODEL_ID,
+        "provider": {"name": "huggingface", "repository": module.MODEL_ID, "revision": "a" * 40},
+        "runtime": {"python": "3.13", "scipy": "1.15.3", "lancedb": "0.34.0"},
+        "provider_files": [{"path": "config.json", "sha256": digest}],
+        "local_compatible_metadata": {"path": "configuration.json", "sha256": "b" * 64, "provenance": {"provider": "modelscope", "model_id": module.MODEL_ID, "kind": "legacy-local-bootstrap"}},
+    }
+    import eval.ann_corpus_manifest as manifests
+    manifest["record_self_sha256"] = manifests.canonical_sha256(manifest)
+    monkeypatch.setattr(module, "SKILL_ROOT", tmp_path); monkeypatch.setattr(module, "MODEL_DIR", tmp_path / "models/model"); monkeypatch.setattr(module, "CACHE_DIR", tmp_path / "cache")
+    (tmp_path / "eval").mkdir(); (tmp_path / "eval/model-manifest.json").write_text(json.dumps(manifest))
+    def fake_download(**kwargs):
+        source = Path(kwargs["local_dir"])
+        (source / "config.json").write_bytes(contents["config.json"])
+        return str(source)
+    module.hydrate_exact_manifest_model(snapshot_download=fake_download)
+    assert (module.MODEL_DIR / "config.json").read_bytes() == contents["config.json"]
+    assert not (module.MODEL_DIR / "configuration.json").exists()
+
+
+def test_confirmation_workflow_hydrates_on_miss_validates_exact_tree_and_preflight_does_not_hydrate() -> None:
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-pr-acceptance-gate:", 1)[0]
+    assert "phase07-model-${{ hashFiles('eval/model-manifest.json', 'scripts/download_embedding_model.py') }}" in confirmation
+    assert "Hydrate exact immutable model only on cache miss" in confirmation
+    assert "python scripts/download_embedding_model.py" in confirmation
+    assert "validate_model_tree" in confirmation
+    for job, next_job in (
+        ("phase07-entitlement-preflight-ubuntu", "phase07-entitlement-preflight-windows"),
+        ("phase07-entitlement-preflight-windows", "phase07-screening"),
+    ):
+        preflight = workflow.split(f"  {job}:", 1)[1].split(f"  {next_job}:", 1)[0]
+        assert "download_embedding_model.py" not in preflight
+
+
+def test_direct_manifest_only_script_mode_is_read_only_and_importable_from_repo_root() -> None:
+    """The screening preflight cannot import, hydrate, or alter the model tree."""
+    model_root = SKILL_ROOT / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
+    before = sorted(
+        (path.relative_to(model_root).as_posix(), path.stat().st_mtime_ns)
+        for path in model_root.rglob("*")
+    ) if model_root.exists() else []
+
+    result = subprocess.run(
+        [sys.executable, "scripts/download_embedding_model.py", "--validate-manifest-only"],
+        cwd=SKILL_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["valid"] is True
+    assert payload["mode"] == "manifest-only"
+    assert payload["revision"] == "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+    after = sorted(
+        (path.relative_to(model_root).as_posix(), path.stat().st_mtime_ns)
+        for path in model_root.rglob("*")
+    ) if model_root.exists() else []
+    assert after == before
 
 
 def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> None:
@@ -83,7 +853,7 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     bootstrap_at = test_and_eval.index("Bootstrap local embedding model")
     phase04_at = test_and_eval.index("Run #22 public build-mode equivalence gate")
     assert bootstrap_at < phase04_at
-    assert "python eval/compare_build_modes.py" in test_and_eval
+    assert "python -m eval.compare_build_modes" in test_and_eval
     assert "--work-dir .review-tmp/phase04-modes" in test_and_eval
     assert "--output .review-tmp/phase04-modes/equivalence.json" in test_and_eval
     comparator = test_and_eval.split("Run #22 public build-mode equivalence gate", 1)[1].split(
@@ -110,7 +880,8 @@ def test_phase04_workflows_gate_real_storage_and_public_route_equivalence() -> N
     assert test_and_eval.index("Run #22 public build-mode equivalence gate") < test_and_eval.index(
         "Upload #22 equivalence and telemetry evidence"
     )
-    assert "--max-seconds 60" in workflow
+    assert "--per-build-cap-seconds 180" in workflow
+    assert "--max-seconds 60" not in workflow
     assert "static_cap_seconds" in workflow
     assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in workflow
     assert "numpy':'2.2.6" in workflow
@@ -241,7 +1012,8 @@ def test_baseline_pr_guard_fetches_history_and_fails_closed():
     assert "git cat-file -e \"$base^{commit}\"" in workflow
     assert "git cat-file -e \"$head^{commit}\"" in workflow
     assert 'changed_files="$(git diff --name-only "$base" "$head")"' in workflow
-    assert "git diff --name-only" not in workflow.split('changed_files="$(git diff --name-only "$base" "$head")"', 1)[1]
+    baseline_guard = workflow.split("Protect evaluation baseline on pull requests", 1)[1].split("Retrieval eval", 1)[0]
+    assert baseline_guard.count("git diff --name-only") == 1
 
 
 def _bundle(path, *, reason="rrf", context_text=None):
@@ -339,14 +1111,15 @@ def test_small_fixture_metric_and_decision_records_are_separate() -> None:
 
     workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
     assert "model-backed-ann-decision" in workflow
-    assert "--decision-evidence" in workflow
     assert "--init-baseline" not in workflow.split("model-backed-ann-decision:", 1)[1]
     model_job = workflow.split("model-backed-ann-decision:", 1)[1].split("reconcile-ann-decision:", 1)[0]
-    assert "candidate-hybrid-ann-decision.json" in model_job
-    assert "--validate-candidate-hybrid-evidence" in model_job
+    assert "phase07-final-hybrid.json" in model_job
+    assert "--phase07-final-output" in model_job
+    assert "--validate-phase07-final-evidence" in model_job
     assert "GITHUB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in model_job
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in model_job
     assert "if: success()" in model_job
-    assert "candidate-hybrid-ann-decision-error" in model_job
+    assert "phase07-final-hybrid-error" in model_job
 
 
 @pytest.mark.parametrize(
@@ -470,6 +1243,213 @@ def test_candidate_hybrid_driver_builds_every_binding_and_calls_production_entry
     assert len(packet["records"]) == 12
 
 
+def _set_phase07_final_ci_env(
+    monkeypatch: pytest.MonkeyPatch, *, job: str = "model-backed-ann-decision",
+) -> None:
+    head = run_eval._head_sha()
+    values = {
+        "GITHUB_REPOSITORY": "allenwoo713/obsidian_wiki_skill",
+        "GITHUB_WORKFLOW": "eval",
+        "GITHUB_WORKFLOW_REF": (
+            "allenwoo713/obsidian_wiki_skill/.github/workflows/eval.yml@refs/pull/53/merge"
+        ),
+        "GITHUB_JOB": job, "GITHUB_RUN_ID": "32999999999", "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_PR_HEAD_SHA": head,
+        "PHASE07_FINAL_ARTIFACT_NAME": "phase07-final-hybrid-32999999999-1",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_phase07_final_gate_builds_only_m16_and_m20_and_calls_public_hybrid_for_original_105(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The final PR authority has two fixed roles and no m32/30k execution."""
+    queries = run_eval.load_queries(SKILL_ROOT / "eval" / "queries.jsonl")
+    by_query = {row["query"]: row for row in queries}
+    builds: list[dict] = []
+    calls: list[tuple[str, dict]] = []
+
+    def fake_build(root, wiki, full_rebuild, *, candidate_query_policy=None):
+        assert wiki == run_eval.FIXTURES_WIKI and full_rebuild is True
+        builds.append(candidate_query_policy.to_json())
+        return SimpleNamespace(role=root.name), run_eval.FIXTURES_WIKI, 0.01
+
+    class _Plan:
+        @staticmethod
+        def to_json():
+            return {"intent": "auto"}
+
+    class _Budget:
+        context_text = ""
+        token_count = 0
+        items: list = []
+
+        @staticmethod
+        def budget_to_json():
+            return {
+                "requested_base_budget_tokens": 4096, "budget_multiplier": 1.0,
+                "effective_budget_tokens": 4096, "hard_max_tokens": None,
+                "budget_policy": "test", "max_context_tokens": 4096,
+            }
+
+    def fake_hybrid(index, query, _planner, **kwargs):
+        specification = by_query[query]
+        pages = specification.get("relevant_pages") or ["Wiki/page.md"]
+        budget = _Budget()
+        budget.context_text = "\n".join(specification.get("required_facts") or [])
+        calls.append((index.role, dict(kwargs)))
+        return SimpleNamespace(
+            query=query, plan=_Plan(),
+            candidates=[SimpleNamespace(page_id=page) for page in pages], bundle=budget,
+        )
+
+    monkeypatch.setattr(run_eval, "_build", fake_build)
+    monkeypatch.setattr(run_eval, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(run_eval, "_decision_environment", lambda: {
+        "python": "3.13.0", "platform": "test", "lancedb": "0.34.0",
+        "numpy": "2.2.6", "pyarrow": "25.0.0",
+    })
+    _set_phase07_final_ci_env(monkeypatch)
+    packet = run_eval.run_phase07_final_hybrid_evaluation(
+        run_eval.FIXTURES_WIKI, queries, tmp_path / "phase07-final", 4096,
+    )
+
+    assert [(row["build_policy"]["m"], row["build_policy"]["ef_construction"], row["query_ef"])
+            for row in builds] == [(16, 300, 100), (20, 300, 300)]
+    assert len(calls) == 210
+    assert {role for role, _kwargs in calls} == {"baseline", "candidate"}
+    assert all(not {"candidate", "candidate_config", "candidate_aware"} & set(kwargs)
+               for _role, kwargs in calls)
+    assert packet["candidate"] == run_eval.PHASE07_FINAL_CANDIDATE
+    assert packet["quality_authority"] == "original_105_query_only"
+    assert packet["authorization"] == "user-approved-d28"
+    assert packet["gates"]["authorization"] == "user-approved-d28"
+    assert packet["provenance"] == {
+        "repository": "allenwoo713/obsidian_wiki_skill", "workflow_name": "eval",
+        "workflow_path": ".github/workflows/eval.yml", "run_id": 32999999999,
+        "run_attempt": 1, "producer_job_id": "model-backed-ann-decision",
+        "producer_job_name": "Phase 07 model-backed m20 original-105 hybrid gate",
+        "artifact_name": "phase07-final-hybrid-32999999999-1", "retention_days": 90,
+        "pr_head_sha": run_eval._head_sha(), "checkout_head_sha": run_eval._head_sha(),
+    }
+    assert packet["content_sha256"] == run_eval._phase07_final_content_digest(packet)
+    assert packet["record_self_sha256"] == run_eval._phase07_final_digest(packet)
+    assert packet["gates"]["candidate_verdict"] == "numeric-success"
+    serialized = json.dumps(packet, sort_keys=True)
+    assert '"m": 32' not in serialized and "expanded_30k" not in serialized
+    _set_phase07_final_ci_env(monkeypatch, job="reconcile-ann-decision")
+    assert run_eval.validate_phase07_final_hybrid_evidence(packet) == packet
+
+
+def test_phase07_final_packet_fails_closed_on_candidate_or_observation_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The validator recomputes identity before accepting final evidence."""
+    _set_phase07_final_ci_env(monkeypatch)
+    provenance = run_eval._phase07_current_workflow_provenance(require_producer=True)
+    packet = {
+        "schema_version": run_eval.PHASE07_FINAL_HYBRID_SCHEMA_VERSION,
+        "packet_kind": "phase07-final-original-105-hybrid/v1",
+        "head_sha": run_eval._head_sha(), "pr_head_sha": run_eval._head_sha(),
+        "checkout_head_sha": run_eval._head_sha(),
+        "environment": {"python": "3.13.0", "platform": "test", "lancedb": "0.34.0",
+                        "numpy": "2.2.6", "pyarrow": "25.0.0"},
+        "baseline": dict(run_eval.PHASE07_FINAL_BASELINE),
+        "candidate": dict(run_eval.PHASE07_FINAL_CANDIDATE),
+        "query_count": 105,
+        "queries_sha256": hashlib.sha256((SKILL_ROOT / "eval" / "queries.jsonl").read_bytes()).hexdigest(),
+        "baselines_sha256": hashlib.sha256((SKILL_ROOT / "eval" / "baselines.json").read_bytes()).hexdigest(),
+        "fixture_sha256": run_eval._fixture_digest(run_eval.FIXTURES_WIKI),
+        "observations": [], "metrics": {}, "gates": {},
+        "hybrid_invocation": {"entrypoint": "query.hybrid_search",
+                              "candidate_aware_public_arguments": False,
+                              "baseline_calls": 105, "candidate_calls": 105},
+        "quality_authority": "original_105_query_only",
+        "authorization": run_eval.PHASE07_FINAL_AUTHORIZATION,
+        "provenance": provenance,
+    }
+    packet["content_sha256"] = run_eval._phase07_final_content_digest(packet)
+    packet["record_self_sha256"] = run_eval._phase07_final_digest(packet)
+    monkeypatch.setattr(run_eval, "_decision_environment", lambda: packet["environment"])
+    bad_self_digest = deepcopy(packet)
+    bad_self_digest["record_self_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="sealed Phase 07"):
+        run_eval.validate_phase07_final_hybrid_evidence(bad_self_digest)
+    missing_provenance = deepcopy(packet)
+    missing_provenance.pop("provenance")
+    missing_provenance["record_self_sha256"] = run_eval._phase07_final_digest(missing_provenance)
+    with pytest.raises(ValueError, match="sealed Phase 07"):
+        run_eval.validate_phase07_final_hybrid_evidence(missing_provenance)
+    substituted_provenance = deepcopy(packet)
+    substituted_provenance["provenance"]["artifact_name"] = "phase07-final-hybrid-other-run"
+    substituted_provenance["record_self_sha256"] = run_eval._phase07_final_digest(substituted_provenance)
+    with pytest.raises(ValueError, match="exact-head binding"):
+        run_eval.validate_phase07_final_hybrid_evidence(substituted_provenance)
+    tampered = deepcopy(packet)
+    tampered["candidate"]["m"] = 32
+    tampered["record_self_sha256"] = run_eval._phase07_final_digest(tampered)
+    with pytest.raises(ValueError, match="sealed Phase 07"):
+        run_eval.validate_phase07_final_hybrid_evidence(tampered)
+    with pytest.raises(ValueError, match="complete observations"):
+        run_eval.validate_phase07_final_hybrid_evidence(packet)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"test-and-eval": "failure"},
+        {"issue41-scale-benchmark": "skipped"},
+        {"model-backed-ann-decision": ""},
+    ],
+)
+def test_phase07_reconciliation_requires_every_dependency_success(
+    mutation: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = {
+        "test-and-eval": "success", "issue41-scale-benchmark": "success",
+        "model-backed-ann-decision": "success",
+    }
+    assert run_eval.validate_phase07_required_needs(results) == results
+    env_names = {
+        "test-and-eval": "PHASE07_NEED_TEST_AND_EVAL",
+        "issue41-scale-benchmark": "PHASE07_NEED_ISSUE41_SCALE",
+        "model-backed-ann-decision": "PHASE07_NEED_MODEL_BACKED",
+    }
+    for dependency, env_name in env_names.items():
+        monkeypatch.setenv(env_name, results[dependency])
+    monkeypatch.setattr(sys, "argv", ["run_eval", "--validate-phase07-required-needs"])
+    assert run_eval.main() == 0
+    rejected = {**results, **mutation}
+    for dependency, env_name in env_names.items():
+        monkeypatch.setenv(env_name, rejected[dependency])
+    with pytest.raises(ValueError, match="required job did not succeed"):
+        run_eval.main()
+
+
+def test_phase07_final_gate_excludes_30k_but_keeps_original_contract_failures() -> None:
+    """Dropping copied-corpus evidence cannot weaken original citation/context/graph gates."""
+    floors, digest = phase07_operator_gate.committed_hybrid_baseline()
+    baseline = {
+        run_eval.FUNCTIONAL_FINAL_RETRIEVAL_METRIC: 1.0,
+        "page_recall_at_5": floors["page_recall_at_5"],
+        "evidence_recall_at_10": floors["evidence_recall_at_10"],
+        "exact_lookup_hit_at_3": floors["exact_lookup_hit_at_3"],
+        "mrr_at_10": floors["mrr_at_10"],
+        "citation_violation_count": 0, "context_overflow_count": 0,
+        "budget_violation_count": 0, "graph_unsupported_count": 0,
+    }
+    candidate = {**baseline, "graph_unsupported_count": 1}
+    verdict = phase07_operator_gate.recompute_hybrid_gate_verdicts(
+        original_absolute={"baseline": baseline, "candidate": candidate},
+        expanded_scale_diagnostics=None, committed_baseline=floors,
+        baselines_sha256=digest,
+    )
+    assert verdict["candidate_verdict"] == "rejected-candidate"
+    assert verdict["quality_authority"] == "original_105_query_only"
+    assert "expanded_30k_scale_diagnostics" not in verdict
+
+
 def test_hybrid_search_interface_remains_candidate_unaware() -> None:
     parameters = inspect.signature(run_eval.hybrid_search).parameters
     assert "candidate" not in parameters
@@ -490,9 +1470,10 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--dimensions 384" in scale
     assert "--max-probes 256" in scale
     assert "--ef-grid 30,50,75,100,150,200" in scale
-    assert "--max-seconds 60" in scale
+    assert "--per-build-cap-seconds 180" in scale
+    assert "--max-seconds 60" not in scale
     assert "--calibrate" not in scale
-    assert "--approved-static-cap" in scale
+    assert "--approved-static-cap" not in scale
     assert "approved_ann_calibration.json" in scale
     assert "OMP_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale
     assert "OPENBLAS_NUM_THREADS: ${{ env.ANN_APPROVED_OMP_THREADS }}" in scale
@@ -507,6 +1488,11 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "--error-output .review-tmp/issue41-scale/index-benchmark-error.json" in scale
     assert "if: success()" in scale
     assert "index-benchmark-error.json" in scale
+
+    model_job = workflow.split("model-backed-ann-decision:", 1)[1].split("reconcile-ann-decision:", 1)[0]
+    assert "--phase07-final-output eval/phase07-final-hybrid.json" in model_job
+    assert "--validate-phase07-final-evidence eval/phase07-final-hybrid.json" in model_job
+    assert "--decision-evidence" not in model_job
     assert "issue41-index-benchmark-error" in scale
     assert "Upload rejected issue #41 comparator error evidence" in scale
 
@@ -515,11 +1501,57 @@ def test_scale_workflow_is_locked_and_reconciliation_is_an_always_run_gate() -> 
     assert "test-and-eval" in reconciliation
     assert "issue41-scale-benchmark" in reconciliation
     assert "model-backed-ann-decision" in reconciliation
-    assert "eval/reconcile_ann_gate.py" in reconciliation
-    assert '--expected-head "${{ github.sha }}"' in reconciliation
-    assert '--expected-pr-head "${{ github.event.pull_request.head.sha }}"' in reconciliation
+    assert "--validate-phase07-final-evidence" in reconciliation
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in reconciliation
     assert "Architecture (ubuntu-latest, Python 3.10)" in reconciliation
     assert "Architecture (windows-latest, Python 3.13)" in reconciliation
+
+
+def test_phase07_final_artifact_is_unique_to_current_run_and_reconciliation_is_bounded() -> None:
+    """The final packet uses same-run artifact identity and exact dependency status gates."""
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    producer = workflow["jobs"]["model-backed-ann-decision"]
+    reconciler = workflow["jobs"]["reconcile-ann-decision"]
+    assert producer["timeout-minutes"] == "45"
+    assert reconciler["timeout-minutes"] == "10"
+    unique_name = "phase07-final-hybrid-${{ github.run_id }}-${{ github.run_attempt }}"
+    assert producer["env"]["PHASE07_FINAL_ARTIFACT_NAME"] == unique_name
+    assert reconciler["env"]["PHASE07_FINAL_ARTIFACT_NAME"] == unique_name
+    section = source.split("  reconcile-ann-decision:", 1)[1].split(
+        "  phase07-entitlement-preflight-ubuntu:", 1,
+    )[0]
+    download = section.split("Download Phase 07 final hybrid evidence", 1)[1].split(
+        "Recompute exact-head Phase 07 final evidence", 1,
+    )[0]
+    assert "name: ${{ env.PHASE07_FINAL_ARTIFACT_NAME }}" in download
+    assert "run-id:" not in download and "repository:" not in download
+    assert "current workflow run" in download and "cross-run name lookup is not used" in download
+    assert "--validate-phase07-required-needs" in section
+    for dependency in (
+        "needs.test-and-eval.result", "needs.issue41-scale-benchmark.result",
+        "needs.model-backed-ann-decision.result",
+    ):
+        assert dependency in section
+
+
+def test_phase07_policy_migration_gate_requires_current_exact_head_results() -> None:
+    """A selected-policy change is accepted only after both current-run gates pass."""
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    gate = workflow["jobs"]["phase07-pr-acceptance-gate"]
+    assert gate["needs"] == ["model-backed-ann-decision", "reconcile-ann-decision"]
+    assert gate["timeout-minutes"] == "5"
+    assert "always()" in gate["if"]
+    checkout = gate["steps"][0]
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+    command = gate["steps"][1]["run"]
+    assert "PHASE07_MODEL_GATE" in command
+    assert "PHASE07_RECONCILIATION_GATE" in command
+    assert "(20,300,300)" in command
+    assert "D-28 / Issue #50" in command
+    assert "Plan 09 same-head baseline/finalist" not in command
+    assert "exit 1" not in command
 
 
 def test_reconciliation_cli_is_fail_closed_for_missing_jobs_and_artifacts() -> None:
@@ -529,6 +1561,2143 @@ def test_reconciliation_cli_is_fail_closed_for_missing_jobs_and_artifacts() -> N
     assert "validate_candidate_decision_records" in source
     assert "all_required_jobs_numeric_success" in source
     assert "!= \"success\"" in source
+
+
+def test_stage1_screening_request_seals_actual_hosted_runtime_identity() -> None:
+    """The Stage 1 runner receives its exact allocation/lock identity, never a generic request."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    screening = workflow.split("  phase07-screening:", 1)[1].split("  phase07-confirmation:", 1)[0]
+    for required in (
+        "RUN_ATTEMPT: ${{ github.run_attempt }}",
+        "JOB_KEY: ${{ github.job }}",
+        "BRANCH: ${{ github.ref_name }}",
+        "workflow_path':'.github/workflows/eval.yml'",
+        "job_allocation_nonce",
+        "'omp_num_threads':2",
+        "'lock_identity':h('requirements.txt')",
+        "Assert actual locked Stage 1 runtime and OMP settings",
+        "expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'}",
+        "OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'",
+        "retention-days: 90",
+    ):
+        assert required in screening
+    source = (SKILL_ROOT / "eval" / "reconcile_ann_gate.py").read_text(encoding="utf-8")
+    assert "--stage1-request" in source
+    assert "expected_shape: tuple[int, int, int] = (77_348, 384, 256)" in source
+
+
+def test_confirmation_workflow_locks_runtime_sources_and_host_measurements_before_build() -> None:
+    """The confirmation request must record actual immutable execution identity, not labels."""
+    workflow = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    confirmation = workflow.split("  phase07-confirmation:", 1)[1].split("  phase07-pr-acceptance-gate:", 1)[0]
+    for required in (
+        "Assert actual locked confirmation runtime and thread settings",
+        "expected={'python':'3.13', 'lancedb':'0.34.0', 'numpy':'2.2.6', 'pyarrow':'25.0.0'}",
+        "OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'",
+        "requirements_sha256",
+        "model_manifest_sha256",
+        "corpus_manifest_sha256",
+        "cpu_count",
+        "cpu_model",
+        "ImageOS",
+        "ImageVersion",
+    ):
+        assert required in confirmation
+
+
+def _phase07_hybrid_workflow_section() -> tuple[dict, str]:
+    """Return the parsed job and its isolated source section.
+
+    This deliberately consumes the real workflow rather than an in-memory
+    facsimile: a green test must describe the hosted production route.
+    """
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(
+        encoding="utf-8"
+    )
+    document = yaml.load(source, Loader=yaml.BaseLoader)
+    assert "phase07-hybrid" in document["jobs"], "missing dedicated hybrid job"
+    return document["jobs"]["phase07-hybrid"], source.split(
+        "  phase07-hybrid:", 1
+    )[1].split("  phase07-pr-acceptance-gate:", 1)[0]
+
+
+def test_phase07_manual_hybrid_dispatch_is_retired_from_hosted_topology() -> None:
+    """No workflow input can mint a new m32/copied-30k hybrid campaign."""
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(
+        encoding="utf-8"
+    )
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    dispatch = workflow["on"]["workflow_dispatch"]["inputs"]
+
+    assert dispatch["campaign_stage"]["options"] == [
+        "preflight", "screening", "confirmation",
+    ]
+    assert dispatch["workflow_inputs"]["description"] == (
+        "Sealed generated Phase 07 campaign dispatch bundle"
+    )
+
+    selected = {
+        name
+        for name, spec in workflow["jobs"].items()
+        if "inputs.campaign_stage == 'hybrid'" in spec.get("if", "")
+    }
+    assert selected == set()
+    job, hybrid = _phase07_hybrid_workflow_section()
+    assert job["if"] == "${{ false }}"
+    assert "Retired:" in hybrid
+    model = source.split("  model-backed-ann-decision:", 1)[1].split(
+        "  reconcile-ann-decision:", 1,
+    )[0]
+    assert "--phase07-final-output" in model
+    assert "m16-vs-m20 original-105" in model
+
+
+def test_phase07_frozen_prepare_is_retained_only_as_disabled_history() -> None:
+    source = (SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8")
+    workflow = yaml.load(source, Loader=yaml.BaseLoader)
+    job = workflow["jobs"]["phase07-hybrid-prepare"]
+    section = source.split("  phase07-hybrid-prepare:", 1)[1].split("  phase07-hybrid:", 1)[0]
+    assert job["timeout-minutes"] == "120"
+    assert job["permissions"] == {"contents": "read", "actions": "read"}
+    assert job["if"] == "${{ false }}"
+    assert "eval.phase07_frozen_base prepare" in section
+    # Prepare uses the same pinned model/cache path as roles and materializes
+    # directly at the canonical root that later role extraction reuses.
+    for required in (
+        "actions/cache@v4",
+        "Hydrate exact immutable model only on cache miss",
+        "Validate immutable cached model tree",
+        ".review-tmp/phase07/frozen-corpus/Wiki",
+        "--frozen-dir .review-tmp/phase07/frozen-corpus",
+        "path: .review-tmp/phase07/frozen-corpus",
+    ):
+        assert required in section
+    assert "include-hidden-files: true" in section
+    assert "retention-days: 90" in section
+    assert "phase07-hybrid" not in section
+
+
+def test_phase07_role_download_uses_the_exact_prepare_run_and_artifact_identity() -> None:
+    """A role invokes the exact-ID REST collector, never action name selection."""
+    _job, hybrid = _phase07_hybrid_workflow_section()
+    assert "Require an empty canonical root before secure artifact extraction" in hybrid
+    assert "assert not root.exists()" in hybrid
+    assert "python -m eval.phase07_operator_gate frozen-download" in hybrid
+    assert "--dispatch-bundle .review-tmp/phase07/hybrid-dispatch.json" in hybrid
+    assert "--archive .review-tmp/phase07/frozen-prepare.zip" in hybrid
+    assert "--frozen-dir .review-tmp/phase07/frozen-corpus" in hybrid
+    assert "--model-dir models/paraphrase-multilingual-MiniLM-L12-v2" in hybrid
+    assert "name: phase07-frozen-base" not in hybrid
+    assert "actions/download-artifact@v4" not in hybrid
+    assert "artifact-ids:" not in hybrid
+
+
+def _frozen_prepare_download_identity(
+    archive: bytes, *, artifact_id: int = 73, base_tree_sha256: str = "c" * 64,
+) -> dict:
+    return {
+        "repository": "allenwoo713/obsidian_wiki_skill", "head_sha": "a" * 40,
+        "run_id": 71, "run_attempt": 1, "job_id": 72, "artifact_id": artifact_id,
+        "artifact_name": "phase07-frozen-base-71-1",
+        "archive_sha256": hashlib.sha256(archive).hexdigest(), "archive_size_bytes": len(archive),
+        "descriptor_self_sha256": "b" * 64, "base_tree_sha256": base_tree_sha256,
+        "model_manifest_sha256": "d" * 64, "corpus_manifest_sha256": "e" * 64,
+        "generator_recipe_sha256": "f" * 64,
+        "runtime": {"python": "3.13", "numpy": "2.2.6"},
+        "artifact_created_at": "2026-08-25T00:00:00Z",
+        "artifact_expires_at": "2026-11-23T00:00:00Z",
+        "retention_days": 90, "replacement_for_run_id": None, "status": "success",
+    }
+
+
+def _frozen_zip(members: dict[str, bytes]) -> bytes:
+    from io import BytesIO
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+    return output.getvalue()
+
+
+def _real_tiny_frozen_archive(root: Path) -> tuple[bytes, str, dict[str, object]]:
+    """Produce a real sealed tiny corpus at its eventual extraction root."""
+    from io import BytesIO
+
+    from eval.phase07_frozen_base import prepare_frozen_base
+    from eval.run_eval import expected_phase07_expanded_corpus_identity
+
+    wiki = root / "Wiki"
+    page = wiki / "concepts" / "redirect.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\ntype: concept\ntitle: Redirect corpus\nsources: []\ntags: []\nrelated: []\n---\n\n"
+        "# Redirect corpus\n\nSEALEDREDIRECT unique frozen validation text.\n",
+        encoding="utf-8",
+    )
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    expected_corpus_identity = expected_phase07_expanded_corpus_identity(
+        fixture_root=wiki, target_size=1, test_only=True,
+    )
+    descriptor = prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=root, embed=embed,
+        tokenizer=_non_equivalent_frozen_tokenizer,
+        expected_corpus_identity=expected_corpus_identity,
+    )
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for member in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+            if member.is_file():
+                archive.write(member, member.relative_to(root).as_posix())
+    shutil.rmtree(root)
+    return output.getvalue(), str(descriptor["frozen_tree_sha256"]), expected_corpus_identity
+
+
+def _non_equivalent_frozen_tokenizer(text: str, **_kwargs: object) -> dict[str, list[int]]:
+    """Deliberately unlike the removed ``len(text)//4`` fallback.
+
+    Its word/punctuation accounting moves the 112-token split boundary and
+    makes a validator using a different tokenizer observably reject the base.
+    """
+    import re
+
+    return {"input_ids": list(range(max(1, 3 * len(re.findall(r"[A-Za-z]+|[^\sA-Za-z]", text)))))}
+
+
+class _ExactFrozenArchiveClient:
+    """Fixture API that exposes one archive endpoint and no name/list fallback."""
+
+    def __init__(self, archive: bytes) -> None:
+        self.archive = archive
+        self.calls: list[str] = []
+
+    def download_artifact(self, path: str, _token: str) -> bytes:
+        self.calls.append(path)
+        if path != "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip":
+            raise ValueError("unknown artifact ID")
+        return self.archive
+
+
+class _ArtifactRedirectResponse:
+    """Small in-memory HTTP response for the stdlib client redirect seam."""
+
+    status = 200
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def getcode(self) -> int:
+        return self.status
+
+    def read(self) -> bytes:
+        return self.payload
+
+
+class _RedirectingArtifactOpener:
+    """Mock transport that deliberately invokes the production redirect handler."""
+
+    def __init__(self, handler: object, redirects: list[str], payload: bytes) -> None:
+        self.handler = handler
+        self.redirects = redirects
+        self.payload = payload
+        self.requests: list[object] = []
+
+    def open(self, request: object, timeout: int) -> _ArtifactRedirectResponse:
+        del timeout
+        current = request
+        self.requests.append(current)
+        for target in self.redirects:
+            current = self.handler.redirect_request(  # type: ignore[attr-defined]
+                current, None, 302, "Found", SimpleNamespace(), target,
+            )
+            self.requests.append(current)
+        return _ArtifactRedirectResponse(self.payload)
+
+
+def test_github_actions_client_allows_one_exact_results_blob_redirect_and_strips_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real redirect handler permits only GitHub's signed results storage hop."""
+    captured: list[_RedirectingArtifactOpener] = []
+
+    def build_opener(handler: object) -> _RedirectingArtifactOpener:
+        opener = _RedirectingArtifactOpener(
+            handler,
+            ["https://productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed"],
+            b"frozen-zip",
+        )
+        captured.append(opener)
+        return opener
+
+    monkeypatch.setattr(phase07_operator_gate.urllib.request, "build_opener", build_opener)
+    payload = phase07_operator_gate.GitHubActionsClient().download_artifact(
+        "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip", "fixture-token",
+    )
+
+    assert payload == b"frozen-zip"
+    initial, redirected = captured[0].requests
+    assert initial.full_url == (
+        "https://api.github.com/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"
+    )
+    assert redirected.full_url.startswith("https://productionresultssa0.blob.core.windows.net/")
+    assert redirected.get_header("Authorization") is None
+    assert redirected.get_header("Cookie") is None
+
+
+@pytest.mark.parametrize("path", (
+    "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/0/zip",
+    "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip?alias=1",
+    "https://api.github.com/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip",
+))
+def test_github_actions_client_rejects_noncanonical_artifact_endpoint(path: str) -> None:
+    with pytest.raises(ValueError, match="exact artifact download request"):
+        phase07_operator_gate.GitHubActionsClient().download_artifact(path, "fixture-token")
+
+
+@pytest.mark.parametrize("redirects", (
+    ["http://productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed"],
+    ["https://not-results.blob.core.windows.net/actions-results/archive?sig=sealed"],
+    ["https://user@productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed"],
+    ["https://productionresultssa0.blob.core.windows.net:443/actions-results/archive?sig=sealed"],
+    ["https://productionresultssa0.blob.core.windows.net.evil.test/actions-results/archive?sig=sealed"],
+    [
+        "https://productionresultssa0.blob.core.windows.net/actions-results/archive?sig=sealed",
+        "https://productionresultssa1.blob.core.windows.net/actions-results/archive?sig=second",
+    ],
+), ids=("http", "non-actions-azure", "userinfo", "port", "hostname-alias", "second-redirect"))
+def test_github_actions_client_rejects_unsafe_artifact_redirects(
+    monkeypatch: pytest.MonkeyPatch, redirects: list[str],
+) -> None:
+    """No generic Azure target, credential URL alias, or second hop is accepted."""
+    def build_opener(handler: object) -> _RedirectingArtifactOpener:
+        return _RedirectingArtifactOpener(handler, redirects, b"should-not-arrive")
+
+    monkeypatch.setattr(phase07_operator_gate.urllib.request, "build_opener", build_opener)
+    with pytest.raises(ValueError, match="exact artifact download unavailable"):
+        phase07_operator_gate.GitHubActionsClient().download_artifact(
+            "/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip", "fixture-token",
+        )
+
+
+@pytest.mark.parametrize("members,accepted", (
+    ({"Wiki/page.md": b"page", "lance_db/data": b"db", ".index/state": b"state",
+      "graph.json": b"{}", "pages.json": b"[]", "frozen-base.json": b"{}"}, True),
+    ({"phase07-frozen-base-71-1/Wiki/page.md": b"subdir"}, False),
+    ({"Wiki/page.md": b"one", "wiki/PAGE.md": b"two"}, False),
+    ({"../Wiki/page.md": b"traversal"}, False),
+))
+def test_frozen_download_uses_exact_archive_api_and_secure_zip_roundtrip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, members: dict[str, bytes], accepted: bool,
+) -> None:
+    """The operator performs real archive bytes→ZIP→canonical-root validation."""
+    import eval.phase07_frozen_base as frozen_base
+
+    archive_bytes = _frozen_zip(members)
+    client = _ExactFrozenArchiveClient(archive_bytes)
+    validated: list[Path] = []
+
+    def validate(root: Path, *, expected_wiki_root: Path, tokenizer: object,
+                 expected_corpus_identity: object | None = None) -> str:
+        validated.append(root)
+        assert expected_wiki_root == root / "Wiki"
+        assert tokenizer is _non_equivalent_frozen_tokenizer
+        assert expected_corpus_identity is None
+        return "c" * 64
+
+    monkeypatch.setattr(frozen_base, "validate_frozen_base", validate)
+    archive, root = tmp_path / "prepare.zip", tmp_path / "frozen-corpus"
+    if accepted:
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=_frozen_prepare_download_identity(archive_bytes), token="fixture-token",
+            archive=archive, frozen_dir=root, client=client, tokenizer=_non_equivalent_frozen_tokenizer,
+        )
+        assert client.calls == ["/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"]
+        assert archive.read_bytes() == archive_bytes
+        assert (root / "Wiki" / "page.md").read_bytes() == b"page"
+        assert validated == [root]
+    else:
+        with pytest.raises(ValueError):
+            phase07_operator_gate.download_frozen_artifact(
+                frozen_prepare=_frozen_prepare_download_identity(archive_bytes), token="fixture-token",
+                archive=archive, frozen_dir=root, client=client, tokenizer=_non_equivalent_frozen_tokenizer,
+            )
+        assert not root.exists()
+
+
+def test_frozen_download_real_tiny_zip_extracts_and_validates_canonical_base(tmp_path: Path) -> None:
+    """The collector validates an actual sealed ZIP through the real frozen-base verifier."""
+    payload, tree_sha256, expected_corpus_identity = _real_tiny_frozen_archive(tmp_path / "frozen-corpus")
+    client = _ExactFrozenArchiveClient(payload)
+    phase07_operator_gate.download_frozen_artifact(
+        frozen_prepare=_frozen_prepare_download_identity(payload, base_tree_sha256=tree_sha256),
+        token="fixture-token", archive=tmp_path / "prepare.zip",
+        frozen_dir=tmp_path / "frozen-corpus", client=client,
+        tokenizer=_non_equivalent_frozen_tokenizer,
+        test_expected_corpus_identity=expected_corpus_identity,
+    )
+
+    from eval.phase07_frozen_base import validate_frozen_base
+
+    assert client.calls == ["/repos/allenwoo713/obsidian_wiki_skill/actions/artifacts/73/zip"]
+    assert validate_frozen_base(
+        tmp_path / "frozen-corpus", expected_wiki_root=tmp_path / "frozen-corpus" / "Wiki",
+        tokenizer=_non_equivalent_frozen_tokenizer,
+        expected_corpus_identity=expected_corpus_identity,
+    ) == tree_sha256
+
+
+@pytest.mark.parametrize("field,value", (
+    ("archive_sha256", "0" * 64),
+    ("archive_size_bytes", 1),
+), ids=("digest", "size"))
+def test_frozen_download_rejects_wrong_sealed_archive_digest_or_size(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    payload, tree_sha256, _expected_corpus_identity = _real_tiny_frozen_archive(tmp_path / "frozen-corpus")
+    identity = _frozen_prepare_download_identity(payload, base_tree_sha256=tree_sha256)
+    identity[field] = value
+    with pytest.raises(ValueError, match="archive digest/size"):
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=identity, token="fixture-token", archive=tmp_path / "prepare.zip",
+            frozen_dir=tmp_path / "frozen-corpus", client=_ExactFrozenArchiveClient(payload),
+            tokenizer=_non_equivalent_frozen_tokenizer,
+        )
+    assert not (tmp_path / "prepare.zip").exists()
+    assert not (tmp_path / "frozen-corpus").exists()
+
+
+def test_frozen_download_rejects_casefold_alias_before_real_base_validation(tmp_path: Path) -> None:
+    payload, tree_sha256, _expected_corpus_identity = _real_tiny_frozen_archive(tmp_path / "frozen-corpus")
+    from io import BytesIO
+
+    source, aliased = BytesIO(payload), BytesIO()
+    with zipfile.ZipFile(source) as input_zip, zipfile.ZipFile(aliased, "w") as output_zip:
+        for member in input_zip.infolist():
+            output_zip.writestr(member, input_zip.read(member))
+        output_zip.writestr("wiki/CONCEPTS/REDIRECT.md", b"casefold alias")
+    archive = aliased.getvalue()
+    with pytest.raises(ValueError, match="ambiguous frozen archive member"):
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=_frozen_prepare_download_identity(archive, base_tree_sha256=tree_sha256),
+            token="fixture-token", archive=tmp_path / "prepare.zip",
+            frozen_dir=tmp_path / "frozen-corpus", client=_ExactFrozenArchiveClient(archive),
+            tokenizer=_non_equivalent_frozen_tokenizer,
+        )
+    assert not (tmp_path / "frozen-corpus").exists()
+
+
+def test_frozen_download_rejects_a_different_artifact_id_before_any_extraction(tmp_path: Path) -> None:
+    """A valid same-name archive cannot replace the collector-bound numeric ID."""
+    archive_bytes = _frozen_zip({"Wiki/page.md": b"page"})
+    client = _ExactFrozenArchiveClient(archive_bytes)
+    with pytest.raises(ValueError):
+        phase07_operator_gate.download_frozen_artifact(
+            frozen_prepare=_frozen_prepare_download_identity(archive_bytes, artifact_id=74),
+            token="fixture-token", archive=tmp_path / "prepare.zip",
+            frozen_dir=tmp_path / "frozen-corpus", client=client, tokenizer=_non_equivalent_frozen_tokenizer,
+        )
+    assert not (tmp_path / "frozen-corpus").exists()
+
+
+def test_frozen_download_cli_is_a_real_module_command_and_workflow_has_no_unknown_action_input() -> None:
+    """Exercise the CLI parser and reject the unsupported artifact-ids action input."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "--help"], cwd=SKILL_ROOT,
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "frozen-download" in completed.stdout
+    workflow = yaml.load((SKILL_ROOT / ".github" / "workflows" / "eval.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    for job in workflow["jobs"].values():
+        for step in job.get("steps", []):
+            if step.get("uses") == "actions/download-artifact@v4":
+                assert "artifact-ids" not in step.get("with", {})
+
+
+def test_frozen_size_preflight_and_prepare_plan_are_reachable_real_operator_clis(tmp_path: Path) -> None:
+    """The two non-network stages are real module CLIs, not dead helpers."""
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True,
+    ).strip()
+    preflight = {
+        "schema_version": 1, "head_sha": head, "target_size": 30000,
+        "wall_time_seconds": 1, "cap_minutes": 120, "uncompressed_bytes": 100,
+        "archive_bytes": 50, "file_count": 1, "largest_file": 100,
+        "descriptor_sha256": hashlib.sha256(b"descriptor").hexdigest(),
+        "tree_sha256": hashlib.sha256(b"tree").hexdigest(),
+        "repository_capability": True, "human_authorized": True,
+    }
+    request, ledger, workflow_input = (
+        tmp_path / "size.json", tmp_path / "sealed-preflight.json", tmp_path / "prepare-input.json",
+    )
+    request.write_text(json.dumps(preflight), encoding="utf-8")
+    first = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "frozen-size-preflight",
+         "--request-file", str(request), "--ledger-file", str(ledger)],
+        cwd=SKILL_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    second = subprocess.run(
+        [sys.executable, "-m", "eval.phase07_operator_gate", "prepare-plan",
+         "--request-file", str(ledger), "--workflow-input-file", str(workflow_input),
+         "--head-sha", head],
+        cwd=SKILL_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    output = json.loads(workflow_input.read_text(encoding="utf-8"))
+    assert output == phase07_operator_gate.validate_frozen_prepare_bundle(output, expected_head=head)
+    assert "artifact_id" not in output["local_preflight"]
+
+
+def _tiny_measurement_materializer(destination: Path) -> dict[str, object]:
+    """Explicit in-process seam; the production CLI has no reduced-size mode."""
+    from eval.ann_corpus_manifest import canonical_content_tree_sha256
+
+    page = destination / "concepts" / "measurement.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\ntype: concept\ntitle: Measurement corpus\nsources: []\ntags: []\nrelated: []\n---\n\n"
+        "# Measurement corpus\n\nLOCALMEASUREMENT unique sealed content.\n",
+        encoding="utf-8",
+    )
+    return {"expanded_content_tree_sha256": canonical_content_tree_sha256(destination), "expanded_member_count": 1}
+
+
+class _TinyMeasurementEmbedder:
+    tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+    def __init__(self) -> None:
+        self.progress_flags: list[bool] = []
+
+    def embed(self, texts: list[str], *, show_progress_bar: bool = False) -> list[list[float]]:
+        self.progress_flags.append(show_progress_bar)
+        return [[1.0, *([0.0] * 383)] for _ in texts]
+
+
+def test_local_frozen_size_measurement_builds_actual_archive_and_cleans_its_scratch(tmp_path: Path,
+                                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """The small corpus is an explicit API seam, never a CLI flag or test env switch."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    expected_identity = {
+        "expanded_content_tree_sha256": hashlib.sha256(b"unused").hexdigest(), "expanded_member_count": 1,
+    }
+    # Materialize once into a disposable directory to obtain the exact source identity.
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    seen: dict[str, object] = {}
+    original_archive = phase07_operator_gate._write_canonical_frozen_archive
+
+    def capture_archive(*, frozen_dir: Path, archive: Path) -> list[dict[str, object]]:
+        inventory = original_archive(frozen_dir=frozen_dir, archive=archive)
+        seen["archive_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+        seen["archive_bytes"] = archive.stat().st_size
+        seen["members"] = {str(item["path"]) for item in inventory}
+        return inventory
+
+    monkeypatch.setattr(phase07_operator_gate, "_write_canonical_frozen_archive", capture_archive)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement-ledger.json"
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "not-used-by-explicit-seam", ledger_file=ledger,
+        head_sha=head, materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    record = json.loads(ledger.read_text(encoding="utf-8"))
+    assert record == phase07_operator_gate.validate_frozen_size_measurement(record, expected_head=head)
+    assert record["archive_sha256"] == seen["archive_sha256"]
+    assert record["archive_bytes"] == seen["archive_bytes"]
+    assert record["file_count"] > 0 and record["uncompressed_bytes"] >= record["largest_file_bytes"] > 0
+    assert ".index/graph.json" in seen["members"]
+    assert record["authorization"] == "none"
+    assert record["repository_capability"] is False and record["human_authorized"] is False
+    assert not work_dir.exists()
+    # A measurement cannot stand in for the separately human/capability-sealed prepare envelope.
+    with pytest.raises(ValueError, match="sealed frozen prepare bundle"):
+        phase07_operator_gate.run_frozen_prepare_plan(
+            preflight_file=ledger, workflow_input_file=tmp_path / "prepare.json", expected_head=head,
+        )
+
+
+def test_local_frozen_size_measurement_reports_embedding_stages(tmp_path: Path) -> None:
+    """The production measurement path reports its opaque embedding phase."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    events: list[tuple[str, dict[str, object]]] = []
+    embedder = _TinyMeasurementEmbedder()
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=embedder, tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 0
+
+    assert embedder.progress_flags == [True]
+    assert [stage for stage, _detail in events] == [
+        "model_ready", "corpus_materialized", "plan_finished", "embedding_started", "embedding_finished",
+        "graph_started", "graph_finished", "lance_persist_started", "lance_persist_finished",
+    ]
+    assert all(detail["event"] == "phase07-frozen-size-progress" for _stage, detail in events)
+    wiki_root = Path(str(events[3][1]["wiki_root"]))
+    assert wiki_root.parts[-2:] == ("frozen-corpus", "Wiki")
+    assert events[4][1]["dense_chunks"] > 0 and events[4][1]["pages"] == 1
+    assert not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_accepts_legacy_injected_embedder(tmp_path: Path) -> None:
+    """Explicit test seams remain compatible with pre-progress embedder objects."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+
+    class LegacyEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str]) -> list[list[float]]:
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=LegacyEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert ledger.is_file() and not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_does_not_pass_progress_keyword_to_positional_varargs(
+        tmp_path: Path) -> None:
+    """A parameter named show_progress_bar in ``*args`` is not keyword-capable."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+
+    class PositionalVarargsEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str], *show_progress_bar: object) -> list[list[float]]:
+            assert show_progress_bar == ()
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=PositionalVarargsEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert ledger.is_file() and not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_passes_progress_keyword_to_keyword_varargs(tmp_path: Path) -> None:
+    """A ``**kwargs`` embedder remains eligible for operator batch progress."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    progress_calls: list[dict[str, object]] = []
+
+    class KeywordVarargsEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str], **kwargs: object) -> list[list[float]]:
+            progress_calls.append(kwargs)
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=KeywordVarargsEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert progress_calls == [{"show_progress_bar": True}]
+
+
+def test_local_frozen_size_measurement_reports_embedding_events_around_embed_call(tmp_path: Path) -> None:
+    """Embedding stage boundaries surround only the actual embed call."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    expected_identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    trace: list[str] = []
+
+    class OrderedEmbedder:
+        tokenizer = staticmethod(_non_equivalent_frozen_tokenizer)
+
+        @staticmethod
+        def embed(texts: list[str], *, show_progress_bar: bool = False) -> list[list[float]]:
+            assert show_progress_bar is True
+            trace.append("embed_called")
+            return [[1.0, *([0.0] * 383)] for _ in texts]
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=tmp_path / "scratch", model_dir=tmp_path / "unused", ledger_file=tmp_path / "measurement.json",
+        head_sha=head, materializer=_tiny_measurement_materializer, corpus_identity=expected_identity,
+        embedder=OrderedEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, _detail: trace.append(stage),
+    ) == 0
+    assert trace == [
+        "model_ready", "corpus_materialized", "plan_finished", "embedding_started", "embed_called",
+        "embedding_finished", "graph_started", "graph_finished", "lance_persist_started",
+        "lance_persist_finished",
+    ]
+
+
+def test_local_frozen_size_measurement_fsyncs_archive_through_write_capable_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The production path must satisfy Windows ``_commit`` access semantics."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    original_open = Path.open
+    original_fsync = phase07_operator_gate.os.fsync
+    archive_streams_by_descriptor: dict[int, tuple[str, object]] = {}
+    archive_open_modes: list[str] = []
+
+    def track_archive_mode(path: Path, mode: str = "r", buffering: int = -1,
+                           encoding: str | None = None, errors: str | None = None,
+                           newline: str | None = None):
+        stream = original_open(path, mode, buffering, encoding, errors, newline)
+        if path.name == "frozen-base.zip":
+            archive_open_modes.append(mode)
+            archive_streams_by_descriptor[stream.fileno()] = (mode, stream)
+        return stream
+
+    def require_windows_fsync_access(descriptor: int) -> None:
+        tracked = archive_streams_by_descriptor.get(descriptor)
+        mode = tracked[0] if tracked is not None and not getattr(tracked[1], "closed", True) else None
+        if mode is not None and not any(marker in mode for marker in ("+", "w", "a", "x")):
+            raise OSError(9, "simulated Windows _commit rejected read-only archive")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(Path, "open", track_archive_mode)
+    monkeypatch.setattr(phase07_operator_gate.os, "fsync", require_windows_fsync_access)
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 0
+    assert archive_open_modes[0] == "r+b"
+    assert ledger.is_file() and not work_dir.exists()
+
+
+def test_local_frozen_size_measurement_reports_sanitized_original_archive_failure_and_cleans_scratch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Terminal rejection retains a fixed error category, never exception text."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def reject_archive(*, frozen_dir: Path, archive: Path) -> list[dict[str, object]]:
+        raise OSError("simulated Windows archive fsync failure")
+
+    monkeypatch.setattr(phase07_operator_gate, "_write_canonical_frozen_archive", reject_archive)
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 1
+    assert events[-1] == (
+        "measurement_rejected",
+        {
+            "event": "phase07-frozen-size-progress",
+            "stage": "measurement_rejected",
+            "reason": "work_failed",
+            "error_kind": "os_error",
+        },
+    )
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_sanitizes_secret_file_not_found_failure(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A path-bearing exception is safe through both callback and stderr reporting."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    secret_path = "/private/ghp_rejection-token/authorization-secret.json"
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def missing_materializer(_destination: Path) -> dict[str, object]:
+        raise FileNotFoundError(secret_path)
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=tmp_path / "scratch", model_dir=tmp_path / "unused",
+        ledger_file=tmp_path / "measurement.json", head_sha=head,
+        materializer=missing_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 1
+
+    rejected = [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert rejected == [{
+        "event": "phase07-frozen-size-progress",
+        "stage": "measurement_rejected",
+        "reason": "work_failed",
+        "error_kind": "file_not_found",
+    }]
+    assert secret_path not in json.dumps(rejected)
+    assert not (tmp_path / "scratch").exists() and not (tmp_path / "measurement.json").exists()
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=tmp_path / "stderr-scratch", model_dir=tmp_path / "unused",
+        ledger_file=tmp_path / "stderr-measurement.json", head_sha=head,
+        materializer=missing_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    stderr = capsys.readouterr().err
+    stderr_events = [json.loads(line) for line in stderr.splitlines() if line]
+    stderr_rejections = [event for event in stderr_events if event["stage"] == "measurement_rejected"]
+    assert stderr_rejections == rejected
+    assert secret_path not in stderr
+    assert "/private/" not in stderr
+    assert not (tmp_path / "stderr-scratch").exists()
+    assert not (tmp_path / "stderr-measurement.json").exists()
+
+
+def test_local_frozen_size_measurement_propagates_unexpected_programming_error(
+        tmp_path: Path) -> None:
+    """Programming errors remain visible and cannot be reclassified as an operator rejection."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def broken_materializer(_destination: Path) -> dict[str, object]:
+        raise TypeError("programming regression")
+
+    with pytest.raises(TypeError, match="programming regression"):
+        phase07_operator_gate.run_local_frozen_size_measurement(
+            work_dir=tmp_path / "scratch", model_dir=tmp_path / "unused",
+            ledger_file=tmp_path / "measurement.json", head_sha=head,
+            materializer=broken_materializer,
+            corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+            embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            stage_reporter=lambda stage, detail: events.append((stage, detail)),
+        )
+    assert not [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert not (tmp_path / "scratch").exists() and not (tmp_path / "measurement.json").exists()
+
+
+def test_local_frozen_size_measurement_cleans_failures_and_preserves_preexisting_paths(tmp_path: Path) -> None:
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    failure_work, failure_ledger = tmp_path / "failure-scratch", tmp_path / "failure-ledger.json"
+
+    def failing_materializer(_destination: Path) -> dict[str, object]:
+        raise ValueError("intentional materialization failure")
+
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=failure_work, model_dir=tmp_path / "unused", ledger_file=failure_ledger, head_sha=head,
+        materializer=failing_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert not failure_work.exists() and not failure_ledger.exists()
+
+    existing_work, existing_ledger = tmp_path / "existing-work", tmp_path / "existing-ledger.json"
+    existing_work.mkdir(); (existing_work / "keep").write_text("keep", encoding="utf-8")
+    existing_ledger.write_text("keep", encoding="utf-8")
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=existing_work, model_dir=tmp_path / "unused", ledger_file=existing_ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert (existing_work / "keep").read_text(encoding="utf-8") == "keep"
+    assert existing_ledger.read_text(encoding="utf-8") == "keep"
+
+
+def test_local_frozen_size_measurement_rejects_ledger_inside_its_scratch_before_mutation(tmp_path: Path) -> None:
+    """The output cannot be made disposable by placing it below the work root."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "scratch" / "measurement.json"
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer,
+        corpus_identity={"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 1},
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_reports_cleanup_failure_and_withholds_ledger(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful build is not a successful command until its scratch is gone."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    original_rmtree = shutil.rmtree
+
+    def reject_cleanup(_path: Path) -> None:
+        raise OSError("intentional cleanup failure")
+
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", reject_cleanup)
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+    ) == 1
+    assert work_dir.exists() and not ledger.exists()
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", original_rmtree)
+    original_rmtree(work_dir)
+
+
+def test_local_frozen_size_measurement_reports_cleanup_and_ledger_failures_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cleanup failures are fail-closed but never displace or duplicate the terminal event."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    original_rmtree = shutil.rmtree
+
+    def reject_scratch_cleanup(_path: Path) -> None:
+        raise OSError("intentional scratch cleanup failure")
+
+    def reject_ledger_cleanup(_path: Path, _identity: tuple[int, int] | None) -> None:
+        raise OSError("intentional ledger cleanup failure")
+
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", reject_scratch_cleanup)
+    monkeypatch.setattr(phase07_operator_gate, "_remove_owned_measurement_ledger", reject_ledger_cleanup)
+    events: list[tuple[str, dict[str, object]]] = []
+    try:
+        assert phase07_operator_gate.run_local_frozen_size_measurement(
+            work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+            materializer=_tiny_measurement_materializer, corpus_identity=identity,
+            embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            stage_reporter=lambda stage, detail: events.append((stage, detail)),
+        ) == 1
+        assert work_dir.exists() and ledger.is_file()
+        rejected = [detail for stage, detail in events if stage == "measurement_rejected"]
+        assert rejected == [{
+            "event": "phase07-frozen-size-progress",
+            "stage": "measurement_rejected",
+            "reason": "scratch_cleanup_failed",
+            "error_kind": "os_error",
+            "cleanup_failures": ["scratch_cleanup_failed", "ledger_removal_failed"],
+        }]
+    finally:
+        if ledger.exists():
+            ledger.unlink()
+        if work_dir.exists():
+            original_rmtree(work_dir)
+
+
+def test_local_frozen_size_measurement_reports_post_cleanup_validation_failure_once(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A published ledger is accepted only after its post-cleanup validation succeeds."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+    original_validate = phase07_operator_gate.validate_frozen_size_measurement
+    calls = 0
+
+    def fail_only_post_cleanup(value: object, *, expected_head: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise ValueError("post-cleanup validation must fail closed")
+        return original_validate(value, expected_head=expected_head)
+
+    monkeypatch.setattr(phase07_operator_gate, "validate_frozen_size_measurement", fail_only_post_cleanup)
+    assert phase07_operator_gate.run_local_frozen_size_measurement(
+        work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+        materializer=_tiny_measurement_materializer, corpus_identity=identity,
+        embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+        stage_reporter=lambda stage, detail: events.append((stage, detail)),
+    ) == 1
+    rejected = [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert rejected == [{
+        "event": "phase07-frozen-size-progress",
+        "stage": "measurement_rejected",
+        "reason": "post_cleanup_validation_failed",
+        "error_kind": "invalid_value",
+    }]
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_removes_published_ledger_before_propagating_post_cleanup_type_error(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unexpected final validation error cannot leave a usable measurement behind."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+    original_validate = phase07_operator_gate.validate_frozen_size_measurement
+    calls = 0
+
+    def fail_only_third_validation(value: object, *, expected_head: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise TypeError("unexpected post-cleanup validation regression")
+        return original_validate(value, expected_head=expected_head)
+
+    monkeypatch.setattr(phase07_operator_gate, "validate_frozen_size_measurement", fail_only_third_validation)
+    with pytest.raises(TypeError, match="unexpected post-cleanup validation regression"):
+        phase07_operator_gate.run_local_frozen_size_measurement(
+            work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+            materializer=_tiny_measurement_materializer, corpus_identity=identity,
+            embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+            stage_reporter=lambda stage, detail: events.append((stage, detail)),
+        )
+    assert calls == 3
+    assert not [detail for stage, detail in events if stage == "measurement_rejected"]
+    assert not work_dir.exists() and not ledger.exists()
+
+
+def test_local_frozen_size_measurement_removes_published_ledger_before_propagating_scratch_cleanup_type_error(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unexpected scratch cleanup errors propagate only after owned-ledger cleanup."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SKILL_ROOT, text=True).strip()
+    identity_root = tmp_path / "identity"
+    identity = _tiny_measurement_materializer(identity_root)
+    shutil.rmtree(identity_root)
+    work_dir, ledger = tmp_path / "scratch", tmp_path / "measurement.json"
+    events: list[tuple[str, dict[str, object]]] = []
+    cleanup_order: list[str] = []
+    original_rmtree = shutil.rmtree
+    original_remove = phase07_operator_gate._remove_owned_measurement_ledger
+
+    def unexpected_scratch_cleanup(path: Path) -> None:
+        assert path == work_dir and ledger.is_file()
+        cleanup_order.append("scratch_cleanup")
+        raise TypeError("unexpected scratch cleanup regression")
+
+    def record_owned_ledger_removal(path: Path, identity: tuple[int, int] | None) -> bool:
+        cleanup_order.append("ledger_removal")
+        return original_remove(path, identity)
+
+    monkeypatch.setattr(phase07_operator_gate.shutil, "rmtree", unexpected_scratch_cleanup)
+    monkeypatch.setattr(phase07_operator_gate, "_remove_owned_measurement_ledger", record_owned_ledger_removal)
+    try:
+        with pytest.raises(TypeError, match="unexpected scratch cleanup regression"):
+            phase07_operator_gate.run_local_frozen_size_measurement(
+                work_dir=work_dir, model_dir=tmp_path / "unused", ledger_file=ledger, head_sha=head,
+                materializer=_tiny_measurement_materializer, corpus_identity=identity,
+                embedder=_TinyMeasurementEmbedder(), tokenizer=_non_equivalent_frozen_tokenizer,
+                stage_reporter=lambda stage, detail: events.append((stage, detail)),
+            )
+        assert cleanup_order == ["scratch_cleanup", "ledger_removal"]
+        assert not [detail for stage, detail in events if stage == "measurement_rejected"]
+        assert work_dir.exists() and not ledger.exists()
+    finally:
+        if work_dir.exists():
+            original_rmtree(work_dir)
+
+
+def test_new_durable_ledger_never_replaces_a_racing_sentinel(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """The destination name is claimed atomically, not checked then replaced."""
+    ledger = tmp_path / "measurement.json"
+    original_link = phase07_operator_gate.os.link
+
+    def racing_link(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
+        Path(destination).write_text("sentinel", encoding="utf-8")
+        original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(phase07_operator_gate.os, "link", racing_link)
+    with pytest.raises(ValueError, match="ledger must be new"):
+        phase07_operator_gate._write_new_durable_ledger(ledger, {"schema_version": 2})
+    assert ledger.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_frozen_measurement_directory_fsync_skips_unsupported_windows_handle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows must not attempt the POSIX-only open/fsync directory sequence."""
+    calls: list[object] = []
+    fake_os = SimpleNamespace(
+        name="nt",
+        O_RDONLY=0,
+        open=lambda *_args, **_kwargs: calls.append("open"),
+        fsync=lambda descriptor: calls.append(("fsync", descriptor)),
+        close=lambda descriptor: calls.append(("close", descriptor)),
+    )
+    monkeypatch.setattr(phase07_operator_gate, "os", fake_os)
+
+    phase07_operator_gate._fsync_directory(tmp_path)
+
+    assert calls == []
+
+
+def test_frozen_measurement_directory_fsync_preserves_posix_durability_sequence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Windows guard must not weaken the established POSIX fsync path."""
+    calls: list[object] = []
+    fake_os = SimpleNamespace(
+        name="posix",
+        O_RDONLY=7,
+        open=lambda path, flags: calls.append(("open", path, flags)) or 41,
+        fsync=lambda descriptor: calls.append(("fsync", descriptor)),
+        close=lambda descriptor: calls.append(("close", descriptor)),
+    )
+    monkeypatch.setattr(phase07_operator_gate, "os", fake_os)
+
+    phase07_operator_gate._fsync_directory(tmp_path)
+
+    assert calls == [
+        ("open", tmp_path, 7),
+        ("fsync", 41),
+        ("close", 41),
+    ]
+
+
+def test_phase07_hybrid_hosted_job_pins_runtime_model_and_single_retained_packet() -> None:
+    """The distinct job is model-backed, finite, and never publishes secrets."""
+    _job, hybrid = _phase07_hybrid_workflow_section()
+    for required in (
+        "python-version: '3.13'",
+        "lancedb':'0.34.0",
+        "numpy':'2.2.6",
+        "pyarrow':'25.0.0",
+        "OMP_NUM_THREADS: \"2\"",
+        "OPENBLAS_NUM_THREADS: \"2\"",
+        "MKL_NUM_THREADS: \"2\"",
+        "Hydrate exact immutable model only on cache miss",
+        "Validate immutable cached model tree",
+        "validate_model_tree",
+        "/attempts/{run_attempt}/jobs",
+        "phase07-hybrid-${{ github.run_id }}-${{ github.run_attempt }}",
+        "path: .review-tmp/phase07/hybrid-artifact",
+        "retention-days: 90",
+    ):
+        assert required in hybrid
+    assert hybrid.count("uses: actions/upload-artifact@v4") == 1
+    assert "if: ${{ always() }}" in hybrid.split(
+        "uses: actions/upload-artifact@v4", 1
+    )[0]
+    for forbidden in ("GITHUB_TOKEN=", "Authorization:", "Bearer ", "echo $GITHUB_TOKEN"):
+        assert forbidden not in hybrid
+
+
+def test_hybrid_allocation_and_collection_interfaces_are_typed_and_fail_closed() -> None:
+    """No confirmation/generic allocation can be relabelled as hybrid evidence."""
+    import phase07_operator_gate as gate
+
+    assert hasattr(gate, "seal_hybrid_allocation")
+    assert hasattr(gate, "build_hybrid_collection_request")
+    assert hasattr(gate, "collect_hybrid_provenance")
+    valid = {
+        "run_id": 701, "run_attempt": 1, "job_id": 703,
+        "job_key": "phase07-hybrid", "job_allocation_nonce": "a" * 32,
+    }
+    assert gate.validate_hybrid_allocation(valid) == valid
+    retried = {**valid, "run_attempt": 2}
+    with pytest.raises(ValueError):
+        gate.validate_hybrid_allocation(retried)
+    for field, value in (
+        ("run_id", True),
+        ("run_attempt", 0),
+        ("job_id", "703"),
+        ("job_key", "phase07-confirmation"),
+        ("job_allocation_nonce", "a" * 31),
+    ):
+        malformed = {**valid, field: value}
+        with pytest.raises(ValueError):
+            gate.validate_hybrid_allocation(malformed)
+
+
+def _phase07_hybrid_fixture_module():
+    """Load only the test-owned Phase 07 raw-evidence fixture helpers.
+
+    The fixture module makes complete raw files with the public serializer
+    shape.  It does not call any exporter/collector under test, so it cannot
+    manufacture a passing production artifact on their behalf.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "phase07_hybrid_evidence_fixture",
+        SKILL_ROOT / "tests" / "test_phase07_ann_campaign.py",
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _zip_hybrid_artifact(raw_root: Path, archive: Path) -> str:
+    """Create the downloaded-artifact envelope whose bytes the API binds."""
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for path in sorted(raw_root.iterdir()):
+            if path.is_file():
+                output.write(path, arcname=path.name)
+    return hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+class _HybridGitHubFixtureClient:
+    """Narrow attempt-scoped GitHub API fixture; no token is retained."""
+
+    def __init__(self, *, head: str, records: list[dict], mutation: str | None = None) -> None:
+        self.head = head
+        self.records = {record["run_id"]: record for record in records}
+        self.mutation = mutation
+
+    def get_json(self, path: str, _token: str) -> dict:
+        run_id = next((value for value in self.records if f"/runs/{value}" in path), None)
+        assert run_id is not None, path
+        record = self.records[run_id]
+        if path.endswith(f"/runs/{run_id}"):
+            response = {
+                "id": run_id, "run_attempt": record["run_attempt"],
+                "head_sha": self.head, "head_branch": "feature/issue-50-dense-ann-recall",
+                "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+                "created_at": "2026-08-25T00:00:00Z",
+            }
+            if self.mutation == "non-success":
+                response["conclusion"] = "failure"
+            if self.mutation == "stale-head":
+                response["head_sha"] = "0" * 40
+            if self.mutation == "run-mismatch":
+                response["id"] = record["api_run_id_mismatch"]
+            if self.mutation == "attempt-mismatch":
+                response["run_attempt"] = record["api_run_attempt_mismatch"]
+            return response
+        if path.endswith(f"/attempts/{record['run_attempt']}/jobs"):
+            job = {
+                "id": record["job_id"], "run_id": run_id,
+                "run_attempt": record["run_attempt"],
+                "name": "Phase 07 independent hybrid campaign",
+                "status": "completed", "conclusion": "success",
+                "runner_name": "GitHub Actions 42", "runner_group_name": "GitHub Actions",
+                "labels": ["ubuntu-latest"],
+            }
+            if self.mutation == "job-mismatch":
+                job["id"] = record["api_job_id_mismatch"]
+            return {"jobs": [job]}
+        if path.endswith(f"/runs/{run_id}/artifacts"):
+            artifact = {
+                "id": record["artifact_id"],
+                "name": f"phase07-hybrid-{run_id}-{record['run_attempt']}",
+                # GitHub's artifact creation time, not the workflow creation
+                # time, is the only valid retention anchor.  The 27-minute
+                # gap makes an accidental run-created-at calculation visible.
+                "created_at": record.get("artifact_created_at", "2026-08-25T00:27:00Z"),
+                "expired": False, "expires_at": record.get("artifact_expires_at", "2026-11-23T00:27:00Z"),
+                "digest": f"sha256:{record['archive_sha256']}",
+                "workflow_run": {
+                    "id": run_id, "head_branch": "feature/issue-50-dense-ann-recall",
+                    "head_sha": self.head,
+                },
+            }
+            if self.mutation == "artifact-mismatch":
+                artifact["id"] = record["api_artifact_id_mismatch"]
+            if self.mutation == "expired":
+                artifact["expired"] = True
+            if self.mutation == "archive-digest":
+                artifact["digest"] = "sha256:" + "0" * 64
+            return {"artifacts": [artifact]}
+        raise AssertionError(path)
+
+
+def _three_download_hybrid_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, frozen: bool = False,
+) -> tuple[dict, list[dict], object]:
+    """Return baseline/m20/m32 role trees and their independent API records."""
+    fixture = _phase07_hybrid_fixture_module()
+    plan_root = tmp_path / "plan"
+    plan_root.mkdir()
+    plan, _ = fixture._build_test_hybrid_plan(plan_root, monkeypatch)
+    frozen_bundles = (
+        phase07_operator_gate.build_frozen_role_dispatch_bundles(
+            hybrid_request=plan["hybrid_request"], frozen_prepare=fixture._frozen_prepare_identity(),
+            expected_head=plan["hybrid_request"]["hybrid_implementation_head"],
+        ) if frozen else []
+    )
+    records: list[dict] = []
+    identities = {
+        16: {
+            "run_id": 700, "run_attempt": 1, "job_id": 800, "artifact_id": 900,
+            "api_run_id_mismatch": 1700, "api_run_attempt_mismatch": 10,
+            "api_job_id_mismatch": 1800, "api_artifact_id_mismatch": 1900,
+        },
+        20: {
+            "run_id": 701, "run_attempt": 1, "job_id": 801, "artifact_id": 901,
+            "api_run_id_mismatch": 1701, "api_run_attempt_mismatch": 11,
+            "api_job_id_mismatch": 1801, "api_artifact_id_mismatch": 1901,
+        },
+        32: {
+            # Separate workflow runs may both be their first (and only)
+            # attempt.  The happy path must not accidentally require an
+            # attempt number to increase across candidates.
+            "run_id": 702, "run_attempt": 1, "job_id": 802, "artifact_id": 902,
+            "api_run_id_mismatch": 1702, "api_run_attempt_mismatch": 12,
+            "api_job_id_mismatch": 1802, "api_artifact_id_mismatch": 1902,
+        },
+    }
+    role_pairs = (("baseline", 16), ("m20", 20), ("m32", 32)) if frozen else (
+        ("baseline", 16), ("candidate", 20), ("candidate", 32),
+    )
+    for role, m in role_pairs:
+        identity = identities[m]
+        run_id, attempt, job_id, artifact_id = (
+            identity["run_id"], identity["run_attempt"], identity["job_id"], identity["artifact_id"],
+        )
+        allocation = {
+            "run_id": run_id, "run_attempt": attempt, "job_id": job_id,
+            "job_key": "phase07-hybrid",
+            "job_allocation_nonce": {16: "a", 20: "b", 32: "c"}[m] * 32,
+        }
+        # This collection fixture continues to cover the ordinary PR packet
+        # reader.  Frozen D-25 roles are covered by the strict role-plan path;
+        # they must not make historic generic evidence unreadable.
+        if frozen:
+            dispatch_bundle = next(
+                bundle for bundle in frozen_bundles
+                if bundle["workflow_input"]["role"] == role and bundle["workflow_input"]["config"]["m"] == m
+            )
+        else:
+            input_record = next(
+                row for row in plan["workflow_inputs"]
+                if row["role"] == role and row["config"]["m"] == m
+            )
+            dispatch_bundle = phase07_operator_gate._sealed({
+                "schema_version": 1, "hybrid_request": plan["hybrid_request"],
+                "workflow_input": input_record, "replacement_for_run_id": None,
+            })
+        # Hosted workflow records `${ImageOS} ${ImageVersion}`.  Keep this
+        # integration fixture production-shaped without changing the shared
+        # raw-tree fixture used by unrelated campaign tests.
+        locked_execution = deepcopy(fixture._locked_confirmation_environment())
+        locked_execution["host"]["image"] = "ubuntu24 20250817.1"
+        tree = fixture._make_valid_test_hybrid_raw_tree(
+            tmp_path / f"m{m}-raw", dispatch_bundle=dispatch_bundle,
+            locked_execution=locked_execution, allocation=allocation,
+        )
+        archive = tmp_path / f"m{m}.zip"
+        records.append({
+            **identity, **allocation, "artifact_id": artifact_id,
+            "role": role, "config": deepcopy(dispatch_bundle["workflow_input"]["config"]),
+            "bundle_sha256": dispatch_bundle["workflow_input"]["record_self_sha256"],
+            "archive": str(archive),
+            "extracted_dir": str(tree), "archive_sha256": _zip_hybrid_artifact(tree, archive),
+        })
+    return plan["hybrid_request"], records, fixture
+
+
+@pytest.fixture(scope="module")
+def _hybrid_evidence_seed(tmp_path_factory: pytest.TempPathFactory):
+    """Build two expensive but test-owned packets once for the tamper matrix."""
+    patch = pytest.MonkeyPatch()
+    root = tmp_path_factory.mktemp("phase07-hybrid-seed")
+    try:
+        yield _three_download_hybrid_evidence(root, patch)
+    finally:
+        patch.undo()
+
+
+def _clone_hybrid_evidence(seed: tuple[dict, list[dict], object], tmp_path: Path) -> tuple[dict, list[dict], object]:
+    request, source_records, fixture = seed
+    records = []
+    for record in source_records:
+        result = json.loads((Path(record["extracted_dir"]) / "hybrid-result.json").read_text(encoding="utf-8"))
+        role, m = result["role"], result["config"]["m"]
+        extracted = tmp_path / f"{role}-m{m}-raw"
+        archive = tmp_path / f"{role}-m{m}.zip"
+        shutil.copytree(record["extracted_dir"], extracted)
+        shutil.copy2(record["archive"], archive)
+        records.append({**deepcopy(record), "archive": str(archive), "extracted_dir": str(extracted)})
+    return deepcopy(request), records, fixture
+
+
+def _write_hybrid_downloads(path: Path, records: list[dict], *, secret: bool = False) -> None:
+    rows = [
+        {name: deepcopy(record[name]) for name in (
+            "run_id", "run_attempt", "job_id", "artifact_id", "role", "config",
+            "bundle_sha256", "archive", "extracted_dir",
+        )}
+        for record in records
+    ]
+    if secret:
+        rows[0]["token"] = "fixture-secret"
+    manifest = {"schema_version": 1, "downloads": rows, "record_self_sha256": ""}
+    manifest["record_self_sha256"] = phase07_operator_gate.canonical_digest(manifest)
+    path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+
+@pytest.mark.parametrize("mutation", ("missing", "wrong"))
+def test_hybrid_collection_request_rejects_unsealed_download_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    """The local download manifest is self-authenticating before raw paths are read."""
+    import phase07_operator_gate as gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    downloads_file = tmp_path / "downloads.json"
+    _write_hybrid_downloads(downloads_file, records)
+    downloads = json.loads(downloads_file.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        downloads.pop("record_self_sha256")
+    else:
+        downloads["record_self_sha256"] = "0" * 64
+    def unexpected_path(*_args, **_kwargs):
+        raise AssertionError("unsealed downloads reached filesystem")
+
+    monkeypatch.setattr(gate, "Path", unexpected_path)
+    monkeypatch.setattr(gate, "_read_object", lambda *_args, **_kwargs: pytest.fail("unsealed downloads reached raw reader"))
+    with pytest.raises(ValueError, match="downloads manifest"):
+        gate.build_hybrid_collection_request(hybrid_request=request, downloads=downloads)
+
+
+def _operator_main_exit_code(gate, argv: list[str]) -> int:
+    """Normalize argparse's pre-route exit into an assertion-friendly code."""
+    try:
+        return gate.main(argv)
+    except SystemExit as exc:
+        return int(exc.code)
+
+
+def test_hybrid_three_download_collection_provenance_and_postdownload_reconstructs_all_roles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the three-role evidence chain from downloaded bytes to ledger."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    request_file, downloads_file = tmp_path / "hybrid-request.json", tmp_path / "downloads.json"
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads_file, records)
+    collection = tmp_path / "collection-request.json"
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads_file), "--ledger-file", str(collection),
+    ]) == 0
+    assert collection.is_file()
+    collected = json.loads(collection.read_text(encoding="utf-8"))
+    assert collected["record_self_sha256"] == gate.canonical_digest(collected)
+
+    provenance_dir, manifest = tmp_path / "provenance", tmp_path / "evidence-manifest.json"
+    client = _HybridGitHubFixtureClient(head=request["hybrid_implementation_head"], records=records)
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=provenance_dir,
+        token="fixture-read-token", client=client,
+    ) == 0
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    assert evidence["record_self_sha256"] == reconcile_ann_gate.canonical_digest(evidence)
+    assert [(row["role"], row["config"]["m"]) for row in evidence["evidence"]] == [
+        ("baseline", 16), ("candidate", 20), ("candidate", 32),
+    ]
+    assert all(row["run_attempt"] == 1 for row in evidence["evidence"])
+    ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
+    assert ledger["schema_version"] == reconcile_ann_gate.HYBRID_POSTDOWNLOAD_LEDGER_SCHEMA_VERSION == 2
+    assert ledger["baseline_record"]["config"]["m"] == 16
+    assert [record["candidate"]["m"] for record in ledger["candidate_records"]] == [20, 32]
+    assert all(record["status"] in {"numeric-success", "rejected-candidate"}
+               for record in ledger["candidate_records"])
+    forbidden_expanded_quality = {
+        "page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10",
+        "functional_final_retrieval_ann_overlap_at_10", "paired_30k_non_regression_gate",
+    }
+    for record in ledger["candidate_records"]:
+        assert set(record) == {
+            "candidate", "status", "original_absolute_gate", "expanded_30k_scale_diagnostics",
+            "aggregate_metrics", "packet_identity", "provenance",
+        }
+        assert set(record["aggregate_metrics"]) == {"original_absolute"}
+        assert set(record["expanded_30k_scale_diagnostics"]) == {"stratum", "baseline", "candidate"}
+        serialized_diagnostics = json.dumps(record["expanded_30k_scale_diagnostics"], sort_keys=True)
+        assert all(name not in serialized_diagnostics for name in forbidden_expanded_quality)
+    assert ledger["record_self_sha256"] == reconcile_ann_gate.canonical_digest(ledger)
+
+
+def test_hybrid_postdownload_rejects_original_functional_overlap_regression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconciliation derives the functional-overlap rejection from raw evidence."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    baseline, candidate = records[0], records[1]
+    queries = [
+        json.loads(line)
+        for line in (SKILL_ROOT / "eval" / "queries.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    target_ordinals = [
+        ordinal for ordinal, query in enumerate(queries)
+        if len(query.get("relevant_pages", [])) >= 2
+    ][:6]
+    assert len(target_ordinals) == 6
+
+    # Keep all non-functional metrics fixed while making the second gold page
+    # visible at rank 6 only for the baseline.  The production raw artifacts
+    # must be resealed as a pair; changing just the downloaded m20 tree would
+    # not exercise the baseline-vs-candidate comparison honestly.
+    mutated_pages: dict[str, dict[int, list[str]]] = {"baseline": {}, "candidate": {}}
+    for record, role in ((baseline, "baseline"), (candidate, "candidate")):
+        raw = Path(record["extracted_dir"])
+        result_path = raw / "hybrid-result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        for ordinal in target_ordinals:
+            first, second = queries[ordinal]["relevant_pages"][:2]
+            non_gold = [
+                f"phase07-non-gold-{ordinal:03d}-{index}.md"
+                for index in range(1, 5)
+            ]
+            pages = [first, *non_gold]
+            if role == "baseline":
+                pages.append(second)
+            assert pages[0] == first and len(pages) >= 5
+            if role == "baseline":
+                assert pages[5] == second
+            else:
+                assert second not in pages
+            assert all(
+                not any(gold.lower() in page.lower() for gold in queries[ordinal]["relevant_pages"])
+                for page in pages[1:5]
+            )
+            mutated_pages[role][ordinal] = pages
+            result["original_observations"][ordinal]["observation"]["result"]["pages"] = pages
+        result_path.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+        fixture._reseal_test_hybrid_raw_tree(raw)
+        record["archive_sha256"] = _zip_hybrid_artifact(raw, Path(record["archive"]))
+        assert record["archive_sha256"] == hashlib.sha256(Path(record["archive"]).read_bytes()).hexdigest()
+    assert all(
+        mutated_pages["baseline"][ordinal][:5] == mutated_pages["candidate"][ordinal][:5]
+        for ordinal in target_ordinals
+    )
+
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+        tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    ledger = reconcile_ann_gate.reconcile_hybrid_postdownload(request, evidence)
+    rejected = next(record for record in ledger["candidate_records"] if record["candidate"]["m"] == 20)
+    metrics = rejected["original_absolute_gate"]
+    baseline_metrics = metrics["baseline_metrics"]
+    candidate_metrics = metrics["candidate_metrics"]
+    committed_floors = gate.committed_hybrid_baseline()[0]
+    for name in (
+        "page_recall_at_5", "evidence_recall_at_10", "exact_lookup_hit_at_3", "mrr_at_10",
+    ):
+        assert candidate_metrics[name] == baseline_metrics[name]
+        assert baseline_metrics[name] >= committed_floors[name] - 0.02
+        assert candidate_metrics[name] >= committed_floors[name] - 0.02
+    for name in (
+        "citation_violation_count", "context_overflow_count", "budget_violation_count", "graph_unsupported_count",
+    ):
+        assert candidate_metrics[name] == baseline_metrics[name] == committed_floors[name] == 0
+    baseline_functional = baseline_metrics["functional_final_retrieval_ann_overlap_at_10"]
+    candidate_functional = candidate_metrics["functional_final_retrieval_ann_overlap_at_10"]
+    assert baseline_functional - candidate_functional > 0.02
+    assert candidate_functional < baseline_functional - 0.02
+    assert rejected["status"] == "rejected-candidate"
+    assert ledger["record_self_sha256"] == reconcile_ann_gate.canonical_digest(ledger)
+
+
+def test_hybrid_success_uses_raw_upload_envelope_and_roundtrips_through_production_clis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful hosted artifact is exactly the seven raw files, then reconciled by CLI."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    _job, workflow = _phase07_hybrid_workflow_section()
+    upload = workflow.split("uses: actions/upload-artifact@v4", 1)[1]
+    assert "path: .review-tmp/phase07/hybrid-artifact/raw" in upload
+    assert "path: .review-tmp/phase07/hybrid-artifact\n" not in upload
+    assert "export-hybrid-packet" not in upload
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    expected_files = {
+        "hybrid-request.json", "hybrid-ledger.json", "hybrid-result.json",
+        "dispatch-bundle.json", "locked-execution.json", "allocation.json",
+        "hybrid-packet.json",
+    }
+    for record in records:
+        role, config = record["role"], record["config"]
+        artifact_root = tmp_path / f"hybrid-artifact-{role}-m{config['m']}"
+        raw = artifact_root / "raw"
+        shutil.copytree(record["extracted_dir"], raw)
+        # Successful workflow layout may retain campaign/export diagnostics at
+        # the parent, but upload/finalization authority is raw alone.
+        (artifact_root / "campaign-output").mkdir()
+        (artifact_root / "campaign-output" / "campaign-log.json").write_text(
+            "{}", encoding="utf-8",
+        )
+        (artifact_root / "exported-hybrid-packet.json").write_text(
+            "{}", encoding="utf-8",
+        )
+        assert gate.finalize_pipeline_artifact(
+            output_dir=artifact_root, stage="hybrid",
+            head_sha=request["hybrid_implementation_head"], run_id=record["run_id"],
+            run_attempt=record["run_attempt"], job_key="phase07-hybrid", job_status="success",
+        ) == 0
+        assert {path.name for path in raw.iterdir() if path.is_file()} == expected_files
+        assert not list(artifact_root.rglob("*-rejection.json"))
+        assert (artifact_root / "campaign-output" / "campaign-log.json").is_file()
+        assert (artifact_root / "exported-hybrid-packet.json").is_file()
+        record["extracted_dir"] = str(raw)
+        record["archive_sha256"] = _zip_hybrid_artifact(raw, Path(record["archive"]))
+        with zipfile.ZipFile(record["archive"]) as archive:
+            assert {member.filename for member in archive.infolist()} == expected_files
+            assert all(not member.is_dir() for member in archive.infolist())
+
+    request_file, downloads = tmp_path / "request.json", tmp_path / "downloads.json"
+    collection, manifest, ledger = (
+        tmp_path / "collection.json", tmp_path / "manifest.json", tmp_path / "ledger.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    monkeypatch.setenv("GITHUB_TOKEN", "fixture-read-token")
+    assert gate.main([
+        "hybrid-provenance", "--request-file", str(collection),
+        "--ledger-file", str(manifest), "--provenance-dir", str(tmp_path / "provenance"),
+    ], github_client=_HybridGitHubFixtureClient(
+        head=request["hybrid_implementation_head"], records=records,
+    )) == 0
+    assert reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(ledger), "--mode", "hybrid-postdownload",
+    ]) == 0
+    reconciled = json.loads(ledger.read_text(encoding="utf-8"))
+    assert reconciled["campaign_stage"] == "hybrid"
+    assert reconciled["schema_version"] == reconcile_ann_gate.HYBRID_POSTDOWNLOAD_LEDGER_SCHEMA_VERSION == 2
+    assert reconciled["record_self_sha256"] == reconcile_ann_gate.canonical_digest(reconciled)
+
+
+def test_hybrid_finalizer_failure_removes_partial_raw_and_seals_only_one_rejection(
+    tmp_path: Path,
+) -> None:
+    """`always()` upload must never retain partial raw/campaign evidence after failure."""
+    import phase07_operator_gate as gate
+
+    output = tmp_path / "hybrid-artifact"
+    (output / "raw").mkdir(parents=True)
+    (output / "raw" / "hybrid-result.json").write_text("partial", encoding="utf-8")
+    (output / "campaign-output").mkdir()
+    (output / "campaign-output" / "measurement.json").write_text("partial", encoding="utf-8")
+    (output / "exported-hybrid-packet.json").write_text("partial", encoding="utf-8")
+
+    assert gate.finalize_pipeline_artifact(
+        output_dir=output, stage="hybrid", head_sha="a" * 40, run_id=701,
+        run_attempt=1, job_key="phase07-hybrid", job_status="failure",
+    ) == 0
+    files = [path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()]
+    assert files == ["raw/hybrid-pipeline-rejection.json"]
+    assert not (output / "campaign-output").exists()
+    assert not (output / "exported-hybrid-packet.json").exists()
+    rejection = json.loads((output / files[0]).read_text(encoding="utf-8"))
+    assert rejection["status"] == "reject-evidence"
+
+
+def test_hybrid_success_finalizer_rejects_stale_head_and_replaces_raw_with_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A success status cannot preserve raw numeric evidence from another head."""
+    import phase07_operator_gate as gate
+
+    _request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    record = records[0]
+    output = tmp_path / "hybrid-artifact"
+    raw = output / "raw"
+    shutil.copytree(record["extracted_dir"], raw)
+    # These fixture packets are internally bound to the actual generated head,
+    # not the stale value supplied below.
+    result = json.loads((raw / "hybrid-result.json").read_text(encoding="utf-8"))
+    assert result["head_sha"] != "0" * 40
+    (output / "campaign-output").mkdir()
+    (output / "campaign-output" / "measurement.json").write_text("{}", encoding="utf-8")
+    (output / "exported-hybrid-packet.json").write_text("{}", encoding="utf-8")
+
+    assert gate.finalize_pipeline_artifact(
+        output_dir=output, stage="hybrid", head_sha="0" * 40,
+        run_id=record["run_id"], run_attempt=record["run_attempt"],
+        job_key="phase07-hybrid", job_status="success",
+    ) == 0
+    files = [path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()]
+    assert files == ["raw/hybrid-pipeline-rejection.json"]
+    rejection = json.loads((output / files[0]).read_text(encoding="utf-8"))
+    assert rejection["status"] == "reject-evidence"
+
+
+@pytest.mark.parametrize(
+    ("created_at", "expires_at", "api_mutation", "accepted"),
+    (
+        ("2026-08-25T00:27:00Z", "2026-11-23T00:27:00Z", None, True),
+        ("2026-08-25T00:27:00Z", "2026-11-22T00:27:00Z", None, False),
+        ("2026-08-25T00:27:00Z", "2026-11-24T00:27:00Z", None, False),
+        # Artifact creation preceding the run is impossible even if its own
+        # apparent retention duration looks correct.
+        ("2026-08-24T23:59:59Z", "2026-11-22T23:59:59Z", None, False),
+        ("2026-08-25T00:27:00Z", "2026-11-23T00:27:00Z", "expired", False),
+    ),
+    ids=("artifact-plus-90d", "89d", "91d", "created-before-run", "expired"),
+)
+def test_hybrid_provenance_retention_is_anchored_to_artifact_creation_and_not_run_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, created_at: str, expires_at: str,
+    api_mutation: str | None, accepted: bool,
+) -> None:
+    """Retention accepts only artifact.created_at + 90 days, never run.created_at."""
+    import phase07_operator_gate as gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    for record in records:
+        record["artifact_created_at"] = created_at
+        record["artifact_expires_at"] = expires_at
+    request_file, downloads, collection = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    output = tmp_path / "manifest.json"
+    client = _HybridGitHubFixtureClient(
+        head=request["hybrid_implementation_head"], records=records, mutation=api_mutation,
+    )
+    if accepted:
+        assert gate.collect_hybrid_provenance(
+            request_file=collection, output=output, provenance_dir=tmp_path / "provenance",
+            token="fixture-read-token", client=client,
+        ) == 0
+    else:
+        with pytest.raises(ValueError):
+            gate.collect_hybrid_provenance(
+                request_file=collection, output=output, provenance_dir=tmp_path / "provenance",
+                token="fixture-read-token", client=client,
+            )
+        assert not output.exists()
+
+
+def test_hybrid_partial_retry_is_not_three_independent_first_attempt_packets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One role cannot be retried and passed off as independent peer evidence."""
+    import phase07_operator_gate as gate
+
+    request, records, fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    retried = records[1]
+    raw = Path(retried["extracted_dir"])
+    allocation = json.loads((raw / "allocation.json").read_text(encoding="utf-8"))
+    allocation["allocation"]["run_attempt"] = 2
+    allocation["record_self_sha256"] = gate.canonical_digest(allocation)
+    (raw / "allocation.json").write_text(json.dumps(allocation, sort_keys=True), encoding="utf-8")
+    fixture._reseal_test_hybrid_raw_tree(raw)
+    retried["run_attempt"] = 2
+    retried["archive_sha256"] = _zip_hybrid_artifact(raw, Path(retried["archive"]))
+
+    request_file, downloads, collection = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 1
+    assert not collection.exists(), "partial retry must be rejected before API collection"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("os", "Windows"), ("architecture", "ARM64"), ("image", "replayed-image")),
+    ids=("os", "architecture", "image"),
+)
+def test_hybrid_workflow_binds_runner_context_without_image_fallbacks_and_raw_host_mutation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str,
+) -> None:
+    """Hosted facts originate in GitHub runner context and must match the raw packet."""
+    import phase07_operator_gate as gate
+
+    _job, workflow = _phase07_hybrid_workflow_section()
+    assert "RUNNER_OS: ${{ runner.os }}" in workflow
+    assert "RUNNER_ARCH: ${{ runner.arch }}" in workflow
+    assert "'os':os.environ['RUNNER_OS']" in workflow
+    assert "'architecture':os.environ['RUNNER_ARCH']" in workflow
+    assert "os.environ.get('ImageOS'" not in workflow
+    assert "os.environ.get('ImageVersion'" not in workflow
+
+    request, records, fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    raw = Path(records[0]["extracted_dir"])
+    execution = json.loads((raw / "locked-execution.json").read_text(encoding="utf-8"))
+    execution["host"][field] = value
+    execution["record_self_sha256"] = gate.canonical_digest(execution)
+    (raw / "locked-execution.json").write_text(json.dumps(execution, sort_keys=True), encoding="utf-8")
+    fixture._reseal_test_hybrid_raw_tree(raw)
+    records[0]["archive_sha256"] = _zip_hybrid_artifact(raw, Path(records[0]["archive"]))
+    request_file, downloads, collection = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    # Any earlier strict raw identity check is an equally fail-closed outcome;
+    # the security contract is rejection, not a particular diagnostic string.
+    with pytest.raises(ValueError):
+        gate.collect_hybrid_provenance(
+            request_file=collection, output=tmp_path / "manifest.json",
+            provenance_dir=tmp_path / "provenance", token="fixture-read-token",
+            client=_HybridGitHubFixtureClient(
+                head=request["hybrid_implementation_head"], records=records,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "manifest-provenance-replay", "provenance-raw-role",
+        "runner-self-hosted", "runner-wrong-group",
+        "runner-arm64-label", "runner-missing-ubuntu-label",
+    ),
+)
+def test_hybrid_postcollection_identity_mutation_or_replay_is_rejected_by_reconcile_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    """Reconciliation rechecks manifest ↔ provenance ↔ raw identity after collection."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+        tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    if mutation == "manifest-provenance-replay":
+        evidence["evidence"][1]["provenance"] = evidence["evidence"][0]["provenance"]
+    elif mutation == "provenance-raw-role":
+        provenance_path = Path(evidence["evidence"][0]["provenance"])
+        provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance_document["evidence"][0]["role"] = evidence["evidence"][1]["role"]
+        provenance_document["evidence"][0]["config"] = deepcopy(evidence["evidence"][1]["config"])
+        provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
+        provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
+    else:
+        provenance_path = Path(evidence["evidence"][0]["provenance"])
+        provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+        runner = provenance_document["evidence"][0]["runner"]
+        if mutation == "runner-self-hosted":
+            runner["name"] = "self-hosted runner"
+        elif mutation == "runner-wrong-group":
+            runner["group"] = "self-hosted"
+        elif mutation == "runner-arm64-label":
+            runner["labels"] = ["ubuntu-latest", "ARM64"]
+        else:
+            runner["labels"] = ["X64"]
+        provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
+        provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
+    evidence["record_self_sha256"] = reconcile_ann_gate.canonical_digest(evidence)
+    manifest.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+
+    output = tmp_path / "ledger.json"
+    assert reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(output), "--mode", "hybrid-postdownload",
+    ]) == 1
+    assert not output.exists()
+
+
+def test_hybrid_postdownload_rejects_retention_provenance_tamper_after_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resealed manifest cannot launder a changed artifact creation/expiry binding."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch)
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json",
+        tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+    evidence = json.loads(manifest.read_text(encoding="utf-8"))
+    provenance_path = Path(evidence["evidence"][0]["provenance"])
+    provenance_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance = provenance_document["evidence"][0]
+    # The future production provenance schema must retain this field and make
+    # post-download reconciliation recompute the exact interval from it.
+    provenance["artifact_created_at"] = "2026-08-25T00:27:00Z"
+    provenance["artifact_expires_at"] = "2026-11-24T00:27:00Z"
+    provenance_document["record_self_sha256"] = reconcile_ann_gate.canonical_digest(provenance_document)
+    provenance_path.write_text(json.dumps(provenance_document, sort_keys=True), encoding="utf-8")
+    assert reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(tmp_path / "ledger.json"), "--mode", "hybrid-postdownload",
+    ]) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-role", "duplicate-role", "config-mismatch", "bundle-mismatch",
+        "user-candidate", "user-scale",
+        "non-success", "replacement", "stale-head", "expired", "run-mismatch",
+        "attempt-mismatch", "job-mismatch", "artifact-mismatch", "archive-digest",
+        "extracted-tree", "packet-digest", "missing-original-row", "missing-30k-row",
+        "query-tamper", "generator-tamper", "precomputed-gate", "secret",
+    ),
+)
+def test_hybrid_collection_and_postdownload_reject_the_full_substitution_matrix(
+    tmp_path: Path, _hybrid_evidence_seed, mutation: str,
+) -> None:
+    """One altered input invalidates the complete three-role evidence batch."""
+    import phase07_operator_gate as gate
+
+    request, records, fixture = _clone_hybrid_evidence(_hybrid_evidence_seed, tmp_path)
+    request_file, downloads_file = tmp_path / "request.json", tmp_path / "downloads.json"
+    collection = tmp_path / "collection.json"
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    raw = Path(records[0]["extracted_dir"])
+    api_mutations = {
+        "non-success", "stale-head", "expired", "run-mismatch", "attempt-mismatch",
+        "job-mismatch", "artifact-mismatch", "archive-digest",
+    }
+    request_mutations = {"user-candidate", "user-scale"}
+
+    if mutation == "missing-role":
+        records.pop()
+    elif mutation == "duplicate-role":
+        records[1]["role"] = records[0]["role"]
+        records[1]["config"] = deepcopy(records[0]["config"])
+    elif mutation == "config-mismatch":
+        records[0]["config"] = {
+            "index_type": "hnsw_sq", "m": 16, "ef_construction": 300, "query_ef": 300,
+        }
+    elif mutation == "bundle-mismatch":
+        records[0]["bundle_sha256"] = "0" * 64
+    elif mutation == "user-candidate":
+        request["candidates"][0]["m"] = 99
+        request["record_self_sha256"] = gate.canonical_digest(request)
+        request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    elif mutation == "user-scale":
+        request["scale"] = 1
+        request["record_self_sha256"] = gate.canonical_digest(request)
+        request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    elif mutation == "replacement":
+        dispatch = json.loads((raw / "dispatch-bundle.json").read_text(encoding="utf-8"))
+        dispatch["replacement_for_run_id"] = 1
+        dispatch["record_self_sha256"] = gate.canonical_digest(dispatch)
+        (raw / "dispatch-bundle.json").write_text(json.dumps(dispatch, sort_keys=True), encoding="utf-8")
+        fixture._reseal_test_hybrid_raw_tree(raw)
+    elif mutation == "extracted-tree":
+        (raw / "unexpected.json").write_text("{}", encoding="utf-8")
+    elif mutation == "packet-digest":
+        packet = json.loads((raw / "hybrid-packet.json").read_text(encoding="utf-8"))
+        packet["raw_tree_sha256"] = "0" * 64
+        (raw / "hybrid-packet.json").write_text(json.dumps(packet, sort_keys=True), encoding="utf-8")
+    elif mutation in {"missing-original-row", "missing-30k-row", "query-tamper", "generator-tamper", "precomputed-gate"}:
+        result = json.loads((raw / "hybrid-result.json").read_text(encoding="utf-8"))
+        if mutation == "missing-original-row":
+            result["original_observations"].pop()
+        elif mutation == "missing-30k-row":
+            result["expanded_observations"].pop()
+        elif mutation == "query-tamper":
+            result["original_observations"][0]["query_sha256"] = "0" * 64
+        elif mutation == "generator-tamper":
+            result["generator_recipe"]["target_size"] = 1
+        else:
+            result["candidate_verdict"] = "numeric-success"
+        (raw / "hybrid-result.json").write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+        fixture._reseal_test_hybrid_raw_tree(raw)
+    _write_hybrid_downloads(downloads_file, records, secret=mutation == "secret")
+
+    collection_code = _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads_file), "--ledger-file", str(collection),
+    ])
+    if mutation in request_mutations | {
+        "missing-role", "duplicate-role", "config-mismatch", "bundle-mismatch", "secret",
+    }:
+        assert collection_code == 1
+        assert not collection.exists()
+        return
+    assert collection_code == 0
+    with pytest.raises(ValueError):
+        gate.collect_hybrid_provenance(
+            request_file=collection, output=tmp_path / "manifest.json",
+            provenance_dir=tmp_path / "provenance", token="fixture-read-token",
+            client=_HybridGitHubFixtureClient(
+                head=request["hybrid_implementation_head"], records=records,
+                mutation=mutation if mutation in api_mutations else None,
+            ),
+        )
+
+
+def test_hybrid_operator_cli_exposes_only_typed_collection_and_provenance_routes(
+    tmp_path: Path,
+) -> None:
+    """Malformed generated authority must seal rejection, not enter a generic route."""
+    import phase07_operator_gate as gate
+
+    request = tmp_path / "forged-hybrid-request.json"
+    request.write_text(json.dumps({"campaign_stage": "representative"}), encoding="utf-8")
+    output = tmp_path / "collection.json"
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request),
+        "--downloads-file", str(tmp_path / "missing-downloads.json"),
+        "--ledger-file", str(output),
+    ]) == 1
+    assert not output.exists(), "invalid collection authority must not be sealed"
+
+
+def test_hybrid_postdownload_cli_rejects_incomplete_or_untyped_evidence_before_trust(
+    tmp_path: Path,
+) -> None:
+    """This hits the production CLI boundary, not a helper-only validator."""
+    request = tmp_path / "hybrid-request.json"
+    manifest = tmp_path / "hybrid-evidence.json"
+    output = tmp_path / "hybrid-ledger.json"
+    request.write_text(json.dumps({"campaign_stage": "hybrid"}), encoding="utf-8")
+    manifest.write_text(json.dumps({"evidence": []}), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "eval.reconcile_ann_gate",
+            "--hybrid-request", str(request),
+            "--hybrid-evidence-manifest", str(manifest),
+            "--output", str(output), "--mode", "hybrid-postdownload",
+        ],
+        cwd=SKILL_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 1
+    assert "unrecognized arguments" not in completed.stderr
+    assert not output.exists(), "invalid hybrid evidence must not become a ledger"
+
+
+def test_hybrid_reconciler_has_no_generic_or_representative_authority() -> None:
+    """The reconciler requires the dedicated three-role reconstruction path."""
+    import reconcile_ann_gate
+
+    assert hasattr(reconcile_ann_gate, "reconcile_hybrid_postdownload")
+    signature = inspect.signature(reconcile_ann_gate.reconcile_hybrid_postdownload)
+    assert set(signature.parameters) == {"request", "manifest"}
+    source = (SKILL_ROOT / "eval" / "reconcile_ann_gate.py").read_text(encoding="utf-8")
+    assert "--hybrid-request" in source
+    assert "--hybrid-evidence-manifest" in source
+    assert "hybrid-postdownload" in source
+    assert "validate_hybrid_artifact_tree" in source
+    assert "exactly-three" in source.lower()
+    assert "_pair_hybrid_role_observations" in source
+
+
+@pytest.mark.parametrize("mutation", ("success", "missing", "mutation", "mixed"))
+def test_frozen_three_role_collector_and_reconciler_share_one_prepare_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    """All frozen roles preserve one identity from raw packet through final ledger."""
+    import phase07_operator_gate as gate
+    import reconcile_ann_gate
+
+    request, records, _fixture = _three_download_hybrid_evidence(tmp_path, monkeypatch, frozen=True)
+    request_file, downloads, collection, manifest = (
+        tmp_path / "request.json", tmp_path / "downloads.json", tmp_path / "collection.json", tmp_path / "manifest.json",
+    )
+    request_file.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+    _write_hybrid_downloads(downloads, records)
+    assert _operator_main_exit_code(gate, [
+        "hybrid-collection-request", "--request-file", str(request_file),
+        "--downloads-file", str(downloads), "--ledger-file", str(collection),
+    ]) == 0
+    assert gate.collect_hybrid_provenance(
+        request_file=collection, output=manifest, provenance_dir=tmp_path / "provenance",
+        token="fixture-read-token", client=_HybridGitHubFixtureClient(
+            head=request["hybrid_implementation_head"], records=records,
+        ),
+    ) == 0
+    collected = json.loads(manifest.read_text(encoding="utf-8"))
+    identities = [row["frozen_prepare"] for row in collected["evidence"]]
+    assert len(identities) == 3 and identities[0] == identities[1] == identities[2]
+    for row in collected["evidence"]:
+        document = json.loads(Path(row["provenance"]).read_text(encoding="utf-8"))
+        assert document["evidence"][0]["frozen_prepare"] == row["frozen_prepare"]
+
+    if mutation == "missing":
+        collected["evidence"][0].pop("frozen_prepare")
+    elif mutation == "mutation":
+        collected["evidence"][0]["frozen_prepare"]["base_tree_sha256"] = "0" * 64
+    elif mutation == "mixed":
+        collected["evidence"][1]["frozen_prepare"]["artifact_id"] = 999
+    collected["record_self_sha256"] = gate.canonical_digest(collected)
+    manifest.write_text(json.dumps(collected, sort_keys=True), encoding="utf-8")
+    output = tmp_path / "hybrid-ledger.json"
+    code = reconcile_ann_gate.main([
+        "--hybrid-request", str(request_file), "--hybrid-evidence-manifest", str(manifest),
+        "--output", str(output), "--mode", "hybrid-postdownload",
+    ])
+    assert code == (0 if mutation == "success" else 1)
+    if mutation == "success":
+        ledger = json.loads(output.read_text(encoding="utf-8"))
+        assert ledger["frozen_prepare"] == identities[0]
+    else:
+        assert not output.exists()
 
 
 @pytest.mark.parametrize("init_baseline", [False, True])

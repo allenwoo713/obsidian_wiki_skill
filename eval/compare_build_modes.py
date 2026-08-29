@@ -19,6 +19,10 @@ from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 SKILL_ROOT = HERE.parent
+if str(SKILL_ROOT) not in sys.path:
+    # Retain direct-file compatibility while resolving shared helpers through
+    # the same package path used by workflow module entry points.
+    sys.path.insert(0, str(SKILL_ROOT))
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -27,10 +31,11 @@ from obsidian_wiki.application.incremental_policy import (  # noqa: E402
     compatibility_identity_from_manifest,
 )
 from obsidian_wiki.domain.index_models import FtsIndexConfig  # noqa: E402
+from obsidian_wiki.domain.index_policy import load_ann_policy_file  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository  # noqa: E402
 from query import hybrid_search  # noqa: E402
 from query_planner import DefaultQueryPlanner  # noqa: E402
-from run_eval import (  # noqa: E402
+from eval.run_eval import (  # noqa: E402
     _citation_violations,
     _evidence_recall,
     _fixture_digest,
@@ -53,13 +58,21 @@ REQUIRED_SCENARIOS = (
     "configuration_drift",
     "failure_recovery",
 )
+_PRODUCTION_ANN_POLICY = load_ann_policy_file()
 _APPROVED_ANN = {
-    "selected_index_type": "ivf-hnsw-sq",
-    "lancedb_index_type": "hnsw_sq",
-    "metric": "cosine",
-    "query_ef": 100,
-    "recall_at_10_floor": 0.19,
-    "recall_at_20_floor": 0.17,
+    name: getattr(_PRODUCTION_ANN_POLICY, name)
+    for name in (
+        "selected_index_type", "lancedb_index_type", "metric", "query_ef",
+        "recall_at_10_floor", "recall_at_20_floor",
+    )
+}
+_APPROVED_VECTOR = {
+    "index_type": _PRODUCTION_ANN_POLICY.lancedb_index_type,
+    "metric": _PRODUCTION_ANN_POLICY.metric,
+    "num_partitions": _PRODUCTION_ANN_POLICY.num_partitions,
+    "m": _PRODUCTION_ANN_POLICY.m,
+    "ef_construction": _PRODUCTION_ANN_POLICY.ef_construction,
+    "index_name": "dense_hnsw",
 }
 
 
@@ -196,8 +209,12 @@ def _manifest_observation(wi: WikiIndex) -> tuple[dict[str, object], dict[str, o
     manifest = json.loads(wi._resolve_active_manifest().read_text(encoding="utf-8"))
     telemetry = manifest["build_telemetry"]
     ann = manifest["ann_policy"]
-    if any(ann.get(name) != value for name, value in _APPROVED_ANN.items()):
-        raise ValueError("fixed Phase-6 ANN contract changed")
+    vector = manifest["vector_config"]
+    if (
+        any(ann.get(name) != value for name, value in _APPROVED_ANN.items())
+        or any(vector.get(name) != value for name, value in _APPROVED_VECTOR.items())
+    ):
+        raise ValueError("fixed production ANN contract changed")
     sparse = telemetry["sparse_rows"]
     dense = telemetry["dense_rows"]
     written = sparse["physically_written"] + dense["physically_written"]

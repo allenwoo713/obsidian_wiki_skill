@@ -4,6 +4,8 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import tarfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import lancedb
@@ -25,6 +27,8 @@ from obsidian_wiki.domain.index_models import (  # noqa: E402
     VectorIndexConfig,
 )
 from obsidian_wiki.application.index_build_service import IndexBuildService  # noqa: E402
+from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir  # noqa: E402
+from obsidian_wiki.application.incremental_index_service import IncrementalIndexService  # noqa: E402
 from obsidian_wiki.infrastructure import lancedb_index_repository as repository_module  # noqa: E402
 from obsidian_wiki.infrastructure.lancedb_index_repository import (  # noqa: E402
     LanceDbIndexRepository,
@@ -33,6 +37,7 @@ from obsidian_wiki.infrastructure.filesystem_index_manifest import FilesystemInd
 from obsidian_wiki.infrastructure.filesystem_post_commit_journal import (  # noqa: E402
     FilesystemPostCommitJournal,
 )
+from obsidian_wiki.ports.incremental_index import IncrementalFallbackEligible  # noqa: E402
 
 
 def _write_page(wiki: Path, body: str) -> None:
@@ -78,6 +83,43 @@ def _embed384(seed: int = 0):
     return embed
 
 
+def _phase07_test_corpus_identity(wiki: Path) -> dict[str, object]:
+    """Small storage fixtures opt in through this explicit function argument."""
+    from eval.ann_corpus_manifest import canonical_content_tree_sha256
+
+    return {
+        "expanded_content_tree_sha256": canonical_content_tree_sha256(wiki),
+        "expanded_member_count": sum(1 for path in wiki.rglob("*.md") if path.is_file()),
+    }
+
+
+class _FacadeEmbedder:
+    """Small deterministic embedder that still exercises WikiIndex's public build path."""
+
+    def __init__(self) -> None:
+        self._encode = _embed384()
+        self.tokenizer = lambda text, **_kwargs: {"input_ids": list(range(max(1, len(text) // 4)))}
+
+    def get_embedding_dimension(self) -> int:
+        return 384
+
+    def encode(self, texts, **_kwargs):
+        return self._encode(texts)
+
+
+def _boundary_tokenizer(text: str, **_kwargs: object) -> dict[str, list[int]]:
+    """A deterministic tokenizer unlike the removed four-char estimator."""
+    import re
+
+    # Seven words are 21 tokens here but only 14 with the old char/4 estimate;
+    # the 112-token chunk boundary therefore falls on different paragraphs.
+    return {"input_ids": list(range(max(1, 3 * len(re.findall(r"[A-Za-z]+|[^\sA-Za-z]", text)))))}
+
+
+def _different_boundary_tokenizer(text: str, **_kwargs: object) -> dict[str, list[int]]:
+    return {"input_ids": list(range(max(1, len(text) // 4)))}
+
+
 def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> None:
     """The direct script wrapper crosses service/port/adapter into LanceDB."""
     long_term = "D01ExactTerm" + "abc123" * 29
@@ -105,7 +147,9 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
     # Phase 06：manifest 绑定批准策略（不再有 requested_vector_index_mode）。
     assert manifest["format_version"] == 6
     assert manifest["ann_policy"]["selected_index_type"] == "ivf-hnsw-sq"
-    assert manifest["ann_policy"]["query_ef"] == 100
+    assert manifest["vector_config"]["m"] == 20
+    assert manifest["vector_config"]["ef_construction"] == 300
+    assert manifest["ann_policy"]["query_ef"] == 300
     assert "requested_vector_index_mode" not in manifest
     assert manifest["fts_config"] == {
         "column": "fts_text",
@@ -117,6 +161,16 @@ def test_wrapper_builds_two_physical_tables_and_explicit_fts(tmp_path: Path) -> 
         "max_token_length": 256,
     }
     assert LanceDbIndexRepository(artifact.artifact.lance_dir).search_sparse(long_term)
+
+    # A persisted m=16/query-ef=100 binding predates the Phase 7 policy.  It
+    # is not incrementally compatible: the caller must fall back to a snapshot
+    # rebuild rather than reuse the old ANN structure.
+    retired = json.loads(artifact.artifact.manifest_path.read_text(encoding="utf-8"))
+    retired["vector_config"]["m"] = 16
+    retired["ann_policy"]["query_ef"] = 100
+    artifact.artifact.manifest_path.write_text(json.dumps(retired), encoding="utf-8")
+    with pytest.raises(IncrementalFallbackEligible, match="incompatible_active_contract"):
+        IncrementalIndexService._assert_current_manifest(artifact.artifact.lance_dir)
 
 
 def test_runtime_mode_selection_is_removed_from_public_surfaces() -> None:
@@ -198,6 +252,73 @@ def test_real_lancedb_has_no_storage_mutation_after_final_seal(
         if event in {"persist", "create_vector_index"}
     )
     assert final_mutation < final_seal, f"storage 在最终 seal 后仍被修改: {events}"
+
+
+def test_wikiindex_post_publication_marker_failure_preserves_published_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final timing write can reject the caller without relabelling a published build failed."""
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "# Timing\n\nPOSTPUBLICATIONMARKERTERM\n")
+    index = WikiIndex(index_dir)
+    index._embedder = _FacadeEmbedder()
+    import build_index as build_index_module
+
+    real_storage_contract = build_index_module.build_storage_contract
+    forwarded_sinks: list[object] = []
+
+    def capture_storage_contract(*args, **kwargs):
+        forwarded_sinks.append(kwargs.get("progress_sink"))
+        return real_storage_contract(*args, **kwargs)
+
+    monkeypatch.setattr(build_index_module, "build_storage_contract", capture_storage_contract)
+    stages: list[str] = []
+
+    def fail_only_after_publication(stage: str) -> None:
+        stages.append(stage)
+        if stage == "validation_seal_publication":
+            raise BrokenPipeError("timing marker transport closed")
+
+    with pytest.raises(BrokenPipeError, match="timing marker transport closed"):
+        index.build(wiki, full_rebuild=True, progress_sink=fail_only_after_publication)
+
+    assert forwarded_sinks == [fail_only_after_publication]
+    assert stages == [
+        "scan_chunk", "dense_embedding", "lance_fts_persist",
+        "hnsw_create_index", "validation_seal_publication",
+    ]
+    active_lance = resolve_active_lance_dir(index_dir)
+    published_build = active_lance.parent
+    assert published_build.parent == index_dir / "builds"
+    assert not (published_build / ".failed").exists()
+    assert not list((index_dir / "builds").glob("*/.failed"))
+    assert not (index_dir / "campaign-success.json").exists()
+    assert not (index_dir / "authorization.json").exists()
+
+
+def test_wikiindex_hnsw_failure_emits_no_later_timing_markers_or_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HNSW failures stay pre-publication and cannot emit a complete timing boundary."""
+    wiki = tmp_path / "Wiki"
+    index_dir = tmp_path / ".index"
+    _write_page(wiki, "# Timing\n\nHNSWMUTATIONMARKERTERM\n")
+    index = WikiIndex(index_dir)
+    index._embedder = _FacadeEmbedder()
+    stages: list[str] = []
+
+    def fail_hnsw(*_args, **_kwargs):
+        raise RuntimeError("forced HNSW mutation failure")
+
+    monkeypatch.setattr(LanceDbIndexRepository, "create_vector_index", fail_hnsw)
+    with pytest.raises(RuntimeError, match="forced HNSW mutation failure"):
+        index.build(wiki, full_rebuild=True, progress_sink=stages.append)
+
+    assert "lance_fts_persist" in stages
+    assert "hnsw_create_index" not in stages
+    assert "validation_seal_publication" not in stages
+    assert not (index_dir / "ACTIVE_INDEX").exists()
 
 
 def test_legacy_manifest_requires_rebuild(tmp_path: Path) -> None:
@@ -408,7 +529,7 @@ def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
 
     approved = VectorIndexConfig(
         index_type="hnsw_sq", metric="cosine", num_partitions=2,
-        m=16, ef_construction=300, dense_chunks_count=20,
+        m=20, ef_construction=300, dense_chunks_count=20,
     )
     repository.create_vector_index(approved)
 
@@ -420,7 +541,7 @@ def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
     assert type(hnsw).__name__ == "HnswSq"
     assert hnsw.distance_type == "cosine"
     assert hnsw.num_partitions == 2
-    assert hnsw.m == 16
+    assert hnsw.m == 20
     assert hnsw.ef_construction == 300
     assert ann == exact == [{"chunk_id": "dense:1"}]
     assert table.queries[0].exact_bypass is False
@@ -428,8 +549,8 @@ def test_bound_adapter_rejects_runtime_type_selection_and_fixes_ef(
     assert table.queries[0].metric == table.queries[1].metric == "cosine"
     assert table.queries[0].predicate == table.queries[1].predicate == "page_id = 'safe'"
     assert table.queries[0].result_limit == table.queries[1].result_limit == 20
-    # 固定批准 ef=100（与 limit 无关；不再有 max(100, 1.5*limit) 启发式）。
-    assert table.queries[0].ef_value == 100
+    # 固定批准 ef=300（与 limit 无关；不再有 max(100, 1.5*limit) 启发式）。
+    assert table.queries[0].ef_value == 300
     assert table.queries[1].ef_value is None  # exact path bypasses ef
 
 
@@ -566,7 +687,7 @@ def test_reopened_artifact_has_validation_evidence_and_publishes(tmp_path: Path)
     evidence = manifest["candidate_publication_evidence"]
     assert evidence["actual_dense_rows"] == 1
     assert evidence["validation_query_count"] == min(256, 1)
-    assert evidence["query_ef"] == 100
+    assert evidence["query_ef"] == 300
     assert evidence["corpus_query_overlap"] == 0
 
 
@@ -704,3 +825,773 @@ def test_require_current_layout_rejects_stale_layout_version(tmp_path: Path):
     }), encoding="utf-8")
     # Current version is accepted without raising.
     LanceDbIndexRepository.require_current_layout(manifest)
+
+
+def test_phase07_frozen_base_prepares_real_tables_and_private_hnsw_roles(tmp_path: Path) -> None:
+    """The frozen path is a real Lance prepare/clone boundary, never a mock cache."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        finalize_private_role,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus" / "Wiki"
+    _write_page(wiki, "# Frozen base\n\nFROZENBASE exact retrieval content.")
+    frozen = tmp_path / "prepared"
+    identity = _phase07_test_corpus_identity(wiki)
+    progress: list[str] = []
+    descriptor = prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity, progress=lambda stage, _detail: progress.append(stage),
+    )
+
+    assert descriptor["schema_version"] == 1
+    assert not (frozen / "ACTIVE_INDEX").exists()
+    assert not list((frozen / "lance_db").rglob("*hnsw*"))
+    source_digest = validate_frozen_base(
+        frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    source = lancedb.connect(str(frozen / "lance_db"))
+    assert set(source.table_names()) == {"sparse_chunks", "dense_chunks"}
+    assert {index.name for index in source.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
+    assert not source.open_table("dense_chunks").list_indices()
+    assert progress.index("graph_started") < progress.index("graph_finished") \
+        < progress.index("lance_persist_started") < progress.index("lance_persist_finished")
+
+    for m, ef in ((16, 100), (20, 300), (32, 300)):
+        policy = CandidateQueryPolicy(
+            candidate="ivf-hnsw-sq", query_ef=ef,
+            build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=m, ef_construction=300),
+        )
+        target = tmp_path / f"role-m{m}"
+        finalized = finalize_private_role(
+            frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki", candidate_query_policy=policy,
+            tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
+        )
+        assert finalized["source_tree_sha256"] == source_digest
+        target_db = lancedb.connect(str(target / "lance_db"))
+        assert len(target_db.open_table("dense_chunks").list_indices()) == 1
+        assert {index.name for index in target_db.open_table("sparse_chunks").list_indices()} == {"fts_text_idx"}
+        assert validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
+        ) == source_digest
+
+
+def test_phase07_frozen_base_rejects_oversize_graph_and_revalidates_complete_tree_size(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Size-only preflight rejects before descriptor JSON or artifact hashing."""
+    from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
+    from eval.phase07_frozen_base import FrozenBaseError, prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Frozen cap\n\nFROZENCAP exact retrieval content.")
+    identity = _phase07_test_corpus_identity(wiki)
+    embedder = _FacadeEmbedder()
+    hash_calls: list[Path] = []
+    real_sha256_file = frozen_module._sha256_file
+
+    def track_sha256(path: Path) -> str:
+        hash_calls.append(Path(path))
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(frozen_module, "_sha256_file", track_sha256)
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 1)
+    with pytest.raises(FrozenBaseError, match="frozen graph size"):
+        prepare_frozen_base(
+            wiki_dir=wiki, frozen_dir=tmp_path / "oversize-graph", embed=_embed384(),
+            tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
+        )
+    # Descriptor authority hashes are resolved before construction; no frozen-tree
+    # artifact is hashed before the graph ceiling rejects it.
+    assert not [path for path in hash_calls if path.is_relative_to(tmp_path)]
+
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1)
+    with pytest.raises(FrozenBaseError, match="frozen base size"):
+        prepare_frozen_base(
+            wiki_dir=wiki, frozen_dir=tmp_path / "oversize-base", embed=_embed384(),
+            tokenizer=embedder.tokenizer, expected_corpus_identity=identity,
+        )
+    assert not [path for path in hash_calls if path.is_relative_to(tmp_path)]
+
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1024 * 1024 * 1024)
+    frozen = tmp_path / "prepared"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=embedder.tokenizer,
+        expected_corpus_identity=identity,
+    )
+    inventory, total_bytes = frozen_module._tree_size_inventory(frozen)
+    sizes = {row["path"]: row["size"] for row in inventory}
+    assert {"graph.json", ".index/graph.json", "frozen-base.json"} <= set(sizes)
+    assert total_bytes == sum(sizes.values())
+    descriptor_size = int(sizes["frozen-base.json"])
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", total_bytes)
+    with pytest.raises(FrozenBaseError, match="frozen base size"):
+        frozen_module._require_complete_frozen_size(total_bytes - descriptor_size, descriptor_size)
+
+    # Validation must reject graph size before it parses the descriptor or hashes any artifact.
+    hash_calls.clear()
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 1)
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", 1024 * 1024 * 1024)
+    monkeypatch.setattr(frozen_module.json, "loads", lambda *_args, **_kwargs: pytest.fail("descriptor JSON parsed"))
+    with pytest.raises(FrozenBaseError, match="frozen graph size"):
+        validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
+            expected_corpus_identity=identity,
+        )
+    assert hash_calls == []
+
+    # Exact equality is also forbidden; the root total includes descriptor and both graph copies.
+    monkeypatch.setattr(frozen_module, "MAX_CANONICAL_GRAPH_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(frozen_module, "MAX_COMPLETE_FROZEN_BASE_BYTES", total_bytes)
+    with pytest.raises(FrozenBaseError, match="frozen base size"):
+        validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=embedder.tokenizer,
+            expected_corpus_identity=identity,
+        )
+    assert hash_calls == []
+
+
+def test_phase07_frozen_base_requires_the_preparation_tokenizer_at_the_112_token_boundary(tmp_path: Path) -> None:
+    """The canonical validation plan must not silently use char/4 token counts."""
+    from eval.phase07_frozen_base import FrozenBaseError, prepare_frozen_base, validate_frozen_base  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    # Each paragraph has seven 8-char words.  The two tokenizers split this
+    # long Markdown on different paragraph boundaries around 112 tokens.
+    body = "\n\n".join("alphabet betaabcd gammabcd deltaabcd epsilonx zetaabcd etaabcde" for _ in range(24))
+    _write_page(wiki, f"# Boundary\n\n{body}\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen = tmp_path / "frozen"
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_boundary_tokenizer,
+        expected_corpus_identity=identity,
+    )
+    assert validate_frozen_base(
+        frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_boundary_tokenizer,
+        expected_corpus_identity=identity,
+    )
+    with pytest.raises(FrozenBaseError, match="canonical Markdown chunk plan"):
+        validate_frozen_base(
+            frozen, expected_wiki_root=frozen / "Wiki", tokenizer=_different_boundary_tokenizer,
+            expected_corpus_identity=identity,
+        )
+
+
+def test_phase07_frozen_base_rejects_missing_tokenizer_before_target_mutation(tmp_path: Path) -> None:
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        FrozenBaseError,
+        finalize_private_role,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# No tokenizer\n\nTOKENIZERREQUIRED\n")
+    with pytest.raises(FrozenBaseError, match="tokenizer is required"):
+        prepare_frozen_base(wiki_dir=wiki, frozen_dir=tmp_path / "frozen", embed=_embed384(), tokenizer=None)
+    assert not (tmp_path / "frozen").exists()
+    # Production frozen APIs cannot regain the default tokenizer by omission.
+    for function in (prepare_frozen_base, validate_frozen_base, finalize_private_role):
+        assert inspect.signature(function).parameters["tokenizer"].default is inspect.Parameter.empty
+
+
+def test_phase07_private_clone_publishes_and_loads_only_after_validation(tmp_path: Path) -> None:
+    """The role clone follows the same ACTIVE_INDEX commit lifecycle as production."""
+    from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus-source" / "Wiki"
+    _write_page(wiki, "# Frozen lifecycle\n\nFROZENLIFECYCLE exact retrieval content.")
+    frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=300,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=20, ef_construction=300),
+    )
+    private_root = tmp_path / "private"
+    published = finalize_private_role(
+        frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+        candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+        publish_index_dir=private_root, expected_corpus_identity=identity,
+    )
+    index = WikiIndex(private_root)
+    index.load()
+    assert (private_root / "ACTIVE_INDEX").is_file()
+    assert Path(published["manifest_path"]).is_file()
+    assert not list((private_root / "builds").glob("*/.failed"))
+
+
+def test_phase07_frozen_base_rejects_unsafe_archive_members(tmp_path: Path) -> None:
+    from eval.phase07_frozen_base import FrozenBaseError, safe_extract_frozen_base  # noqa: PLC0415
+
+    archive = tmp_path / "unsafe.tar"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("not allowed", encoding="utf-8")
+    with tarfile.open(archive, "w") as handle:
+        handle.add(payload, arcname="../escape.txt")
+    with pytest.raises(FrozenBaseError, match="archive member"):
+        safe_extract_frozen_base(archive, tmp_path / "extract", tokenizer=_FacadeEmbedder().tokenizer)
+
+
+def test_phase07_frozen_prepare_uses_the_final_canonical_root_and_rejects_relocated_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fixed absolute page IDs make a relocated base invalid before clone/HNSW."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        FrozenBaseError,
+        finalize_private_role,
+        prepare_frozen_base,
+        validate_frozen_base,
+    )
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    root_a = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
+    wiki = root_a / "Wiki"
+    _write_page(wiki, "# Canonical root\n\nCANONICALROOTTERM\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=root_a, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    assert validate_frozen_base(
+        root_a, expected_wiki_root=root_a / "Wiki", tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+
+    root_b = tmp_path / "relocated-frozen-corpus"
+    import shutil
+    shutil.copytree(root_a, root_b)
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("relocated frozen source reached clone"),
+    )
+    with pytest.raises(FrozenBaseError, match="resolved root"):
+        finalize_private_role(
+            frozen_dir=root_b, target_dir=tmp_path / "should-not-exist",
+            expected_wiki_root=root_b / "Wiki", candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
+        )
+    assert not (tmp_path / "should-not-exist").exists()
+
+
+def test_phase07_frozen_prepare_loads_and_validates_model_before_creating_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI must not use a target-local probe or create a failed target."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    wiki = tmp_path / "Wiki"
+    _write_page(wiki, "# CLI\n\nMODELBEFORETARGETTERM\n")
+    bundle = tmp_path / "prepare-bundle.json"
+    bundle.write_text("{}", encoding="utf-8")
+    target = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
+    calls: list[Path] = []
+
+    monkeypatch.setattr(frozen, "validate_frozen_prepare_bundle", lambda *_args, **_kwargs: {}, raising=False)
+    def fail_model(model_dir: Path):
+        calls.append(Path(model_dir))
+        raise frozen.FrozenBaseError("verified model unavailable")
+    monkeypatch.setattr(frozen, "load_verified_frozen_embedder", fail_model)
+
+    with pytest.raises(frozen.FrozenBaseError, match="verified model unavailable"):
+        frozen.main([
+            "prepare", "--wiki-dir", str(wiki), "--frozen-dir", str(target),
+            "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "models" / "missing"),
+        ])
+    assert calls == [tmp_path / "models" / "missing"]
+    assert not target.exists()
+    assert not list(tmp_path.rglob(".embedder-probe"))
+
+
+def test_phase07_frozen_prepare_cli_cannot_select_a_tiny_identity_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI preparation has no test identity switch; only direct calls may inject one."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    target = tmp_path / ".review-tmp" / "phase07" / "frozen-corpus"
+    _write_page(target / "Wiki", "# CLI success\n\nEXTERNALMODELTERM\n")
+    bundle = tmp_path / "prepare-bundle.json"
+    bundle.write_text("{}", encoding="utf-8")
+
+    class VerifiedEmbedder:
+        def __init__(self) -> None:
+            self.tokenizer = _FacadeEmbedder().tokenizer
+
+        def embed(self, texts):
+            return _embed384()(texts)
+
+    monkeypatch.setattr(frozen, "validate_frozen_prepare_bundle", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(frozen, "load_verified_frozen_embedder", lambda _model_dir: VerifiedEmbedder())
+    monkeypatch.setattr(
+        frozen, "_default_expected_corpus_identity",
+        lambda: {"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 30_000},
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
+        frozen.main([
+            "prepare", "--wiki-dir", str(target / "Wiki"), "--frozen-dir", str(target),
+            "--prepare-bundle", str(bundle), "--model-dir", str(tmp_path / "external-model"),
+        ])
+    assert not (target / "frozen-base.json").exists()
+    assert not list(target.rglob(".embedder-probe"))
+
+
+def test_phase07_frozen_archive_rejects_noncanonical_aliases_and_extracted_tree_is_revalidated(
+    tmp_path: Path,
+) -> None:
+    """Archive member spelling is part of the sealed POSIX inventory."""
+    from eval.phase07_frozen_base import FrozenBaseError, safe_extract_frozen_base  # noqa: PLC0415
+
+    archive = tmp_path / "aliases.tar"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("x", encoding="utf-8")
+    with tarfile.open(archive, "w") as handle:
+        handle.add(payload, arcname="x")
+        handle.add(payload, arcname="./x")
+    with pytest.raises(FrozenBaseError, match="archive member"):
+        safe_extract_frozen_base(archive, tmp_path / "extract", tokenizer=_FacadeEmbedder().tokenizer)
+
+
+def test_phase07_private_finalizer_uses_durable_manifest_collaborator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private publication must preserve the production pre/post-pointer fault boundary."""
+    from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    frozen = tmp_path / "frozen"
+    _write_page(frozen / "Wiki", "# Finalizer\n\nDURABLEMANIFESTTERM\n")
+    identity = _phase07_test_corpus_identity(frozen / "Wiki")
+    prepare_frozen_base(
+        wiki_dir=frozen / "Wiki", frozen_dir=frozen,
+        embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    writes: list[Path] = []
+    real_write = FilesystemIndexManifest.write
+    def capture_write(self, path: Path, manifest):
+        writes.append(path)
+        return real_write(self, path, manifest)
+    monkeypatch.setattr(FilesystemIndexManifest, "write", capture_write)
+
+    index_dir = tmp_path / "private"
+    result = finalize_private_role(
+        frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+        candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+        publish_index_dir=index_dir, expected_corpus_identity=identity,
+    )
+    assert writes == [Path(result["manifest_path"])]
+    assert (index_dir / "ACTIVE_INDEX").is_file()
+
+
+@pytest.mark.parametrize("sidecar", (
+    "Wiki/nested/candidate-policy.json",
+    ".index/nested/authorization.json",
+    "lance_db/candidate-verdict.json",
+))
+def test_phase07_frozen_base_requires_canonical_corpus_identity_and_rejects_nested_sidecars_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: str,
+) -> None:
+    """#6: a descriptor may not bless a tiny/self-reported source or hidden policy file."""
+    from eval.phase07_frozen_base import FrozenBaseError, finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Canonical corpus\n\nCANONICALCORPUSIDENTITYTERM\n")
+    with pytest.raises(FrozenBaseError, match="corpus identity"):
+        prepare_frozen_base(
+            wiki_dir=wiki, frozen_dir=tmp_path / "default-rejects-tiny",
+            embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        )
+
+    frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
+    descriptor = prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    assert descriptor["expected_corpus_identity"] == _phase07_test_corpus_identity(wiki)
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    injected = frozen / sidecar
+    injected.parent.mkdir(parents=True, exist_ok=True)
+    injected.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("untrusted frozen tree reached clone"),
+    )
+    with pytest.raises(FrozenBaseError):
+        finalize_private_role(
+            frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
+        )
+    assert not (tmp_path / "clone").exists()
+
+
+def test_phase07_private_finalizer_marks_every_pre_pointer_clone_failure_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The record/build/clone/HNSW window has one pre-commit failure outcome."""
+    from eval.phase07_frozen_base import finalize_private_role, prepare_frozen_base  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Clone fault\n\nCLONEFAULTTERM\n")
+    frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
+    prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(LanceDbIndexRepository, "clone_tables", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("clone boom")))
+    target = tmp_path / "clone"
+    private = tmp_path / "private"
+    with pytest.raises(RuntimeError, match="clone boom"):
+        finalize_private_role(
+            frozen_dir=frozen, target_dir=target, expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            publish_index_dir=private, expected_corpus_identity=identity,
+        )
+    builds = list((private / "builds").glob("*"))
+    assert len(builds) == 1
+    assert (builds[0] / ".failed").is_file()
+    assert not (private / "ACTIVE_INDEX").exists()
+
+
+@pytest.mark.parametrize("fault", ("hnsw", "reopen", "seal", "manifest", "validated", "pointer"))
+def test_phase07_private_finalizer_has_one_failed_outcome_for_every_pre_pointer_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    """Faults after BUILDING and before a durable pointer all leave clone-local .failed."""
+    from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Window fault\n\nWINDOWFAULTTERM\n")
+    frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen_module.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    error = RuntimeError(f"forced {fault} failure")
+    if fault == "hnsw":
+        monkeypatch.setattr(LanceDbIndexRepository, "create_eval_candidate_index", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    elif fault == "reopen":
+        real_validate = LanceDbIndexRepository.validate_reopened
+        def fail_clone_reopen(self, *args, **kwargs):
+            if Path(self._lance_dir) == frozen / "lance_db":
+                return real_validate(self, *args, **kwargs)
+            raise error
+        monkeypatch.setattr(LanceDbIndexRepository, "validate_reopened", fail_clone_reopen)
+    elif fault == "seal":
+        monkeypatch.setattr(LanceDbIndexRepository, "seal", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    elif fault == "manifest":
+        monkeypatch.setattr(FilesystemIndexManifest, "write", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    elif fault == "validated":
+        monkeypatch.setattr(frozen_module, "record_validated", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    else:
+        monkeypatch.setattr(frozen_module, "publish_pointer", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    private = tmp_path / "private"
+    with pytest.raises(RuntimeError, match=f"forced {fault} failure"):
+        frozen_module.finalize_private_role(
+            frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            publish_index_dir=private, expected_corpus_identity=identity,
+        )
+    builds = list((private / "builds").glob("*"))
+    assert len(builds) == 1
+    assert (builds[0] / ".failed").is_file()
+    assert not (private / "ACTIVE_INDEX").exists()
+
+
+def test_phase07_private_finalizer_does_not_lie_after_uncertain_pointer_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CommitUncertainError is a possible pointer commit, never a failed clone."""
+    from eval import phase07_frozen_base as frozen_module  # noqa: PLC0415
+    from obsidian_wiki.application.durable_filesystem import CommitUncertainError  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Uncertain\n\nUNCERTAINPOINTERTERM\n")
+    frozen = tmp_path / "frozen"
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen_module.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        frozen_module, "publish_pointer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CommitUncertainError("pointer state uncertain")),
+    )
+    private = tmp_path / "private"
+    with pytest.raises(CommitUncertainError, match="pointer state uncertain"):
+        frozen_module.finalize_private_role(
+            frozen_dir=frozen, target_dir=tmp_path / "clone", expected_wiki_root=frozen / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            publish_index_dir=private, expected_corpus_identity=identity,
+        )
+    builds = list((private / "builds").glob("*"))
+    assert len(builds) == 1
+    assert not (builds[0] / ".failed").exists()
+
+
+def test_phase07_frozen_prepare_identity_shape_rejects_future_or_noncanonical_collector_data() -> None:
+    """The operator shares one fail-closed, API-collector-shaped prepare identity."""
+    from eval.phase07_frozen_base import (  # noqa: PLC0415
+        FROZEN_PREPARE_IDENTITY_FIELDS,
+        FrozenBaseError,
+        validate_frozen_prepare_identity_shape,
+    )
+
+    now = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    head_sha = "b" * 40
+    digest = "a" * 64
+    identity = {
+        "repository": "example/obsidian-wiki-skill", "head_sha": head_sha,
+        "run_id": 11, "run_attempt": 1, "job_id": 12, "artifact_id": 13,
+        "artifact_name": "phase07-frozen-base-11-1", "archive_sha256": digest,
+        "archive_size_bytes": 99, "descriptor_self_sha256": digest,
+        "base_tree_sha256": digest, "model_manifest_sha256": digest,
+        "corpus_manifest_sha256": digest, "generator_recipe_sha256": digest,
+        "runtime": {"python": "3.13"},
+        "artifact_created_at": (now - timedelta(minutes=1)).isoformat(),
+        "artifact_expires_at": (now + timedelta(days=89, hours=23, minutes=59)).isoformat(),
+        "retention_days": 90, "replacement_for_run_id": None, "status": "success",
+    }
+    assert set(identity) == FROZEN_PREPARE_IDENTITY_FIELDS
+    assert validate_frozen_prepare_identity_shape(
+        identity, expected_repository=identity["repository"], expected_head=head_sha, now=now,
+    ) == identity
+    for key, value in (("run_attempt", 2), ("status", "completed"),
+                       ("artifact_name", "latest"),
+                       ("artifact_created_at", (now + timedelta(seconds=1)).isoformat()),
+                       ("replacement_for_run_id", 7)):
+        invalid = dict(identity); invalid[key] = value
+        with pytest.raises(FrozenBaseError):
+            validate_frozen_prepare_identity_shape(
+                invalid, expected_repository=identity["repository"], expected_head=head_sha, now=now,
+            )
+
+
+@pytest.mark.parametrize("forged", (
+    {"expanded_content_tree_sha256": "b" * 64, "expanded_member_count": 30_000},
+    {"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 29_999},
+))
+def test_phase07_frozen_corpus_identity_is_exact_authority_not_a_30k_shaped_label(
+    monkeypatch: pytest.MonkeyPatch, forged: dict[str, object],
+) -> None:
+    """A descriptor may not substitute an arbitrary 64-hex/count-30k identity."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    authority = {
+        "expanded_content_tree_sha256": "a" * 64,
+        "expanded_member_count": 30_000,
+    }
+    monkeypatch.setattr(frozen, "_default_expected_corpus_identity", lambda: authority)
+
+    assert frozen._expected_corpus_identity(None) == authority
+    with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
+        frozen._expected_corpus_identity(forged)
+
+
+def test_phase07_descriptor_recipe_fields_are_exact_authority_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-sealed descriptor cannot replace a committed recipe digest label."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+
+    authority = {
+        "target_size": 30_000, "corpus_manifest_sha256": "a" * 64,
+        "generator_recipe_sha256": "b" * 64, "model_manifest_sha256": "c" * 64,
+        "runtime": {"python": "3.13"},
+    }
+    monkeypatch.setattr(frozen, "_default_descriptor_identity", lambda: dict(authority))
+    forged = dict(authority)
+    forged["generator_recipe_sha256"] = "d" * 64
+    with pytest.raises(frozen.FrozenBaseError, match="descriptor identity"):
+        frozen._descriptor_identity(forged)
+
+
+def test_phase07_resealed_30k_descriptor_cannot_choose_its_own_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production validation rejects a self-consistent but wrong 30k descriptor."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Re-sealed descriptor\n\nRESEALEDIDENTITYTERM\n")
+    fixture_identity = _phase07_test_corpus_identity(wiki)
+    frozen_dir = tmp_path / "frozen"
+    frozen.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen_dir, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=fixture_identity,
+    )
+    descriptor = frozen._read_descriptor(frozen_dir, expected_corpus_identity=fixture_identity)
+    authority = {"expanded_content_tree_sha256": "a" * 64, "expanded_member_count": 30_000}
+    descriptor["expected_corpus_identity"] = {
+        "expanded_content_tree_sha256": "b" * 64, "expanded_member_count": 30_000,
+    }
+    descriptor["record_self_sha256"] = frozen._sha256_bytes(frozen._canonical_json({
+        key: value for key, value in descriptor.items() if key != "record_self_sha256"
+    }))
+    (frozen_dir / "frozen-base.json").write_bytes(frozen._canonical_json(descriptor))
+    monkeypatch.setattr(frozen, "_default_expected_corpus_identity", lambda: authority)
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("re-sealed source reached clone/HNSW"),
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="corpus identity"):
+        frozen.finalize_private_role(
+            frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+        )
+
+
+@pytest.mark.parametrize("field", ("text", "token_count", "start_char", "chunk_id"))
+def test_phase07_frozen_validator_recomputes_markdown_plan_before_clone_or_hnsw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    """Even a re-sealed dense table cannot drift from canonical Markdown chunks."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Plan source\n\nMARKDOWNPLANIDENTITYTERM\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen_dir = tmp_path / "frozen"
+    frozen.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen_dir, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+
+    repository = LanceDbIndexRepository(frozen_dir / "lance_db")
+    original = dict(repository.table_rows("dense_chunks")[0])
+    changed = dict(original)
+    if field == "chunk_id":
+        changed[field] = original[field] + "-tampered"
+        deleted = [str(original["chunk_id"])]
+    elif field == "token_count":
+        changed[field] = int(original[field]) + 1
+        deleted = []
+    elif field == "start_char":
+        changed[field] = int(original[field]) + 1
+        deleted = []
+    else:
+        changed[field] = str(original[field]) + " tampered"
+        deleted = []
+    repository.apply_delta("dense_chunks", added=(), updated=(changed,), deleted_ids=deleted)
+    repository.seal(frozen_dir / "lance_db")
+
+    # Model an attacker who also recomputes every descriptor/tree digest.  The
+    # remaining validator must derive the non-vector plan from Markdown.
+    descriptor = frozen._read_descriptor(frozen_dir, expected_corpus_identity=identity)
+    sparse = repository.table_rows("sparse_chunks")
+    dense = repository.table_rows("dense_chunks")
+    descriptor["canonical_chunk_plan_sha256"] = frozen._canonical_chunk_plan_sha256(sparse, dense)
+    descriptor["dense_vectors_sha256"] = frozen._dense_vectors_sha256(dense)
+    descriptor["lance_tree_sha256"] = frozen._tree_inventory(frozen_dir / "lance_db")[1]
+    inventory, tree = frozen._tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))
+    descriptor["frozen_file_inventory"] = inventory
+    descriptor["frozen_tree_sha256"] = tree
+    descriptor["record_self_sha256"] = frozen._sha256_bytes(frozen._canonical_json({
+        key: value for key, value in descriptor.items() if key != "record_self_sha256"
+    }))
+    (frozen_dir / "frozen-base.json").write_bytes(frozen._canonical_json(descriptor))
+
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("tampered frozen source reached clone/HNSW"),
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="canonical Markdown chunk plan"):
+        frozen.finalize_private_role(
+            frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
+        )
+
+
+def test_phase07_frozen_validator_rejects_resealed_page_metadata_before_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The source scan also binds page title metadata, not merely table rows."""
+    from eval import phase07_frozen_base as frozen  # noqa: PLC0415
+    from obsidian_wiki.domain.index_models import CandidateBuildPolicy, CandidateQueryPolicy  # noqa: PLC0415
+
+    wiki = tmp_path / "source" / "Wiki"
+    _write_page(wiki, "# Page metadata\n\nPAGEMETADATATERM\n")
+    identity = _phase07_test_corpus_identity(wiki)
+    frozen_dir = tmp_path / "frozen"
+    frozen.prepare_frozen_base(
+        wiki_dir=wiki, frozen_dir=frozen_dir, embed=_embed384(), tokenizer=_FacadeEmbedder().tokenizer,
+        expected_corpus_identity=identity,
+    )
+    descriptor = frozen._read_descriptor(frozen_dir, expected_corpus_identity=identity)
+    pages = json.loads((frozen_dir / "pages.json").read_text(encoding="utf-8"))
+    pages[0]["title"] = "Re-sealed false title"
+    (frozen_dir / "pages.json").write_text(json.dumps(pages), encoding="utf-8")
+    descriptor["pages_sha256"] = frozen._sha256_file(frozen_dir / "pages.json")
+    inventory, tree = frozen._tree_inventory(frozen_dir, exclude=frozenset({"frozen-base.json"}))
+    descriptor["frozen_file_inventory"] = inventory
+    descriptor["frozen_tree_sha256"] = tree
+    descriptor["record_self_sha256"] = frozen._sha256_bytes(frozen._canonical_json({
+        key: value for key, value in descriptor.items() if key != "record_self_sha256"
+    }))
+    (frozen_dir / "frozen-base.json").write_bytes(frozen._canonical_json(descriptor))
+    policy = CandidateQueryPolicy(
+        candidate="ivf-hnsw-sq", query_ef=100,
+        build_policy=CandidateBuildPolicy(candidate="ivf-hnsw-sq", m=16, ef_construction=300),
+    )
+    monkeypatch.setattr(
+        LanceDbIndexRepository, "clone_tables",
+        lambda *_args, **_kwargs: pytest.fail("re-sealed pages reached clone/HNSW"),
+    )
+    with pytest.raises(frozen.FrozenBaseError, match="page metadata identity"):
+        frozen.finalize_private_role(
+            frozen_dir=frozen_dir, target_dir=tmp_path / "clone", expected_wiki_root=frozen_dir / "Wiki",
+            candidate_query_policy=policy, tokenizer=_FacadeEmbedder().tokenizer,
+            expected_corpus_identity=identity,
+        )

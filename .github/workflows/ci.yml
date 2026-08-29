@@ -129,6 +129,12 @@ jobs:
       # and public CLI dispatch on both operating systems.  The model-backed
       # public retrieval-equivalence artifact belongs in eval.yml after its cache.
       # All named suites are model-free and must pass on Windows + Linux.
+      - name: Enforce cross-platform process and filesystem contracts
+        run: >
+          python -m pytest -p no:cacheprovider
+          --basetemp=.review-tmp/portability-contract
+          tests/test_portability_contract.py -q
+
       - name: Run storage, publication, chunking, and ANN benchmark acceptance gates
         run: >
           python -m pytest -p no:cacheprovider
@@ -158,3 +164,20 @@ jobs:
 
       - name: Run architecture compatibility regression
         run: python tests/test_architecture_foundation.py
+
+  phase07-windows-reduced-real-lancedb:
+    name: Phase 07 Windows reduced real LanceDB create/reopen/query proof
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 12
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Install exact locked storage dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run reduced production LanceDB create reopen query exact-vs-ANN path
+        run: >
+          python -m pytest -p no:cacheprovider
+          tests/test_lancedb_storage_contract.py tests/test_benchmark_sampling.py -q
