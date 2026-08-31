@@ -522,13 +522,13 @@ fi
 
 ## 测试
 
-测试代码本地保留（`tests/` 目录），但**不在公开发布的 skill 仓库中包含**（`.gitignore` 已排除）。本地运行：
+单元测试与脱敏评测集随 issue #9 公开，位于 `tests/`（fixtures 已脱敏、离线可跑），由 CI（`.github/workflows/ci.yml`）与评测（`.github/workflows/eval.yml`）在 PR 上自动执行。本地运行：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 <venv_python> -m pytest -p no:cacheprovider
 ```
 
-覆盖：索引构建、图谱构建、BM25/向量/融合检索、各 parser、manifest 增量、图片 caption。
+覆盖（65 个测试文件）：索引构建与分块契约、图谱构建与证据、BM25/向量/融合检索与 Query Planner、预算与 ContextBundle、各 parser、manifest 增量与 online incremental、ANN 策略与校准、索引持久化与安全发布、图片 caption 与溯源、可移植性契约。
 
 ## 技术栈
 
