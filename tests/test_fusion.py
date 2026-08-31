@@ -190,3 +190,71 @@ def test_dual_channel_outranks_single_channel():
     )[0]
     # A page present in both channels scores exactly double a single-channel page.
     assert dual.rrf_score == pytest.approx(2.0 * single.rrf_score)
+
+
+def test_page_level_rrf_k_none_returns_full_pool_and_preserves_page_type():
+    image = ChunkHit(
+        chunk_id="image:1",
+        page_id="image",
+        path="/wiki/assets/image.jpg",
+        title="image",
+        page_type="image_caption",
+        section_path=[],
+        heading="",
+        chunk_kind="dense",
+        text="image caption",
+        channel="vector",
+        score=1.0,
+    )
+    text = ChunkHit(
+        chunk_id="text:1",
+        page_id="text",
+        path="/wiki/text.md",
+        title="text",
+        page_type="concept",
+        section_path=[],
+        heading="",
+        chunk_kind="dense",
+        text="text",
+        channel="vector",
+        score=0.9,
+    )
+
+    out = page_level_rrf([], [image, text], k=None)
+
+    assert len(out) == 2
+    by_id = {candidate.page_id: candidate for candidate in out}
+    assert by_id["image"].page_type == "image_caption"
+    assert by_id["text"].page_type == "concept"
+
+
+def test_page_level_rrf_rejects_inconsistent_page_type_across_channels():
+    fts = ChunkHit(
+        chunk_id="p:fts",
+        page_id="p",
+        path="/wiki/p.md",
+        title="p",
+        page_type="concept",
+        section_path=[],
+        heading="",
+        chunk_kind="sparse",
+        text="p",
+        channel="fts",
+        score=1.0,
+    )
+    vector = ChunkHit(
+        chunk_id="p:vector",
+        page_id="p",
+        path="/wiki/p.md",
+        title="p",
+        page_type="image_caption",
+        section_path=[],
+        heading="",
+        chunk_kind="dense",
+        text="p",
+        channel="vector",
+        score=1.0,
+    )
+
+    with pytest.raises(ValueError, match="inconsistent page_type"):
+        page_level_rrf([fts], [vector], k=None)

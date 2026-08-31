@@ -76,6 +76,31 @@ class ManifestEntry:
 # These define the cross-module contract consumed by chunking, fusion,
 # context packing and graph expansion.
 # --------------------------------------------------------------------------
+IMAGE_PAGE_TYPE = "image_caption"
+_IMAGE_FILE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+
+def is_image_page(page_type: Optional[str], path: object = "",
+                  page_id: str = "") -> bool:
+    """Return whether a retrieval object represents an image-caption page.
+
+    Persisted ``page_type`` is authoritative. Path/suffix detection exists only
+    for backward compatibility with hand-built test objects or legacy callers
+    whose page type is absent/unknown.
+    """
+    normalized_type = (page_type or "").strip().lower()
+    if normalized_type and normalized_type != "unknown":
+        return normalized_type == IMAGE_PAGE_TYPE
+
+    normalized_path = str(path or "").replace("\\", "/").lower()
+    normalized_id = str(page_id or "").replace("\\", "/").lower()
+    return (
+        "/assets/" in f"/{normalized_path.lstrip('/')}"
+        or normalized_path.endswith(_IMAGE_FILE_SUFFIXES)
+        or normalized_id.endswith(_IMAGE_FILE_SUFFIXES)
+    )
+
+
 @dataclass
 class GraphPath:
     """A relation path from a seed page to a graph candidate."""
@@ -112,6 +137,7 @@ class PageCandidate:
     sparse_evidence: List[EvidenceHit] = field(default_factory=list)
     dense_evidence: List[EvidenceHit] = field(default_factory=list)
     graph_paths: List[GraphPath] = field(default_factory=list)
+    page_type: str = "unknown"
 
 
 @dataclass
@@ -130,6 +156,7 @@ class ContextItem:
     truncated: bool = False
     truncation_reason: Optional[str] = None
     omitted_ranges: List[dict] = field(default_factory=list)
+    page_type: str = "unknown"
 
 
 @dataclass

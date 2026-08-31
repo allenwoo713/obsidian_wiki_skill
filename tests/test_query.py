@@ -110,20 +110,31 @@ def test_hybrid_search_read_full(tmp_path):
     assert "这是完整正文" in result.text_items[0].text
 
 
-def test_split_text_image():
-    """_split_text_image 按 path 含 assets/ 把 ContextItem 归入 images。"""
+def test_split_text_image_uses_page_type_before_path_heuristics():
+    """page_type 是权威判据：误导性路径不能覆盖已知非图片类型，反之亦然。"""
     text_item = ContextItem(
-        page_id="p", path="Wiki/p.md", title="P",
-        inclusion_reason="rrf", scope="chunk", text="正文",
+        page_id="text.jpg",
+        path="Wiki/assets/misleading.jpg",
+        title="text",
+        inclusion_reason="rrf",
+        scope="chunk",
+        text="normal page",
+        page_type="concept",
     )
-    img_item = ContextItem(
-        page_id="img1", path="Wiki/assets/x_img01.png", title="图1",
-        inclusion_reason="image", scope="chunk", text="图注",
+    image_item = ContextItem(
+        page_id="virtual-image",
+        path="Wiki/generated/virtual-image.md",
+        title="image",
+        inclusion_reason="image",
+        scope="chunk",
+        text="caption",
+        page_type="image_caption",
     )
-    tc, ic = _split_text_image([text_item, img_item])
-    assert len(tc) == 1
-    assert len(ic) == 1
-    assert Path(ic[0].path).name == "x_img01.png"
+
+    text, images = _split_text_image([text_item, image_item])
+
+    assert text == [text_item]
+    assert images == [image_item]
 
 
 def test_retry_entities_are_used_for_graph_seeds(tmp_path, monkeypatch):

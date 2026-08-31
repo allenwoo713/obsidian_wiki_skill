@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 
 from models import (
     ChunkHit, PageCandidate, ContextItem, ContextBundle, EvidenceHit, GraphPath,
+    is_image_page,
 )
 
 _FM_RE = re.compile(r"^---\n.*?\n---\n(.*)$", re.DOTALL)
@@ -56,12 +57,16 @@ def _read_full_content(path: Path, max_chars: Optional[int] = None) -> str:
 
 
 def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
-                   k: int = 5, k_rrf: int = 60) -> List[PageCandidate]:
-    """Page-level RRF 融合。
+                   k: Optional[int] = 5, k_rrf: int = 60) -> List[PageCandidate]:
+    """Fuse chunk hits by page while retaining full evidence provenance.
 
-    FTS 与向量两路各自按 score 排序（rank 从 1），命中按 page_id 归并，
-    每页的 RRF 分 = Σ 1/(k_rrf + rank)。每页保留各路最佳 chunk 作为证据。
-    图谱不在主 RRF 内——由调用方作为独立通道追加，避免噪声挤占 top。
+    Each page contributes at most once per retrieval channel to public
+    ``rrf_score``. ``page_ranking_score`` remains the legacy production ordering
+    for #58; changing that policy belongs to #23.
+
+    Args:
+        k: Maximum candidates to return. ``None`` returns the complete fused
+           pool. The pool is still bounded by the upstream raw hit limits.
     """
     # 归并：保留每一路的所有命中证据；呈现文本随后去重，provenance 不去重。
     pages: dict = {}
@@ -78,6 +83,13 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
                     "fts_hits": [], "vec_hits": [], "rrf": 0.0,
                 }
                 pages[pid] = entry
+            elif entry["page_type"] != h.page_type:
+                # A page identity must not change type between sparse/dense rows.
+                # Fail closed rather than letting path heuristics decide later.
+                raise ValueError(
+                    "inconsistent page_type for page_id="
+                    f"{pid!r}: {entry['page_type']!r} != {h.page_type!r}"
+                )
             if pid not in scored_pages[channel]:
                 entry["rrf"] += 1.0 / (k_rrf + rank)
                 scored_pages[channel].add(pid)
@@ -106,9 +118,11 @@ def page_level_rrf(fts_hits: List[ChunkHit], vector_hits: List[ChunkHit],
             page_id=pid, path=Path(e["path"]), title=e["title"],
             rrf_score=e["rrf"], sparse_rank=e["fts_rank"], dense_rank=e["vec_rank"],
             sparse_evidence=sparse_ev, dense_evidence=dense_ev,
+            page_type=e["page_type"],
         ))
+    # Deliberately unchanged for the #58 hotfix.
     candidates.sort(key=lambda c: (-page_ranking_score(c, k_rrf), -c.rrf_score, c.page_id))
-    return candidates[:k]
+    return candidates if k is None else candidates[:k]
 
 
 def _all_evidence(c: PageCandidate) -> List[EvidenceHit]:
@@ -284,12 +298,18 @@ def assemble_context(
     # channels immediately rejoins the shared pool.
     fractions = {"dense": .60, "page": .20, "image": .05, "graph": .15}
     category_by_id: Dict[str, str] = {}
-    for c in candidates:
-        path = str(c.path).replace("\\", "/").lower()
-        category_by_id[c.page_id] = ("image" if "assets/" in path or path.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-                                      else "graph" if c.graph_paths and c.rrf_score <= 0
-                                      else "page" if requested_scope in ("full_page", "full_source")
-                                      else "dense")
+    for candidate in candidates:
+        category_by_id[candidate.page_id] = (
+            "image"
+            if is_image_page(
+                candidate.page_type, candidate.path, candidate.page_id
+            )
+            else "graph"
+            if candidate.graph_paths and candidate.rrf_score <= 0
+            else "page"
+            if requested_scope in ("full_page", "full_source")
+            else "dense"
+        )
     active = set(category_by_id.values())
     reserved = {kind: int(max_tokens * fractions[kind]) if kind in active else 0 for kind in fractions}
     used = 0
@@ -308,7 +328,8 @@ def assemble_context(
         item = ContextItem(
             page_id=c.page_id, path=_citation_path(c.path, citation_root), title=c.title,
             inclusion_reason=("graph_expansion" if type_key == "graph"
-                              else ("image" if type_key == "image" else "rrf")),
+                              else "image" if type_key == "image"
+                              else "rrf"),
             scope=item_scope, evidence=evidence,
             text=selected_text, sources=(item_sources or sources), graph_paths=c.graph_paths,
             token_count=tc,
@@ -317,6 +338,7 @@ def assemble_context(
                                if truncated and item_scope in ("full_page", "full_source")
                                else "token_limit" if truncated else None),
             omitted_ranges=omitted_ranges,
+            page_type=c.page_type,
         )
         bundle.items.append(item)
         included_order[id(item)] = order
