@@ -30,6 +30,10 @@ eval/graph_detail.jsonl
 # GSD local planning state and quick-task artifacts are intentionally local.
 .planning/
 
+# CodeGraph MCP local cache (codegraph.db, daemon.pid, sockets, logs) — per-machine data.
+# Ignoring the directory here also stops the untracked .codegraph/.gitignore from showing up.
+.codegraph/
+
 # Python 编译缓存
 __pycache__/
 *.pyc
