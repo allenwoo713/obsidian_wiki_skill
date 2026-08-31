@@ -151,6 +151,7 @@ jobs:
           tests/test_issue14_context_contract.py
           tests/test_sparse_structure_contract.py
           tests/test_fusion.py
+          tests/test_image_admission.py
           tests/test_community_reports.py
           tests/test_online_incremental.py
           tests/test_online_incremental_policy.py

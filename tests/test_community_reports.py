@@ -336,9 +336,15 @@ def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, t
     calls = []
     monkeypatch.setattr(query, "compose_global_report_service", lambda root: MissingService())
     candidate = SimpleNamespace(page_id="local", rrf_score=1.0)
+    # issue #58: _retrieve_for_plan now returns a RetrievalPass dataclass.
+    retrieval_pass = SimpleNamespace(
+        fts_hits=[object()], vector_hits=[],
+        direct_text_candidates=[candidate], merged_candidates=[candidate],
+        image_candidates=[], graph_validated_count=0, diagnostics={},
+    )
     monkeypatch.setattr(query, "_retrieve_for_plan",
                         lambda *args, **kwargs: calls.append((args, kwargs)) or
-                        ([object()], [], [candidate], [candidate], 0))
+                        retrieval_pass)
     monkeypatch.setattr(
         query,
         "assemble_context",

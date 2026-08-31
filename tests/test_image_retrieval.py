@@ -66,7 +66,7 @@ def test_image_caption_indexed_and_classified_as_image(tmp_path):
 
     # 端到端：hybrid_search 内部 _split_text_image 把图注页归入 images
     from query_planner import DefaultQueryPlanner
-    from query import hybrid_search
+    from query import hybrid_search, result_to_json
     planner = DefaultQueryPlanner(project_root=tmp_path)
     result = hybrid_search(wi, "exposure 信噪比 curve", planner, k=5, wiki_dir=wiki)
     all_items = result.text_items + result.image_items
@@ -79,6 +79,23 @@ def test_image_caption_indexed_and_classified_as_image(tmp_path):
     img_paths = [str(it.path).replace("\\", "/") for it in result.image_items]
     assert any("fig_exposure_curve.jpg" in p for p in img_paths), \
         f"图注页应被归入 images 字段，实际 images: {img_paths}"
+
+    # issue #58：图片作为独立准入通道的候选/JSON 契约
+    assert result.image_candidates
+    assert any(
+        candidate.page_type == "image_caption"
+        and "fig_exposure_curve.jpg" in str(candidate.path)
+        for candidate in result.image_candidates
+    )
+
+    payload = result_to_json(result)
+    assert payload["images"]
+    assert payload["images"][0]["page_type"] == "image_caption"
+    assert payload["images"][0]["score"] > 0
+    assert (
+        payload["retrieval_diagnostics"]["image_outcome"]
+        == "included_in_context_bundle"
+    )
 
 
 def test_empty_caption_image_not_indexed(tmp_path):

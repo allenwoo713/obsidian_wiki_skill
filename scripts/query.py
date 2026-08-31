@@ -32,7 +32,10 @@ torch.set_grad_enabled(False)
 
 import _config  # noqa: F401  # 加载 <skill_dir>/.env（ISSUE-01）
 
-from models import PageCandidate, ContextBundle, ContextItem, EvidenceHit, GraphPath, ChunkHit
+from models import (
+    PageCandidate, ContextBundle, ContextItem, EvidenceHit, GraphPath, ChunkHit,
+    is_image_page,
+)
 from fusion import page_level_rrf, page_ranking_score, assemble_context, render_context_markdown
 from query_planner import DefaultQueryPlanner, InMemoryEntityCatalog, ResolvedEntity
 from query_plan_models import (
@@ -62,6 +65,13 @@ logger = logging.getLogger(__name__)
 # 任何下游（eval / 宿主）都不得复制本表，只能读 bundle.effective_budget_tokens。
 # ---------------------------------------------------------------------------
 BUDGET_POLICY = "context_mode_multiplier_v1"
+
+# issue #58 质量门控图片准入策略：图片页与文本页在同一融合池内分区，图片按
+# 「单路强命中 rank<=5，或双路佐证 rank<=10」准入，最多 IMAGE_CONTEXT_K 张。
+IMAGE_CONTEXT_K = 1
+IMAGE_STRONG_RAW_RANK_MAX = 5
+IMAGE_DUAL_CHANNEL_RAW_RANK_MAX = 10
+IMAGE_ADMISSION_POLICY = "qualified_separate_channel_v1"
 
 # planner.context_mode → (ContextBundle mode, token 预算倍率)
 _CONTEXT_MODE_MAP = {
@@ -105,17 +115,138 @@ class HybridResult:
     local_fallback_used: bool = False
     community_report_status: Optional[str] = None
     confidence_warning: Optional[str] = None
+    image_candidates: List[PageCandidate] = field(default_factory=list)
+    retrieval_diagnostics: Dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
+class RetrievalPass:
+    fts_hits: List[ChunkHit]
+    vector_hits: List[ChunkHit]
+    direct_text_candidates: List[PageCandidate]
+    merged_candidates: List[PageCandidate]
+    image_candidates: List[PageCandidate]
+    graph_validated_count: int
+    diagnostics: Dict[str, object] = field(default_factory=dict)
 
 
 def _split_text_image(items: List[ContextItem]):
     text, images = [], []
-    for it in items:
-        ps = str(it.path).replace("\\", "/")
-        if "assets/" in ps or it.page_id.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-            images.append(it)
+    for item in items:
+        if is_image_page(item.page_type, item.path, item.page_id):
+            images.append(item)
         else:
-            text.append(it)
+            text.append(item)
     return text, images
+
+
+def _candidate_is_image(candidate: PageCandidate) -> bool:
+    return is_image_page(
+        candidate.page_type, candidate.path, candidate.page_id
+    )
+
+
+def _qualifies_image_candidate(candidate: PageCandidate) -> bool:
+    if not _candidate_is_image(candidate):
+        return False
+
+    ranks = [
+        rank for rank in (candidate.sparse_rank, candidate.dense_rank)
+        if rank is not None
+    ]
+    if not ranks:
+        return False
+
+    if min(ranks) <= IMAGE_STRONG_RAW_RANK_MAX:
+        return True
+
+    return (
+        candidate.sparse_rank is not None
+        and candidate.dense_rank is not None
+        and max(candidate.sparse_rank, candidate.dense_rank)
+        <= IMAGE_DUAL_CHANNEL_RAW_RANK_MAX
+    )
+
+
+def _image_candidate_sort_key(candidate: PageCandidate):
+    ranks = [
+        rank for rank in (candidate.sparse_rank, candidate.dense_rank)
+        if rank is not None
+    ]
+    return (
+        -candidate.rrf_score,
+        min(ranks) if ranks else 10**9,
+        -len(ranks),
+        candidate.page_id,
+    )
+
+
+def _select_image_candidates(
+    fused_pool: List[PageCandidate],
+    *,
+    limit: int = IMAGE_CONTEXT_K,
+):
+    if limit < 0:
+        raise ValueError("image candidate limit must be non-negative")
+
+    image_pool = [
+        candidate for candidate in fused_pool
+        if _candidate_is_image(candidate)
+    ]
+    qualified = [
+        candidate for candidate in image_pool
+        if _qualifies_image_candidate(candidate)
+    ]
+    selected = sorted(
+        qualified, key=_image_candidate_sort_key
+    )[:limit]
+
+    diagnostics: Dict[str, object] = {
+        "image_admission_policy": IMAGE_ADMISSION_POLICY,
+        "fused_image_pages": len(image_pool),
+        "qualified_image_pages": len(qualified),
+        "admitted_image_pages": len(selected),
+        "image_outcome": (
+            "admitted_to_context_candidates"
+            if selected
+            else "image_below_rank_gate"
+            if image_pool
+            else "no_fused_image_page"
+        ),
+    }
+    return selected, diagnostics
+
+
+def _finalize_image_diagnostics(
+    diagnostics: Dict[str, object],
+    image_candidates: List[PageCandidate],
+    image_items: List[ContextItem],
+    bundle: ContextBundle,
+) -> Dict[str, object]:
+    final = dict(diagnostics)
+    final["context_image_items"] = len(image_items)
+
+    if image_items:
+        final["image_outcome"] = "included_in_context_bundle"
+        return final
+
+    selected_ids = {candidate.page_id for candidate in image_candidates}
+    if not selected_ids:
+        return final
+
+    omitted = {
+        item.get("page_id"): item.get("reason")
+        for item in bundle.omitted_items
+        if isinstance(item, dict)
+    }
+    if any(
+        omitted.get(page_id) == "image_budget_exhausted"
+        for page_id in selected_ids
+    ):
+        final["image_outcome"] = "image_budget_exhausted"
+    else:
+        final["image_outcome"] = "image_context_assembly_failed"
+    return final
 
 
 def _dedup_chunk_hits(hits: List[ChunkHit]) -> List[ChunkHit]:
@@ -221,6 +352,7 @@ def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
                     sparse_rank=None,
                     dense_rank=None,
                     graph_paths=[gp],
+                    page_type=n.get("page_type", "unknown"),
                 ))
                 nxt.append(nbr)
                 if len(expanded) >= k:
@@ -257,6 +389,8 @@ def _validate_graph_candidates(wi, graph_candidates: List[PageCandidate],
         # (including an explicit one) substitutes for supporting page text.
         candidate.sparse_evidence = sparse
         candidate.dense_evidence = dense
+        if candidate.page_type in ("", "unknown") and hits:
+            candidate.page_type = hits[0].page_type
         validated.append(candidate)
     return validated
 
@@ -297,40 +431,94 @@ def _merge_graph_candidates(direct_candidates: List[PageCandidate],
 
 
 def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path],
-                       *, enable_graph: bool = True):
+                       *, enable_graph: bool = True) -> RetrievalPass:
     """One complete retrieval/graph-validation pass, reusable for retries."""
-    fts_hits = wi.search_fts_terms(plan.lexical_terms, plan.exact_terms, k=20)
-    vec_hits: List[ChunkHit] = []
+    fts_hits = wi.search_fts_terms(
+        plan.lexical_terms, plan.exact_terms, k=20
+    )
+
+    raw_vector_hits: List[ChunkHit] = []
     for semantic_query in plan.semantic_queries:
-        vec_hits.extend(wi.search_vector(semantic_query, k=20))
-    vec_hits = _dedup_chunk_hits(vec_hits)
-    # Keep enough direct RRF hits to seed graph expansion, while preserving the
-    # requested direct-result count as a separate post-RRF channel.
-    direct_candidates = page_level_rrf(fts_hits, vec_hits, k=max(k, 5))
-    candidates = direct_candidates[:k]
+        raw_vector_hits.extend(wi.search_vector(semantic_query, k=20))
+    vector_hits = _dedup_chunk_hits(raw_vector_hits)
+
+    # Keep current legacy ordering for text. The #58 behavior change is only
+    # partitioning the complete fused pool before the mixed top-k cut.
+    fused_pool = page_level_rrf(fts_hits, vector_hits, k=None)
+    text_pool = [
+        candidate for candidate in fused_pool
+        if not _candidate_is_image(candidate)
+    ]
+    direct_text_candidates = text_pool[:k]
+    image_candidates, diagnostics = _select_image_candidates(fused_pool)
+
+    raw_image_hits = [
+        hit for hit in [*fts_hits, *raw_vector_hits]
+        if is_image_page(hit.page_type, hit.path, hit.page_id)
+    ]
+    deduped_image_hits = [
+        hit for hit in [*fts_hits, *vector_hits]
+        if is_image_page(hit.page_type, hit.path, hit.page_id)
+    ]
+    diagnostics.update({
+        "raw_image_chunk_hits": len(raw_image_hits),
+        "deduped_image_chunk_hits": len(deduped_image_hits),
+        "raw_image_pages": len({hit.page_id for hit in raw_image_hits}),
+    })
+    if not raw_image_hits:
+        diagnostics["image_outcome"] = "no_raw_image_hit"
+    elif not diagnostics["fused_image_pages"]:
+        diagnostics["image_outcome"] = "image_not_fused"
 
     graph_candidates: List[PageCandidate] = []
     if enable_graph and wiki_dir:
         try:
             graph_file = wiki_dir.parent / ".index" / "graph.json"
             graph_data = json.loads(graph_file.read_text(encoding="utf-8"))
-            direct_seeds = [candidate.page_id for candidate in direct_candidates[:5]]
-            entity_seeds = _resolve_entity_seeds(graph_data, plan.entities)
+
+            # Preserve the existing graph contract: expansion may use up to five
+            # direct text seeds even when output k is smaller. Images are not
+            # graph seeds in this hotfix.
+            direct_seeds = [
+                candidate.page_id for candidate in text_pool[:5]
+            ]
+            entity_seeds = _resolve_entity_seeds(
+                graph_data, plan.entities
+            )
             seeds = list(dict.fromkeys(direct_seeds + entity_seeds))
             if seeds:
+                expanded = graph_expand(
+                    wi, seeds, wiki_dir, k=10, hop=1
+                )
                 graph_candidates = _validate_graph_candidates(
-                    wi, graph_expand(wi, seeds, wiki_dir, k=10, hop=1), plan)
+                    wi, expanded, plan
+                )
+                graph_candidates = [
+                    candidate for candidate in graph_candidates
+                    if not _candidate_is_image(candidate)
+                ]
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning("图谱扩展/验证失败: %s", exc)
 
-    merged = _merge_graph_candidates(candidates, graph_candidates)
+    merged = _merge_graph_candidates(
+        direct_text_candidates, graph_candidates
+    )
     merged.sort(key=lambda candidate: (
         candidate.rrf_score <= 0,
         -page_ranking_score(candidate),
         -candidate.rrf_score,
         candidate.page_id,
     ))
-    return fts_hits, vec_hits, candidates, merged, len(graph_candidates)
+
+    return RetrievalPass(
+        fts_hits=fts_hits,
+        vector_hits=vector_hits,
+        direct_text_candidates=direct_text_candidates,
+        merged_candidates=merged,
+        image_candidates=image_candidates,
+        graph_validated_count=len(graph_candidates),
+        diagnostics=diagnostics,
+    )
 
 
 def compose_global_report_service(project_root: Path) -> CommunityReportService:
@@ -444,19 +632,31 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         if not allow_local_fallback:
             return gr
 
-    fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(
-        wi, plan, k, wiki_dir, enable_graph=enable_graph)
+    retrieval = _retrieve_for_plan(
+        wi, plan, k, wiki_dir, enable_graph=enable_graph
+    )
 
-    # 6) 低召回重试（最多 1 次，issue #6）
-    sparse_n, dense_n, ev_n = len(fts_hits), len(vec_hits), len(candidates)
-    if (sparse_n == 0 and dense_n == 0) or ev_n == 0:
-        feedback = RetrievalFeedback(sparse_hit_count=sparse_n, dense_hit_count=dense_n,
-                                     top_score_gap=None, evidence_count=ev_n,
-                                     failure_reason="low_recall")
+    # 6) 低召回重试（最多 1 次，issue #6）；图片命中本身即是证据，
+    #    image-only 的有效结果不算零召回。
+    sparse_n = len(retrieval.fts_hits)
+    dense_n = len(retrieval.vector_hits)
+    evidence_n = (
+        len(retrieval.direct_text_candidates)
+        + len(retrieval.image_candidates)
+    )
+    if (sparse_n == 0 and dense_n == 0) or evidence_n == 0:
+        feedback = RetrievalFeedback(
+            sparse_hit_count=sparse_n,
+            dense_hit_count=dense_n,
+            top_score_gap=None,
+            evidence_count=evidence_n,
+            failure_reason="low_recall",
+        )
         plan2 = planner.plan_retry(plan, feedback, ctx)
         if plan2 is not None:
-            fts_hits, vec_hits, candidates, merged, graph_validated_count = _retrieve_for_plan(
-                wi, plan2, k, wiki_dir, enable_graph=enable_graph)
+            retrieval = _retrieve_for_plan(
+                wi, plan2, k, wiki_dir, enable_graph=enable_graph
+            )
             plan = plan2
 
     # 7) 按 token 预算装配 ContextBundle（预算策略：context_mode → mode/倍率 + 硬上限）
@@ -468,17 +668,43 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
     effective_wiki_dir = wiki_dir
     if effective_wiki_dir is None and getattr(wi, "index_dir", None) is not None:
         effective_wiki_dir = Path(wi.index_dir).parent / "Wiki"
-    bundle = assemble_context(merged, repository=wi, mode=mode,
-                              scope=("full_page" if mode == "full" else plan.context_mode), max_tokens=eff_tokens,
-                              token_counter=wi.count_tokens,
-                              citation_root=effective_wiki_dir)
+
+    # Images are context candidates but not text page-ranking candidates.
+    context_candidates = [
+        *retrieval.merged_candidates,
+        *retrieval.image_candidates,
+    ]
+    bundle = assemble_context(
+        context_candidates,
+        repository=wi,
+        mode=mode,
+        scope=("full_page" if mode == "full" else plan.context_mode),
+        max_tokens=eff_tokens,
+        token_counter=wi.count_tokens,
+        citation_root=effective_wiki_dir,
+    )
     bundle.apply_budget(base_tokens=max_tokens, multiplier=mult,
                         effective_tokens=eff_tokens, hard_max_tokens=hard_max_tokens,
                         policy=BUDGET_POLICY)
     text_items, image_items = _split_text_image(bundle.items)
-    result = HybridResult(query=original_query, bundle=bundle, plan=plan,
-                          candidates=merged, text_items=text_items, image_items=image_items,
-                          graph_validated_count=graph_validated_count)
+    diagnostics = _finalize_image_diagnostics(
+        retrieval.diagnostics,
+        retrieval.image_candidates,
+        image_items,
+        bundle,
+    )
+
+    result = HybridResult(
+        query=original_query,
+        bundle=bundle,
+        plan=plan,
+        candidates=retrieval.merged_candidates,
+        text_items=text_items,
+        image_items=image_items,
+        graph_validated_count=retrieval.graph_validated_count,
+        image_candidates=retrieval.image_candidates,
+        retrieval_diagnostics=diagnostics,
+    )
     if plan.intent == QueryIntent.GLOBAL.value:
         result.bundle.mode = "local_fallback"
         result.status = "local_fallback_used"
@@ -519,18 +745,26 @@ def _rrf_score_by_id(candidates: List[PageCandidate]) -> Dict[str, float]:
 
 
 def result_to_json(result: HybridResult) -> dict:
-    rrf = _rrf_score_by_id(result.candidates)
+    # Admitted images live outside result.candidates; without them in the map
+    # the JSON would wrongly expose score 0.0 for a validly fused image.
+    ranked_candidates = [
+        *result.candidates,
+        *result.image_candidates,
+    ]
+    rrf = _rrf_score_by_id(ranked_candidates)
 
     def item_entry(it: ContextItem):
-        ps = str(it.path).replace("\\", "/")
         # Community reports are not Wiki pages; they carry no resolvable
         # citation path (issue #43).
         is_report = it.inclusion_reason == "global_community_report"
+        item_is_image = is_image_page(it.page_type, it.path, it.page_id)
+
         return {
             "page_id": it.page_id,
             "path": str(it.path),
             "citation": None if is_report else f"[来源: {it.path}]",
             "title": it.title,
+            "page_type": it.page_type,
             "score": round(rrf.get(it.page_id, 0.0), 6),
             "snippet": it.text,
             "sources": it.sources,
@@ -549,7 +783,7 @@ def result_to_json(result: HybridResult) -> dict:
             "truncated": it.truncated,
             "truncation_reason": it.truncation_reason,
             "omitted_ranges": it.omitted_ranges,
-            "embed": f"![[{Path(it.path).name}]]" if "assets/" in ps else None,
+            "embed": f"![[{Path(it.path).name}]]" if item_is_image else None,
         }
 
     return {
@@ -569,6 +803,7 @@ def result_to_json(result: HybridResult) -> dict:
         "text": [item_entry(it) for it in result.text_items],
         "images": [item_entry(it) for it in result.image_items],
         "omitted": result.bundle.omitted_items,
+        "retrieval_diagnostics": result.retrieval_diagnostics,
     }
 
 
@@ -610,7 +845,7 @@ def _exit_code_for_result(result: HybridResult) -> int:
     """Keep CLI success aligned with the public strict/fallback trust contract."""
     if result.status is None or result.status == CommunityReportStatus.FRESH.value:
         return 0
-    if result.local_fallback_used and result.text_items:
+    if result.local_fallback_used and (result.text_items or result.image_items):
         return 0
     return 2
 
