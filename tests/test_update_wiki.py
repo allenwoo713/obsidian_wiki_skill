@@ -155,3 +155,62 @@ def test_write_source_fulltext_cleans_legacy_images(tmp_path):
     # FULLTEXT 区保留且更新
     assert "BEGIN AUTO-GENERATED FULLTEXT" in content
     assert "新全文" in content
+
+
+def _make_project(tmp_path, name="a.md", content="# A\nbody"):
+    """构造最小知识库骨架：Raw/sources/<name> + Wiki/ + .index/。"""
+    _write_src(tmp_path / "Raw" / "sources", name, content)
+    (tmp_path / "Wiki").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".index").mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
+def _run_main(proj, *flags, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["update_wiki.py", str(proj), *flags])
+    from update_wiki import main
+    main()
+
+
+def test_main_dry_run_writes_nothing(tmp_path, monkeypatch):
+    """--dry-run 必须零写盘。
+
+    回归防线：历史上 `--apply` 是死开关（赋值后从未被读取），dry-run 实际会
+    落盘 wiki 页 / manifest.json / index.md。证据：git log -S "if apply" 全空。
+    """
+    proj = _make_project(tmp_path)
+    _run_main(proj, "--dry-run", monkeypatch=monkeypatch)
+    assert not (proj / ".index" / "manifest.json").exists()
+    assert not (proj / "Wiki" / "sources" / "a.md").exists()
+    assert not (proj / "Wiki" / "index.md").exists()
+
+
+def test_main_default_writes(tmp_path, monkeypatch):
+    """默认（不带 --dry-run）仍是增量落盘 —— 与 SKILL.md 工作流 2 步骤 1 一致。"""
+    proj = _make_project(tmp_path)
+    _run_main(proj, monkeypatch=monkeypatch)
+    assert (proj / ".index" / "manifest.json").exists()
+    assert (proj / "Wiki" / "sources" / "a.md").exists()
+    assert (proj / "Wiki" / "index.md").exists()
+
+
+def test_main_dry_run_does_not_extract_images(tmp_path, monkeypatch):
+    """--dry-run 不抽图。
+
+    PDF/DOCX 的图片清单与图片落盘是 extract() 同一次调用的产物
+    （parse_sources.py:130），无法只取清单，故 dry-run 必须整段跳过抽图。
+    """
+    from docx import Document
+    from docx.shared import Inches
+
+    raw = tmp_path / "Raw" / "sources"
+    raw.mkdir(parents=True)
+    seed = tmp_path / "seed.png"
+    _create_minimal_png(seed)
+    doc = Document()
+    doc.add_picture(str(seed), width=Inches(1))
+    doc.save(str(raw / "t.docx"))
+    (tmp_path / "Wiki").mkdir()
+    (tmp_path / ".index").mkdir()
+
+    _run_main(tmp_path, "--dry-run", monkeypatch=monkeypatch)
+    assert not (tmp_path / "Wiki" / "assets").exists()

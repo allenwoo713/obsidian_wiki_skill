@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Fixed — `update_wiki.py` `--apply` 死开关：dry-run 从未实现
+
+- **根因**：`--apply` 的取值 `apply = args.apply` 在 `main()` 中**从未被读取**（`git log -S "if apply"` 全历史为空），全部写盘路径无条件执行 ⇒ 帮助文本声称的「默认仅 dry-run」实际会照常落盘。隔离沙箱实测：不带任何 flag 运行即产生 `Wiki/sources/<doc>.md`、`.index/manifest.json`、`Wiki/index.md` 三份文件。此为「未实现的意图 + 误导性帮助文本」，非回归。
+- **修复**：删除死开关 `--apply`，改为显式 opt-in 的 **`--dry-run`**——默认行为保持增量落盘，与 SKILL.md 工作流 2 步骤 1（调用不带 flag、依赖其自动落盘）保持一致。`--dry-run` 门控全部写盘动作：wiki 页落盘、`manifest.json` 写盘、`index.md` 重建，并在末尾打印未落盘提示。
+- **已知边界（设计取舍）**：`--dry-run` **不解析 new/modified 文档**，因此不报告新增文档将带来的新图，图片统计退化为 `manifest.json` 现有快照。原因：PDF/DOCX 的图片清单与图片文件是 `extract()` 同一次调用的两个产物（`parse_sources.py` 的 `parse_file` 二进制分支），无法只取清单而不落盘。升级路径：若确需「只清点不落盘」，需在 `extract_assets` 层拆分，属设计变更而非缺陷修复。
+- **测试**：`tests/test_update_wiki.py` 新增 3 项 `main()` 级回归测试（此前对 `main()` 零覆盖，是本问题潜伏至今的直接原因）。已按 CONTRIBUTING 验证 fails-before/passes-after：旧代码上 2 项 FAILED（`SystemExit`，参数不存在），新代码上该文件 10 项全过。
+
 ### Fixed — ISSUE-16：向量重建段错误根因（pyarrow/torch 导入顺序）+ crash-safe 断点续
 
 - **根因定位（重要）**：`build_index.py` 长期在 `build()` 阶段非确定性 RC=139 段错误，此前归因为「encode 阶段 OpenMP/torch 多线程 race」。经 `faulthandler` 追踪确认真实根因是 **在已加载 torch 的进程里再经 `lancedb` `import pyarrow` 触发 Windows access violation（原生 DLL 加载冲突）**，与 encode 线程无关。

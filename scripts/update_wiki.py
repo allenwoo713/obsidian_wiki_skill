@@ -1,5 +1,5 @@
 """增量更新调度：扫描 Raw/sources → diff manifest → 输出 new/modified/deleted 列表。
-用法：python update_wiki.py <project_root> [--apply]
+用法：python update_wiki.py <project_root> [--dry-run]
 """
 from __future__ import annotations
 import json
@@ -153,10 +153,10 @@ def main():
         description="增量更新调度：扫描 Raw/sources → diff manifest → 输出 new/modified/deleted 列表",
     )
     p.add_argument("project_root", help="知识库项目根目录（含 Raw/sources/ 与 .index/）")
-    p.add_argument("--apply", action="store_true", help="执行全文落盘与 manifest 更新（默认仅 dry-run）")
+    p.add_argument("--dry-run", action="store_true", help="只扫描并报告变更，不落盘（默认行为为增量落盘）")
     args = p.parse_args()
     proj = Path(args.project_root)
-    apply = args.apply
+    dry_run = args.dry_run
     raw_sources = proj / "Raw" / "sources"
     idx_dir = proj / ".index"
     idx_dir.mkdir(exist_ok=True)
@@ -199,7 +199,13 @@ def main():
     assets_dir = proj / "Wiki" / "assets"
     existing_images = manifest.get("images", [])
     new_or_mod = diff["new"] + diff["modified"]
-    image_manifest = extract_images_for_diff(new_or_mod, diff["unchanged"], assets_dir, existing_images)
+    if dry_run:
+        # ponytail: dry-run 不解析 new/modified —— PDF/DOCX 的图片清单与图片落盘是
+        # extract() 同一次调用的产物（parse_sources.py:130），无法只取清单而不写盘。
+        # 故图片统计退化为现有 manifest 快照；新增图需去掉 --dry-run 后重跑才可见。
+        image_manifest = list(existing_images)
+    else:
+        image_manifest = extract_images_for_diff(new_or_mod, diff["unchanged"], assets_dir, existing_images)
     # 图片注册自愈：扫描全库 ![[ref]] 补登未注册引用图（status=pending_vlm）
     healed = heal_image_registration(proj, {"images": image_manifest}, assets_dir)
     if healed:
@@ -212,7 +218,7 @@ def main():
     manifest["images"] = image_manifest
     # 确定性全文落盘：对 new/modified 文档，把 ParsedDoc.text 机械写入 source-summary 页
     # （脚本管理区），不经过 LLM，保证数据完整性
-    if new_or_mod:
+    if new_or_mod and not dry_run:
         print(f"\n全文落盘（确定性，非 LLM）:")
         for d in new_or_mod:
             try:
@@ -221,20 +227,23 @@ def main():
                 print(f"  -> {page.name}: {len(parsed.text)} chars, {len(parsed.images)} imgs")
             except Exception as e:
                 print(f"  [WARN] 全文落盘失败 {d.path}: {e}")
-    # 回填 entries（含 unchanged），使未来增量可用
-    wiki_pages_map = build_wiki_pages_map(proj)
-    update_manifest(diff, manifest, wiki_pages_map)
-    print(f"\nmanifest entries: {len(manifest.get('entries', {}))}")
-    (idx_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if dry_run:
+        print("\n[dry-run] 未落盘：未写 wiki 页 / manifest.json / index.md。去掉 --dry-run 后重跑即生效。")
+    else:
+        # 回填 entries（含 unchanged），使未来增量可用
+        wiki_pages_map = build_wiki_pages_map(proj)
+        update_manifest(diff, manifest, wiki_pages_map)
+        print(f"\nmanifest entries: {len(manifest.get('entries', {}))}")
+        (idx_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
-    # ISSUE: index-md-auto —— 增量更新末尾自动重建 Wiki/index.md MOC，避免人工维护遗漏/漂移
-    try:
-        from build_index_md import build_wiki_index_md
-        build_wiki_index_md(proj)
-    except Exception as e:
-        print(f"[WARN] index.md 自动重建失败（不影响主流程）: {e}")
+        # ISSUE: index-md-auto —— 增量更新末尾自动重建 Wiki/index.md MOC，避免人工维护遗漏/漂移
+        try:
+            from build_index_md import build_wiki_index_md
+            build_wiki_index_md(proj)
+        except Exception as e:
+            print(f"[WARN] index.md 自动重建失败（不影响主流程）: {e}")
 
 
 def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path) -> int:
