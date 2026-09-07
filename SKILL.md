@@ -583,6 +583,7 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/audit_images.py <pro
 `query.py` 返回 `text`（段落）和 `images`（图片）两组命中，字段形状一致（score/title/path/evidence/sources/citation）。
 
 > **解析契约（强制）**：脚本解析 JSON **必须**用稳定接口，不要直接读顶层 `text`/`images` 键，也不要找 `results`/`hits`：
+> （import 前置：`obsidian_wiki` 包不在 venv 中，实体在 `<skill_dir>/scripts/obsidian_wiki/`。入口脚本靠 `sys.path[0]` 自动解析，无需任何设置；**外部代码 import 时**需 cwd=`<skill_dir>/scripts` 或 `PYTHONPATH=<skill_dir>/scripts`，否则 `ModuleNotFoundError`。）
 > ```python
 > from obsidian_wiki.query_result import load_hits
 > hits = load_hits("tmp/rf_out.json")   # 合并 text+images，每项带 kind 判别
