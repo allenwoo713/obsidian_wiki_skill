@@ -766,7 +766,7 @@ def result_to_json(result: HybridResult) -> dict:
             "title": it.title,
             "page_type": it.page_type,
             "score": round(rrf.get(it.page_id, 0.0), 6),
-            "snippet": it.text,
+            "text": it.text,
             "sources": it.sources,
             "evidence": [{
                 "chunk_id": hit.chunk_id, "channel": hit.channel, "rank": hit.rank,

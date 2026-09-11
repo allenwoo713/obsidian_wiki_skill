@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### Fixed — query.py JSON 输出契约：item 正文字段误名 `snippet`（与顶层列表 `text` 不一致）
+
+- **根因**：`result_to_json()` 的 `item_entry` 把 ContextItem 正文输出为 `"snippet": it.text`，而顶层列表键叫 `"text"`——同名异义。该值并非 snippet：snippet 模式下是证据 chunk 全文，full 模式下是整页正文。调用方按顶层命名直觉读 `payload["text"][0]["text"]` 得到 `KeyError`（用 `.get()` 则静默 `None`），极易误判为"正文缺失/召回失败"。仓库内零消费方读该字段名（tests/eval/scripts 均 grep 无命中），故为纯命名缺陷、非功能性 bug；`scripts/models.py` 的 `RetrievedPage.snippet` 属旧检索接口，与本输出无关。
+- **修复**：`item_entry` 字段改名 `"snippet"` → `"text"`，与顶层列表同名同义；无别名冗余（不重复序列化正文）。
+- **文档同步**：SKILL.md 补「长标准源页（20 万+ 字符）例外」——`--mode full` 按"整页头部"投递，长页目标小节（char 100k+）不在返回里，应保持默认并读 `evidence[].section_path` 定位小节；SKILL.md 新增「JSON 输出关键字段」速查（顶层 `text` 列表 / `item["text"]` 正文 / evidence 元数据 / `truncated`+`omitted_ranges`）；README 检索示例修正 `--mode full` 的适用边界注释。
+- **测试**：`tests/test_issue14_context_contract.py` 契约测试新增 `payload["text"][0]["text"] == item.text` 与 `"snippet" not in item` 断言；fails-before（`KeyError: 'text'`）/passes-after 已验证，相关 5 个测试文件 70 项全过。
+
 ### Fixed — `update_wiki.py` `--apply` 死开关：dry-run 从未实现
 
 - **根因**：`--apply` 的取值 `apply = args.apply` 在 `main()` 中**从未被读取**（`git log -S "if apply"` 全历史为空），全部写盘路径无条件执行 ⇒ 帮助文本声称的「默认仅 dry-run」实际会照常落盘。隔离沙箱实测：不带任何 flag 运行即产生 `Wiki/sources/<doc>.md`、`.index/manifest.json`、`Wiki/index.md` 三份文件。此为「未实现的意图 + 误导性帮助文本」，非回归。

@@ -364,9 +364,11 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/update_wiki.py <proj
 
 ```bash
 # 默认：把用户原始问题原样传入，Query Planner 自动做查询预处理（禁止调用前改写）
+# 注意：默认模式（snippet/section）投递的就是命中的 chunk/section 正文，大多数问题不需要 --mode full
 PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<用户原始问题>" --k 5 --json
 
-# 全文模式（问具体数值/流程/对比时用，必须 --out 落盘）
+# 全文模式：仅适合短页通读（整页投递）。长标准源页（20 万+ 字符，如 ISO/IEC 全文）用 full 只会投出
+# 页头头部（truncation_reason=full_page_token_limit），应保持默认并读 evidence[].section_path 定位小节
 PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_root> "<用户原始问题>" --mode full --k 5 --json --out <project_root>/tmp/rf_out.json
 ```
 
