@@ -73,6 +73,10 @@ def test_dual_channel_provenance_and_citations_survive_rendering():
     payload = result_to_json(HybridResult("q", bundle, SimpleNamespace(to_json=lambda: {}), [_candidate()], [item], []))
     assert {ev["channel"] for ev in payload["text"][0]["evidence"]} == {"sparse", "dense"}
     assert payload["text"][0]["sources"] == ["Raw/sources/a.docx"]
+    # JSON 契约：顶层列表叫 text，item 正文字段必须同名 text（此前误名 snippet，
+    # 调用方读 payload["text"][0]["text"] 会静默得到 None）。
+    assert payload["text"][0]["text"] == item.text
+    assert "snippet" not in payload["text"][0]
 
 
 def test_requested_scopes_use_repository_content_and_report_token_aware_fallback():

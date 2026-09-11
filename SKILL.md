@@ -235,6 +235,13 @@ PYTHONDONTWRITEBYTECODE=1 <venv_python> <skill_dir>/scripts/query.py <project_ro
 
 **决策原则：** snippet 能否支撑你给出完整、准确的答案？如果不确定，先用默认 snippet，发现不够再补 `--mode full`。
 
+> **⚠️ 长标准源页例外（20 万+ 字符，如 ISO/IEC/VW 全文页）：`--mode full` 反而失效**——full 按"整页头部"投递，超预算部分全部截断（`truncation_reason=full_page_token_limit`），目标小节（可能位于 char 100k+）根本不在返回里。此时应**保持默认**（snippet/section 模式投递命中的 chunk/section 正文），读完返回的正文与 `evidence[].section_path` 再决定是否回源文件 grep 精确小节。
+
+**JSON 输出关键字段（调用方必读，防踩坑）：**
+- 顶层列表叫 `text`（文本命中）与 `images`（图片命中）；**每个 item 的正文在 `item["text"]`**（同名，不是 `snippet`）；
+- `evidence[]` 只含元数据（chunk_id / channel / rank / raw_score / section_path）——`section_path` 精确到小节名，是判断"命中了哪一节"的最高价值信号；
+- 长页截断看 item 的 `truncated` / `truncation_reason` / `omitted_ranges`，不要把"正文只有页头"误判为"召回失败"。
+
 > 返回的 JSON 含完整 `query_plan`（original_query / intent / semantic_queries / lexical_terms / exact_terms / entities / context_mode / rewrite 来源 / 约束保留 / retry 原因）。用它判断实际检索路径，并用 `context_text` 合成答案。
 
 **证据与引用契约（issue #14/#15，强制）：** `context_text` 中每个条目都自带 page ID、Wiki 路径、frontmatter `sources`、Evidence IDs、scope 和正文；图谱条目还带完整 graph path 与所有 edge signals。普通命中会保留 sparse 与 dense 两路 evidence（正文可去重，证据来源不丢失）。当 token 预算无法容纳所选范围时，结果会明确给出 `truncated`、`truncation_reason` 和 omitted range，绝不静默按字符截断。
