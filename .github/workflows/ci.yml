@@ -41,6 +41,10 @@ jobs:
           python -c "from models import WikiPage, RetrievedPage, ManifestEntry; print('models import OK')"
           python -c "from parsers.utils import slugify, image_filename, attach_captions; print('parsers.utils import OK')"
 
+      # Issue #65: prove the freshness core module has no heavy dependencies.
+      - name: Issue #65 freshness core stdlib unit tests (no heavy deps)
+        run: python -S tests/test_wiki_freshness_unit.py
+
       - name: Verify .env not tracked
         run: |
           if git ls-files | grep -q '^\.env$'; then
@@ -157,6 +161,8 @@ jobs:
           tests/test_online_incremental_policy.py
           tests/test_online_incremental_cli.py
           tests/test_eval_workflow.py
+          tests/test_wiki_freshness_unit.py
+          tests/test_index_freshness_integration.py
           tests/test_query_result.py -q
 
       - name: Enforce package import contracts

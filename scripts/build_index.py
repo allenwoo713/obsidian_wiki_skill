@@ -64,11 +64,13 @@ from chunking import (chunk_page, CHUNK_SCHEMA_VERSION, EmbeddingTokenizer,
 from chunk_plan import (
     chunk_records_to_sparse,
     page_metadata_from_pages,
+    plan_pages_and_chunks,
     plan_sparse_chunks,
 )
 from lexical_tokenizer import fts_terms, extract_exact_terms, load_lexicon
 from vector_scoring import apply_vector_metric, normalize_vector_score
 from obsidian_wiki.application.index_build_service import CandidateQueryPolicy
+from obsidian_wiki.application.wiki_freshness import capture_wiki, decode_markdown
 
 
 def _compose_storage_services(
@@ -135,7 +137,8 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
                            build_mode: str = "snapshot",
                            build_mode_policy=None,
                            outer_lock_held: bool = False,
-                           progress_sink=None):
+                           progress_sink=None,
+                           wiki_snapshot: Optional[dict] = None):
     """Direct-script facade for the D-01/D-04 storage-contract build path.
 
     The public script remains the entry point while orchestration and storage are
@@ -186,15 +189,16 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
         project_root = Path(wiki_dir).parent
         resolved_lexicon = lexicon if lexicon is not None else load_lexicon(project_root)
 
-        def plan_provider(wiki_snapshot: Path):
-            import build_index as _self  # 模块级符号，供测试 monkeypatch plan_sparse_chunks
-            chunks = _self.plan_sparse_chunks(
-                Path(wiki_snapshot), project_root,
-                tokenizer=tokenizer, lexicon=resolved_lexicon,
+        def plan_provider(locked_wiki_dir: Path):
+            import build_index as _self  # 模块级符号，供测试 monkeypatch plan_pages_and_chunks
+            # #65：持锁后单次捕获快照；分块、manifest 元数据与发布 provenance
+            # 消费同一份捕获字节（三元组 PlanProvider，不再二次扫描）。
+            snap = _self.capture_wiki(Path(locked_wiki_dir), retain_bytes=True)
+            planned_pages, chunks = _self.plan_pages_and_chunks(
+                Path(locked_wiki_dir), project_root,
+                tokenizer=tokenizer, lexicon=resolved_lexicon, snapshot=snap,
             )
-            # manifest：每 canonical 源文件一逻辑页（全文件 SHA-256），与 chunks 同一快照。
-            pages = _self.scan_wiki(Path(wiki_snapshot), project_root)
-            return chunks, page_metadata_from_pages(pages)
+            return chunks, page_metadata_from_pages(planned_pages), snap.to_json()
 
     composed = _compose_storage_services(
         Path(index_dir), candidate_query_policy=candidate_query_policy,
@@ -204,7 +208,7 @@ def build_storage_contract(wiki_dir: Path, index_dir: Path, *, embed, sparse_chu
         page_metadata=page_metadata, image_metadata=image_metadata, ctx=ctx,
         plan_provider=plan_provider, build_mode=build_mode,
         build_mode_policy=build_mode_policy, outer_lock_held=outer_lock_held,
-        progress_sink=progress_sink)
+        progress_sink=progress_sink, wiki_snapshot=wiki_snapshot)
     # #37：pointer commit 之后执行 post-commit（可观察、可重试；失败保留 PREPARED）。
     post_commit_status, warnings = _run_post_commit(Path(index_dir), composed.journal, artifact)
     # #34：outcome 的 build_id/generation 必须来自 artifact（单一事实来源），
@@ -283,8 +287,13 @@ def _read_page_content(path: Path) -> str:
     return (match.group(2) if match else raw).strip()
 
 
-def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
-    raw = path.read_text(encoding="utf-8", errors="replace")
+def parse_wiki_page(path: Path, project_root: Path, *, raw_bytes: Optional[bytes] = None) -> Optional[WikiPage]:
+    # #65：单次读取——正文与内容哈希来自同一份原始字节。旧实现先 read_text 再
+    # read_bytes，两次读取之间发生编辑会把「旧正文 + 新哈希」一起发布，随后
+    # freshness 检查错误地通过。hash 始终锚定原始字节（不归一 CRLF），正文经
+    # decode_markdown 保留 read_text 的 universal-newline 语义。
+    data = path.read_bytes() if raw_bytes is None else raw_bytes
+    raw = decode_markdown(data)
     m = _FM_RE.match(raw)
     if not m:
         return None
@@ -292,11 +301,7 @@ def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
     import yaml
     fm = yaml.safe_load(fm_text) or {}
     links = [l.strip() for l in _LINK_RE.findall(body)]
-    import hashlib
-    # #39 (review)：page 身份哈希必须锚定磁盘原始字节，而非 read_text 归一化后的
-    # 文本（Windows 上 read_text 会把 CRLF 折成 LF，再 encode 会丢 \r，导致同一
-    # 文件产生与 sha256(read_bytes()) 不一致的指纹）。用原始字节保证可复现、跨平台。
-    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    sha = hashlib.sha256(data).hexdigest()
     sources = fm.get("sources", []) or []
     if isinstance(sources, str):
         sources = [sources]
@@ -315,14 +320,20 @@ def parse_wiki_page(path: Path, project_root: Path) -> Optional[WikiPage]:
     )
 
 
-def scan_wiki(wiki_dir: Path, project_root: Path) -> List[WikiPage]:
+def scan_wiki(wiki_dir: Path, project_root: Path, snapshot=None) -> List[WikiPage]:
+    """#65：可注入构建期捕获的 WikiSnapshot——分块、哈希与发布校验消费同一份字节。
+
+    ``snapshot`` 为 None 时按旧契约即时捕获（retain_bytes=True，保证 parse 与
+    hash 同源）；传入已有快照时不再读磁盘。
+    """
+    snap = snapshot if snapshot is not None else capture_wiki(wiki_dir, retain_bytes=True)
+    if set(snap.raw) != set(snap.hashes):
+        raise ValueError("canonical planning requires retained source bytes")
     pages = []
-    for md in sorted(wiki_dir.rglob("*.md")):
-        if ".graph" in md.parts:
-            continue
-        p = parse_wiki_page(md, project_root)
-        if p:
-            pages.append(p)
+    for relative, raw in sorted(snap.raw.items()):
+        page = parse_wiki_page(snap.root / relative, project_root, raw_bytes=raw)
+        if page:
+            pages.append(page)
     return pages
 
 
@@ -356,6 +367,11 @@ class WikiIndex:
         self._candidate_query_policy: CandidateQueryPolicy | None = None
         # #12 多模态：图片父文档回溯元数据（rel_path → meta），由 _load_image_meta 填充
         self._image_meta: Dict[str, dict] = {}
+        # #65 加载身份固定：本次 load() 只解析一次 ACTIVE_INDEX；manifest 与
+        # repository 绑定同一 generation，查询期新鲜度对比实际加载的 manifest，
+        # 不再「检查最新 pointer、检索另一代」。
+        self._loaded_manifest: Optional[dict] = None
+        self._loaded_lance_dir: Optional[Path] = None
 
     # ---- embedder ----
     def _get_embedder(self):
@@ -406,7 +422,8 @@ class WikiIndex:
         if self._repository is None:
             from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
 
-            lance_dir = self._resolve_active_lance_dir()
+            # #65：load() 已固定 generation 时直接复用，不再重新解析 pointer。
+            lance_dir = self._loaded_lance_dir or self._resolve_active_lance_dir()
             LanceDbIndexRepository.require_current_layout(lance_dir.parent / "manifest.json")
             self._repository = LanceDbIndexRepository(lance_dir)
         return self._repository
@@ -509,7 +526,10 @@ class WikiIndex:
             source_images = json.loads(source_manifest.read_text(encoding="utf-8")).get("images", [])
         except (OSError, json.JSONDecodeError):
             source_images = []
-        self.pages = scan_wiki(Path(wiki_dir), self._project_root)
+        # #65：已有锁内单次捕获 canonical 快照——pages、chunks 与发布 provenance
+        # 全部来自这一份捕获字节，杜绝「计划 A、发布 B」。
+        plan_snapshot = capture_wiki(Path(wiki_dir), retain_bytes=True)
+        self.pages = scan_wiki(Path(wiki_dir), self._project_root, snapshot=plan_snapshot)
         self.pages.extend(self._load_image_caption_pages(self.index_dir))
         self._page_by_id = {page_id_of(page.path): page for page in self.pages}
         tokenizer = EmbeddingTokenizer(getattr(embedder, "tokenizer", None))
@@ -571,6 +591,7 @@ class WikiIndex:
             build_mode_policy=build_mode_policy,
             outer_lock_held=True,
             progress_sink=progress_sink,
+            wiki_snapshot=plan_snapshot.to_json(),
         )
         published_manifest = json.loads(
             outcome.artifact.manifest_path.read_text(encoding="utf-8")
@@ -585,6 +606,9 @@ class WikiIndex:
         self._candidate_query_policy = candidate_query_policy
         # #21 review #3: single publication — service publishes once with
         # complete manifest (pages/images injected before publish_pointer).
+        # #65：构建成功后清除加载身份缓存；下一次显式 load() 才刷新 generation。
+        self._loaded_manifest = None
+        self._loaded_lance_dir = None
         self._repository = None
         self._lance_table = None
         return outcome
@@ -710,25 +734,27 @@ class WikiIndex:
                 "_load_image_caption_pages: 跳过 %d 条 rel_path 缺失的图片条目", skipped)
         return pages
 
-    def _load_image_meta(self):
+    def _load_image_meta(self, manifest: Optional[dict] = None):
         """#12 多模态：从 manifest images[] 加载图片父文档回溯元数据。
 
         每条记录按 rel_path 索引，含 source_doc/source_page/source_section/
         parent_page_id/nearby_text 等可选字段（由 parser 填充，缺失则回退标记）。
         查询期 assemble_context 据 get_image_meta() 回溯父文档/页码/附近正文。
+        #65：传入 ``manifest`` 时直接使用本次 load 固定的那份，不再独立 resolve。
         """
-        try:
-            manifest_file = self._resolve_active_manifest()
-        except Exception:
-            manifest_file = self.index_dir / "manifest.json"
-        if not manifest_file.exists():
-            self._image_meta = {}
-            return
-        try:
-            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            self._image_meta = {}
-            return
+        if manifest is None:
+            try:
+                manifest_file = self._resolve_active_manifest()
+            except Exception:
+                manifest_file = self.index_dir / "manifest.json"
+            if not manifest_file.exists():
+                self._image_meta = {}
+                return
+            try:
+                manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self._image_meta = {}
+                return
         meta: Dict[str, dict] = {}
         for img in manifest.get("images", []):
             rel = img.get("rel_path")
@@ -812,15 +838,19 @@ class WikiIndex:
 
     # ---- load ----
     def load(self):
-        manifest_file = self._resolve_active_manifest()
+        """#65：本次 load 只解析一次 ACTIVE_INDEX；manifest、image metadata 与
+        repository 绑定同一 generation（不能各自 resolve 造成混代）。"""
+        from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir
+        lance_dir = resolve_active_lance_dir(self.index_dir)
+        manifest_file = lance_dir.parent / "manifest.json"
         if not manifest_file.exists():
             raise RuntimeError("索引未找到，请先运行 build_index.py")
         from obsidian_wiki.infrastructure.lancedb_index_repository import LanceDbIndexRepository
         LanceDbIndexRepository.require_current_layout(manifest_file)
         self._project_root = Path(self.index_dir).parent
         self._lexicon = load_lexicon(self._project_root)
-        self._load_image_meta()  # #12 多模态：加载图片父文档回溯元数据
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        self._load_image_meta(manifest=manifest)  # #12 多模态：加载图片父文档回溯元数据
         # Phase 06：固定策略加载——eval candidate manifest 绑定 candidate 策略，
         # 生产 manifest 绑定批准策略；exact/auto 运行时路由已移除。
         self._vector_index_mode = (
@@ -851,9 +881,19 @@ class WikiIndex:
             {"eval_candidate_policy": self._candidate_query_policy}
             if self._candidate_query_policy is not None else {}
         )
-        self._repository = LanceDbIndexRepository(
-            self._resolve_active_lance_dir(), **repository_kwargs
-        )
+        self._repository = LanceDbIndexRepository(lance_dir, **repository_kwargs)
+        self._loaded_lance_dir = lance_dir
+        self._loaded_manifest = manifest
+
+    def get_loaded_manifest(self) -> dict:
+        """#65：返回本次 load 固定的 manifest（未 load 时显式加载一次）。
+
+        查询期新鲜度检查的对比对象必须是**实际加载的 generation** 的 provenance，
+        而不是最新 pointer——否则并发发布会造成「检查 A、检索 B」。
+        """
+        if self._loaded_manifest is None:
+            self.load()
+        return self._loaded_manifest
 
     # ---- search ----
     def search_fts(self, query: str, k: int = 20) -> List[ChunkHit]:

@@ -694,10 +694,10 @@ def test_frozen_runner_uses_the_prepared_source_and_keeps_the_full_public_query_
     monkeypatch.setattr(run_eval.WikiIndex, "build", record_public_build)
     real_scan_wiki = build_index.scan_wiki
 
-    def record_scan_chunk(wiki_dir, project_root):
+    def record_scan_chunk(wiki_dir, project_root, *args, **kwargs):
         assert Path(wiki_dir) != frozen_wiki
         scan_calls.append(Path(wiki_dir))
-        return real_scan_wiki(wiki_dir, project_root)
+        return real_scan_wiki(wiki_dir, project_root, *args, **kwargs)
 
     monkeypatch.setattr(build_index, "scan_wiki", record_scan_chunk)
     real_chunk_page = build_index.chunk_page

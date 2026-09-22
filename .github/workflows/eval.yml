@@ -109,6 +109,17 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider
           --basetemp=.review-tmp/chunking-real-model
           tests/test_index_chunking_eval_contract.py -q
+      # Issue #65: real-CLI freshness acceptance against the same local model.
+      - name: Run issue 65 real CLI freshness acceptance
+        run: python scripts/verify_issue65_e2e.py
+      - name: Upload issue 65 CLI evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue65-freshness-evidence
+          path: .review-tmp/issue65-e2e-results.json
+          if-no-files-found: error
+          retention-days: 30
       # #43 citation contract is part of publication acceptance: a bundle that
       # cites a noncanonical path or gives a community report a fake page citation
       # is not publishable evidence.

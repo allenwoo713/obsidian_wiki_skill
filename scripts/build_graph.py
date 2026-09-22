@@ -34,27 +34,42 @@ def _page_id(path: Path) -> str:
     return str(Path(path).resolve())
 
 
-def _load_pages(wiki_dir: Path) -> List[dict]:
+def _page_from_md(md: Path, raw_text: str = None) -> dict:
+    raw = md.read_text(encoding="utf-8", errors="replace") if raw_text is None else raw_text
+    m = _FM_RE.match(raw)
+    if not m:
+        return None
+    import yaml
+    fm = yaml.safe_load(m.group(1)) or {}
+    links = [l.strip() for l in re.findall(r"\[\[([^\]]+)\]\]", m.group(2))]
+    return {
+        "page_id": _page_id(md),
+        "path": str(md),
+        "title": fm.get("title", md.stem),
+        "type": fm.get("type", "concept"),
+        "sources": fm.get("sources", []) or [],
+        "links": links,
+    }
+
+
+def _load_pages(wiki_dir: Path, snapshot=None) -> List[dict]:
+    """#65：可从构建期捕获的 WikiSnapshot 解析（正文与 provenance 同源）；
+    无快照时保持旧的磁盘读取行为。parser 语义（frontmatter 接受规则）不变。"""
+    if snapshot is None:
+        pages = []
+        for md in sorted(wiki_dir.rglob("*.md")):
+            if ".graph" in md.parts:
+                continue
+            page = _page_from_md(md)
+            if page:
+                pages.append(page)
+        return pages
+    from obsidian_wiki.application.wiki_freshness import decode_markdown
     pages = []
-    for md in sorted(wiki_dir.rglob("*.md")):
-        if ".graph" in md.parts:
-            continue
-        raw = md.read_text(encoding="utf-8", errors="replace")
-        m = _FM_RE.match(raw)
-        if not m:
-            continue
-        import yaml
-        fm = yaml.safe_load(m.group(1)) or {}
-        links = [l.strip() for l in re.findall(r"\[\[([^\]]+)\]\]", m.group(2))]
-        pid = _page_id(md)
-        pages.append({
-            "page_id": pid,
-            "path": str(md),
-            "title": fm.get("title", md.stem),
-            "type": fm.get("type", "concept"),
-            "sources": fm.get("sources", []) or [],
-            "links": links,
-        })
+    for relative, raw in sorted(snapshot.raw.items()):
+        page = _page_from_md(snapshot.root / relative, raw_text=decode_markdown(raw))
+        if page:
+            pages.append(page)
     return pages
 
 
@@ -109,8 +124,8 @@ def _adamic_adar_candidates(G: nx.Graph) -> list[tuple[str, str]]:
     return sorted(candidates)
 
 
-def build_graph(wiki_dir: Path) -> nx.Graph:
-    pages = _load_pages(wiki_dir)
+def build_graph(wiki_dir: Path, snapshot=None) -> nx.Graph:
+    pages = _load_pages(wiki_dir, snapshot=snapshot)
     G = nx.Graph()
     title_to_pid: Dict[str, str] = {p["title"]: p["page_id"] for p in pages}
     slug_to_pid: Dict[str, str] = {Path(p["path"]).stem: p["page_id"] for p in pages}
@@ -250,26 +265,50 @@ def main():
     args = p.parse_args()
     proj = Path(args.project_root)
     wiki = proj / "Wiki"
-    G = build_graph(wiki)
-    stats = compute_4_signals(G)
-    comms = detect_communities(G)
-    graph_json = {
-        "nodes": [{"id": n, **{k: v for k, v in d.items() if k != "signals"}}
-                  for n, d in G.nodes(data=True)],
-        "edges": [{"source": u, "target": v,
-                   "weight": round(d.get("weight", 1.0), 4),
-                   "signal": sorted(d.get("signals", set()))[0] if d.get("signals") else "unknown",
-                   "signals": sorted(d.get("signals", set()))}
-                  for u, v, d in G.edges(data=True)],
-        "signals": stats,
-        "communities": comms,
-    }
+    from obsidian_wiki.application.build_lock import BuildLock, new_build_context
+    from obsidian_wiki.application.durable_filesystem import atomic_write_bytes
+    from obsidian_wiki.application.wiki_freshness import capture_wiki, require_current
+
+    # #65：构图与发布期间持锁（#21 单写者）；锁内单次捕获快照，图数据与
+    # provenance 在同一次原子 JSON 写入中发布，发布前校验 Wiki 未再变化。
+    ctx = new_build_context()
     idx = proj / ".index"
     idx.mkdir(exist_ok=True)
-    (idx / "graph.json").write_text(
-        json.dumps(graph_json, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
-    _mark_community_reports_stale(proj)
-    render_html(G, wiki / ".graph" / "index.html", title=_read_title(proj))
+    lock = BuildLock(idx, ctx=ctx)
+    lock.acquire()
+    try:
+        snap = capture_wiki(wiki, retain_bytes=True)
+        G = build_graph(wiki, snapshot=snap)
+        stats = compute_4_signals(G)
+        comms = detect_communities(G)
+        graph_json = {
+            "nodes": [{"id": n, **{k: v for k, v in d.items() if k != "signals"}}
+                      for n, d in G.nodes(data=True)],
+            "edges": [{"source": u, "target": v,
+                       "weight": round(d.get("weight", 1.0), 4),
+                       "signal": sorted(d.get("signals", set()))[0] if d.get("signals") else "unknown",
+                       "signals": sorted(d.get("signals", set()))}
+                      for u, v, d in G.edges(data=True)],
+            "signals": stats,
+            "communities": comms,
+            # #65：provenance 与图数据同一次原子写入；graph_build_id 独立生成，
+            # 不复制 index generation 冒充图谱版本。
+            "wiki_snapshot": snap.to_json(),
+            "graph_build_id": ctx.build_id,
+        }
+        require_current(wiki, graph_json["wiki_snapshot"])
+        atomic_write_bytes(
+            idx / "graph.json",
+            json.dumps(graph_json, ensure_ascii=False, indent=2, default=list).encode("utf-8"),
+        )
+    finally:
+        lock.release()
+    # 发布后的非关键步骤失败：图已发布，如实报告，不声称旧图仍在。
+    try:
+        _mark_community_reports_stale(proj)
+        render_html(G, wiki / ".graph" / "index.html", title=_read_title(proj))
+    except Exception as exc:
+        print(f"[WARN] 图已发布，但后续步骤失败: {exc}")
     print(f"图谱构建完成: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边, {len(comms)} 社区")
     print(f"信号分布: {stats}")
     print(f"HTML → {wiki / '.graph' / 'index.html'}")

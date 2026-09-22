@@ -266,7 +266,7 @@ def test_query_preserves_fresh_no_fit_budget_diagnostic(monkeypatch, tmp_path):
                 stale_reasons=("one or more community reports exceeded the effective token budget",),
             )
 
-    monkeypatch.setattr(query, "compose_global_report_service", lambda root: BudgetLimitedService())
+    monkeypatch.setattr(query, "compose_global_report_service", lambda root, **kwargs: BudgetLimitedService())
 
     class Wiki:
         index_dir = tmp_path / ".index"
@@ -289,7 +289,7 @@ def test_fresh_global_route_adapts_validated_reports_to_public_result(monkeypatc
 
     service = CommunityReportService(_ReportStore(), _Graph(_fresh_snapshot()), _NamedTokenCounter())
     service.build()
-    monkeypatch.setattr(query, "compose_global_report_service", lambda root: service)
+    monkeypatch.setattr(query, "compose_global_report_service", lambda root, **kwargs: service)
 
     class Wiki:
         index_dir = tmp_path / ".index"
@@ -334,7 +334,7 @@ def test_rejected_global_routing_requires_explicit_local_fallback(monkeypatch, t
             )
 
     calls = []
-    monkeypatch.setattr(query, "compose_global_report_service", lambda root: MissingService())
+    monkeypatch.setattr(query, "compose_global_report_service", lambda root, **kwargs: MissingService())
     candidate = SimpleNamespace(page_id="local", rrf_score=1.0)
     # issue #58: _retrieve_for_plan now returns a RetrievalPass dataclass.
     retrieval_pass = SimpleNamespace(

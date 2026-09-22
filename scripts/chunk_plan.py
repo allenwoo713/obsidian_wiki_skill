@@ -78,7 +78,7 @@ def _chunks_for_page(page: WikiPage, *, tokenizer, lexicon) -> List[SparseChunk]
 
 
 def plan_pages_and_chunks(
-    wiki_dir: Path, project_root: Path, *, tokenizer, lexicon
+    wiki_dir: Path, project_root: Path, *, tokenizer, lexicon, snapshot=None
 ) -> Tuple[Tuple[WikiPage, ...], Tuple[SparseChunk, ...]]:
     """Canonical pages + token-bounded plan from the *same* Wiki snapshot.
 
@@ -87,6 +87,10 @@ def plan_pages_and_chunks(
     semantics match ``WikiIndex`` exactly. Files without valid front matter are
     skipped, not treated as hard chunking errors.
 
+    ``snapshot`` (issue #65): an already-captured ``WikiSnapshot``; when given,
+    planning consumes the retained bytes instead of re-reading the disk, so the
+    chunk plan, page metadata and the published provenance come from one read.
+
     Returns ``(pages, chunks)`` where ``pages`` has one entry per canonical
     source file (each carries the full-file ``sha256``) and ``chunks`` is the
     flattened token-bounded sparse+dense plan for those pages.
@@ -94,14 +98,15 @@ def plan_pages_and_chunks(
     # Imported lazily to avoid a build_index <-> chunk_plan import cycle.
     from build_index import scan_wiki
 
-    pages = tuple(scan_wiki(Path(wiki_dir), Path(project_root)))
+    pages = tuple(scan_wiki(Path(wiki_dir), Path(project_root), snapshot=snapshot))
     chunks: List[SparseChunk] = []
     for page in pages:
         chunks.extend(_chunks_for_page(page, tokenizer=tokenizer, lexicon=lexicon))
     return pages, tuple(chunks)
 
 
-def plan_sparse_chunks(wiki_dir: Path, project_root: Path, *, tokenizer, lexicon) -> Tuple[SparseChunk, ...]:
+def plan_sparse_chunks(wiki_dir: Path, project_root: Path, *, tokenizer, lexicon,
+                       snapshot=None) -> Tuple[SparseChunk, ...]:
     """Token-bounded sparse+dense plan for every canonical page under ``wiki_dir``.
 
     ``tokenizer`` is ``callable[[str], int]`` (e.g. ``EmbeddingTokenizer(...).count``).
@@ -110,7 +115,7 @@ def plan_sparse_chunks(wiki_dir: Path, project_root: Path, *, tokenizer, lexicon
     are accepted/rejected through the canonical ``scan_wiki`` parser.
     """
     _pages, chunks = plan_pages_and_chunks(
-        wiki_dir, project_root, tokenizer=tokenizer, lexicon=lexicon
+        wiki_dir, project_root, tokenizer=tokenizer, lexicon=lexicon, snapshot=snapshot
     )
     return chunks
 

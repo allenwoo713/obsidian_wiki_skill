@@ -144,6 +144,38 @@ def build_wiki_pages_map(proj: Path) -> Dict[str, List[str]]:
     return mapping
 
 
+def _report_index_staleness(proj: Path) -> None:
+    """#65：全部实际写入结束后，用 verified active build manifest 对比当前 Wiki 树；
+    确认过期或无法证明一致时显式输出 rebuild 提示（不写任何 stale 标志/文件）。
+
+    注意：根目录 `.index/manifest.json` 是 raw/image 调度信息，**不是** active
+    build manifest；这里经 resolve_active_lance_dir 走与生产一致的验证/恢复路径。
+    """
+    try:
+        from obsidian_wiki.application.active_index_pointer import resolve_active_lance_dir
+        from obsidian_wiki.application.wiki_freshness import (
+            collect_reports, diagnostic_exit_code, read_graph_payload,
+        )
+        lance_dir = resolve_active_lance_dir(proj / ".index")
+        manifest = json.loads((lance_dir.parent / "manifest.json").read_bytes())
+        if not isinstance(manifest, dict):
+            raise ValueError("active build manifest is not an object")
+        graph_payload, graph_error = read_graph_payload(proj / ".index")
+        reports = collect_reports(proj / "Wiki", manifest, graph_payload, graph_error=graph_error)
+        code = diagnostic_exit_code(reports)
+    except Exception as exc:
+        # 无法证明一致 ≠ fresh：unknown 也提示重建，并附原因供诊断。
+        print("\nindex stale -> run: python scripts/build_index.py <project_root>")
+        print("graph stale -> run: python scripts/build_graph.py <project_root>")
+        print(f"[WARN] 索引新鲜度无法校验（active index unavailable: {type(exc).__name__}: {exc}）")
+        return
+    if code != 0:
+        print("\nindex stale -> run: python scripts/build_index.py <project_root>")
+    graph_status = reports.get("graph", {}).get("status")
+    if graph_status not in ("fresh", "not_built"):
+        print("graph stale -> run: python scripts/build_graph.py <project_root>")
+
+
 def main():
     # .env 已由顶部 `import _config` 统一加载（ISSUE-01）
     # ISSUE-06：argparse 替代手写 argv
@@ -244,6 +276,10 @@ def main():
             build_wiki_index_md(proj)
         except Exception as e:
             print(f"[WARN] index.md 自动重建失败（不影响主流程）: {e}")
+
+        # #65：全部实际写入结束后才做 staleness 对比与提示；--dry-run 不提示。
+        # 部分写入失败时同样检查已落盘的 Wiki，而非仅靠成功计数判断。
+        _report_index_staleness(proj)
 
 
 def heal_image_registration(project_root: Path, manifest: dict, assets_dir: Path) -> int:

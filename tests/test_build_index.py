@@ -101,7 +101,10 @@ def test_wikiindex_build_has_no_runtime_mode_selection(monkeypatch, tmp_path):
         def encode(self, texts, **kwargs):
             return [[1.0, 0.0] for _ in texts]
 
-    monkeypatch.setattr(build_module, "scan_wiki", lambda *_args: [])
+    # #65：_build 在 scan_wiki 之前先 capture_wiki（真实目录必须存在）；fake 须
+    # 接受新签名（含 snapshot kwarg）。
+    (tmp_path / "Wiki").mkdir()
+    monkeypatch.setattr(build_module, "scan_wiki", lambda *args, **kwargs: [])
     monkeypatch.setattr(build_module, "EmbeddingTokenizer", lambda _tokenizer: types.SimpleNamespace(count=len))
 
     def fake_build(*_args, **kwargs):

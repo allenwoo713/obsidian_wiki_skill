@@ -9,13 +9,18 @@ from obsidian_wiki.domain.community_report_models import GraphEdge, GraphSnapsho
 
 
 class FilesystemGraphSnapshot:
-    def __init__(self, project_root: Path):
+    def __init__(self, project_root: Path, *, pinned_payload: dict | None = None):
         self._project_root = Path(project_root)
+        # #65：请求内固定同一份图结构 payload；None 保持「从磁盘读取」的既有行为。
+        self._pinned_payload = pinned_payload
 
     def read(self) -> GraphSnapshotState:
         graph_path = self._project_root / ".index" / "graph.json"
         try:
-            payload = json.loads(graph_path.read_text(encoding="utf-8"))
+            if self._pinned_payload is not None:
+                payload = self._pinned_payload
+            else:
+                payload = json.loads(graph_path.read_text(encoding="utf-8"))
             nodes, edges, communities = payload["nodes"], payload["edges"], payload["communities"]
             if not isinstance(nodes, list) or not isinstance(edges, list) or not isinstance(communities, list):
                 raise ValueError("invalid graph snapshot")

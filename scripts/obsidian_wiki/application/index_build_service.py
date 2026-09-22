@@ -55,6 +55,7 @@ from obsidian_wiki.ports.post_commit import PostCommitJournal
 from obsidian_wiki.application.incremental_policy import compatibility_digest_from_manifest
 from obsidian_wiki.application.incremental_policy import select_auto_build_mode
 from obsidian_wiki.application.index_publication_service import IndexPublicationService
+from obsidian_wiki.application.wiki_freshness import attach_snapshot
 from obsidian_wiki.domain.incremental_models import BuildModePolicyLoad, BuildModeSelection
 from obsidian_wiki.ports.incremental_index import (
     IncrementalExecutorFactory,
@@ -66,8 +67,10 @@ Embedder = Callable[[Sequence[str]], Sequence[Sequence[float]]]
 BenchmarkObserver = Callable[[IndexStats], BenchmarkObservation]
 BuildProgressSink = Callable[[str], None]
 # #39 (review)：持锁后运行的分块回调，返回 (sparse_chunks, page_metadata)。
+# #65：返回第三元 wiki_snapshot（计划输入的 provenance JSON）；无 provenance 的
+# synthetic/legacy 计划返回 None，发布时写 wiki_snapshot: null（查询期视为 unknown）。
 PlanProvider = Callable[
-    [Path], tuple[Sequence["SparseChunk"], "list[dict] | None"]
+    [Path], tuple[Sequence["SparseChunk"], "list[dict] | None", "dict | None"]
 ]
 # #41→Phase 06：构建期 held-out 验证的最大 query 数。只决定
 # ``min(BENCHMARK_MAX_PROBES, actual_dense_rows)`` 的验证采样规模，
@@ -153,15 +156,21 @@ class IndexBuildService:
         build_mode_policy: BuildModePolicyLoad | None = None,
         outer_lock_held: bool = False,
         progress_sink: BuildProgressSink | None = None,
+        wiki_snapshot: dict | None = None,
     ) -> StorageArtifact:
         """#21/#34 单写者构建：最外层传入或创建一次 BuildContext，锁 metadata、
         build 目录、manifest、pointer 与返回 artifact 共用同一个 build_id；
         service 不再独立生成 ID。
 
         #39 (review)：``plan_provider`` 是持锁后运行的分块回调
-        ``(wiki_dir) -> (sparse_chunks, page_metadata)``。分块必须在 BUILD.lock
-        获取之后、针对已加锁的 Wiki 快照执行；调用方传入的 ``sparse_chunks``
-        （显式计划）仍然优先。"""
+        ``(wiki_dir) -> (sparse_chunks, page_metadata, wiki_snapshot)``。分块必须在
+        BUILD.lock 获取之后、针对已加锁的 Wiki 快照执行；调用方传入的 ``sparse_chunks``
+        （显式计划）仍然优先，其 provenance 由 ``wiki_snapshot`` 显式携带。
+
+        #65：``wiki_snapshot`` 是计划输入的 provenance JSON（``WikiSnapshot.to_json()``）；
+        无 canonical builder 证明的 synthetic/legacy 计划保持 None → 发布 manifest 写
+        ``wiki_snapshot: null``，查询期视为 unknown，绝不从当前磁盘补 hash 冒充认证。
+        """
         if build_mode not in {"snapshot", "incremental", "auto"}:
             raise ValueError("build_mode must be snapshot, incremental, or auto")
         ctx = ctx or new_build_context()
@@ -171,9 +180,11 @@ class IndexBuildService:
             lock.acquire()
         try:
             if sparse_chunks is None and plan_provider is not None:
-                sparse_chunks, planned_pages = plan_provider(wiki_dir)
+                sparse_chunks, planned_pages, planned_snapshot = plan_provider(wiki_dir)
                 if page_metadata is None and planned_pages is not None:
                     page_metadata = planned_pages
+                if wiki_snapshot is None:
+                    wiki_snapshot = planned_snapshot
             sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
             selection = self._select_build_mode(
                 index_dir, build_mode=build_mode, policy_load=build_mode_policy,
@@ -195,7 +206,7 @@ class IndexBuildService:
                             page_metadata=page_metadata, ctx=ctx,
                             mode_requested=build_mode, selection_reason=selection.reason,
                             build_mode_policy_sha256=selection.policy_sha256,
-                            outer_lock_held=True,
+                            outer_lock_held=True, wiki_snapshot=wiki_snapshot,
                         )
                         return result.artifact
                     except IncrementalFallbackEligible as exc:
@@ -223,7 +234,7 @@ class IndexBuildService:
                 plan_provider=None, mode_requested=build_mode,
                 selection_reason=selection.reason,
                 build_mode_policy_sha256=selection.policy_sha256,
-                progress_sink=progress_sink,
+                progress_sink=progress_sink, wiki_snapshot=wiki_snapshot,
             )
         finally:
             if lock is not None:
@@ -239,14 +250,17 @@ class IndexBuildService:
         selection_reason: str = "explicit_snapshot",
         build_mode_policy_sha256: str | None = None,
         progress_sink: BuildProgressSink | None = None,
+        wiki_snapshot: dict | None = None,
     ) -> StorageArtifact:
         build_started = time.perf_counter()
         # #39 (review)：持锁后再分块。显式 sparse_chunks > plan_provider > 回退整页 plan。
         if sparse_chunks is None and plan_provider is not None:
-            planned_chunks, planned_pages = plan_provider(wiki_dir)
+            planned_chunks, planned_pages, planned_snapshot = plan_provider(wiki_dir)
             sparse_chunks = planned_chunks
             if page_metadata is None and planned_pages is not None:
                 page_metadata = planned_pages
+            if wiki_snapshot is None:
+                wiki_snapshot = planned_snapshot
         sparse_chunks = tuple(sparse_chunks) if sparse_chunks is not None else self._sparse_plan(wiki_dir)
         if not sparse_chunks:
             raise RuntimeError("No canonical Wiki Markdown pages were available to index")
@@ -456,6 +470,10 @@ class IndexBuildService:
                     f"build 身份不一致：dir={build_dir.name} manifest="
                     f"{manifest.get('build_id')!r} ctx={ctx.build_id}"
                 )
+            # #65：发布边界附加 Wiki provenance——交叉校验 manifest 页哈希与计划输入，
+            # 并重新对比当前 Wiki；构建期间发生编辑抛 SnapshotError，旧 ACTIVE_INDEX
+            # 保持不变。此检查紧贴最终写入，不得放到 pointer commit 之后。
+            attach_snapshot(manifest, wiki_dir, wiki_snapshot)
             manifest_path = build_dir / "manifest.json"
             self._manifest_store.write(manifest_path, manifest)
             # #35：manifest 完整落盘后写入 validated 生命周期记录——manifest 写后、
