@@ -296,8 +296,10 @@ def read_graph_payload(index_dir: Path) -> tuple:
         return None, f"graph_unreadable:{type(exc).__name__}:{exc}"
     if not isinstance(payload, dict):
         return None, "graph_not_object"
+    # Only what the retrieval path consumes is required; communities is optional
+    # here (the community-report gate validates it via FilesystemGraphSnapshot).
     if any(not isinstance(payload.get(key), list)
-           for key in ("nodes", "edges", "communities")):
+           for key in ("nodes", "edges")):
         return None, "invalid_graph_structure"
     return payload, None
 

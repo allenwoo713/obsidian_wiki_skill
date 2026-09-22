@@ -665,8 +665,12 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
     root = Path(wiki_dir) if wiki_dir is not None else (
         Path(index_dir).parent / "Wiki" if index_dir is not None else None)
     manifest = getattr(wi, "get_loaded_manifest", lambda: {})()
+    # graph.json 发现路径与旧 _retrieve_for_plan 契约一致：优先 index_dir，
+    # 无 index_dir 的调用方（测试 double / 自定义 index）回退 wiki_dir 推导。
+    graph_dir = Path(index_dir) if index_dir is not None else (
+        Path(wiki_dir).parent / ".index" if wiki_dir is not None else None)
     graph_payload, graph_error = (
-        read_graph_payload(Path(index_dir)) if index_dir is not None else (None, None)
+        read_graph_payload(graph_dir) if graph_dir is not None else (None, None)
     )
     if root is not None:
         before = collect_reports(root, manifest, graph_payload, graph_error=graph_error)
