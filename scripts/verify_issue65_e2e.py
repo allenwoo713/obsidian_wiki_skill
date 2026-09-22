@@ -31,9 +31,14 @@ def main():
         wiki.mkdir()
         (root / "Raw" / "sources").mkdir(parents=True)
         for n in range(24):
+            # Heterogeneous per-page vocabulary: a single shared template makes
+            # every page vector-identical (0.347 cluster), so the double-channel
+            # needle page can be pushed out of top-k by same-score siblings.
+            words = ["antenna", "beamwidth", "mounting", "alignment",
+                     "thermal", "connector", "firmware", "calibration"]
             body = "\n".join(
-                f"## Topic {section}\nDocument {n} engineering calibration protocol "
-                f"range {n + section} procedure. " * 8
+                f"## Topic {section}\n{words[(n + section) % len(words)]} assembly "
+                f"document {n} range {n + section} torque value {section * n}. " * 8
                 for section in range(8)
             )
             (wiki / f"page-{n:02d}.md").write_text(
@@ -45,7 +50,7 @@ def main():
         def run(script, extra=(), expected=0):
             command = [args.python, str(repo / "scripts" / script), str(root), *map(str, extra)]
             p = subprocess.run(command, cwd=repo, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=args.timeout)
+                               encoding="utf-8", errors="strict", timeout=args.timeout)
             if p.returncode != expected:
                 raise AssertionError(json.dumps({
                     "command": command, "expected": expected, "actual": p.returncode,
@@ -75,8 +80,13 @@ def main():
         assert check(0)["components"]["index"]["status"] == "fresh"
         assert query(["--strict-freshness"])["index_freshness"]["status"] == "fresh"
 
+        # Three needle sections: page_ranking_score rewards multi-fragment
+        # corroboration (bounded 5 ranks/channel), so a single-chunk page can be
+        # outranked by long same-template siblings on the vector channel.
         target.write_text(target.read_text(encoding="utf-8") +
-                          "\n## Issue65NewSection\nneedleissue65updated new content.\n",
+                          "\n## Issue65NewSection\nneedleissue65updated new content.\n"
+                          "\n## Issue65SecondSection\nneedleissue65updated follow-up detail.\n"
+                          "\n## Issue65ThirdSection\nneedleissue65updated verification note.\n",
                           encoding="utf-8")
         state = check(1)["components"]
         assert state["index"]["status"] == state["graph"]["status"] == "stale"
