@@ -19,6 +19,7 @@ from obsidian_wiki.application.active_index_pointer import (
 from obsidian_wiki.application.build_lock import BuildLock, new_build_context
 from obsidian_wiki.application.durable_filesystem import CommitUncertainError
 from obsidian_wiki.application.index_publication_service import IndexPublicationService
+from obsidian_wiki.application.wiki_freshness import attach_snapshot
 from obsidian_wiki.domain.incremental_models import (
     BuildModeContractDriftCode, BuildTelemetry, BuildTiming, CoverageObservation, IncrementalBuildResult,
     IncrementalJournalRecord, IncrementalJournalState, MutationResult,
@@ -326,13 +327,17 @@ class IncrementalIndexService:
                      ctx: BuildContext, mode_requested: str = "incremental",
                      selection_reason: str = "explicit_incremental",
                      build_mode_policy_sha256: str | None = None,
-                     outer_lock_held: bool = False) -> IncrementalBuildResult:
+                     outer_lock_held: bool = False,
+                     wiki_snapshot: dict | None = None) -> IncrementalBuildResult:
         """Build an unpublished incremental candidate for the caller's request.
 
         The public dispatcher owns the request-scoped context and outer writer
         boundary; direct callers retain the historical lock acquisition.
+
+        #65：``wiki_snapshot`` 绑定计划输入 provenance；journal 的 plan digest 覆盖
+        metadata/provenance（frontmatter sources/aliases 变化不改变 chunk rows 也能
+        被检测），并在 manifest 写入前经 ``attach_snapshot`` 发布前校验。
         """
-        del wiki_dir  # Canonical planning occurs under the caller's existing writer boundary.
         build_started = time.perf_counter()
         lock = None
         if not outer_lock_held:
@@ -357,7 +362,14 @@ class IncrementalIndexService:
             pointer_payload = (index_dir / "ACTIVE_INDEX").read_bytes()
             pointer_digest = self._digest(pointer_payload)
             source_build_id = str(json.loads(pointer_payload.decode("utf-8"))["build_id"])
-            plan_digest = self._plan_digest(lexical, dense)
+            # #65：journal 指纹从「仅 chunk rows」扩展为 chunks + page metadata +
+            # wiki_snapshot——frontmatter sources/aliases/成员集合变化不改变 lexical/
+            # dense rows 时同样使旧 pending 证据失配（按既有规则拒绝恢复，snapshot required）。
+            plan_digest = self._digest({
+                "chunks_sha256": self._plan_digest(lexical, dense),
+                "page_metadata": page_metadata,
+                "wiki_snapshot": wiki_snapshot,
+            })
             config_digest = self._digest(source_manifest)
             policy_digest = build_mode_policy_sha256 or self._digest(source_manifest["ann_policy"])
             journal = self._journal_factory(index_dir)
@@ -520,6 +532,9 @@ class IncrementalIndexService:
                         build_mode_policy_sha256=build_mode_policy_sha256,
                     )
                     manifest = self._publication_service.construct_manifest(**manifest_kwargs, build_telemetry=telemetry)
+                    # #65：发布边界附加 Wiki provenance（同 snapshot 路径）；构建期间
+                    # Wiki 变更抛 SnapshotError → journal abort，旧 ACTIVE_INDEX 不变。
+                    attach_snapshot(manifest, wiki_dir, wiki_snapshot)
                     manifest_path = build_dir / "manifest.json"
                     self._manifest_store.write(manifest_path, manifest)
                     record_validated(build_dir, generation=generation, build_id=build_id,

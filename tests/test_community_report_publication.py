@@ -143,7 +143,7 @@ def test_successful_producers_invalidate_only_after_publication(tmp_path, monkey
     assert (tmp_path / ".index" / "graph.json").is_file()
 
     graph_state = manifest_path.read_bytes()
-    monkeypatch.setattr(build_graph, "build_graph", lambda _wiki: (_ for _ in ()).throw(RuntimeError("graph failed")))
+    monkeypatch.setattr(build_graph, "build_graph", lambda _wiki, **_kwargs: (_ for _ in ()).throw(RuntimeError("graph failed")))
     with pytest.raises(RuntimeError, match="graph failed"):
         build_graph.main()
     assert manifest_path.read_bytes() == graph_state

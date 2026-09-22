@@ -58,6 +58,7 @@ class IncrementalBuildExecutor(Protocol):
         selection_reason: str = "explicit_incremental",
         build_mode_policy_sha256: str | None = None,
         outer_lock_held: bool = False,
+        wiki_snapshot: dict | None = None,
     ) -> IncrementalBuildResult: ...
 
 

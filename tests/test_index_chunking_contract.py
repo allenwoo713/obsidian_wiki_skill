@@ -107,14 +107,14 @@ def test_storage_contract_honors_token_bounded_dense_chunks(tmp_path: Path) -> N
 
 
 def test_production_chunk_planning_runs_after_build_lock_acquire(tmp_path: Path, monkeypatch) -> None:
-    """#39/#34: the canonical Wiki snapshot must be planned only while BUILD.lock is held."""
+    """#39/#34/#65: the canonical Wiki snapshot must be planned only while BUILD.lock is held."""
     import build_index as build_module
     import obsidian_wiki.application.index_build_service as service_module
 
     wiki = tmp_path / "Wiki"
     _write_big_page(wiki, "# Locked plan\n" + ("stable content line " * 300))
     events: list[str] = []
-    real_plan = build_module.plan_sparse_chunks
+    real_plan = build_module.plan_pages_and_chunks
     real_acquire = service_module.BuildLock.acquire
 
     def _plan(*args, **kwargs):
@@ -126,7 +126,7 @@ def test_production_chunk_planning_runs_after_build_lock_acquire(tmp_path: Path,
         events.append("lock_acquired")
         return result
 
-    monkeypatch.setattr(build_module, "plan_sparse_chunks", _plan)
+    monkeypatch.setattr(build_module, "plan_pages_and_chunks", _plan)
     monkeypatch.setattr(service_module.BuildLock, "acquire", _acquire)
 
     build_storage_contract(

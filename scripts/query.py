@@ -42,6 +42,14 @@ from query_plan_models import (
     QueryPlan, PlannerContext, RetrievalFeedback, QueryIntent,
 )
 from obsidian_wiki.application.community_report_service import CommunityReportService
+from obsidian_wiki.application.wiki_freshness import (
+    FreshnessError,
+    GuardedContextRepository,
+    collect_reports,
+    diagnostic_exit_code,
+    enforce_freshness,
+    read_graph_payload,
+)
 from obsidian_wiki.domain.community_report_models import (
     CommunityReportStatus,
     GlobalRetrievalOutcome,
@@ -117,6 +125,8 @@ class HybridResult:
     confidence_warning: Optional[str] = None
     image_candidates: List[PageCandidate] = field(default_factory=list)
     retrieval_diagnostics: Dict[str, object] = field(default_factory=dict)
+    # #65：本次请求的索引/图谱新鲜度诊断（before/after/full_page 三段报告）。
+    index_freshness: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -299,21 +309,29 @@ def _catalog_from_index(wi, context: PlannerContext) -> InMemoryEntityCatalog:
     return InMemoryEntityCatalog(entries)
 
 
+# #65：区分「参数未提供（兼容旧调用，读磁盘）」与「明确 None（本次请求无可用图，
+# 禁止偷偷再从磁盘读取）」。
+_MISSING_GRAPH = object()
+
+
 def graph_expand(wi, seed_page_ids: List[str], wiki_dir: Path, k: int = 10,
-                 hop: int = 1) -> List[PageCandidate]:
+                 hop: int = 1, graph_payload=_MISSING_GRAPH) -> List[PageCandidate]:
     """图谱 1-hop 扩展（issue #5）：从 seed page_id 出发找邻居。
 
     节点用 page_id（规范化绝对路径）精确匹配；默认 1-hop。图谱结果作为独立通道
     返回 PageCandidate（带 graph_paths），由上层合并，不进主 RRF，避免噪声挤占 top。
+    #65：``graph_payload`` 传入请求内固定的图数据；未提供时保持旧磁盘读取行为。
     """
-    idx_file = wiki_dir.parent / ".index" / "graph.json"
-    if not idx_file.exists():
-        return []
-    try:
-        data = json.loads(idx_file.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("graph_expand: graph.json 解析失败: %s", e)
-        return []
+    if graph_payload is _MISSING_GRAPH:
+        idx_file = wiki_dir.parent / ".index" / "graph.json"
+        if not idx_file.exists():
+            return []
+        try:
+            graph_payload = json.loads(idx_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("graph_expand: graph.json 解析失败: %s", e)
+            return []
+    data = graph_payload
     nodes = {n["id"]: n for n in data.get("nodes", [])}
     edges = data.get("edges", [])
     neighbors: Dict[str, List[tuple]] = {}
@@ -431,8 +449,13 @@ def _merge_graph_candidates(direct_candidates: List[PageCandidate],
 
 
 def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path],
-                       *, enable_graph: bool = True) -> RetrievalPass:
-    """One complete retrieval/graph-validation pass, reusable for retries."""
+                       *, enable_graph: bool = True,
+                       graph_payload=_MISSING_GRAPH) -> RetrievalPass:
+    """One complete retrieval/graph-validation pass, reusable for retries.
+
+    #65：``graph_payload`` 为请求内固定的图数据（None=本次无可用图）；仅未提供时
+    才回退到旧的磁盘读取，保证一次查询内不会混用两份图。
+    """
     fts_hits = wi.search_fts_terms(
         plan.lexical_terms, plan.exact_terms, k=20
     )
@@ -471,10 +494,17 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path],
         diagnostics["image_outcome"] = "image_not_fused"
 
     graph_candidates: List[PageCandidate] = []
-    if enable_graph and wiki_dir:
+    if graph_payload is _MISSING_GRAPH and enable_graph and wiki_dir:
+        # Legacy callers only: read the graph once from disk, then reuse it below.
         try:
             graph_file = wiki_dir.parent / ".index" / "graph.json"
-            graph_data = json.loads(graph_file.read_text(encoding="utf-8"))
+            graph_payload = json.loads(graph_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("图谱扩展/验证失败: %s", exc)
+            graph_payload = None
+    if enable_graph and wiki_dir and graph_payload is not None:
+        try:
+            graph_data = graph_payload
 
             # Preserve the existing graph contract: expansion may use up to five
             # direct text seeds even when output k is smaller. Images are not
@@ -488,7 +518,7 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path],
             seeds = list(dict.fromkeys(direct_seeds + entity_seeds))
             if seeds:
                 expanded = graph_expand(
-                    wi, seeds, wiki_dir, k=10, hop=1
+                    wi, seeds, wiki_dir, k=10, hop=1, graph_payload=graph_payload
                 )
                 graph_candidates = _validate_graph_candidates(
                     wi, expanded, plan
@@ -521,12 +551,16 @@ def _retrieve_for_plan(wi, plan: QueryPlan, k: int, wiki_dir: Optional[Path],
     )
 
 
-def compose_global_report_service(project_root: Path) -> CommunityReportService:
+def compose_global_report_service(project_root: Path, *,
+                                  graph_payload: Optional[dict] = None) -> CommunityReportService:
     """Compose query-time report policy from the same configured local artifact.
 
     The service validates this counter identity against the active builder
     manifest before it selects any report, so report text never crosses the
     query boundary with mismatched tokenizer evidence.
+
+    #65：``graph_payload`` 提供时，图结构读取请求内固定的同一份 payload
+    （页面内容哈希校验保持原样），Global Search 不再与检索路径各读各的图。
     """
     from build_community_reports import DEFAULT_TOKENIZER_DIR
 
@@ -534,7 +568,7 @@ def compose_global_report_service(project_root: Path) -> CommunityReportService:
     tokenizer_dir = Path(os.environ.get("WIKI_EMBEDDER_LOCAL_PATH") or DEFAULT_TOKENIZER_DIR)
     return CommunityReportService(
         FilesystemCommunityReportStore(root / ".index"),
-        FilesystemGraphSnapshot(root),
+        FilesystemGraphSnapshot(root, pinned_payload=graph_payload),
         LocalReportTokenCounter(tokenizer_dir),
     )
 
@@ -573,10 +607,13 @@ def _report_diagnostic(plan: QueryPlan, outcome: GlobalRetrievalOutcome, max_tok
     )
 
 
-def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int) -> HybridResult:
+def _global_retrieve(wi, plan: QueryPlan, k: int, max_tokens: int,
+                     *, graph_payload: Optional[dict] = None) -> HybridResult:
     """Run the typed report gate exactly once, before any local retrieval decision."""
     try:
-        service = compose_global_report_service(Path(wi.index_dir).parent)
+        service = compose_global_report_service(
+            Path(wi.index_dir).parent, graph_payload=graph_payload,
+        )
         outcome = service.retrieve(query_terms=_global_terms(plan), k=k, max_tokens=max_tokens)
     except (TokenCounterUnavailable, OSError, ValueError):
         outcome = GlobalRetrievalOutcome(
@@ -600,14 +637,45 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
                   mode_override: Optional[str] = None,
                   hard_max_tokens: Optional[int] = None,
                   allow_local_fallback: bool = False,
-                  enable_graph: bool = True) -> HybridResult:
-    """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。"""
+                  enable_graph: bool = True,
+                  freshness_policy: str = "warn") -> HybridResult:
+    """``max_tokens`` 是**基础预算**；最终上限见 bundle.effective_budget_tokens。
+
+    #65 新鲜度契约（``freshness_policy``，与 ``--strict-freshness``/``--allow-stale`` 对应）：
+
+    - ``warn``（默认）：发现 stale/unknown 继续检索，但绝不静默——stderr 显著警告，
+      结果携带 ``index_freshness`` 诊断；检索成功保持原退出码。
+    - ``strict``：拒绝在未验证证据上回答——planner 之前发现 index stale/unknown 直接
+      抛 ``FreshnessError``（stale→1，unknown→2）；查询结束前再次校验（含全文读取）。
+    - ``allow``：显式承认使用旧缓存——仍扫描、仍报告真实状态，``acknowledged=true``；
+      不绕过 pointer/layout 校验与 community-report gate。
+
+    全程固定同一 manifest（``get_loaded_manifest``）、同一 graph payload 与同一
+    全文读取仓库（``GuardedContextRepository``），杜绝「检查 A、检索 B」。
+    """
     ctx = context or PlannerContext()
     # The planner stays free of index implementations; query.py injects the
     # catalog only when the caller did not supply a custom catalog.
     if isinstance(getattr(planner, "entity_catalog", None), InMemoryEntityCatalog) \
             and not getattr(planner.entity_catalog, "_entries", ()):
         planner.entity_catalog = _catalog_from_index(wi, ctx)
+
+    # ---- #65 查询期新鲜度：planner 之前先固定身份并检查 index 组件 ----
+    index_dir = getattr(wi, "index_dir", None)
+    root = Path(wiki_dir) if wiki_dir is not None else (
+        Path(index_dir).parent / "Wiki" if index_dir is not None else None)
+    manifest = getattr(wi, "get_loaded_manifest", lambda: {})()
+    graph_payload, graph_error = (
+        read_graph_payload(Path(index_dir)) if index_dir is not None else (None, None)
+    )
+    if root is not None:
+        before = collect_reports(root, manifest, graph_payload, graph_error=graph_error)
+    else:
+        from obsidian_wiki.application.wiki_freshness import unknown as _unknown
+        before = {"index": _unknown("wiki_root_unavailable")}
+    enforce_freshness({"index": before["index"]}, freshness_policy)
+    context_repository = GuardedContextRepository(wi, manifest, root)
+
     plan = planner.plan(original_query, ctx)
     if intent_override not in (None, "auto"):
         from dataclasses import replace
@@ -618,22 +686,52 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         logger.info("rewrite_override=%s (effective config: planner.config['rewrite']=%s)",
                     rewrite_override, planner.config["rewrite"])
 
+    graph_used = enable_graph or plan.intent == QueryIntent.GLOBAL.value
+    if not graph_used:
+        before.pop("graph", None)
+    enforce_freshness(before, freshness_policy)
+
+    def finish(result: HybridResult) -> HybridResult:
+        after = collect_reports(
+            root, manifest, graph_payload, graph_error=graph_error,
+            include_graph=graph_used,
+        ) if root is not None else {"index": before["index"]}
+        checks = {f"before:{key}": value for key, value in before.items()}
+        checks.update({f"after:{key}": value for key, value in after.items()})
+        checks.update({f"full_page:{key}": value for key, value in context_repository.reports.items()})
+        code = diagnostic_exit_code(checks)
+        result.index_freshness = {
+            "status": {0: "fresh", 1: "stale", 2: "unknown"}[code],
+            "policy": freshness_policy,
+            "acknowledged": freshness_policy == "allow",
+            "before": before, "after": after,
+            "full_page_reads": context_repository.reports,
+            "scope": "wiki_markdown_only",
+        }
+        enforce_freshness(checks, freshness_policy)
+        if code:
+            logger.warning("INDEX_FRESHNESS_%s: %s",
+                           result.index_freshness["status"].upper(),
+                           json.dumps(result.index_freshness, ensure_ascii=False))
+        return result
+
     # Global reports are a distinct evidence contract.  A rejected report gate
     # must return its diagnostic before any local retrieval can run.
     if plan.intent == QueryIntent.GLOBAL.value:
         _, g_mult, _, g_eff = resolve_budget(plan.context_mode, max_tokens,
                                              mode_override, hard_max_tokens)
-        gr = _global_retrieve(wi, plan, k, g_eff)
+        gr = _global_retrieve(wi, plan, k, g_eff, graph_payload=graph_payload)
         gr.bundle.apply_budget(base_tokens=max_tokens, multiplier=g_mult,
                                effective_tokens=g_eff, hard_max_tokens=hard_max_tokens,
                                policy=BUDGET_POLICY)
         if gr.status == CommunityReportStatus.FRESH.value:
-            return gr
+            return finish(gr)
         if not allow_local_fallback:
-            return gr
+            return finish(gr)
 
     retrieval = _retrieve_for_plan(
-        wi, plan, k, wiki_dir, enable_graph=enable_graph
+        wi, plan, k, wiki_dir, enable_graph=enable_graph,
+        graph_payload=graph_payload,
     )
 
     # 6) 低召回重试（最多 1 次，issue #6）；图片命中本身即是证据，
@@ -655,7 +753,8 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         plan2 = planner.plan_retry(plan, feedback, ctx)
         if plan2 is not None:
             retrieval = _retrieve_for_plan(
-                wi, plan2, k, wiki_dir, enable_graph=enable_graph
+                wi, plan2, k, wiki_dir, enable_graph=enable_graph,
+                graph_payload=graph_payload,
             )
             plan = plan2
 
@@ -666,17 +765,19 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
     # rightmost-"Wiki" guess (issue #43). Fall back to the index sibling only
     # when the caller supplied no wiki_dir.
     effective_wiki_dir = wiki_dir
-    if effective_wiki_dir is None and getattr(wi, "index_dir", None) is not None:
-        effective_wiki_dir = Path(wi.index_dir).parent / "Wiki"
+    if effective_wiki_dir is None and index_dir is not None:
+        effective_wiki_dir = Path(index_dir).parent / "Wiki"
 
     # Images are context candidates but not text page-ranking candidates.
     context_candidates = [
         *retrieval.merged_candidates,
         *retrieval.image_candidates,
     ]
+    # #65：全文读取经 GuardedContextRepository——hash 与正文解码来自同一份字节，
+    # 查询过程中的编辑不会以「旧 chunk + 新正文」逃过末尾扫描。
     bundle = assemble_context(
         context_candidates,
-        repository=wi,
+        repository=context_repository,
         mode=mode,
         scope=("full_page" if mode == "full" else plan.context_mode),
         max_tokens=eff_tokens,
@@ -715,12 +816,24 @@ def hybrid_search(wi, original_query: str, planner: DefaultQueryPlanner,
         result.confidence_warning = (
             "Degraded local evidence only: community reports were rejected; rebuild before relying on Global Search."
         )
-    return result
+    return finish(result)
 
 
 def format_for_agent(result: HybridResult) -> str:
     """markdown 渲染（替代旧 format_for_agent）。"""
     rendered = render_context_markdown(result.bundle)
+    # #65：非 fresh 时在 Markdown 顶部给出明确警告（JSON 侧见 index_freshness）。
+    freshness = getattr(result, "index_freshness", None) or {}
+    if freshness.get("status") == "stale":
+        rendered = (
+            "Warning: 索引内容已过期（wiki 自上次构建后发生变化）；"
+            "以下证据可能不反映当前 Wiki。请运行 build_index.py / build_graph.py 重建。\n\n" + rendered
+        )
+    elif freshness.get("status") == "unknown":
+        rendered = (
+            "Warning: 无法证明索引与当前 Wiki 一致（缺少 provenance 或校验失败）；"
+            "以下证据未经新鲜度验证。请诊断并重建索引。\n\n" + rendered
+        )
     if result.status and result.status != CommunityReportStatus.FRESH.value:
         status_messages = {
             CommunityReportStatus.MISSING.value: "全局报告尚未构建。",
@@ -804,6 +917,9 @@ def result_to_json(result: HybridResult) -> dict:
         "images": [item_entry(it) for it in result.image_items],
         "omitted": result.bundle.omitted_items,
         "retrieval_diagnostics": result.retrieval_diagnostics,
+        # #65：查询期新鲜度诊断；status ∈ fresh/stale/unknown（not_built 的可选图谱
+        # 不阻塞，聚合到 fresh 退出码），policy ∈ warn/strict/allow。
+        "index_freshness": result.index_freshness,
     }
 
 
@@ -832,6 +948,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-local-fallback", action="store_true",
                    help="仅当 Global Search 报告被拒绝时，允许返回降级的本地证据；"
                         "该结果不是 Global Search 结论，可能不完整，仍应先重建报告")
+    # #65：新鲜度策略。两个显式 flag 互斥；默认 warn（继续检索但显著告警）。
+    freshness_group = p.add_mutually_exclusive_group()
+    freshness_group.add_argument("--strict-freshness", action="store_true",
+                                 help="严格模式：索引/图谱过期或无法验证一致时拒绝返回证据"
+                                      "（stale 退出码 1，unknown 退出码 2）")
+    freshness_group.add_argument("--allow-stale", action="store_true",
+                                 help="显式承认使用旧缓存：仍扫描并报告真实状态"
+                                      "（acknowledged=true），不绕过其他校验")
     p.add_argument("--conversation-context", default=None,
                    help="多轮对话的最小必要上下文（只消解指代，不替代原始问题）")
     p.add_argument("--conversation-context-file", default=None,
@@ -886,18 +1010,42 @@ def main():
     planner = DefaultQueryPlanner(project_root=proj, config=planner_config or None)
     ctx = _load_context(args)
 
-    result = hybrid_search(
-        wi, args.query, planner, ctx,
-        k=args.k, max_tokens=args.max_tokens,
-        hard_max_tokens=args.hard_max_tokens,
-        wiki_dir=proj / "Wiki",
-        intent_override=args.intent,
-        rewrite_override=args.rewrite,
-        mode_override=args.mode,
-        allow_local_fallback=args.allow_local_fallback,
-    )
-    payload = (json.dumps(result_to_json(result), ensure_ascii=False, indent=2)
-               if args.as_json else format_for_agent(result))
+    # #65：policy 解析；FreshnessError 的 JSON 也必须写入 --out（程序化调用方靠
+    # --out 消费，异常路径同样要有结构化输出），然后统一走既有写出逻辑。
+    policy = ("strict" if args.strict_freshness
+              else "allow" if args.allow_stale else "warn")
+    try:
+        result = hybrid_search(
+            wi, args.query, planner, ctx,
+            k=args.k, max_tokens=args.max_tokens,
+            hard_max_tokens=args.hard_max_tokens,
+            wiki_dir=proj / "Wiki",
+            intent_override=args.intent,
+            rewrite_override=args.rewrite,
+            mode_override=args.mode,
+            allow_local_fallback=args.allow_local_fallback,
+            freshness_policy=policy,
+        )
+        output = result_to_json(result)
+        markdown = format_for_agent(result)
+        exit_code = _exit_code_for_result(result)
+    except FreshnessError as exc:
+        state = "stale" if exc.exit_code == 1 else "unknown"
+        output = {
+            "query": args.query, "query_plan": None,
+            "status": "index_" + state,
+            "text": [], "images": [],
+            "index_freshness": {
+                "status": state, "policy": policy, "acknowledged": False,
+                "components": exc.reports,
+            },
+        }
+        markdown = "索引新鲜度检查未通过；未返回检索证据。\n" + json.dumps(
+            output["index_freshness"], ensure_ascii=False, indent=2)
+        logger.warning("INDEX_FRESHNESS_%s", state.upper())
+        exit_code = exc.exit_code
+    payload = (json.dumps(output, ensure_ascii=False, indent=2)
+               if args.as_json else markdown)
     if args.out_path:
         op = Path(args.out_path)
         op.parent.mkdir(parents=True, exist_ok=True)
@@ -905,7 +1053,7 @@ def main():
         print(f"wrote {op} ({len(payload)} bytes)")
     else:
         print(payload)
-    return _exit_code_for_result(result)
+    return exit_code
 
 
 if __name__ == "__main__":
