@@ -127,15 +127,17 @@ PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" "$SKILL_DIR/scripts/query.py" "$PROJ" "<用
    - **source-summary 全文区**（`## 全文内容` + `## 文档内嵌图片`）：`update_wiki.py` 步骤 1 已自动落盘 `ParsedDoc.text` 到 `<!-- BEGIN AUTO-GENERATED -->` 标记区，**不经 LLM**，保证数据完整性
    - **source-summary 的 frontmatter/摘要/related** + **entities/concepts/comparisons 衍生页**：agent 生成/更新。衍生页数值必须从 source-summary 全文区提取，不得凭摘要臆测
 3. 对 deleted 文档：agent 清理关联 `Wiki/*.md`（`index.md` 由脚本自动重建，见步骤 7，无需手改）
-4. 重建索引：`<venv_python> <skill_dir>/scripts/build_index.py <project_root>`（默认安全 snapshot；存储模式契约见下）。
-5. 重建图谱：`<venv_python> <skill_dir>/scripts/build_graph.py <project_root>`
-6. 更新 `Wiki/log.md`（append 操作记录）
+4. 更新 `Wiki/log.md`（append 操作记录）——**必须在重建索引/图谱之前**：`log.md` 也是 Wiki 页，落在 build 之后会让 freshness 立即转 stale
+5. 重建索引：`<venv_python> <skill_dir>/scripts/build_index.py <project_root>`（默认安全 snapshot；存储模式契约见下）。
+6. 重建图谱：`<venv_python> <skill_dir>/scripts/build_graph.py <project_root>`
 7. 重建 Wiki 索引 MOC（`index.md`）：由 `build_index_md.py` 扫描 `Wiki/**/*.md`、按页面 `type` 分组自动生成 `[[slug|title]]` 列表。
    - `update_wiki.py` 末尾已**自动调用**，增量流程无需手动触发；重建时同时自动修复非法 `tags:`（含空格标签转连字符，见上方 frontmatter 规范）；
 
    - 仅当**绕过 update_wiki.py 手动新增/删除 Wiki 页面**时，须单独运行：
      `<venv_python> <skill_dir>/scripts/build_index_md.py <project_root>`
    - 该文件为自动生成，**禁止手改**（下次重建会被覆盖）。
+
+> **硬规则：build 是 Wiki 写入的最后一步。** `build_index.py` / `build_graph.py` 认的是整棵 `Wiki/**/*.md` 的内容指纹，任何发生在 build 之后的 Wiki 写入（补 frontmatter、改 related、修错别字、写 `log.md`）都会让 freshness 转 stale 并强制重跑一次完整 build。确需在 build 后改动时，改完必须重新 build。
 
 **增量原理：** 源文档层仍由 `manifest.json` 的 SHA256 跟踪，未变更文件零开销跳过解析。不要把这个或向量缓存混同为存储级 online incremental；下面是唯一可向用户陈述的存储模式与恢复契约。
 
